@@ -963,6 +963,8 @@ fn scan_interpolation_tail(bytes: &[u8], depth: usize) -> Result<usize, LexError
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleAst {
+    /// None for legacy fixtures; Napalm exports are explicit (local, public).
+    pub exports: Option<Vec<(Ident, Ident)>>,
     pub statements: Vec<Stmt>,
     pub span: Span,
 }
@@ -990,6 +992,11 @@ pub enum StmtKind {
     While {
         condition: Expr,
         body: Box<Stmt>,
+        increment: Option<Expr>,
+    },
+    DoWhile {
+        body: Box<Stmt>,
+        condition: Expr,
     },
     For {
         name: Ident,
@@ -1237,10 +1244,33 @@ pub enum ExprKind {
         target: Box<Expr>,
         value: Box<Expr>,
     },
+    Update {
+        target: Box<Expr>,
+        operator: BinaryOp,
+        value: Box<Expr>,
+        postfix: bool,
+    },
+    /// JavaScript logical assignment (`&&=`, `||=`, `??=`). The lowerer
+    /// evaluates property/subscript targets once before short-circuiting.
+    LogicalAssign {
+        target: Box<Expr>,
+        operator: LogicalOp,
+        value: Box<Expr>,
+    },
     Invoke(InvokeExpr),
     Subscript {
         receiver: Box<Expr>,
         args: Vec<Expr>,
+    },
+    /// Napalm/TypeScript surface-only spread element. The lowerer accepts this
+    /// only in collection literals; ordinary expression use is rejected.
+    Spread(Box<Expr>),
+    /// JavaScript/TypeScript optional-chain semantics. Once an optional segment
+    /// short-circuits, the remainder of this chain is skipped and the expression
+    /// evaluates to null (Napalm intentionally has no separate `undefined`).
+    OptionalChain {
+        base: Box<Expr>,
+        segments: Vec<OptionalChainSegment>,
     },
     /// WrenJIT extension: suspend the current async execution until a Promise settles.
     Await(Box<Expr>),
@@ -1274,9 +1304,31 @@ pub struct SuperExpr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapEntry {
+    /// For normal entries this is the source key. For `{ ...expr }`, `spread` is
+    /// true and the key is an inert null placeholder; the value is the source map.
     pub key: Expr,
     pub value: Expr,
     pub span: Span,
+    pub spread: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionalChainSegment {
+    Property {
+        name: Ident,
+        optional: bool,
+        /// `Some(args)` represents a direct method call and preserves the
+        /// receiver instead of materializing a bound method closure.
+        call_args: Option<Vec<Expr>>,
+    },
+    Subscript {
+        key: Expr,
+        optional: bool,
+    },
+    Call {
+        args: Vec<Expr>,
+        optional: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1325,7 +1377,8 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             }
             ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
-            | ExprKind::Await(inner) => visit_expr(inner, out),
+            | ExprKind::Await(inner)
+            | ExprKind::Spread(inner) => visit_expr(inner, out),
             ExprKind::Binary { left, right, .. }
             | ExprKind::Logical { left, right, .. } => {
                 visit_expr(left, out);
@@ -1340,7 +1393,9 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                 visit_expr(then_expr, out);
                 visit_expr(else_expr, out);
             }
-            ExprKind::Assign { target, value } => {
+            ExprKind::Assign { target, value }
+            | ExprKind::Update { target, value, .. }
+            | ExprKind::LogicalAssign { target, value, .. } => {
                 visit_expr(target, out);
                 visit_expr(value, out);
             }
@@ -1356,6 +1411,26 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                 visit_expr(receiver, out);
                 for arg in args {
                     visit_expr(arg, out);
+                }
+            }
+            ExprKind::OptionalChain { base, segments } => {
+                visit_expr(base, out);
+                for segment in segments {
+                    match segment {
+                        OptionalChainSegment::Property { call_args, .. } => {
+                            if let Some(args) = call_args {
+                                for arg in args {
+                                    visit_expr(arg, out);
+                                }
+                            }
+                        }
+                        OptionalChainSegment::Subscript { key, .. } => visit_expr(key, out),
+                        OptionalChainSegment::Call { args, .. } => {
+                            for arg in args {
+                                visit_expr(arg, out);
+                            }
+                        }
+                    }
                 }
             }
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => visit_body(body, out),
@@ -1400,9 +1475,14 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                     visit_stmt(else_branch, out);
                 }
             }
-            StmtKind::While { condition, body } => {
+            StmtKind::While { condition, body, increment } => {
                 visit_expr(condition, out);
                 visit_stmt(body, out);
+                if let Some(e) = increment { visit_expr(e, out); }
+            }
+            StmtKind::DoWhile { body, condition } => {
+                visit_stmt(body, out);
+                visit_expr(condition, out);
             }
             StmtKind::For { iterable, body, .. } => {
                 visit_expr(iterable, out);
@@ -1452,6 +1532,7 @@ pub enum UnaryOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
+    Power,
     Multiply,
     Divide,
     Modulo,
@@ -1477,6 +1558,8 @@ pub enum BinaryOp {
 pub enum LogicalOp {
     And,
     Or,
+    /// `a ?? b`: evaluate `b` only when `a` is null.
+    Nullish,
 }
 
 // =============================================================================
@@ -1577,6 +1660,7 @@ impl<'a> Parser<'a> {
         }
 
         ModuleAst {
+            exports: None,
             statements,
             span: Span::new(start, self.peek().span.end),
         }
@@ -2128,7 +2212,7 @@ impl<'a> Parser<'a> {
         let body = Box::new(self.parse_statement()?);
         let end = body.span.end;
         Ok(Stmt {
-            kind: StmtKind::While { condition, body },
+            kind: StmtKind::While { condition, body, increment: None },
             span: Span::new(start, end),
         })
     }
@@ -3097,7 +3181,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             let value = self.parse_expression()?;
             let span = key.span.join(value.span);
-            entries.push(MapEntry { key, value, span });
+            entries.push(MapEntry { key, value, span, spread: false });
 
             if self.match_kind(TokenKind::Comma) {
                 continue;

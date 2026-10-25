@@ -6022,7 +6022,15 @@ impl TracingJit {
         }
 
         let compiler = CraneliftTraceCompiler::new(trace, &options)?;
-        compiler.compile(self.backend.as_mut().unwrap())
+        let backend = self.backend.as_mut().unwrap();
+        let result = compiler.compile(backend);
+        if result.is_err() {
+            // A lowering error can bypass FunctionBuilder::finalize. A later
+            // trace must not reuse the partially populated SSA builder context.
+            backend.function_context = FunctionBuilderContext::new();
+            backend.context.clear();
+        }
+        result
     }
 
     pub fn trace(&self, id: TraceId) -> Option<&Trace> {

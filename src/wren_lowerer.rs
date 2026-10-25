@@ -495,9 +495,14 @@ impl Analyzer {
                         self.visit_expr(initializer);
                     }
                 } else {
-                    self.declare(name);
+                    let binding = self.declare(name);
                     if let Some(initializer) = initializer {
                         self.visit_expr(initializer);
+                    }
+                    // A closure in its own initializer captures the binding
+                    // before the value exists. It needs an initially empty cell.
+                    if self.analysis.bindings[binding.0 as usize].captured {
+                        self.analysis.bindings[binding.0 as usize].mutated = true;
                     }
                 }
             }
@@ -536,9 +541,14 @@ impl Analyzer {
                     self.visit_stmt(else_branch, false);
                 }
             }
-            StmtKind::While { condition, body } => {
+            StmtKind::While { condition, body, increment } => {
                 self.visit_expr(condition);
                 self.visit_stmt(body, false);
+                if let Some(e) = increment { self.visit_expr(e); }
+            }
+            StmtKind::DoWhile { body, condition } => {
+                self.visit_stmt(body, false);
+                self.visit_expr(condition);
             }
             StmtKind::For {
                 name,
@@ -640,7 +650,9 @@ impl Analyzer {
                 self.visit_expr(then_expr);
                 self.visit_expr(else_expr);
             }
-            ExprKind::Assign { target, value } => {
+            ExprKind::Assign { target, value }
+            | ExprKind::Update { target, value, .. }
+            | ExprKind::LogicalAssign { target, value, .. } => {
                 self.visit_assignment_target(target);
                 self.visit_expr(value);
             }
@@ -658,6 +670,23 @@ impl Analyzer {
                 self.visit_expr(receiver);
                 for arg in args {
                     self.visit_expr(arg);
+                }
+            }
+            ExprKind::Spread(value) => self.visit_expr(value),
+            ExprKind::OptionalChain { base, segments } => {
+                self.visit_expr(base);
+                for segment in segments {
+                    match segment {
+                        front::OptionalChainSegment::Property { call_args, .. } => {
+                            if let Some(args) = call_args {
+                                for arg in args { self.visit_expr(arg); }
+                            }
+                        }
+                        front::OptionalChainSegment::Subscript { key, .. } => self.visit_expr(key),
+                        front::OptionalChainSegment::Call { args, .. } => {
+                            for arg in args { self.visit_expr(arg); }
+                        }
+                    }
                 }
             }
             ExprKind::Await(value) => self.visit_expr(value),
@@ -1005,6 +1034,11 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             }
         }
 
+        if let Some(explicit) = &self.ast.exports {
+            names = explicit.iter().filter_map(|(local, public)| {
+                self.module_layout.get(&local.value).map(|slot| (public.value.clone(), slot))
+            }).collect();
+        }
         let exports = names
             .into_iter()
             .map(|(name, slot)| ModuleExport {
@@ -1223,6 +1257,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             name: "toString".to_owned(),
             kind: MethodKind::Getter,
             arity: 0,
+        });
+        // Napalm surface sugar lowered by the compiler itself.
+        keys.insert(MethodKey {
+            name: "keys".to_owned(),
+            kind: MethodKind::Getter,
+            arity: 0,
+        });
+        keys.insert(MethodKey {
+            name: "[]".to_owned(),
+            kind: MethodKind::SubscriptGetter,
+            arity: 1,
         });
 
         for key in keys {
@@ -1554,6 +1599,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             source_file: self.source_file,
             module,
             module_layout: &self.module_layout,
+            implicit_this: self.ast.exports.is_none(),
             symbols: &self.symbols,
             class_plans: &self.class_plans,
             string_ids: &self.string_ids,
@@ -1684,6 +1730,7 @@ struct FunctionCompilerContext<'a> {
     source_file: ir::StringId,
     module: ModuleId,
     module_layout: &'a ModuleLayout,
+    implicit_this: bool,
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
     string_ids: &'a HashMap<String, ir::StringId>,
@@ -2125,6 +2172,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.set_source(stmt.span);
         match &stmt.kind {
             StmtKind::Variable { name, initializer } => {
+                let early_binding = if module_level { None } else {
+                    self.context.analysis.declaration_map.get(&name.span).copied().filter(|binding| {
+                        let info = self.context.analysis.binding(*binding);
+                        info.captured && info.mutated
+                    })
+                };
+                if let Some(binding) = early_binding {
+                    let empty = self.builder.const_null();
+                    self.bind_initial(binding, empty);
+                }
                 let value = initializer
                     .as_ref()
                     .map(|expr| self.lower_expr(expr))
@@ -2139,6 +2196,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     } else {
                         self.error("WREN-L010", "missing module slot for variable", name.span);
                     }
+                } else if let Some(binding) = early_binding {
+                    self.write_binding(binding, value);
                 } else if let Some(binding) = self
                     .context
                     .analysis
@@ -2157,7 +2216,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 then_branch,
                 else_branch,
             } => self.lower_if(condition, then_branch, else_branch.as_deref()),
-            StmtKind::While { condition, body } => self.lower_while(condition, body),
+            StmtKind::While { condition, body, increment } => self.lower_while(condition, body, increment.as_ref()),
+            StmtKind::DoWhile { body, condition } => self.lower_do_while(body, condition),
             StmtKind::For {
                 name,
                 iterable,
@@ -2390,8 +2450,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
     }
 
-    fn lower_while(&mut self, condition: &Expr, body: &Stmt) {
-        let carried = self.loop_carried_bindings(condition, body);
+    fn lower_while(&mut self, condition: &Expr, body: &Stmt, increment: Option<&Expr>) {
+        let scan_body = increment.map(|e| Stmt {
+            kind: StmtKind::Block(vec![body.clone(), Stmt { kind: StmtKind::Expression(e.clone()), span: e.span }]),
+            span: body.span,
+        });
+        let carried = self.loop_carried_bindings(condition, scan_body.as_ref().unwrap_or(body));
         let preheader_env = self.env.clone();
 
         let header = self.new_block(&[]);
@@ -2401,6 +2465,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             header_params.insert(*binding, param);
         }
         let body_block = self.new_block(&[]);
+        let step = increment.map(|_| self.new_block(&[]));
+        let step_params: Vec<_> = carried.iter().filter_map(|binding| {
+            step.map(|block| (*binding, self.builder.add_block_param(block, Type::Top)))
+        }).collect();
         let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
@@ -2426,7 +2494,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let body_env = self.env.clone();
         self.env = body_env;
         self.loops.push(LoopContext {
-            continue_target: header,
+            continue_target: step.unwrap_or(header),
             break_target: exit,
             carried: carried.clone(),
             continue_prefix: Vec::new(),
@@ -2436,6 +2504,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.loops.pop();
         if !self.current_terminated() {
             let back_args = self.values_for_bindings(&carried, &self.env);
+            self.builder.jump(step.unwrap_or(header), back_args);
+        }
+        if let (Some(step), Some(increment)) = (step, increment) {
+            self.builder.seal_block(step);
+            self.builder.position_at(step);
+            self.env = preheader_env.clone();
+            for (binding, value) in step_params { self.env.insert(binding, Storage::Value(value)); }
+            self.lower_expr(increment);
+            let back_args = self.values_for_bindings(&carried, &self.env);
             self.builder.jump(header, back_args);
         }
 
@@ -2444,6 +2521,84 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.env = preheader_env;
         for binding in &carried {
             self.env.insert(*binding, Storage::Value(exit_params[binding]));
+        }
+    }
+
+    fn lower_do_while(&mut self, body: &Stmt, condition: &Expr) {
+        let carried = self.loop_carried_bindings(condition, body);
+        let preheader_env = self.env.clone();
+
+        let body_block = self.new_block(&[]);
+        let mut body_params = HashMap::new();
+        for binding in &carried {
+            body_params.insert(*binding, self.builder.add_block_param(body_block, Type::Top));
+        }
+
+        let condition_block = self.new_block(&[]);
+        let mut condition_params = HashMap::new();
+        for binding in &carried {
+            condition_params.insert(
+                *binding,
+                self.builder.add_block_param(condition_block, Type::Top),
+            );
+        }
+
+        let exit = self.new_block(&[]);
+        let mut exit_params = HashMap::new();
+        for binding in &carried {
+            exit_params.insert(*binding, self.builder.add_block_param(exit, Type::Top));
+        }
+
+        let entry_args = self.values_for_bindings(&carried, &preheader_env);
+        self.builder.jump(body_block, entry_args);
+
+        self.builder.position_at(body_block);
+        self.env = preheader_env.clone();
+        for binding in &carried {
+            self.env
+                .insert(*binding, Storage::Value(body_params[binding]));
+        }
+
+        self.loops.push(LoopContext {
+            continue_target: condition_block,
+            break_target: exit,
+            carried: carried.clone(),
+            continue_prefix: Vec::new(),
+            exit_action_depth: self.exit_actions.len(),
+        });
+        self.lower_scoped_stmt(body);
+        self.loops.pop();
+
+        if !self.current_terminated() {
+            let args = self.values_for_bindings(&carried, &self.env);
+            self.builder.jump(condition_block, args);
+        }
+
+        self.builder.seal_block(condition_block);
+        self.builder.position_at(condition_block);
+        self.env = preheader_env.clone();
+        for binding in &carried {
+            self.env
+                .insert(*binding, Storage::Value(condition_params[binding]));
+        }
+
+        let cond = self.lower_expr(condition);
+        let carried_args = self.values_for_bindings(&carried, &self.env);
+        self.builder.branch(
+            cond,
+            body_block,
+            carried_args.clone(),
+            exit,
+            carried_args,
+        );
+
+        self.builder.seal_block(body_block);
+        self.builder.seal_block(exit);
+        self.builder.position_at(exit);
+        self.env = preheader_env;
+        for binding in &carried {
+            self.env
+                .insert(*binding, Storage::Value(exit_params[binding]));
         }
     }
 
@@ -2648,8 +2803,23 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 else_expr,
             } => self.lower_conditional(condition, then_expr, else_expr),
             ExprKind::Assign { target, value } => self.lower_assignment(target, value),
+            ExprKind::Update { target, operator, value, postfix } => self.lower_update(target, *operator, value, *postfix),
+            ExprKind::LogicalAssign { target, operator, value } => {
+                self.lower_logical_assignment(target, *operator, value, expr.span)
+            }
             ExprKind::Invoke(invoke) => self.lower_invoke(invoke, expr.span),
             ExprKind::Subscript { receiver, args } => self.lower_subscript(receiver, args),
+            ExprKind::Spread(value) => {
+                self.error(
+                    "NAPALM-L100",
+                    "spread is only valid in collection literals or call argument lists",
+                    expr.span,
+                );
+                self.lower_expr(value)
+            }
+            ExprKind::OptionalChain { base, segments } => {
+                self.lower_optional_chain(base, segments, expr.span)
+            }
             ExprKind::Await(promise) => {
                 let promise = self.lower_expr(promise);
                 if !self.context.allows_await {
@@ -2714,7 +2884,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
             return self.read_binding(binding);
         }
-        if self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
+        if self.context.implicit_this && self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
             let receiver = self.lower_this(name.span);
             let method = self.context.symbols.expect(&name.value, MethodKind::Getter, 0);
             return self.builder.invoke(receiver, method, Vec::new());
@@ -2825,7 +2995,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // A missing superclass implementation is a runtime dispatch error, not
         // a missing-symbol panic in the compiler (including changed arities).
         let symbol = self.builder.intern_method(&name, kind, arity as u8);
-        let args = super_expr.args.iter().map(|arg| self.lower_expr(arg)).collect();
+        let args = self.lower_call_args(&super_expr.args, span);
         self.builder.invoke_super(method.class, receiver, symbol, args)
     }
 
@@ -2838,7 +3008,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_list(&mut self, items: &[Expr]) -> ValueId {
-        let capacity = self.builder.const_i32(items.len().min(i32::MAX as usize) as i32);
+        let fixed = items
+            .iter()
+            .filter(|item| !matches!(&item.kind, ExprKind::Spread(_)))
+            .count();
+        let capacity = self.builder.const_i32(fixed.min(i32::MAX as usize) as i32);
         let list = self.builder.emit1(
             Inst::AllocList {
                 capacity: Some(capacity),
@@ -2846,20 +3020,114 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Type::List(None),
         );
         for item in items {
-            let value = self.lower_expr(item);
-            self.builder.emit0(Inst::ListAppend { list, value });
+            match &item.kind {
+                ExprKind::Spread(iterable) => {
+                    let sequence = self.lower_expr(iterable);
+                    self.append_iterable_to_list(list, sequence);
+                }
+                _ => {
+                    let value = self.lower_expr(item);
+                    self.builder.emit0(Inst::ListAppend { list, value });
+                }
+            }
         }
         list
+    }
+
+    fn append_iterable_to_list(&mut self, list: ValueId, sequence: ValueId) {
+        // This is deliberately emitted as ordinary SSA control flow rather than a
+        // runtime helper. The existing optimizer/JIT can therefore specialize the
+        // iterator protocol and keep the destination list hot.
+        let saved_env = self.env.clone();
+        let initial = self.builder.const_null();
+        let header = self.new_block(&[]);
+        let iter_param = self.builder.add_block_param(header, Type::Top);
+        let body = self.new_block(&[]);
+        let exit = self.new_block(&[]);
+
+        self.builder.jump(header, vec![initial]);
+        self.builder.seal_block(header);
+        self.builder.position_at(header);
+        self.env = saved_env.clone();
+
+        let iterate = self.context.symbols.expect("iterate", MethodKind::Method, 1);
+        let iter = self.builder.invoke(sequence, iterate, vec![iter_param]);
+        self.builder.branch(iter, body, Vec::new(), exit, Vec::new());
+
+        self.builder.position_at(body);
+        self.env = saved_env.clone();
+        let value_symbol = self
+            .context
+            .symbols
+            .expect("iteratorValue", MethodKind::Method, 1);
+        let value = self.builder.invoke(sequence, value_symbol, vec![iter]);
+        self.builder.emit0(Inst::ListAppend { list, value });
+        self.builder.jump(header, vec![iter]);
+
+        self.builder.seal_block(exit);
+        self.builder.position_at(exit);
+        self.env = saved_env;
     }
 
     fn lower_map(&mut self, entries: &[front::MapEntry]) -> ValueId {
         let map = self.builder.emit1(Inst::AllocMap, Type::Map);
         for entry in entries {
-            let key = self.lower_expr(&entry.key);
-            let value = self.lower_expr(&entry.value);
-            self.builder.emit0(Inst::MapSet { map, key, value });
+            if entry.spread {
+                let source = self.lower_expr(&entry.value);
+                self.copy_map_entries(map, source);
+            } else {
+                let key = self.lower_expr(&entry.key);
+                let value = self.lower_expr(&entry.value);
+                self.builder.emit0(Inst::MapSet { map, key, value });
+            }
         }
         map
+    }
+
+    fn copy_map_entries(&mut self, destination: ValueId, source: ValueId) {
+        // Napalm object literals are backed by Map. Spreading therefore means
+        // copying the source's enumerable map entries in source iteration order.
+        let saved_env = self.env.clone();
+        let keys_symbol = self.context.symbols.expect("keys", MethodKind::Getter, 0);
+        let keys = self.builder.invoke(source, keys_symbol, Vec::new());
+
+        let initial = self.builder.const_null();
+        let header = self.new_block(&[]);
+        let iter_param = self.builder.add_block_param(header, Type::Top);
+        let body = self.new_block(&[]);
+        let exit = self.new_block(&[]);
+
+        self.builder.jump(header, vec![initial]);
+        self.builder.seal_block(header);
+        self.builder.position_at(header);
+        self.env = saved_env.clone();
+
+        let iterate = self.context.symbols.expect("iterate", MethodKind::Method, 1);
+        let iter = self.builder.invoke(keys, iterate, vec![iter_param]);
+        self.builder.branch(iter, body, Vec::new(), exit, Vec::new());
+
+        self.builder.position_at(body);
+        self.env = saved_env.clone();
+        let value_symbol = self
+            .context
+            .symbols
+            .expect("iteratorValue", MethodKind::Method, 1);
+        let key = self.builder.invoke(keys, value_symbol, vec![iter]);
+        let getter = self
+            .context
+            .symbols
+            .expect("[]", MethodKind::SubscriptGetter, 1);
+        let value = self.builder.invoke(source, getter, vec![key]);
+        self.builder.emit0(Inst::MapSet {
+            map: destination,
+            key,
+            value,
+        });
+        self.builder.jump(header, vec![iter]);
+
+        self.builder.seal_block(exit);
+        self.builder.position_at(exit);
+        self.env = saved_env;
     }
 
     fn lower_unary(&mut self, operator: UnaryOp, operand: &Expr) -> ValueId {
@@ -2909,6 +3177,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 rhs_block,
                 Vec::new(),
             ),
+            LogicalOp::Nullish => {
+                let is_null = self.emit_is_null(left_value);
+                self.builder.branch(
+                    is_null,
+                    rhs_block,
+                    Vec::new(),
+                    short_block,
+                    Vec::new(),
+                )
+            }
         }
 
         self.builder.position_at(short_block);
@@ -3021,12 +3299,159 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_assignment(&mut self, target: &Expr, value: &Expr) -> ValueId {
+        let location = self.prepare_assignment(target);
         let value = self.lower_expr(value);
+        self.store_assignment(target, value, location)
+    }
+
+    fn prepare_assignment(&mut self, target: &Expr) -> Option<(ValueId, Vec<ValueId>)> {
+        match &target.kind {
+            ExprKind::Invoke(invoke) => Some((invoke.receiver.as_ref()
+                .map(|e| self.lower_expr(e)).unwrap_or_else(|| self.lower_this(target.span)), Vec::new())),
+            ExprKind::Subscript { receiver, args } => {
+                let receiver = self.lower_expr(receiver);
+                let args = args.iter().map(|e| self.lower_expr(e)).collect();
+                Some((receiver, args))
+            }
+            _ => None,
+        }
+    }
+
+    fn lower_logical_assignment(
+        &mut self,
+        target: &Expr,
+        operator: LogicalOp,
+        rhs: &Expr,
+        _span: Span,
+    ) -> ValueId {
+        let location = self.prepare_assignment(target);
+        let old = match (&target.kind, &location) {
+            (ExprKind::Invoke(invoke), Some((receiver, _))) => {
+                let getter = self
+                    .context
+                    .symbols
+                    .expect(&invoke.name.value, MethodKind::Getter, 0);
+                self.builder.invoke(*receiver, getter, Vec::new())
+            }
+            (ExprKind::Subscript { .. }, Some((receiver, args))) => {
+                let getter = self
+                    .context
+                    .symbols
+                    .expect("[]", MethodKind::SubscriptGetter, args.len());
+                self.builder.invoke(*receiver, getter, args.clone())
+            }
+            _ => self.lower_expr(target),
+        };
+
+        let rhs_block = self.new_block(&[]);
+        let short_block = self.new_block(&[]);
+        let join = self.new_block(&[]);
+        let result_param = self.builder.add_block_param(join, Type::Top);
+        let incoming = self.env.clone();
+
+        match operator {
+            LogicalOp::And => self.builder.branch(
+                old,
+                rhs_block,
+                Vec::new(),
+                short_block,
+                Vec::new(),
+            ),
+            LogicalOp::Or => self.builder.branch(
+                old,
+                short_block,
+                Vec::new(),
+                rhs_block,
+                Vec::new(),
+            ),
+            LogicalOp::Nullish => {
+                let is_null = self.emit_is_null(old);
+                self.builder.branch(
+                    is_null,
+                    rhs_block,
+                    Vec::new(),
+                    short_block,
+                    Vec::new(),
+                );
+            }
+        }
+
+        self.builder.position_at(short_block);
+        self.env = incoming.clone();
+        let short_end = self.builder.current_block();
+        let short_env = self.env.clone();
+
+        self.builder.position_at(rhs_block);
+        self.env = incoming.clone();
+        let rhs_value = self.lower_expr(rhs);
+        let rhs_result = self.store_assignment(target, rhs_value, location.clone());
+        let rhs_end = self.builder.current_block();
+        let rhs_env = self.env.clone();
+
+        let mut merged_env = incoming.clone();
+        let mut env_params = Vec::new();
+        for binding in incoming.keys().copied().collect::<Vec<_>>() {
+            match (short_env.get(&binding).copied(), rhs_env.get(&binding).copied()) {
+                (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
+                    let param = self.builder.add_block_param(join, Type::Top);
+                    merged_env.insert(binding, Storage::Value(param));
+                    env_params.push(binding);
+                }
+                (Some(value), Some(_)) => {
+                    merged_env.insert(binding, value);
+                }
+                _ => {}
+            }
+        }
+
+        self.builder.position_at(short_end);
+        let mut short_args = vec![old];
+        short_args.extend(env_params.iter().map(|binding| match short_env[binding] {
+            Storage::Value(value) => value,
+            Storage::Cell(_) => unreachable!(),
+        }));
+        self.builder.jump(join, short_args);
+
+        self.builder.position_at(rhs_end);
+        let mut rhs_args = vec![rhs_result];
+        rhs_args.extend(env_params.iter().map(|binding| match rhs_env[binding] {
+            Storage::Value(value) => value,
+            Storage::Cell(_) => unreachable!(),
+        }));
+        self.builder.jump(join, rhs_args);
+
+        self.builder.seal_block(join);
+        self.builder.position_at(join);
+        self.env = merged_env;
+        result_param
+    }
+
+    fn lower_update(&mut self, target: &Expr, operator: BinaryOp, rhs: &Expr, postfix: bool) -> ValueId {
+        let location = self.prepare_assignment(target);
+        let old = match (&target.kind, &location) {
+            (ExprKind::Invoke(i), Some((receiver, _))) => {
+                let symbol = self.context.symbols.expect(&i.name.value, MethodKind::Getter, 0);
+                self.builder.invoke(*receiver, symbol, Vec::new())
+            }
+            (ExprKind::Subscript { .. }, Some((receiver, args))) => {
+                let symbol = self.context.symbols.expect("[]", MethodKind::SubscriptGetter, args.len());
+                self.builder.invoke(*receiver, symbol, args.clone())
+            }
+            _ => self.lower_expr(target),
+        };
+        let rhs = self.lower_expr(rhs);
+        let symbol = self.context.symbols.expect(binary_operator_name(operator), MethodKind::Method, 1);
+        let value = self.builder.invoke(old, symbol, vec![rhs]);
+        self.store_assignment(target, value, location);
+        if postfix { old } else { value }
+    }
+
+    fn store_assignment(&mut self, target: &Expr, value: ValueId, location: Option<(ValueId, Vec<ValueId>)>) -> ValueId {
         match &target.kind {
             ExprKind::Name(name) => {
                 if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
                     self.write_binding(binding, value);
-                } else if self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
+                } else if self.context.implicit_this && self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
                     let receiver = self.lower_this(name.span);
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
                     let _ = self.builder.invoke(receiver, setter, vec![value]);
@@ -3081,11 +3506,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 }
             }
             ExprKind::Invoke(invoke) => {
-                let receiver = invoke
-                    .receiver
-                    .as_ref()
-                    .map(|receiver| self.lower_expr(receiver))
-                    .unwrap_or_else(|| self.lower_this(target.span));
+                let (receiver, _) = location.expect("prepared property assignment");
                 let setter = self
                     .context
                     .symbols
@@ -3093,8 +3514,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 let _ = self.builder.invoke(receiver, setter, vec![value]);
             }
             ExprKind::Subscript { receiver, args } => {
-                let receiver = self.lower_expr(receiver);
-                let mut lowered: Vec<_> = args.iter().map(|arg| self.lower_expr(arg)).collect();
+                let (receiver, mut lowered) = location.expect("prepared subscript assignment");
                 lowered.push(value);
                 let method = self.context.symbols.expect(
                     "[]=",
@@ -3116,7 +3536,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             .as_ref()
             .map(|receiver| self.lower_expr(receiver))
             .unwrap_or_else(|| self.lower_this(span));
-        let args: Vec<_> = invoke.args.iter().map(|arg| self.lower_expr(arg)).collect();
+        let args = self.lower_call_args(&invoke.args, span);
         let kind = match invoke.syntax {
             InvokeSyntax::Getter => MethodKind::Getter,
             InvokeSyntax::Method => MethodKind::Method,
@@ -3136,6 +3556,201 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             .symbols
             .expect("[]", MethodKind::SubscriptGetter, args.len());
         self.builder.invoke(receiver, symbol, args)
+    }
+
+    fn emit_is_null(&mut self, value: ValueId) -> ValueId {
+        let Some(slot) = self.context.module_layout.get("Null") else {
+            self.error(
+                "NAPALM-L101",
+                "internal error: core global `Null` is not available",
+                Span::empty(0),
+            );
+            return self.builder.const_bool(false);
+        };
+        let class = self.builder.emit1(
+            Inst::LoadModuleVar {
+                module: self.context.module,
+                slot,
+            },
+            Type::Class(ClassSet::new()),
+        );
+        self.builder
+            .emit1(Inst::IsInstance { value, class }, Type::Bool)
+    }
+
+    fn lower_optional_chain(
+        &mut self,
+        base: &Expr,
+        segments: &[front::OptionalChainSegment],
+        span: Span,
+    ) -> ValueId {
+        let base_value = self.lower_expr(base);
+        let join = self.new_block(&[]);
+        let result_param = self.builder.add_block_param(join, Type::Top);
+        let mut exits: Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)> = Vec::new();
+
+        self.lower_optional_chain_path(base_value, segments, 0, span, &mut exits);
+
+        if exits.is_empty() {
+            self.error("NAPALM-L102", "optional chain produced no exit path", span);
+            return self.builder.const_null();
+        }
+
+        // Merge SSA locals from every possible short-circuit point exactly like
+        // conditional expressions do. Captured mutable locals are cells and keep
+        // the same storage identity across every path.
+        let first_env = exits[0].2.clone();
+        let mut merged_env = first_env.clone();
+        let mut env_params = Vec::new();
+
+        for binding in first_env.keys().copied().collect::<Vec<_>>() {
+            let mut values = Vec::with_capacity(exits.len());
+            let mut complete = true;
+            for (_, _, env) in &exits {
+                if let Some(storage) = env.get(&binding).copied() {
+                    values.push(storage);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete || values.is_empty() {
+                continue;
+            }
+            if values.iter().all(|value| *value == values[0]) {
+                merged_env.insert(binding, values[0]);
+                continue;
+            }
+            if values.iter().all(|value| matches!(value, Storage::Value(_))) {
+                let param = self.builder.add_block_param(join, Type::Top);
+                merged_env.insert(binding, Storage::Value(param));
+                env_params.push(binding);
+            }
+        }
+
+        for (block, value, env) in exits {
+            self.builder.position_at(block);
+            let mut args = vec![value];
+            args.extend(env_params.iter().map(|binding| match env[binding] {
+                Storage::Value(value) => value,
+                Storage::Cell(_) => unreachable!("cell identity must not require a merge parameter"),
+            }));
+            self.builder.jump(join, args);
+        }
+
+        self.builder.seal_block(join);
+        self.builder.position_at(join);
+        self.env = merged_env;
+        result_param
+    }
+
+    fn lower_optional_chain_path(
+        &mut self,
+        current: ValueId,
+        segments: &[front::OptionalChainSegment],
+        index: usize,
+        span: Span,
+        exits: &mut Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)>,
+    ) {
+        if index == segments.len() {
+            exits.push((self.builder.current_block(), current, self.env.clone()));
+            return;
+        }
+
+        let segment = &segments[index];
+        let optional = match segment {
+            front::OptionalChainSegment::Property { optional, .. }
+            | front::OptionalChainSegment::Subscript { optional, .. }
+            | front::OptionalChainSegment::Call { optional, .. } => *optional,
+        };
+
+        if optional {
+            let is_null = self.emit_is_null(current);
+            let null_block = self.new_block(&[]);
+            let continue_block = self.new_block(&[]);
+            let incoming = self.env.clone();
+            self.builder
+                .branch(is_null, null_block, Vec::new(), continue_block, Vec::new());
+
+            self.builder.position_at(null_block);
+            self.env = incoming.clone();
+            let null = self.builder.const_null();
+            exits.push((self.builder.current_block(), null, self.env.clone()));
+
+            self.builder.position_at(continue_block);
+            self.env = incoming;
+        }
+
+        let next = match segment {
+            front::OptionalChainSegment::Property {
+                name,
+                call_args,
+                ..
+            } => {
+                if let Some(args) = call_args {
+                    let args = self.lower_call_args(args, span);
+                    let method = self
+                        .context
+                        .symbols
+                        .expect(&name.value, MethodKind::Method, args.len());
+                    self.builder.invoke(current, method, args)
+                } else {
+                    let getter = self
+                        .context
+                        .symbols
+                        .expect(&name.value, MethodKind::Getter, 0);
+                    self.builder.invoke(current, getter, Vec::new())
+                }
+            }
+            front::OptionalChainSegment::Subscript { key, .. } => {
+                let key = self.lower_expr(key);
+                let getter = self
+                    .context
+                    .symbols
+                    .expect("[]", MethodKind::SubscriptGetter, 1);
+                self.builder.invoke(current, getter, vec![key])
+            }
+            front::OptionalChainSegment::Call { args, .. } => {
+                let args = self.lower_call_args(args, span);
+                let call = self
+                    .context
+                    .symbols
+                    .expect("call", MethodKind::Method, args.len());
+                self.builder.invoke(current, call, args)
+            }
+        };
+
+        self.lower_optional_chain_path(next, segments, index + 1, span, exits);
+    }
+
+    fn lower_call_args(&mut self, args: &[Expr], span: Span) -> Vec<ValueId> {
+        let mut lowered = Vec::with_capacity(args.len());
+        for arg in args {
+            match &arg.kind {
+                ExprKind::Spread(value) => {
+                    // Dynamic call-spread needs a variable-arity invoke ABI. Do
+                    // not silently turn it into one list argument.
+                    self.error(
+                        "NAPALM-L103",
+                        "call spread (`fn(...args)`) needs the pending variable-arity call ABI",
+                        arg.span,
+                    );
+                    // Preserve source side effects so diagnostics do not hide
+                    // unrelated lowering issues in the spread operand.
+                    let _ = self.lower_expr(value);
+                    lowered.push(self.builder.const_null());
+                }
+                _ => lowered.push(self.lower_expr(arg)),
+            }
+        }
+        if lowered.len() > MAX_WREN_ARITY {
+            self.error(
+                "NAPALM-L104",
+                format!("calls currently support at most {MAX_WREN_ARITY} arguments"),
+                span,
+            );
+        }
+        lowered
     }
 
     fn lower_closure(&mut self, body: &FunctionBody) -> ValueId {
@@ -3280,6 +3895,7 @@ fn display_method_signature(signature: &MethodSignatureAst) -> String {
 
 fn binary_operator_name(operator: BinaryOp) -> &'static str {
     match operator {
+        BinaryOp::Power => "**",
         BinaryOp::Multiply => "*",
         BinaryOp::Divide => "/",
         BinaryOp::Modulo => "%",
@@ -3327,8 +3943,8 @@ fn collect_class_declarations<'a>(statements: &'a [Stmt], out: &mut Vec<(&'a Cla
                         walk(std::slice::from_ref(else_branch.as_ref()), out, false);
                     }
                 }
-                StmtKind::While { body, .. } | StmtKind::For { body, .. }
-                | StmtKind::Defer { body, .. } => {
+                StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. }
+                | StmtKind::For { body, .. } | StmtKind::Defer { body, .. } => {
                     walk(std::slice::from_ref(body.as_ref()), out, false)
                 }
                 StmtKind::Try { body, catch, finally_branch } => {
@@ -3403,9 +4019,14 @@ fn collect_fields_stmt<'a>(stmt: &'a Stmt, instance: &mut SmallVec<[&'a str; 8]>
                 collect_fields_stmt(else_branch, instance, statics)
             }
         }
-        StmtKind::While { condition, body } => {
+        StmtKind::While { condition, body, increment } => {
             collect_fields_expr(condition, instance, statics);
-            collect_fields_stmt(body, instance, statics)
+            collect_fields_stmt(body, instance, statics);
+            if let Some(e) = increment { collect_fields_expr(e, instance, statics); }
+        }
+        StmtKind::DoWhile { body, condition } => {
+            collect_fields_stmt(body, instance, statics);
+            collect_fields_expr(condition, instance, statics);
         }
         StmtKind::For { iterable, body, .. } => {
             collect_fields_expr(iterable, instance, statics);
@@ -3457,7 +4078,9 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
             collect_fields_expr(then_expr, instance, statics);
             collect_fields_expr(else_expr, instance, statics);
         }
-        ExprKind::Assign { target, value } => {
+        ExprKind::Assign { target, value }
+        | ExprKind::Update { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
             collect_fields_expr(target, instance, statics);
             collect_fields_expr(value, instance, statics);
         }
@@ -3473,6 +4096,25 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
             collect_fields_expr(receiver, instance, statics);
             for arg in args {
                 collect_fields_expr(arg, instance, statics)
+            }
+        }
+        ExprKind::Spread(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::OptionalChain { base, segments } => {
+            collect_fields_expr(base, instance, statics);
+            for segment in segments {
+                match segment {
+                    front::OptionalChainSegment::Property { call_args, .. } => {
+                        if let Some(args) = call_args {
+                            for arg in args { collect_fields_expr(arg, instance, statics); }
+                        }
+                    }
+                    front::OptionalChainSegment::Subscript { key, .. } => {
+                        collect_fields_expr(key, instance, statics)
+                    }
+                    front::OptionalChainSegment::Call { args, .. } => {
+                        for arg in args { collect_fields_expr(arg, instance, statics); }
+                    }
+                }
             }
         }
         ExprKind::Await(value) => collect_fields_expr(value, instance, statics),
@@ -3548,9 +4190,14 @@ fn collect_method_keys_stmt(stmt: &Stmt, out: &mut HashSet<MethodKey>) {
                 collect_method_keys_stmt(else_branch, out)
             }
         }
-        StmtKind::While { condition, body } => {
+        StmtKind::While { condition, body, increment } => {
             collect_method_keys_expr(condition, out);
-            collect_method_keys_stmt(body, out)
+            collect_method_keys_stmt(body, out);
+            if let Some(e) = increment { collect_method_keys_expr(e, out); }
+        }
+        StmtKind::DoWhile { body, condition } => {
+            collect_method_keys_stmt(body, out);
+            collect_method_keys_expr(condition, out);
         }
         StmtKind::For { iterable, body, .. } => {
             collect_method_keys_expr(iterable, out);
@@ -3640,7 +4287,50 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 collect_method_keys_expr(arg, out)
             }
         }
-        ExprKind::Assign { target, value } => {
+        ExprKind::Spread(value) => collect_method_keys_expr(value, out),
+        ExprKind::OptionalChain { base, segments } => {
+            collect_method_keys_expr(base, out);
+            for segment in segments {
+                match segment {
+                    front::OptionalChainSegment::Property { name, call_args, .. } => {
+                        let (kind, arity) = match call_args {
+                            Some(args) => (MethodKind::Method, args.len() as u8),
+                            None => (MethodKind::Getter, 0),
+                        };
+                        out.insert(MethodKey {
+                            name: name.value.clone(),
+                            kind,
+                            arity,
+                        });
+                        if let Some(args) = call_args {
+                            for arg in args { collect_method_keys_expr(arg, out); }
+                        }
+                    }
+                    front::OptionalChainSegment::Subscript { key, .. } => {
+                        out.insert(MethodKey {
+                            name: "[]".to_owned(),
+                            kind: MethodKind::SubscriptGetter,
+                            arity: 1,
+                        });
+                        collect_method_keys_expr(key, out);
+                    }
+                    front::OptionalChainSegment::Call { args, .. } => {
+                        out.insert(MethodKey {
+                            name: "call".to_owned(),
+                            kind: MethodKind::Method,
+                            arity: args.len() as u8,
+                        });
+                        for arg in args { collect_method_keys_expr(arg, out); }
+                    }
+                }
+            }
+        }
+        ExprKind::Assign { target, value }
+        | ExprKind::Update { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
+            if let ExprKind::Update { operator, .. } = &expr.kind {
+                out.insert(MethodKey { name: binary_operator_name(*operator).to_owned(), kind: MethodKind::Method, arity: 1 });
+            }
             if let ExprKind::Name(name) = &target.kind {
                 out.insert(MethodKey {
                     name: name.value.clone(),
@@ -3768,9 +4458,14 @@ fn collect_strings_stmt(stmt: &Stmt, out: &mut Vec<Vec<u8>>) {
                 collect_strings_stmt(else_branch, out)
             }
         }
-        StmtKind::While { condition, body } => {
+        StmtKind::While { condition, body, increment } => {
             collect_strings_expr(condition, out);
-            collect_strings_stmt(body, out)
+            collect_strings_stmt(body, out);
+            if let Some(e) = increment { collect_strings_expr(e, out); }
+        }
+        StmtKind::DoWhile { body, condition } => {
+            collect_strings_stmt(body, out);
+            collect_strings_expr(condition, out);
         }
         StmtKind::For { iterable, body, .. } => {
             collect_strings_expr(iterable, out);
@@ -3822,7 +4517,9 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
             collect_strings_expr(then_expr, out);
             collect_strings_expr(else_expr, out)
         }
-        ExprKind::Assign { target, value } => {
+        ExprKind::Assign { target, value }
+        | ExprKind::Update { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
             collect_strings_expr(target, out);
             collect_strings_expr(value, out)
         }
@@ -3838,6 +4535,23 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
             collect_strings_expr(receiver, out);
             for arg in args {
                 collect_strings_expr(arg, out)
+            }
+        }
+        ExprKind::Spread(value) => collect_strings_expr(value, out),
+        ExprKind::OptionalChain { base, segments } => {
+            collect_strings_expr(base, out);
+            for segment in segments {
+                match segment {
+                    front::OptionalChainSegment::Property { call_args, .. } => {
+                        if let Some(args) = call_args {
+                            for arg in args { collect_strings_expr(arg, out); }
+                        }
+                    }
+                    front::OptionalChainSegment::Subscript { key, .. } => collect_strings_expr(key, out),
+                    front::OptionalChainSegment::Call { args, .. } => {
+                        for arg in args { collect_strings_expr(arg, out); }
+                    }
+                }
             }
         }
         ExprKind::Await(value) => collect_strings_expr(value, out),
@@ -3900,9 +4614,14 @@ fn collect_written_bindings_stmt(
                 collect_written_bindings_stmt(else_branch, analysis, out)
             }
         }
-        StmtKind::While { condition, body } => {
+        StmtKind::While { condition, body, increment } => {
             collect_written_bindings_expr(condition, analysis, out);
-            collect_written_bindings_stmt(body, analysis, out)
+            collect_written_bindings_stmt(body, analysis, out);
+            if let Some(e) = increment { collect_written_bindings_expr(e, analysis, out); }
+        }
+        StmtKind::DoWhile { body, condition } => {
+            collect_written_bindings_stmt(body, analysis, out);
+            collect_written_bindings_expr(condition, analysis, out);
         }
         StmtKind::For { iterable, body, .. } => {
             collect_written_bindings_expr(iterable, analysis, out);
@@ -3923,7 +4642,9 @@ fn collect_written_bindings_expr(
     out: &mut HashSet<BindingId>,
 ) {
     match &expr.kind {
-        ExprKind::Assign { target, value } => {
+        ExprKind::Assign { target, value }
+        | ExprKind::Update { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
             if let ExprKind::Name(name) = &target.kind {
                 if let Some(binding) = analysis.use_map.get(&name.span).copied() {
                     out.insert(binding);
@@ -3977,6 +4698,29 @@ fn collect_written_bindings_expr(
             collect_written_bindings_expr(receiver, analysis, out);
             for arg in args {
                 collect_written_bindings_expr(arg, analysis, out)
+            }
+        }
+        ExprKind::Spread(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::OptionalChain { base, segments } => {
+            collect_written_bindings_expr(base, analysis, out);
+            for segment in segments {
+                match segment {
+                    front::OptionalChainSegment::Property { call_args, .. } => {
+                        if let Some(args) = call_args {
+                            for arg in args {
+                                collect_written_bindings_expr(arg, analysis, out);
+                            }
+                        }
+                    }
+                    front::OptionalChainSegment::Subscript { key, .. } => {
+                        collect_written_bindings_expr(key, analysis, out)
+                    }
+                    front::OptionalChainSegment::Call { args, .. } => {
+                        for arg in args {
+                            collect_written_bindings_expr(arg, analysis, out);
+                        }
+                    }
+                }
             }
         }
         ExprKind::Super(super_expr) => {

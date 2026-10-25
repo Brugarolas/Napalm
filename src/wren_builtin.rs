@@ -114,10 +114,12 @@ enum BuiltinPrimitive {
     NumAdd,
     NumSub,
     NumMul,
+    NumPow,
     NumDiv,
     NumMod,
     NumInclusiveRange,
     NumExclusiveRange,
+    RangeNew,
     NumLt,
     NumLe,
     NumGt,
@@ -257,7 +259,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let n = instance(BuiltinClass::Num);
     for (name, op) in [
         ("+", BuiltinPrimitive::NumAdd), ("-", BuiltinPrimitive::NumSub),
-        ("*", BuiltinPrimitive::NumMul), ("/", BuiltinPrimitive::NumDiv),
+        ("*", BuiltinPrimitive::NumMul), ("**", BuiltinPrimitive::NumPow),
+        ("/", BuiltinPrimitive::NumDiv),
         ("%", BuiltinPrimitive::NumMod), ("<", BuiltinPrimitive::NumLt),
         ("<=", BuiltinPrimitive::NumLe), (">", BuiltinPrimitive::NumGt),
         (">=", BuiltinPrimitive::NumGe), ("==", BuiltinPrimitive::NumEq),
@@ -409,6 +412,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, instance(BuiltinClass::MapEntry), "value", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryValue);
 
     // Range.
+    manifest.register(program, static_(BuiltinId::Range), "new", MethodKind::Method, 2, BuiltinPrimitive::RangeNew);
+    manifest.register(program, static_(BuiltinId::Range), "new", MethodKind::Method, 3, BuiltinPrimitive::RangeNew);
     let range = instance(BuiltinClass::Range);
     for (name, kind, arity, op) in [
         ("from", MethodKind::Getter, 0, BuiltinPrimitive::RangeFrom),
@@ -788,12 +793,21 @@ fn execute_primitive(
         NumAdd => Ok(Value::from_num(num(this, "receiver")? + num(argument(args, 0)?, "argument")?)),
         NumSub => Ok(Value::from_num(num(this, "receiver")? - num(argument(args, 0)?, "argument")?)),
         NumMul => Ok(Value::from_num(num(this, "receiver")? * num(argument(args, 0)?, "argument")?)),
+        NumPow => Ok(Value::from_num(num(this, "receiver")?.powf(num(argument(args, 0)?, "argument")?))),
         NumDiv => Ok(Value::from_num(num(this, "receiver")? / num(argument(args, 0)?, "argument")?)),
         NumMod => Ok(Value::from_num(num(this, "receiver")? % num(argument(args, 0)?, "argument")?)),
         NumInclusiveRange | NumExclusiveRange => {
             let from = num(this, "range start")?;
             let to = num(argument(args, 0)?, "range end")?;
             Ok(context.allocate_range(from, to, matches!(op, NumInclusiveRange)))
+        }
+        RangeNew => {
+            let from = num(argument(args, 0)?, "range start")?;
+            let to = num(argument(args, 1)?, "range end")?;
+            let inclusive = if args.len() > 3 {
+                argument(args, 2)?.as_bool().ok_or_else(|| RuntimeError::new("inclusive must be a boolean"))?
+            } else { false };
+            Ok(context.allocate_range(from, to, inclusive))
         }
         NumLt => Ok(Value::from_bool(num(this, "receiver")? < num(argument(args, 0)?, "argument")?)),
         NumLe => Ok(Value::from_bool(num(this, "receiver")? <= num(argument(args, 0)?, "argument")?)),

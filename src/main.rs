@@ -1,4 +1,4 @@
-//! Wren VM executable entry point.
+//! Napalm VM executable entry point.
 //!
 //! Expected layout:
 //!
@@ -18,7 +18,7 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run -- path/to/program.wren
+//! cargo run -- path/to/program.nap
 //! ```
 //!
 //! The pipeline is:
@@ -28,7 +28,7 @@
 //!   -> static module graph resolution (@lib / @std / relative)
 //!   -> tokenizer/parser for every module
 //!   -> ASTs
-//!   -> one multi-module Wren HIR program
+//!   -> one multi-module dynamic HIR program
 //!   -> HIR optimization passes
 //!   -> register bytecode
 //!   -> interpreter / tracing JIT
@@ -40,6 +40,7 @@ pub mod wren_builtin;
 pub mod wren_bytecode;
 pub mod wren_bytecodecompiler;
 pub mod wren_front;
+pub mod napalm_front_main;
 pub mod wren_gc;
 pub mod wren_interpreter;
 pub mod wren_ir;
@@ -84,7 +85,7 @@ fn run() -> u8 {
     };
 
     if cfg!(debug_assertions) {
-        eprintln!("Debug build: use `cargo run --release -- <file.wren>` for performance measurements.");
+        eprintln!("Debug build: use `cargo run --release -- <file.nap>` for performance measurements.");
     }
 
     // -------------------------------------------------------------------------
@@ -144,17 +145,17 @@ fn run() -> u8 {
     // Diagnostics useful for comparing the threaded baseline against the tracing
     // tier without recompiling the VM. They are intentionally opt-in so normal
     // execution has no environment lookup in the hot path.
-    if env::var_os("WREN_NO_JIT").is_some() {
+    if env::var_os("NAPALM_NO_JIT").is_some() || env::var_os("WREN_NO_JIT").is_some() {
         interpreter.set_jit_options(None);
     }
 
     let execution = interpreter.run_module(lowered_module.entry);
 
-    if env::var_os("WREN_JIT_STATS").is_some() {
-        eprintln!("WrenJIT stats: {:#?}", interpreter.jit_stats());
+    if env::var_os("NAPALM_JIT_STATS").is_some() || env::var_os("WREN_JIT_STATS").is_some() {
+        eprintln!("Napalm JIT stats: {:#?}", interpreter.jit_stats());
     }
-    if env::var_os("WREN_GC_STATS").is_some() {
-        eprintln!("WrenGC stats: {:#?}", interpreter.gc_statistics());
+    if env::var_os("NAPALM_GC_STATS").is_some() || env::var_os("WREN_GC_STATS").is_some() {
+        eprintln!("Napalm GC stats: {:#?}", interpreter.gc_statistics());
     }
 
     match execution {
@@ -179,11 +180,11 @@ fn parse_command_line() -> Result<PathBuf, ()> {
     let mut args = env::args_os();
     let executable = args
         .next()
-        .unwrap_or_else(|| OsStr::new("wren").to_owned());
+        .unwrap_or_else(|| OsStr::new("napalm").to_owned());
 
     let executable = Path::new(&executable)
         .file_name()
-        .unwrap_or_else(|| OsStr::new("wren"))
+        .unwrap_or_else(|| OsStr::new("napalm"))
         .to_string_lossy();
 
     let Some(first) = args.next() else {
@@ -209,5 +210,5 @@ fn parse_command_line() -> Result<PathBuf, ()> {
 }
 
 fn print_usage(executable: &str) {
-    eprintln!("Usage: {executable} <file.wren>");
+    eprintln!("Usage: {executable} <file.nap>");
 }

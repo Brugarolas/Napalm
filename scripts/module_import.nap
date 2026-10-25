@@ -1,0 +1,6 @@
+import Math, { Answer, Greeting, Calculator } from './module_exports';
+
+System.print(Greeting);
+System.print(`Answer: ${Answer}`);
+System.print(`20 + 22 = ${Calculator.add(20, 22)}`);
+System.print(`6 * 7 = ${Math.multiply(6, 7)}`);

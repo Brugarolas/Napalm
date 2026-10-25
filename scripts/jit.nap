@@ -1,0 +1,89 @@
+let start = System.clock
+
+class JitBench {
+  static integratePi(steps) {
+    let sum = 0.0
+    let i = 0
+
+    while (i < steps) {
+      let x = (i + 0.5) / steps
+      sum = sum + 4.0 / (1.0 + x * x)
+      i = i + 1
+    }
+
+    return sum / steps
+  }
+
+  static xorshift(iterations) {
+    let x = 123456789
+    let checksum = 0
+    let i = 0
+
+    while (i < iterations) {
+      x = x ^ (x << 13)
+      x = x ^ (x >> 17)
+      x = x ^ (x << 5)
+
+      x = x & 2147483647
+
+      if ((x & 255) < 32) {
+        checksum = checksum + (x & 1023)
+      } else {
+        checksum = checksum - (x & 31)
+      }
+
+      i = i + 1
+    }
+
+    return checksum + x
+  }
+
+  static mandelbrot(width, height, maxIter) {
+    let checksum = 0
+    let escaped = 0
+    let y = 0
+
+    while (y < height) {
+      let ci = (y / height) * 2.0 - 1.0
+      let x = 0
+
+      while (x < width) {
+        let cr = (x / width) * 3.5 - 2.5
+
+        let zr = 0.0
+        let zi = 0.0
+        let zr2 = 0.0
+        let zi2 = 0.0
+        let i = 0
+
+        while (i < maxIter && (zr2 + zi2) <= 4.0) {
+          zi = 2.0 * zr * zi + ci
+          zr = zr2 - zi2 + cr
+
+          zr2 = zr * zr
+          zi2 = zi * zi
+
+          i = i + 1
+        }
+
+        if (i < maxIter) {
+          escaped = escaped + 1
+        }
+
+        checksum = checksum + i * (x + 1) * (y + 1)
+        x = x + 1
+      }
+
+      y = y + 1
+    }
+
+    return checksum + escaped
+  }
+}
+
+JitBench.integratePi(1000000)
+JitBench.xorshift(1000000)
+JitBench.mandelbrot(800, 600, 1000)
+
+let elapsed = System.clock - start
+System.print(`elapsed: ${elapsed}`)

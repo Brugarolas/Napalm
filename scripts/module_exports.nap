@@ -1,0 +1,9 @@
+export const Answer: number = 42;
+export const Greeting = 'Hello from the exported module!';
+
+export class Calculator {
+    static add(a: number, b: number): number { return a + b; }
+    static multiply(a: number, b: number): number { return a * b; }
+}
+
+export default Calculator;

@@ -3172,6 +3172,9 @@ enum CallTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeBuiltin {
+    MapPropertyGet(MethodSymbol),
+    MapPropertySet(MethodSymbol),
+    MapPropertyCall(MethodSymbol),
     FnNew,
     FnArity,
     FnCall,
@@ -6341,12 +6344,24 @@ impl Interpreter<'_> {
         let kind = class.0 >> 56;
         let payload = (class.0 & 0x00ff_ffff_ffff_ffff) as u32;
         if kind == (CLASS_KIND_BUILTIN >> 56) {
-            return self
+            let bound = self
                 .builtin_methods
                 .get(payload as usize)?
                 .get(method.0 as usize)
                 .copied()
                 .flatten();
+            if bound.is_some() { return bound; }
+            if payload == BuiltinClass::Map as u32 {
+                use crate::wren_ir::MethodKind;
+                let signature = self.program.metadata.methods.get(method.0 as usize)?;
+                return match signature.kind {
+                    MethodKind::Getter => Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(method))),
+                    MethodKind::Setter => Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertySet(method))),
+                    MethodKind::Method => Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyCall(method))),
+                    _ => None,
+                };
+            }
+            return None;
         }
         if kind == (CLASS_KIND_CORE_STATIC >> 56) {
             return self
@@ -6997,6 +7012,35 @@ impl Interpreter<'_> {
             return;
         }
         match native {
+            NativeBuiltin::MapPropertyGet(method) | NativeBuiltin::MapPropertySet(method) | NativeBuiltin::MapPropertyCall(method) => {
+                let signature = &self.program.metadata.methods[method.0 as usize];
+                let key = MapKey::String(MapStringKey::new(Arc::from(self.program.metadata.string(signature.name).unwrap_or("").as_bytes())));
+                let map = Value::from_word(receiver);
+                let result = if matches!(native, NativeBuiltin::MapPropertySet(_)) {
+                    let item = arg(0);
+                    self.heap.remember_if_reference(map, item);
+                    self.heap.map_set_encoded(map, key, item, None).map(|structural| {
+                        if structural {
+                            if let Some(bytes) = self.heap.map_external_bytes(map) {
+                                self.heap.set_external_bytes(map, bytes);
+                            }
+                            self.heap.refresh_jit_view(map);
+                        }
+                        item
+                    })
+                } else { self.heap.map_get_encoded(map, &key) };
+                match result {
+                    Ok(value) if matches!(native, NativeBuiltin::MapPropertyCall(_)) => {
+                        let function = match self.heap.get(value) {
+                            Some(HeapObject::Closure { function_index, .. }) => *function_index,
+                            _ => { self.fail_at(op, "object property is not a function"); return; }
+                        };
+                        self.enter_bytecode_call(op, function, None, args, Some(value));
+                    }
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
             NativeBuiltin::FnNew => {
                 let closure = arg(0);
                 if !matches!(self.heap.get(closure), Some(HeapObject::Closure { .. })) {
@@ -9486,6 +9530,7 @@ var result = Runner.run()
     }
 
     include!("wren_class_tests.rs");
+    include!("napalm_tests.rs");
 
     #[test]
     fn shaped_maps_share_shapes_use_pic_and_promote_for_general_keys() {
@@ -11113,7 +11158,7 @@ var result = CallLoop.run()
 
     #[test]
     fn jit_benchmark_checksums_match_original_wren() {
-        let benchmark = include_str!("../scripts/jit.wren");
+        let benchmark = include_str!("../tests/fixtures/wren/jit.wren");
         let definitions = benchmark.split("JitBench.integratePi(1000000)").next().unwrap();
         // Reference values from the bundled original Wren executable.
         for (expression, expected) in [

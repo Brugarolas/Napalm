@@ -1,16 +1,16 @@
-//! Static module graph discovery and module-specifier resolution for WrenJIT.
+//! Static module graph discovery and module-specifier resolution for Napalm.
 //!
 //! Resolution happens before WIR/bytecode generation. The VM therefore pays no
 //! filesystem/package-manager cost when executing ImportModule: imports are
 //! lowered to canonical StringId values and resolved by the VM's dense module map.
 //!
 //! Supported specifiers:
-//! - `./foo`, `../foo.wren`, `foo`  -> importer-relative source modules.
+//! - `./foo`, `../foo.nap`, `foo`  -> importer-relative source modules.
 //! - `@lib/pkg[/subpath]`           -> package roots.
 //! - `@std/name[/subpath]`          -> standard-library roots.
 //!
-//! For every filesystem base we try the exact path, `<path>.wren`, and
-//! `<path>/index.wren`. Package/std specifiers may not contain `..` and symlink
+//! For every filesystem base we try the exact path, `<path>.nap`, and
+//! `<path>/index.nap`. Package/std specifiers may not contain `..` and symlink
 //! escapes outside their configured root are rejected.
 
 use crate::wren_front::{self, Diagnostic, ModuleAst};
@@ -26,8 +26,8 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-const SOURCE_EXTENSION: &str = "wren";
-const PROJECT_MARKERS: &[&str] = &["wrenjit.toml", "wren.toml", "Wren.toml", ".wrenjit", ".git"];
+const SOURCE_EXTENSION: &str = "nap";
+const PROJECT_MARKERS: &[&str] = &["napalm.toml", "Napalm.toml", ".napalm", ".git"];
 
 #[derive(Clone, Debug)]
 pub struct ModuleResolverConfig {
@@ -43,14 +43,14 @@ impl ModuleResolverConfig {
         let project_root = discover_project_root(start);
 
         let mut package_roots = Vec::new();
-        package_roots.push(project_root.join(".wrenjit").join("packages"));
-        extend_env_paths(&mut package_roots, "WRENJIT_LIB_PATH");
+        package_roots.push(project_root.join(".napalm").join("packages"));
+        extend_env_paths(&mut package_roots, "NAPALM_LIB_PATH");
 
         let mut std_roots = Vec::new();
-        std_roots.push(project_root.join(".wrenjit").join("std"));
-        extend_env_paths(&mut std_roots, "WRENJIT_STD_PATH");
+        std_roots.push(project_root.join(".napalm").join("std"));
+        extend_env_paths(&mut std_roots, "NAPALM_STD_PATH");
 
-        if let Some(home) = env::var_os("WRENJIT_HOME") {
+        if let Some(home) = env::var_os("NAPALM_HOME") {
             let home = PathBuf::from(home);
             package_roots.push(home.join("packages"));
             std_roots.push(home.join("std"));
@@ -59,7 +59,7 @@ impl ModuleResolverConfig {
         if let Ok(executable) = env::current_exe() {
             if let Some(bin) = executable.parent() {
                 std_roots.push(bin.join("std"));
-                std_roots.push(bin.join("share").join("wrenjit").join("std"));
+                std_roots.push(bin.join("share").join("napalm").join("std"));
             }
         }
 
@@ -524,7 +524,7 @@ fn load_parsed_module(
         error,
     })?;
     let source_name = resolved.path.to_string_lossy().into_owned();
-    let parsed = wren_front::parse(&source_name, &source);
+    let parsed = crate::napalm_front_main::parse(&source_name, &source);
     let has_errors = parsed.has_errors();
     if !parsed.diagnostics.is_empty() {
         diagnostics.push(ModuleDiagnosticSource {
@@ -651,9 +651,11 @@ fn candidate_paths(base: &Path) -> Vec<PathBuf> {
 
     if base.extension().is_none() {
         candidates.push(base.with_extension(SOURCE_EXTENSION));
+        candidates.push(base.with_extension("ts"));
     }
 
     candidates.push(base.join(format!("index.{SOURCE_EXTENSION}")));
+    candidates.push(base.join("index.ts"));
     candidates
 }
 
@@ -700,10 +702,10 @@ mod tests {
     #[test]
     fn resolves_relative_extension_and_directory_index() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
-        let entry = tree.write("src/main.wren", "");
-        let direct = tree.write("src/util.wren", "");
-        let index = tree.write("src/widgets/index.wren", "");
+        tree.write("napalm.toml", "");
+        let entry = tree.write("src/main.nap", "");
+        let direct = tree.write("src/util.nap", "");
+        let index = tree.write("src/widgets/index.nap", "");
         let resolver = ModuleResolver::for_entry(&entry).unwrap();
 
         assert_eq!(resolver.resolve_import(&entry, "./util").unwrap().path, fs::canonicalize(direct).unwrap());
@@ -713,10 +715,10 @@ mod tests {
     #[test]
     fn relative_and_namespaced_package_import_share_identity() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
-        let entry = tree.write("main.wren", "");
-        let package = tree.write("packages/foo/index.wren", "");
-        let child = tree.write("packages/foo/child.wren", "");
+        tree.write("napalm.toml", "");
+        let entry = tree.write("main.nap", "");
+        let package = tree.write("packages/foo/index.nap", "");
+        let child = tree.write("packages/foo/child.nap", "");
 
         let mut config = ModuleResolverConfig::for_entry(&entry).unwrap();
         config.package_roots.insert(0, tree.root.join("packages"));
@@ -726,21 +728,21 @@ mod tests {
         let from_package = resolver.resolve_import(&package, "./child").unwrap();
         assert_eq!(by_namespace.path, fs::canonicalize(child).unwrap());
         assert_eq!(by_namespace.canonical_name, from_package.canonical_name);
-        assert_eq!(by_namespace.canonical_name, "@lib/foo/child.wren");
+        assert_eq!(by_namespace.canonical_name, "@lib/foo/child.nap");
     }
 
     #[test]
     fn discovers_a_complete_graph_and_records_exports() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
+        tree.write("napalm.toml", "");
         let entry = tree.write(
-            "src/main.wren",
-            r#"import "./dep" for Answer
+            "src/main.nap",
+            r#"import { Answer } from "./dep"
 var Seen = Answer
 return Seen
 "#,
         );
-        tree.write("src/dep.wren", "var Answer = 42\n");
+        tree.write("src/dep.nap", "export let Answer = 42\n");
 
         let mut program = Program::new();
         let graph = compile_module_graph(&mut program, &entry).unwrap();
@@ -749,7 +751,7 @@ return Seen
         let dep = program
             .modules
             .iter()
-            .find(|module| program.string(module.name) == Some("file:src/dep.wren"))
+            .find(|module| program.string(module.name) == Some("file:src/dep.nap"))
             .expect("dependency module metadata missing");
         assert!(dep
             .exports
@@ -776,20 +778,20 @@ return Seen
         use crate::wren_interpreter::{ExecutionResult, Interpreter};
 
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
+        tree.write("napalm.toml", "");
         let entry = tree.write(
-            "main.wren",
-            r#"import "./bridge" for Answer as Result, Greeting, Calculator, Empty
-import "./other" for Answer as Other
-return "%(Greeting)|%(Result)|%(Calculator.add(20, 22))|%(Empty)|%(Other)"
+            "main.nap",
+            r#"import { Answer as Result, Greeting, Calculator, Empty } from "./bridge"
+import { Answer as Other } from "./other"
+return `${Greeting}|${Result}|${Calculator.add(20, 22)}|${Empty}|${Other}`
 "#,
         );
         tree.write(
-            "dep.wren",
-            r#"var Answer = 42
-var Greeting = "hello"
-var Empty = null
-class Calculator {
+            "dep.nap",
+            r#"export let Answer = 42
+export let Greeting = "hello"
+export let Empty = null
+export class Calculator {
   static add(a, b) {
     return a + b
   }
@@ -797,10 +799,10 @@ class Calculator {
 "#,
         );
         tree.write(
-            "bridge.wren",
-            "import \"./dep\" for Answer, Greeting, Calculator, Empty\n",
+            "bridge.nap",
+            "import { Answer, Greeting, Calculator, Empty } from \"./dep\"\nexport { Answer, Greeting, Calculator, Empty };\n",
         );
-        tree.write("other.wren", "var Answer = 7\n");
+        tree.write("other.nap", "export let Answer = 7\n");
 
         let mut program = Program::new();
         let manifest = wren_builtin::install_hir_builtins(&mut program);
@@ -820,9 +822,9 @@ class Calculator {
     #[test]
     fn importing_a_missing_export_still_fails() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
-        let entry = tree.write("main.wren", "import \"./dep\" for Missing\n");
-        tree.write("dep.wren", "var Answer = 42\n");
+        tree.write("napalm.toml", "");
+        let entry = tree.write("main.nap", "import { Missing } from \"./dep\"\n");
+        tree.write("dep.nap", "export let Answer = 42\n");
 
         let mut program = Program::new();
         let graph = compile_module_graph(&mut program, &entry).unwrap();
@@ -836,11 +838,11 @@ class Calculator {
     #[test]
     fn cyclic_graph_is_discovered_once() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
-        let entry = tree.write("a.wren", r#"import "./b"
+        tree.write("napalm.toml", "");
+        let entry = tree.write("a.nap", r#"import "./b"
 var A = 1
 "#);
-        tree.write("b.wren", r#"import "./a"
+        tree.write("b.nap", r#"import "./a"
 var B = 2
 "#);
 
@@ -861,8 +863,8 @@ var B = 2
     #[test]
     fn rejects_namespace_escape() {
         let tree = TempTree::new();
-        tree.write("wrenjit.toml", "");
-        let entry = tree.write("main.wren", "");
+        tree.write("napalm.toml", "");
+        let entry = tree.write("main.nap", "");
         let mut config = ModuleResolverConfig::for_entry(&entry).unwrap();
         config.package_roots.insert(0, tree.root.join("packages"));
         let resolver = ModuleResolver::new(config);
@@ -870,5 +872,34 @@ var B = 2
             resolver.resolve_import(&entry, "@lib/foo/../../secret"),
             Err(ModuleError::InvalidSpecifier { .. })
         ));
+    }
+
+    #[test]
+    fn napalm_named_default_reexports_and_private_bindings() {
+        use crate::wren_builtin::{self, BuiltinHost};
+        use crate::wren_interpreter::{ExecutionResult, Interpreter};
+        let tree = TempTree::new();
+        tree.write("napalm.toml", "");
+        let entry = tree.write("main.nap", r#"
+            import twice, { answer as value } from './bridge';
+            return twice(value);
+        "#);
+        tree.write("dep.ts", "const hidden = 99; export const value = 21; export default function(n: number) { return n * 2; }");
+        tree.write("bridge.nap", "export { default, value as answer } from './dep';");
+        let mut program = Program::new();
+        let manifest = wren_builtin::install_hir_builtins(&mut program);
+        let graph = compile_module_graph(&mut program, &entry).unwrap();
+        assert_eq!(graph.module_count, 3);
+        let dep = program.modules.iter().find(|m| program.string(m.name).unwrap().ends_with("dep.ts")).unwrap();
+        assert_eq!(dep.exports.len(), 2);
+        assert!(dep.exports.iter().all(|e| program.string(e.name) != Some("hidden")));
+        let bytecode = crate::wren_pipeline::compile_program(&mut program).unwrap();
+        for jit in [false, true] {
+            let mut vm = Interpreter::with_host(&bytecode, Box::new(BuiltinHost::new(manifest.clone()))).unwrap();
+            wren_builtin::install_vm_builtins(&mut vm, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let ExecutionResult::Returned(result) = vm.run_module(graph.entry.entry).unwrap() else { panic!("expected return"); };
+            assert_eq!(result.as_num(), Some(42.0));
+        }
     }
 }
