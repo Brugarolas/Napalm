@@ -5,14 +5,14 @@
 //! ```text
 //! src/
 //! ├── main.rs
-//! ├── wren_front.rs
-//! ├── wren_builtin.rs
-//! ├── wren_lowerer.rs
-//! ├── wren_ir.rs
-//! ├── wren_bytecode.rs
-//! ├── wren_bytecodecompiler.rs
-//! ├── wren_gc.rs
-//! └── wren_interpreter.rs
+//! ├── napalm_front.rs
+//! ├── napalm_builtin.rs
+//! ├── napalm_lowerer.rs
+//! ├── napalm_ir.rs
+//! ├── napalm_bytecode.rs
+//! ├── napalm_bytecodecompiler.rs
+//! ├── napalm_gc.rs
+//! └── napalm_interpreter.rs
 //! ```
 //!
 //! Usage:
@@ -36,24 +36,24 @@
 
 #![allow(warnings)]
 
-pub mod wren_builtin;
-pub mod wren_bytecode;
-pub mod wren_bytecodecompiler;
-pub mod wren_front;
+pub mod napalm_builtin;
+pub mod napalm_bytecode;
+pub mod napalm_bytecodecompiler;
+pub mod napalm_front;
 pub mod napalm_front_main;
-pub mod wren_gc;
-pub mod wren_interpreter;
-pub mod wren_ir;
-pub mod wren_lowerer;
-pub mod wren_modules;
-pub mod wren_trace_ir;
-pub mod wren_trace_ir_optimizer;
-pub mod wren_trace_ir_optimizing;
-pub mod wren_tracing_jit;
-pub mod wren_ir_optimizer;
-pub mod wren_ir_optimizing;
-pub mod wren_ir_escape;
-pub mod wren_pipeline;
+pub mod napalm_gc;
+pub mod napalm_ir;
+pub mod napalm_lowerer;
+pub mod napalm_modules;
+pub mod napalm_trace_ir;
+pub mod napalm_trace_ir_optimizer;
+pub mod napalm_trace_ir_optimizing;
+pub mod napalm_interpreter;
+pub mod napalm_tracing_jit;
+pub mod napalm_ir_optimizer;
+pub mod napalm_ir_optimizing;
+pub mod napalm_ir_escape;
+pub mod napalm_pipeline;
 
 use std::env;
 use std::ffi::OsStr;
@@ -62,8 +62,8 @@ use std::process::ExitCode;
 
 use mimalloc::MiMalloc;
 
-use crate::wren_interpreter::{ExecutionResult, Interpreter};
-use crate::wren_ir::Program;
+use crate::napalm_interpreter::{ExecutionResult, Interpreter};
+use crate::napalm_ir::Program;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -93,8 +93,8 @@ fn run() -> u8 {
     // -------------------------------------------------------------------------
 
     let mut hir = Program::new();
-    let builtin_manifest = wren_builtin::install_hir_builtins(&mut hir);
-    let modules = match wren_modules::compile_module_graph(&mut hir, &source_path) {
+    let builtin_manifest = napalm_builtin::install_hir_builtins(&mut hir);
+    let modules = match napalm_modules::compile_module_graph(&mut hir, &source_path) {
         Ok(modules) => modules,
         Err(error) => {
             if let Err(render_error) = error.emit() {
@@ -102,8 +102,8 @@ fn run() -> u8 {
                 return EXIT_IO_ERROR;
             }
             return match error.kind() {
-                wren_modules::ModuleErrorKind::Io => EXIT_IO_ERROR,
-                wren_modules::ModuleErrorKind::Compile => EXIT_COMPILE_ERROR,
+                napalm_modules::ModuleErrorKind::Io => EXIT_IO_ERROR,
+                napalm_modules::ModuleErrorKind::Compile => EXIT_COMPILE_ERROR,
             };
         }
     };
@@ -120,7 +120,7 @@ fn run() -> u8 {
     // Compilation pipeline: HIR -> optimizations -> register bytecode
     // -------------------------------------------------------------------------
 
-    let bytecode = match wren_pipeline::compile_program(&mut hir) {
+    let bytecode = match napalm_pipeline::compile_program(&mut hir) {
         Ok(program) => program,
         Err(error) => {
             eprintln!("bytecode compilation error: {error}");
@@ -132,7 +132,7 @@ fn run() -> u8 {
     // Runtime: bytecode -> execution
     // -------------------------------------------------------------------------
 
-    let host = Box::new(wren_builtin::BuiltinHost::new(builtin_manifest.clone()));
+    let host = Box::new(napalm_builtin::BuiltinHost::new(builtin_manifest.clone()));
     let mut interpreter = match Interpreter::with_host(&bytecode, host) {
         Ok(interpreter) => interpreter,
         Err(error) => {
@@ -140,7 +140,7 @@ fn run() -> u8 {
             return EXIT_RUNTIME_ERROR;
         }
     };
-    wren_builtin::install_vm_builtins(&mut interpreter, &builtin_manifest);
+    napalm_builtin::install_vm_builtins(&mut interpreter, &builtin_manifest);
 
     // Diagnostics useful for comparing the threaded baseline against the tracing
     // tier without recompiling the VM. They are intentionally opt-in so normal

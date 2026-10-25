@@ -3,7 +3,7 @@ fn run_napalm(source: &str, expected: &str) {
     let parsed = crate::napalm_front_main::parse("test.nap", source);
     assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
     let mut hir = Program::new();
-    let manifest = wren_builtin::install_hir_builtins(&mut hir);
+    let manifest = napalm_builtin::install_hir_builtins(&mut hir);
     let output = lower_module(&mut hir, "test.nap", source, "test", &parsed.module);
     assert!(!output.has_errors(), "{:#?}", output.diagnostics);
     let entry = output.lowered.unwrap().entry;

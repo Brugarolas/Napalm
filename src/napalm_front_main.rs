@@ -1,8 +1,8 @@
 //! Napalm's TypeScript-inspired surface syntax. Types are parsed and erased.
 //!
 //! The frontend produces the existing engine AST directly, retaining source byte
-//! spans. The legacy Wren parser is used only by historical backend regressions.
-pub use crate::wren_front::*;
+//! spans. The legacy Napalm parser is used only by historical backend regressions.
+pub use crate::napalm_front::*;
 use logos::Logos;
 use std::collections::{HashMap, HashSet};
 
@@ -2604,7 +2604,7 @@ impl<'a> Parser<'a> {
 }
 
 
-/// Convert a TypeScript-style class property into the existing Wren-compatible
+/// Convert a TypeScript-style class property into the existing Napalm-compatible
 /// AST representation: fixed storage plus ordinary getter/setter methods. This
 /// keeps all field layout, GC and JIT machinery unchanged while the surface
 /// syntax becomes Napalm/TypeScript-like.
