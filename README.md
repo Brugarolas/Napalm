@@ -1,3 +1,5 @@
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/brugarolas)
+
 # Napalm Reloaded
 
 Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dynamic runtime. WrenJIT remains the frozen Wren-syntax project. This repository builds the `napalm` executable.
