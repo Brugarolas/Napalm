@@ -5,10 +5,9 @@ class GcBench {
     let old = []
     let i = 0
     while (i < 256) {
-      old.add(null)
+      old.add(i)
       i = i + 1
     }
-    System.gc()
 
     let checksum = 0
     i = 0

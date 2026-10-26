@@ -100,8 +100,15 @@ pub struct TraceDirectCall {
     /// the lifetime of the Interpreter/JIT instance that owns this trace.
     pub function_index: u32,
     pub destination: Reg,
+    /// Dynamic call subject. Method ABI calls store the receiver here; closure
+    /// ABI calls store the closure value itself (explicit CallClosure or a proven
+    /// ordinary Invoke("call")).
     pub receiver: TraceValueId,
     pub args: Vec<TraceValueId>,
+    /// Closure ABI calls specialize an immutable closure function identity. The
+    /// side exit replays the original source opcode if heap kind or function index
+    /// no longer matches the observation used to build this trace.
+    pub closure_guard_exit: Option<SideExitId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -288,6 +295,7 @@ impl TraceInst {
     pub fn exit(&self) -> Option<SideExitId> {
         use TraceInst::*;
         match self {
+            Runtime { direct_call: Some(call), .. } if call.closure_guard_exit.is_some() => call.closure_guard_exit,
             GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. } | GuardClass { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
@@ -326,6 +334,9 @@ impl TraceInst {
     pub fn set_exit(&mut self, new: SideExitId) {
         use TraceInst::*;
         match self {
+            Runtime { direct_call: Some(call), .. } if call.closure_guard_exit.is_some() => {
+                call.closure_guard_exit = Some(new);
+            }
             GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. }
             | GuardType { exit, .. } | GuardClass { exit, .. } | GuardBounds { exit, .. }
@@ -420,6 +431,19 @@ pub struct TraceStats {
     /// synchronous bytecode target and therefore bypasses dynamic dispatch even
     /// when the callee is too large or complex for bounded inlining.
     pub invoke_direct_calls: usize,
+    /// InvokeSuper sites whose lexical super lookup is resolved while recording
+    /// and replaced by a guarded direct bytecode call.
+    pub invoke_super_direct_calls: usize,
+    /// CallClosure sites specialized to one immutable closure function identity.
+    /// Captures stay attached to the dynamic closure object and are installed by
+    /// the normal bytecode frame builder. This also counts ordinary Invoke("call")
+    /// sites devirtualized to the same closure direct-call machinery.
+    pub closure_direct_calls: usize,
+    /// Ordinary Invoke sites whose receiver was proven to be a Closure and whose
+    /// resolved method target was the standard Fn.call builtin. These are rewritten
+    /// inside the trace to guarded closure DirectBytecodeCall without changing
+    /// frontend or bytecode semantics.
+    pub invoke_closure_direct_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
 }
@@ -606,7 +630,7 @@ impl TraceBuilder {
         value
     }
 
-    /// Synchronized direct bytecode call used after Invoke/InvokeSpread has proven
+    /// Synchronized direct bytecode call used after Invoke/InvokeSuper/InvokeSpread has proven
     /// a concrete bytecode target. Unlike a generic RuntimeCall, caller register
     /// SSA survives because a synchronous callee cannot reassign caller locals.
     /// Heap/memory facts still die at the boundary, and the destination/return
@@ -630,6 +654,7 @@ impl TraceBuilder {
                 destination,
                 receiver,
                 args,
+                closure_guard_exit: None,
             }),
         });
         self.memory_epoch = true;
@@ -637,6 +662,51 @@ impl TraceBuilder {
         // The call writes the destination and the return bank. They are already
         // synchronized by the runtime helper, so discard any pre-call SSA view
         // before loading the actual result. Other caller locals remain valid SSA.
+        for slot in [
+            FrameSlot::General(destination),
+            FrameSlot::Return(ReturnReg(0)),
+            FrameSlot::Return(ReturnReg(1)),
+        ] {
+            self.slots.remove(&slot);
+            self.dirty.retain(|dirty| *dirty != slot);
+        }
+
+        self.reload_slot_after_runtime(
+            FrameSlot::General(destination),
+            TraceType::Any,
+            TraceRep::Tagged,
+        )
+    }
+
+    /// Direct closure-call specialization. Distinct closure instances of the same
+    /// bytecode function share the trace; generated code guards the sidecar's
+    /// immutable prepared-function index before entering the common direct-call
+    /// runtime boundary.
+    pub fn runtime_direct_closure_call(
+        &mut self,
+        location: TraceLocation,
+        next: BytecodePc,
+        function_index: u32,
+        destination: Reg,
+        closure: TraceValueId,
+        args: Vec<TraceValueId>,
+        guard_exit: SideExitId,
+    ) -> TraceValueId {
+        self.commit_preserving_ssa();
+        self.emit0(TraceInst::Runtime {
+            location,
+            next,
+            terminal: false,
+            direct_call: Some(TraceDirectCall {
+                function_index,
+                destination,
+                receiver: closure,
+                args,
+                closure_guard_exit: Some(guard_exit),
+            }),
+        });
+        self.memory_epoch = true;
+
         for slot in [
             FrameSlot::General(destination),
             FrameSlot::Return(ReturnReg(0)),
@@ -738,6 +808,9 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             }
             if call.args.len() > MAX_WREN_ARITY {
                 errors.push("direct bytecode call exceeds argument ABI".into());
+            }
+            if call.closure_guard_exit.is_some_and(|exit| exit.0 as usize >= t.exits.len()) {
+                errors.push("direct closure call references an unknown guard exit".into());
             }
             if t.value(t.canonical_value(call.receiver))
                 .is_some_and(|value| value.rep != TraceRep::Tagged)
@@ -1195,11 +1268,49 @@ mod optimizer_tests {
                 && call.destination == destination
                 && call.receiver == receiver
                 && call.args == vec![argument]
+                && call.closure_guard_exit.is_none()
         )));
         assert!(matches!(
             builder.trace.value(result).map(|value| &value.origin),
             Some(TraceValueOrigin::InstResult { .. })
         ));
+    }
+
+    #[test]
+    fn runtime_direct_closure_call_records_function_guard_and_preserves_ssa() {
+        let location = TraceLocation::new(FuncId(0), BytecodePc(30));
+        let mut builder = TraceBuilder::new(
+            TraceId(102),
+            TraceAnchor { kind: TraceKind::Loop, location },
+        );
+        let preserved_slot = FrameSlot::General(Reg(1));
+        let destination = Reg(5);
+        let preserved = builder.constant(TraceConstant::StableTagged(0x1234));
+        let closure = builder.constant(TraceConstant::StableTagged(0xfffc_0000_0000_0001));
+        let argument = builder.constant(TraceConstant::StableTagged(0x9abc));
+        builder.write_slot(preserved_slot, preserved);
+        let guard_exit = builder.add_side_exit(ExitReason::GuardValue, location.pc);
+
+        let result = builder.runtime_direct_closure_call(
+            location,
+            BytecodePc(33),
+            9,
+            destination,
+            closure,
+            vec![argument],
+            guard_exit,
+        );
+
+        assert_eq!(builder.slot_value(preserved_slot), Some(preserved));
+        assert_eq!(builder.slot_value(FrameSlot::General(destination)), Some(result));
+        assert!(builder.has_runtime_calls());
+        assert!(builder.trace.nodes.iter().any(|node| matches!(
+            &node.kind,
+            TraceInst::Runtime { direct_call: Some(call), .. }
+                if call.function_index == 9
+                    && call.receiver == closure
+                    && call.closure_guard_exit == Some(guard_exit)
+        )));
     }
 
     #[test]

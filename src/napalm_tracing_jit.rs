@@ -225,6 +225,11 @@ pub const TRACE_RUNTIME_MODE_MAP_SET: u32 = 11 << TRACE_RUNTIME_MODE_SHIFT;
 /// pushes the already-resolved callee and runs it back to the caller.
 pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
 
+/// Direct-call scratch describes closure ABI rather than method/receiver ABI.
+/// The source opcode may be CallClosure or an Invoke("call") proven to resolve
+/// to the standard Fn.call builtin.
+pub const TRACE_DIRECT_CALL_FLAG_CLOSURE: u32 = 1 << 0;
+
 /// Maximum number of distinct dynamic values one side-exit snapshot may
 /// describe. Native exits now commit these values directly to architectural
 /// register banks, so this is a structural verifier limit rather than a large
@@ -271,18 +276,20 @@ pub enum TraceHeapKind {
 ///
 /// `address` is the moving MMTk object address and is rewritten by GC through the
 /// existing precise handle slot. `data` points only at stable external allocations
-/// (Box/Vec/Arc payloads), never into the moving GC object. `len` is the logical
-/// length used by fast paths. `receiver_class` is the immutable semantic class key
-/// (zero means no Napalm class). All fields are atomics so the GC/handle machinery can retain its
-/// existing shared handle-table representation.
+/// (Box/Vec/Arc payloads), never into the moving GC object. `len` is normally the
+/// logical collection/string length; for Closure it stores the immutable prepared
+/// function index while `data` points at the capture array and packed metadata stores
+/// the capture count. `receiver_class` is the immutable semantic class key (zero
+/// means no Napalm class). All fields are atomics so the GC/handle machinery can
+/// retain its existing shared handle-table representation.
 #[repr(C)]
 pub struct TraceHeapEntry {
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
     /// Packed metadata: low 8 bits are TraceHeapKind. The upper 24 bits are a
     /// type-specific payload: ShapeId for shaped Maps, UTF-8 byte length for
-    /// Strings, and settlement state for Promises. Packing avoids extra sidecar
-    /// fields for small type-specific metadata.
+    /// Strings, settlement state for Promises, and capture count for Closures.
+    /// Packing avoids extra sidecar fields for small type-specific metadata.
     pub(crate) kind: AtomicU32,
     pub(crate) receiver_class: AtomicU64,
     pub(crate) data: AtomicUsize,
@@ -340,6 +347,8 @@ pub struct TraceActivation {
     pub direct_call_function: u32,
     pub direct_call_destination: u32,
     pub direct_call_arity: u32,
+    /// Reserved direct-call scratch word. TRACE_DIRECT_CALL_FLAG_* bits use it
+    /// without changing the public TraceActivation layout.
     pub direct_call_reserved: u32,
     pub direct_call_receiver: RegisterWord,
     pub direct_call_args: [RegisterWord; MAX_WREN_ARITY],
@@ -489,9 +498,11 @@ pub trait TraceRuntime {
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
-    /// Actual bytecode method selected for this receiver, plus up to four
-    /// observed receiver classes sharing that target. The native trace must
-    /// guard both the class set and method-table epoch against rebinding.
+    /// Actual bytecode method selected for this receiver and inline-cache
+    /// descriptor, plus up to four observed receiver classes sharing that target.
+    /// The descriptor may represent ordinary Invoke or lexical InvokeSuper; the
+    /// runtime must honor its home_class when present. Generated code guards both
+    /// the class set and method-table epoch against rebinding.
     fn trace_inline_target(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> { None }
 
     /// Resolve a concrete method symbol without requiring an inline-cache slot.
@@ -509,6 +520,24 @@ pub trait TraceRuntime {
     /// Translate a stable FuncId to the interpreter's prepared-function index.
     /// This is recording-only metadata used by direct known-bytecode calls.
     fn trace_prepared_function_index(&self, _function: FuncId) -> Option<u32> { None }
+
+    /// Observe the immutable bytecode function carried by a closure value. The
+    /// generated trace must still guard the closure heap kind and exact prepared
+    /// function index before reusing this recording-time observation.
+    fn trace_closure_target(&self, _closure: RegisterWord) -> Option<FuncId> { None }
+
+    /// Resolve an ordinary Invoke site to closure-call semantics only when the
+    /// observed receiver is a Closure and the descriptor currently resolves to
+    /// the VM's standard Fn.call builtin. Generated code must additionally guard
+    /// method_epoch before bypassing method dispatch.
+    fn trace_invoke_closure_target(
+        &self,
+        _function: FuncId,
+        _cache: u32,
+        _receiver: RegisterWord,
+    ) -> Option<FuncId> {
+        None
+    }
 
     /// Observe the length of a List while recording. Generated code must still
     /// guard both List kind and exact length before reusing the observation.
@@ -760,6 +789,11 @@ pub struct TracingJitStats {
     pub spread_inlined_calls: u64,
     pub spread_direct_calls: u64,
     pub invoke_direct_calls: u64,
+    pub invoke_super_direct_calls: u64,
+    pub closure_direct_calls: u64,
+    /// Ordinary Invoke("call") sites proven to target the standard Fn.call
+    /// builtin and lowered to the closure DirectBytecodeCall path.
+    pub invoke_closure_direct_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
@@ -1708,6 +1742,50 @@ impl<'a> TraceRecorder<'a> {
         op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
+        // InvokeSuper's X operand is an inline-cache slot, not a FuncId. The
+        // current bounded inliner only has explicit dynamic-dispatch support for
+        // ordinary Invoke, so never let InvokeSuper fall through its generic
+        // non-Invoke branch. Its direct-call tier still removes lexical lookup,
+        // PIC probing and baseline dispatch from the native hot path.
+        if op.opcode == Opcode::InvokeSuper {
+            let checkpoint = builder.clone();
+            match self.direct_dynamic_invoke_call(runtime, program, op, builder) {
+                Ok(step) => return Ok(step),
+                Err(
+                    RecordingAbort::UnsupportedCall
+                    | RecordingAbort::UnsupportedOpcode(_)
+                    | RecordingAbort::UnsupportedConstant
+                    | RecordingAbort::RepresentationConflict,
+                ) => {
+                    *builder = checkpoint;
+                    builder.runtime_call(op.location, op.next_pc);
+                    return Ok(ExpectedStep::RuntimeCall);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        // A source-level closure call is still encoded as ordinary Invoke("call")
+        // in current Napalm bytecode. Before generic method inlining/devirtualization,
+        // recognize the exact standard Fn.call target and route it through the
+        // closure direct-call ABI. The method-epoch guard preserves rebinding
+        // semantics; closure kind/function guards preserve the dynamic callee.
+        if op.opcode == Opcode::Invoke {
+            let closure_checkpoint = builder.clone();
+            match self.direct_invoke_closure_call(runtime, program, op, builder) {
+                Ok(step) => return Ok(step),
+                Err(
+                    RecordingAbort::UnsupportedCall
+                    | RecordingAbort::UnsupportedOpcode(_)
+                    | RecordingAbort::UnsupportedConstant
+                    | RecordingAbort::RepresentationConflict,
+                ) => {
+                    *builder = closure_checkpoint;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         // Inlining is preferable, but it is speculative. Ordinary Invoke has a
         // second tier before generic RuntimeCall: when the observed receiver-class
         // set resolves to one synchronous bytecode target, keep dispatch native and
@@ -1725,7 +1803,7 @@ impl<'a> TraceRecorder<'a> {
             ) => {
                 *builder = checkpoint.clone();
                 if op.opcode == Opcode::Invoke {
-                    match self.direct_invoke_call(runtime, program, op, builder) {
+                    match self.direct_dynamic_invoke_call(runtime, program, op, builder) {
                         Ok(step) => return Ok(step),
                         Err(
                             RecordingAbort::UnsupportedCall
@@ -1747,23 +1825,32 @@ impl<'a> TraceRecorder<'a> {
         }
     }
 
-    /// Direct known-target fallback for an ordinary dynamic Invoke. The inline
-    /// cache observation is only used to choose the target/class set while
-    /// recording; generated code rechecks method_epoch and receiver class before
-    /// entering the prepared bytecode function. Argument values stay fully dynamic
-    /// SSA values and are materialized into TraceActivation scratch on every call.
-    fn direct_invoke_call<R: TraceRuntime>(
+    /// Direct known-target fallback for ordinary Invoke and lexical InvokeSuper.
+    /// Recording resolves the complete inline-cache descriptor, including
+    /// home_class for super dispatch. Generated code then rechecks method_epoch and
+    /// the observed receiver-class set before entering the prepared bytecode target.
+    /// Arguments remain dynamic SSA values and are copied to TraceActivation scratch
+    /// on every execution.
+    fn direct_dynamic_invoke_call<R: TraceRuntime>(
         &self,
         runtime: &R,
         program: &BytecodeProgram,
         op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
-        if op.opcode != Opcode::Invoke
+        if !matches!(op.opcode, Opcode::Invoke | Opcode::InvokeSuper)
             || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
             || op.args.len() > MAX_WREN_ARITY
             || op.c as usize != op.args.len()
         {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let descriptor = program
+            .function(op.location.function)
+            .and_then(|function| function.chunk.inline_caches.get(op.x as usize))
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if (op.opcode == Opcode::InvokeSuper) != descriptor.home_class.is_some() {
             return Err(RecordingAbort::UnsupportedCall);
         }
 
@@ -1790,9 +1877,9 @@ impl<'a> TraceRecorder<'a> {
             .trace_prepared_function_index(target)
             .ok_or(RecordingAbort::UnsupportedCall)?;
 
-        // Every guard resumes before the original Invoke. No callee effect has
-        // happened yet, so a changed method table or receiver class replays exact
-        // baseline dispatch and can naturally seed a side trace for that case.
+        // All guards replay the original bytecode call before any callee effect.
+        // In the super case baseline therefore repeats the exact lexical lookup
+        // from descriptor.home_class if method tables or receiver shape changed.
         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
         builder.emit0(TraceInst::GuardMethodEpoch {
             expected: runtime.trace_method_epoch(),
@@ -1820,7 +1907,147 @@ impl<'a> TraceRecorder<'a> {
         );
         self.write_gpr(builder, op.a, result);
         builder.trace_mut().stats.devirtualized_calls += 1;
-        builder.trace_mut().stats.invoke_direct_calls += 1;
+        if op.opcode == Opcode::InvokeSuper {
+            builder.trace_mut().stats.invoke_super_direct_calls += 1;
+        } else {
+            builder.trace_mut().stats.invoke_direct_calls += 1;
+        }
+        Ok(ExpectedStep::RuntimeCall)
+    }
+
+    /// Specialize CallClosure to the immutable function identity stored by the
+    /// observed closure. Unlike method dispatch this needs no method-epoch guard:
+    /// closure function identity never changes after allocation. Distinct closure
+    /// instances of the same function therefore share one trace while retaining
+    /// their own capture payloads.
+    fn direct_closure_or_runtime_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        let checkpoint = builder.clone();
+        match self.direct_closure_call(runtime, program, op, builder) {
+            Ok(step) => Ok(step),
+            Err(
+                RecordingAbort::UnsupportedCall
+                | RecordingAbort::UnsupportedOpcode(_)
+                | RecordingAbort::UnsupportedConstant
+                | RecordingAbort::RepresentationConflict,
+            ) => {
+                *builder = checkpoint;
+                builder.runtime_call(op.location, op.next_pc);
+                Ok(ExpectedStep::RuntimeCall)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn direct_closure_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::CallClosure
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.args.len() > MAX_WREN_ARITY
+            || op.c as usize != op.args.len()
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let closure_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let target = runtime
+            .trace_closure_target(closure_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        self.emit_direct_closure_call(runtime, program, op, builder, target, false)
+    }
+
+    /// Devirtualize ordinary Invoke("call") when the observed receiver is a
+    /// Closure and the current descriptor resolves exactly to NativeBuiltin::FnCall.
+    /// This keeps source/bytecode semantics unchanged while giving normal Napalm
+    /// closure syntax the same fast path as explicit CallClosure bytecode.
+    fn direct_invoke_closure_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::Invoke
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.args.len() > MAX_WREN_ARITY
+            || op.c as usize != op.args.len()
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let closure_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let target = runtime
+            .trace_invoke_closure_target(op.location.function, op.x, closure_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        self.emit_direct_closure_call(runtime, program, op, builder, target, true)
+    }
+
+    fn emit_direct_closure_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        target: FuncId,
+        guard_method_epoch: bool,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
+        if callee.is_async
+            || crate::napalm_bytecode::function_kind_uses_this(callee.kind)
+            || callee.arity as usize != op.args.len()
+            || callee.frame.return_kind != RegisterKind::Value
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let function_index = runtime
+            .trace_prepared_function_index(target)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+
+        let closure = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let mut args = Vec::with_capacity(op.args.len());
+        for reg in &op.args {
+            args.push(self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)?);
+        }
+
+        // One replay exit covers both method rebinding and closure identity. For
+        // Invoke("call"), an epoch mismatch must replay the original Invoke so
+        // a rebound Fn.call implementation is observed before any callee effect.
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        if guard_method_epoch {
+            builder.emit0(TraceInst::GuardMethodEpoch {
+                expected: runtime.trace_method_epoch(),
+                exit,
+            });
+        }
+        let result = builder.runtime_direct_closure_call(
+            op.location,
+            op.next_pc,
+            function_index,
+            Reg(op.a),
+            closure,
+            args,
+            exit,
+        );
+        self.write_gpr(builder, op.a, result);
+        builder.trace_mut().stats.devirtualized_calls += 1;
+        builder.trace_mut().stats.closure_direct_calls += 1;
+        if guard_method_epoch {
+            builder.trace_mut().stats.invoke_closure_direct_calls += 1;
+        }
         Ok(ExpectedStep::RuntimeCall)
     }
 
@@ -3037,6 +3264,7 @@ impl<'a> TraceRecorder<'a> {
                     self.inline_or_runtime_call(runtime, program, op, builder)
                 }
             }
+            InvokeSuper => self.inline_or_runtime_call(runtime, program, op, builder),
             CallDirect => self.inline_or_runtime_call(runtime, program, op, builder),
 
             // Specialized integer unary.
@@ -3903,7 +4131,9 @@ impl<'a> TraceRecorder<'a> {
             // removes the tier-manager round trip without pretending that host
             // or foreign calls are pure or non-GC. CallDirect is handled above by
             // the bounded inliner and therefore does not belong in this fallback.
-            InvokeSuper | CallClosure | CallPrimitive | CallForeign | ImportModule => {
+            CallClosure => self.direct_closure_or_runtime_call(runtime, program, op, builder),
+
+            CallPrimitive | CallForeign | ImportModule => {
                 builder.runtime_call(op.location, op.next_pc);
                 Ok(ExpectedStep::RuntimeCall)
             }
@@ -6435,6 +6665,26 @@ impl CraneliftLoweringState<'_, '_> {
                     {
                         return Err(self.error("invalid direct bytecode call runtime payload"));
                     }
+                    if let Some(exit) = direct.closure_guard_exit {
+                        // Closure function identity is immutable and published in
+                        // TraceHeapEntry::len. Guard it entirely in native code so
+                        // different closure instances of the same function share
+                        // this trace without entering baseline dispatch.
+                        let (entry, _) = self.heap_entry_for_value(
+                            direct.receiver,
+                            TraceHeapKind::Closure,
+                            exit,
+                        )?;
+                        let actual_function = self.heap_entry_len(entry);
+                        let mismatch = self.builder.ins().icmp_imm_u(
+                            IntCC::NotEqual,
+                            actual_function,
+                            direct.function_index as i64,
+                        );
+                        let mismatch = self.bool32(mismatch);
+                        self.emit_side_exit(exit, mismatch)?;
+                    }
+
                     let store_i32 = |state: &mut Self, offset: i32, value: u32| {
                         let value = state.builder.ins().iconst(types::I32, value as i64);
                         state.builder.ins().store(
@@ -6458,6 +6708,15 @@ impl CraneliftLoweringState<'_, '_> {
                         self,
                         offset_of!(TraceActivation, direct_call_arity) as i32,
                         direct.args.len() as u32,
+                    );
+                    store_i32(
+                        self,
+                        offset_of!(TraceActivation, direct_call_reserved) as i32,
+                        if direct.closure_guard_exit.is_some() {
+                            TRACE_DIRECT_CALL_FLAG_CLOSURE
+                        } else {
+                            0
+                        },
                     );
                     let receiver = self.lower_value(direct.receiver)?;
                     self.builder.ins().store(
@@ -7757,6 +8016,9 @@ impl TracingJit {
                 self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
                 self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
                 self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
+                self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
+                self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
+                self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
                 self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
@@ -7895,6 +8157,9 @@ impl TracingJit {
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
         self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
+        self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
+        self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
+        self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
         self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
         self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
         self.stats.promoted_u32_loop_phis += trace.stats.promoted_u32_loop_phis as u64;
@@ -8136,6 +8401,9 @@ impl TracingJit {
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
         self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
+        self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
+        self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
+        self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
         self.stats.recorded_bytecodes = self
             .stats
             .recorded_bytecodes
@@ -8968,6 +9236,7 @@ mod tests {
             assert_eq!(activation.direct_call_function, 7);
             assert_eq!(activation.direct_call_destination, 1);
             assert_eq!(activation.direct_call_arity, 2);
+            assert_eq!(activation.direct_call_reserved, 0);
             assert_eq!(activation.direct_call_receiver, RegisterWord(0x2222));
             assert_eq!(activation.direct_call_args[0], RegisterWord(0x3333));
             assert_eq!(activation.direct_call_args[1], RegisterWord(0x4444));
@@ -9019,6 +9288,98 @@ mod tests {
         assert_eq!(general[0], RegisterWord(0x1111));
         assert_eq!(general[1], RegisterWord(0xdead_beef));
         assert_eq!(general[2], RegisterWord(0x1111));
+    }
+
+    #[test]
+    fn direct_closure_call_guards_function_index_before_runtime() {
+        unsafe extern "C" fn direct_call_runtime(
+            activation: *mut TraceActivation,
+            _: u32,
+            _: u32,
+            next: u32,
+        ) -> u32 {
+            let activation = unsafe { &mut *activation };
+            assert_eq!(next & TRACE_RUNTIME_MODE_MASK, TRACE_RUNTIME_MODE_DIRECT_CALL);
+            assert_eq!(activation.direct_call_function, 9);
+            assert_eq!(activation.direct_call_destination, 2);
+            assert_eq!(activation.direct_call_arity, 1);
+            assert_eq!(
+                activation.direct_call_reserved,
+                TRACE_DIRECT_CALL_FLAG_CLOSURE
+            );
+            assert_eq!(activation.direct_call_receiver, RegisterWord(TAG_HEAP));
+            assert_eq!(activation.direct_call_args[0], RegisterWord(0x4444));
+            unsafe { *activation.general.add(2) = RegisterWord(0xfeed_face) };
+            TRACE_RESULT_CONTINUE
+        }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::napalm_trace_ir::TraceBuilder::new(
+            TraceId(78),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let closure = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let argument = builder.constant(TraceConstant::StableTagged(0x4444));
+        let slow = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let result = builder.runtime_direct_closure_call(
+            location,
+            BytecodePc(1),
+            9,
+            Reg(2),
+            closure,
+            vec![argument],
+            slow,
+        );
+        builder.write_slot(FrameSlot::General(Reg(2)), result);
+        let success = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        builder.set_terminator(TraceTerminator::Exit(success));
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+        let mut chunk = (0..TRACE_HEAP_CHUNK_SIZE)
+            .map(|_| TraceHeapEntry::new(0))
+            .collect::<Vec<_>>();
+        let chunks = [chunk.as_mut_ptr()];
+        let entry = &chunk[0];
+        entry.address.store(1, Ordering::Relaxed);
+        entry.kind.store(TraceHeapKind::Closure as u32, Ordering::Relaxed);
+        entry.len.store(9, Ordering::Relaxed);
+
+        let mut general = [RegisterWord(TAG_HEAP), RegisterWord(0), RegisterWord(0)];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: direct_call_runtime,
+            heap_chunks: chunks.as_ptr(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, success.0);
+        assert_eq!(general[2], RegisterWord(0xfeed_face));
+
+        // A different closure function must replay the original CallClosure and
+        // must not enter the direct-call runtime helper.
+        entry.len.store(10, Ordering::Relaxed);
+        general[2] = RegisterWord(0);
+        activation.reset_result();
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, slow.0);
+        assert_eq!(general[2], RegisterWord(0));
+
+        // Kind is guarded independently from function identity. Reusing the same
+        // handle for a non-Closure object must also replay baseline CallClosure.
+        entry.len.store(9, Ordering::Relaxed);
+        entry.kind.store(TraceHeapKind::List as u32, Ordering::Release);
+        activation.reset_result();
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, slow.0);
+        assert_eq!(general[2], RegisterWord(0));
     }
 
     #[test]

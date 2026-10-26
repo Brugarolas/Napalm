@@ -892,7 +892,12 @@ impl HandleTable {
                 0,
             ),
             HeapObject::Range { .. } => (TraceHeapKind::Range, 0, 0, 0),
-            HeapObject::Closure { .. } => (TraceHeapKind::Closure, 0, 0, 0),
+            HeapObject::Closure { function_index, captures, .. } => (
+                TraceHeapKind::Closure,
+                captures.as_ptr() as usize,
+                *function_index as usize,
+                captures.len().min(crate::napalm_tracing_jit::TRACE_HEAP_METADATA_MAX as usize) as u32,
+            ),
             HeapObject::FiberObject { .. } => (TraceHeapKind::Fiber, 0, 0, 0),
             HeapObject::ModuleObject { .. } => (TraceHeapKind::Module, 0, 0, 0),
             HeapObject::ClassObject { .. } => (TraceHeapKind::Class, 0, 0, 0),
@@ -9029,18 +9034,22 @@ impl TraceRuntime for Interpreter<'_> {
     fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
         let class = self.heap.receiver_class(Value::from_word(receiver))?;
         let descriptor = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
-        let target = self.lookup_method(class, descriptor.method, None)?;
+        let home_slot = match descriptor.home_class {
+            Some(id) => Some(*self.prepared.class_by_id.get(&id)?),
+            None => None,
+        };
+        let target = self.lookup_method(class, descriptor.method, home_slot)?;
         let CallTarget::Bytecode(index) = target else { return None };
         let mut classes = vec![class.0];
         let function_index = *self.prepared.function_by_id.get(&function)? as usize;
         let cache = self.inline_caches.get(function_index)?.get(cache as usize)?;
         if !cache.megamorphic {
             for entry in &cache.entries[..cache.len as usize] {
-                // Recheck the method table: a stale PIC must not authorize an
-                // inlined call to a different target.
+                // Recheck the complete descriptor lookup. For InvokeSuper this
+                // starts at the superclass of the lexical home class.
                 if classes.len() < 4 && !classes.contains(&entry.class.0)
                     && entry.target == target
-                    && self.lookup_method(entry.class, descriptor.method, None) == Some(target) {
+                    && self.lookup_method(entry.class, descriptor.method, home_slot) == Some(target) {
                     classes.push(entry.class.0);
                 }
             }
@@ -9071,6 +9080,47 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_prepared_function_index(&self, function: FuncId) -> Option<u32> {
         self.prepared.function_by_id.get(&function).copied()
+    }
+
+    fn trace_closure_target(&self, closure: RegisterWord) -> Option<FuncId> {
+        let closure = Value::from_word(closure);
+        let function_index = match self.heap.get(closure)? {
+            HeapObject::Closure { function_index, .. } => *function_index,
+            _ => return None,
+        };
+        self.prepared.functions.get(function_index as usize).map(|function| function.id)
+    }
+
+    fn trace_invoke_closure_target(
+        &self,
+        function: FuncId,
+        cache: u32,
+        receiver: RegisterWord,
+    ) -> Option<FuncId> {
+        let caller = self.program.function(function)?;
+        let descriptor = caller.chunk.inline_caches.get(cache as usize)?;
+        if descriptor.home_class.is_some() { return None; }
+        let signature = self.program.metadata.method(descriptor.method)?;
+        if signature.kind != crate::napalm_ir::MethodKind::Method
+            || self.program.metadata.string(signature.name)? != "call"
+        {
+            return None;
+        }
+
+        let closure = Value::from_word(receiver);
+        let function_index = match self.heap.get(closure)? {
+            HeapObject::Closure { function_index, .. } => *function_index,
+            _ => return None,
+        };
+        let class = self.heap.receiver_class(closure)?;
+        if self.lookup_method(class, descriptor.method, None)
+            != Some(CallTarget::NativeBuiltin(NativeBuiltin::FnCall))
+        {
+            return None;
+        }
+        let callee = self.prepared.functions.get(function_index as usize)?;
+        if callee.arity != signature.arity { return None; }
+        Some(callee.id)
     }
 
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
@@ -9465,10 +9515,12 @@ unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, ob
 
 impl Interpreter<'_> {
     /// Execute a bytecode target already proven by the native trace. This skips
-    /// ordinary Invoke dispatch and InvokeSpread signature scanning/lookup.
-    /// Cranelift has materialized receiver/arguments directly into the activation
-    /// scratch frame after guarding method epoch and receiver class.
-    /// InvokeSpread additionally guards exact argument-list arity in native code.
+    /// ordinary Invoke/InvokeSuper dispatch, InvokeSpread signature scanning,
+    /// and CallClosure target extraction. Cranelift materializes the dynamic call
+    /// subject and arguments directly into activation scratch. Invoke-family
+    /// calls guard method/class assumptions; closure-ABI calls (explicit
+    /// CallClosure or proven Invoke("call")) guard immutable closure function
+    /// identity in the handle sidecar before entering this helper.
     fn trace_execute_direct_bytecode_call(
         &mut self,
         activation: &TraceActivation,
@@ -9493,8 +9545,8 @@ impl Interpreter<'_> {
             .and_then(|function| function.chunk.code.get(op.raw_pc as usize))
             .and_then(|word| word.opcode())
             .ok_or_else(|| RuntimeError::new("direct trace call opcode is invalid"))?;
-        if !matches!(opcode, Opcode::Invoke | Opcode::InvokeSpread) {
-            return Err(RuntimeError::new("direct trace call used outside Invoke/InvokeSpread"));
+        if !matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::InvokeSpread | Opcode::CallClosure) {
+            return Err(RuntimeError::new("direct trace call used outside Invoke/InvokeSuper/InvokeSpread/CallClosure"));
         }
 
         let function_index = activation.direct_call_function;
@@ -9503,20 +9555,39 @@ impl Interpreter<'_> {
         if destination > u8::MAX as u32
             || destination as u8 != op.a
             || arity > ARGUMENT_REGISTER_COUNT
-            || (opcode == Opcode::Invoke && op.c as usize != arity)
+            || (matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure)
+                && op.c as usize != arity)
         {
             return Err(RuntimeError::new("invalid direct trace call metadata"));
         }
-        let callee = self
-            .prepared
-            .functions
-            .get(function_index as usize)
-            .ok_or_else(|| RuntimeError::new("direct trace call target is unavailable"))?;
-        if callee.is_async
-            || callee.capture_count != 0
-            || !function_kind_uses_this(callee.kind)
-            || callee.arity as usize != arity
-            || callee.return_kind != RegisterKind::Value
+        let (callee_is_async, callee_arity, callee_return_kind, callee_capture_count, callee_uses_this) = {
+            let callee = self
+                .prepared
+                .functions
+                .get(function_index as usize)
+                .ok_or_else(|| RuntimeError::new("direct trace call target is unavailable"))?;
+            (
+                callee.is_async,
+                callee.arity as usize,
+                callee.return_kind,
+                callee.capture_count as usize,
+                function_kind_uses_this(callee.kind),
+            )
+        };
+        let closure_call =
+            activation.direct_call_reserved & crate::napalm_tracing_jit::TRACE_DIRECT_CALL_FLAG_CLOSURE != 0;
+        if closure_call {
+            if !matches!(opcode, Opcode::CallClosure | Opcode::Invoke) {
+                return Err(RuntimeError::new("closure direct trace call used from incompatible opcode"));
+            }
+        } else if opcode == Opcode::CallClosure {
+            return Err(RuntimeError::new("CallClosure direct trace call is missing closure ABI flag"));
+        }
+        if callee_is_async
+            || callee_arity != arity
+            || callee_return_kind != RegisterKind::Value
+            || (closure_call && callee_uses_this)
+            || (!closure_call && (callee_capture_count != 0 || !callee_uses_this))
         {
             return Err(RuntimeError::new("direct trace call target contract changed"));
         }
@@ -9525,16 +9596,24 @@ impl Interpreter<'_> {
         // enter_bytecode_call only publishes the caller safepoint and pushes the
         // new frame for synchronous bytecode callees; subsequent GC sees these
         // values in the callee's precise architectural registers.
-        let receiver = activation.direct_call_receiver;
+        let subject = activation.direct_call_receiver;
         let mut args = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
         args[..arity].copy_from_slice(&activation.direct_call_args[..arity]);
-        self.enter_bytecode_call(
-            &op,
-            function_index,
-            Some(receiver),
-            &args[..arity],
-            None,
-        );
+        if closure_call {
+            let closure = Value::from_word(subject);
+            let valid = matches!(
+                self.heap.get(closure),
+                Some(HeapObject::Closure { function_index: actual, captures, .. })
+                    if *actual == function_index
+                        && captures.len() == callee_capture_count
+            );
+            if !valid {
+                return Err(RuntimeError::new("direct closure call target contract changed"));
+            }
+            self.enter_bytecode_call(&op, function_index, None, &args[..arity], Some(closure));
+        } else {
+            self.enter_bytecode_call(&op, function_index, Some(subject), &args[..arity], None);
+        }
 
         while self.run_state == RunState::Running
             && self.current_fiber == caller_fiber
@@ -9836,6 +9915,32 @@ mod tests {
     }
 
     #[test]
+    fn closure_sidecar_exposes_function_identity_and_stable_capture_payload() {
+        let entry = HandleEntry::new(FREE_HANDLE_NONE);
+        let captures = vec![RegisterWord(0x1111), RegisterWord(0x2222)].into_boxed_slice();
+        let capture_ptr = captures.as_ptr() as usize;
+        let closure = HeapObject::Closure {
+            function_index: 37,
+            captures,
+            reference_indices: vec![0u16].into_boxed_slice(),
+        };
+
+        HandleTable::refresh_entry(&entry, &closure);
+
+        let packed = entry.kind.load(Ordering::Acquire);
+        assert_eq!(
+            packed & crate::napalm_tracing_jit::TRACE_HEAP_KIND_MASK,
+            TraceHeapKind::Closure as u32,
+        );
+        assert_eq!(
+            packed >> crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT,
+            2,
+        );
+        assert_eq!(entry.len.load(Ordering::Relaxed), 37);
+        assert_eq!(entry.data.load(Ordering::Relaxed), capture_ptr);
+    }
+
+    #[test]
     fn trace_inlines_small_methods_with_class_and_epoch_guards() {
         let source = r#"
 class Box {
@@ -9899,6 +10004,130 @@ return result
                 assert!(stats.spread_inlined_calls > 0, "{stats:?}");
                 assert!(stats.inlined_calls >= stats.spread_inlined_calls, "{stats:?}");
                 assert!(stats.devirtualized_calls >= stats.spread_inlined_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_invoke_call_devirtualizes_to_closure_direct_call() {
+        let source = r#"
+var captured = 7
+var callable = Fn.new { |x|
+  var total = captured + x
+  var j = 0
+  while (j < 4) {
+    total = total + j
+    j = j + 1
+  }
+  return total
+}
+var result = 0
+var i = 0
+while (i < 200) {
+  result = result + callable.call(i)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // Each call returns 7 + i + (0 + 1 + 2 + 3) = i + 13.
+            assert_eq!(result.as_num(), Some(22500.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_closure_direct_calls > 0, "{stats:?}");
+                assert!(stats.closure_direct_calls >= stats.invoke_closure_direct_calls, "{stats:?}");
+                assert!(stats.devirtualized_calls >= stats.invoke_closure_direct_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_invoke_call_uses_dynamic_capture_instance() {
+        let source = r#"
+class Factory {
+  static make(v) { return Fn.new { |x| v + x } }
+}
+var result = 0
+var i = 0
+while (i < 200) {
+  var callable = Factory.make(i)
+  result = result + callable.call(1)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // The trace may specialize the closure function but must use each
+            // newly allocated closure's current capture payload.
+            assert_eq!(result.as_num(), Some(20100.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_closure_direct_calls > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_invoke_call_direct_closure_unwinds_into_caller_catch() {
+        let source = r#"
+class Runner {
+  static run() {
+    var callable = Fn.new { |x|
+      if (x == 190) { throw 7 }
+      return x + 1
+    }
+    var result = 0
+    var i = 0
+    try {
+      while (i < 200) {
+        result = result + callable.call(i)
+        i = i + 1
+      }
+    } catch (error) {
+      result = result + error * 1000
+    }
+    return result
+  }
+}
+var result = Runner.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // Successful calls x=0..189 contribute sum(x + 1) = 18_145;
+            // x=190 throws before assignment and the caller adds 7_000.
+            assert_eq!(source_result(&vm), 25145.0);
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_closure_direct_calls > 0, "{stats:?}");
             }
         }
     }
@@ -9999,6 +10228,108 @@ var result = Runner.run()
             if native {
                 let stats = vm.jit_stats().unwrap();
                 assert!(stats.invoke_direct_calls > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_direct_calls_large_invoke_super() {
+        let source = r#"
+class Base {
+  construct new() {}
+  combine(a, b) {
+    var total = a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    return total
+  }
+}
+class Child extends Base {
+  construct new() { super() }
+  run() {
+    var result = 0
+    var i = 0
+    while (i < 200) {
+      result = result + super.combine(i, 3)
+      i = i + 1
+    }
+    return result
+  }
+}
+var result = Child.new().run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            assert_eq!(source_result(&vm), 21700.0);
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_super_direct_calls > 0, "{stats:?}");
+                assert!(stats.devirtualized_calls >= stats.invoke_super_direct_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_invoke_super_unwinds_into_caller_catch() {
+        let source = r#"
+class Base {
+  construct new() {}
+  combine(a, b) {
+    var total = a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    if (a == 190) { throw 7 }
+    return total
+  }
+}
+class Child extends Base {
+  construct new() { super() }
+  run() {
+    var result = 0
+    var i = 0
+    try {
+      while (i < 200) {
+        result = result + super.combine(i, 3)
+        i = i + 1
+      }
+    } catch (error) {
+      result = result + error * 1000
+    }
+    return result
+  }
+}
+var result = Child.new().run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            assert_eq!(source_result(&vm), 26665.0);
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_super_direct_calls > 0, "{stats:?}");
             }
         }
     }
