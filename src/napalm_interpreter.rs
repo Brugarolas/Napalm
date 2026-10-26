@@ -9048,6 +9048,27 @@ impl TraceRuntime for Interpreter<'_> {
         Some((self.prepared.functions.get(index as usize)?.id, classes))
     }
 
+    fn trace_inline_method_target(
+        &self,
+        receiver: RegisterWord,
+        method: MethodSymbol,
+        home_class: Option<ClassId>,
+    ) -> Option<(FuncId, Vec<u64>)> {
+        let class = self.heap.receiver_class(Value::from_word(receiver))?;
+        let home = match home_class {
+            Some(class) => Some(*self.prepared.class_by_id.get(&class)?),
+            None => None,
+        };
+        let target = self.lookup_method(class, method, home)?;
+        let CallTarget::Bytecode(index) = target else { return None };
+        let function = self.prepared.functions.get(index as usize)?.id;
+
+        // InvokeSpread has no ordinary per-arity PIC slot to mine for a small
+        // polymorphic class set. Guard the actually observed receiver class and
+        // let a different class form a side trace instead of weakening dispatch.
+        Some((function, vec![class.0]))
+    }
+
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
         let Some(function) = self.program.function(function) else { return false; };
         let Some(cache) = function.chunk.inline_caches.get(cache as usize) else { return false; };
@@ -9367,6 +9388,13 @@ impl TraceRuntime for Interpreter<'_> {
             returns: banks.returns.as_mut_ptr(), special: banks.special.as_mut_ptr(), runtime,
             execute: execute_trace_runtime, heap_chunks: handles().jit_chunks(),
             heap_write_barrier: trace_heap_write_barrier })
+    }
+
+    fn trace_list_len(&self, value: RegisterWord) -> Option<usize> {
+        match self.heap.get(Value::from_word(value))? {
+            HeapObject::List(values) => Some(values.len()),
+            _ => None,
+        }
     }
 
     fn trace_heap_object_kind(&self, value: RegisterWord) -> Option<TraceHeapObjectKind> {
@@ -9727,6 +9755,44 @@ return result
             if native {
                 let stats = vm.jit_stats().unwrap();
                 assert!(stats.inlined_calls >= 2 && stats.devirtualized_calls >= 2 && stats.native_entries > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_inlines_invoke_spread_at_observed_arity() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  combine(a, b) { _x + a + b }
+}
+var box = Box.new(1)
+var args = [2, 3]
+var result = 0
+var i = 0
+while (i < 200) {
+  result = result + box.combine(...args)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            assert_eq!(result.as_num(), Some(1200.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.spread_inlined_calls > 0, "{stats:?}");
+                assert!(stats.inlined_calls >= stats.spread_inlined_calls, "{stats:?}");
+                assert!(stats.devirtualized_calls >= stats.spread_inlined_calls, "{stats:?}");
             }
         }
     }

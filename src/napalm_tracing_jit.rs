@@ -61,12 +61,12 @@ use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Module};
 use cranelift::prelude::*;
 
 use crate::napalm_bytecode::{
-    instruction_word_len, ArgReg, BytecodeFunction, BytecodePc, BytecodeProgram,
-    Opcode, Reg, RegisterKind, RegisterWord, ReturnReg,
-    SpecialReg,
+    instruction_word_len, ArgReg, BytecodeFunction, BytecodePc, BytecodeProgram, Opcode, Reg,
+    RegisterKind, RegisterWord, ReturnReg, SpecialReg, MAX_WREN_ARITY,
 };
 use crate::napalm_ir::{
-    CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind, StringId, Type,
+    ClassId, CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp,
+    MethodKind, MethodSymbol, StringId, Type,
 };
 use crate::napalm_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
@@ -473,6 +473,22 @@ pub trait TraceRuntime {
     /// guard both the class set and method-table epoch against rebinding.
     fn trace_inline_target(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> { None }
 
+    /// Resolve a concrete method symbol without requiring an inline-cache slot.
+    /// InvokeSpread uses this after specializing its runtime arity to a concrete
+    /// MethodSymbol. `home_class` preserves lexical super-dispatch semantics.
+    fn trace_inline_method_target(
+        &self,
+        _receiver: RegisterWord,
+        _method: MethodSymbol,
+        _home_class: Option<ClassId>,
+    ) -> Option<(FuncId, Vec<u64>)> {
+        None
+    }
+
+    /// Observe the length of a List while recording. Generated code must still
+    /// guard both List kind and exact length before reusing the observation.
+    fn trace_list_len(&self, _value: RegisterWord) -> Option<usize> { None }
+
     /// Resolve a GuardClass descriptor to stable runtime receiver-class keys.
     fn trace_class_guard(&self, _function: FuncId, _guard: u32) -> Option<Vec<u64>> { None }
     fn trace_receiver_class(&self, _value: RegisterWord) -> Option<u64> { None }
@@ -716,6 +732,7 @@ impl Default for TracingJitOptions {
 pub struct TracingJitStats {
     pub inlined_calls: u64,
     pub devirtualized_calls: u64,
+    pub spread_inlined_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
@@ -979,6 +996,32 @@ fn deopt_resume(
         .iter()
         .find(|point| point.id.0 == deopt)
         .map(|point| point.resume_pc)
+}
+
+/// InvokeSpread stores the syntactic method identity, while the explicit arity
+/// is known only from the runtime argument List. Resolve that observation to the
+/// same concrete MethodSymbol that the baseline handler would select. Metadata is
+/// immutable, so this lookup is recording-only; native code guards the List
+/// length and method-table epoch before using the specialization.
+fn spread_method_for_arity(
+    program: &BytecodeProgram,
+    base: MethodSymbol,
+    arity: usize,
+) -> Option<MethodSymbol> {
+    if arity > MAX_WREN_ARITY {
+        return None;
+    }
+    let signature = program.metadata.method(base)?;
+    program
+        .metadata
+        .methods
+        .iter()
+        .position(|candidate| {
+            candidate.name == signature.name
+                && candidate.kind == signature.kind
+                && candidate.arity as usize == arity
+        })
+        .map(|index| MethodSymbol(index as u32))
 }
 
 // =============================================================================
@@ -1620,7 +1663,7 @@ impl<'a> TraceRecorder<'a> {
                 builder.set_source(op.location);
                 let terminal = matches!(op.opcode,
                     Opcode::Trap | Opcode::Return | Opcode::Return2 | Opcode::Bailout
-                    | Opcode::Switch | Opcode::Invoke | Opcode::InvokeSuper
+                    | Opcode::Switch | Opcode::Invoke | Opcode::InvokeSpread | Opcode::InvokeSuper
                     | Opcode::CallDirect | Opcode::CallClosure | Opcode::ImportModule
                     | Opcode::FiberCall | Opcode::FiberTry | Opcode::FiberTransfer
                     | Opcode::FiberTransferError | Opcode::FiberYield | Opcode::FiberSuspend
@@ -1652,6 +1695,475 @@ impl<'a> TraceRecorder<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn inline_spread_or_runtime_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        // InvokeSpread is profitable only when its argument List is stable enough
+        // to recover a concrete call signature. Every emitted guard resumes at the
+        // original spread call, so a changed arity/class/epoch simply replays full
+        // baseline semantics before any inlined callee effect can become visible.
+        let checkpoint = builder.clone();
+        match self.inline_spread_call(runtime, program, op, builder) {
+            Ok(step) => Ok(step),
+            Err(
+                RecordingAbort::UnsupportedCall
+                | RecordingAbort::UnsupportedOpcode(_)
+                | RecordingAbort::UnsupportedConstant,
+            ) => {
+                *builder = checkpoint;
+                builder.runtime_call(op.location, op.next_pc);
+                Ok(ExpectedStep::RuntimeCall)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn inline_spread_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::InvokeSpread {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let argument_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.c)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let arity = runtime
+            .trace_list_len(argument_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if arity > MAX_WREN_ARITY {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let method = spread_method_for_arity(program, MethodSymbol(op.x), arity)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let home_class = (op.y != u32::MAX).then_some(ClassId(op.y));
+        let (target, classes) = runtime
+            .trace_inline_method_target(receiver_word, method, home_class)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if classes.is_empty() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let callee = program
+            .function(target)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if callee.is_async
+            || callee.capture_count != 0
+            || !callee.chunk.exception_handlers.is_empty()
+            || callee.frame.return_kind != RegisterKind::Value
+            || target == op.location.function
+            || !crate::napalm_bytecode::function_kind_uses_this(callee.kind)
+            || callee.arity as usize != arity
+            || builder.trace().stats.inlined_calls >= 8
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+
+        let receiver = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let receiver = builder.emit1(
+            TraceInst::GuardClass {
+                value: receiver,
+                classes,
+                exit,
+            },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+
+        let arguments = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+        let arguments = self.guard_heap_object(
+            builder,
+            arguments,
+            TraceHeapObjectKind::List,
+            exit,
+        );
+        let length = builder.emit1(
+            TraceInst::HeapListLen {
+                list: arguments,
+                exit,
+            },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let observed_length = builder.constant(TraceConstant::Int32(arity as i32));
+        builder.emit0(TraceInst::GuardEq {
+            lhs: length,
+            rhs: observed_length,
+            exit,
+        });
+
+        let mut args = Vec::with_capacity(arity);
+        for index in 0..arity {
+            let index = builder.constant(TraceConstant::Int32(index as i32));
+            args.push(builder.emit1(
+                TraceInst::HeapListGet {
+                    list: arguments,
+                    index,
+                    exit,
+                },
+                TraceType::Any,
+                TraceRep::Tagged,
+            ));
+        }
+
+        let mut registers = vec![None; 256];
+        for binding in &callee.frame.parameters {
+            if binding.kind != RegisterKind::Value {
+                return Err(RecordingAbort::UnsupportedCall);
+            }
+            let value = match binding.source {
+                crate::napalm_bytecode::IncomingSource::This => Some(receiver),
+                crate::napalm_bytecode::IncomingSource::Argument(argument) => {
+                    args.get(argument.0 as usize).copied()
+                }
+            }
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+            registers[binding.destination.0 as usize] = Some(value);
+        }
+
+        let mut pc = BytecodePc(0);
+        for count in 1..=32 {
+            let inst = decode_at(program, TraceLocation::new(target, pc))
+                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+            let get = |reg: u8| {
+                registers[reg as usize].ok_or(RecordingAbort::UnsupportedCall)
+            };
+            let scalar = |reg: u8, rep: TraceRep| {
+                let value = get(reg)?;
+                if builder
+                    .trace()
+                    .value(value)
+                    .is_some_and(|value| value.rep == rep)
+                {
+                    Ok(value)
+                } else {
+                    Err(RecordingAbort::UnsupportedCall)
+                }
+            };
+
+            use Opcode::*;
+            let value = match inst.opcode {
+                Nop | OsrPoint => {
+                    pc = inst.next_pc;
+                    continue;
+                }
+                Move => get(inst.b)?,
+                LoadNull => builder.constant(TraceConstant::Null),
+                LoadFalse | LoadTrue => {
+                    builder.constant(TraceConstant::Bool(inst.opcode == LoadTrue))
+                }
+                LoadI8 => builder.constant(TraceConstant::Int32(inst.b as i8 as i32)),
+                LoadI32 => builder.constant(TraceConstant::Int32(inst.x as i32)),
+                LoadConst => {
+                    let constant = match callee.chunk.constants.get(inst.x as usize) {
+                        Some(Constant::Null) => TraceConstant::Null,
+                        Some(Constant::Bool(value)) => TraceConstant::Bool(*value),
+                        Some(Constant::Num(value)) => TraceConstant::NumBits(
+                            if value.is_nan() { CANONICAL_NAN } else { value.to_bits() },
+                        ),
+                        Some(Constant::Int32(value)) => TraceConstant::Int32(*value),
+                        Some(Constant::String(id)) => {
+                            let word = runtime
+                                .trace_materialize_constant(TraceConstant::String(*id))
+                                .map_err(|_| RecordingAbort::UnsupportedConstant)?;
+                            TraceConstant::StableTagged(word.0)
+                        }
+                        None => return Err(RecordingAbort::UnsupportedCall),
+                    };
+                    builder.constant(constant)
+                }
+                MoveFromArg => *args
+                    .get(inst.b as usize)
+                    .ok_or(RecordingAbort::UnsupportedCall)?,
+                MoveFromSpecial if inst.b == SpecialReg::This as u8 => receiver,
+                GuardNotNull => {
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    builder.emit1(
+                        TraceInst::GuardNotNull { value, exit },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    )
+                }
+                LoadField => {
+                    let object = scalar(inst.b, TraceRep::Tagged)?;
+                    let slot = runtime.trace_field_slot(inst.location, inst.x);
+                    builder.emit1(
+                        TraceInst::HeapLoadField { object, slot, exit },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    )
+                }
+                LoadCell => {
+                    let cell = scalar(inst.b, TraceRep::Tagged)?;
+                    builder.emit1(
+                        TraceInst::HeapLoadCell { cell, exit },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    )
+                }
+                ListLen => {
+                    let list = scalar(inst.b, TraceRep::Tagged)?;
+                    let list = self.guard_heap_object(
+                        builder,
+                        list,
+                        TraceHeapObjectKind::List,
+                        exit,
+                    );
+                    builder.emit1(
+                        TraceInst::HeapListLen { list, exit },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    )
+                }
+                ListGet => {
+                    let list = scalar(inst.b, TraceRep::Tagged)?;
+                    let index = scalar(inst.c, TraceRep::Int32)?;
+                    let list = self.guard_heap_object(
+                        builder,
+                        list,
+                        TraceHeapObjectKind::List,
+                        exit,
+                    );
+                    builder.emit1(
+                        TraceInst::HeapListGet { list, index, exit },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    )
+                }
+                NumToF64 | GuardF64 => {
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    builder.emit1(
+                        TraceInst::GuardF64 { value, exit },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    )
+                }
+                NumToInt32 | GuardInt32 => {
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    builder.emit1(
+                        TraceInst::GuardInt32 { value, exit },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    )
+                }
+                Int32ToNum => {
+                    let value = scalar(inst.b, TraceRep::Int32)?;
+                    builder.emit1(
+                        TraceInst::BoxInt32 { value },
+                        TraceType::Num,
+                        TraceRep::Tagged,
+                    )
+                }
+                F64ToNum => {
+                    let value = scalar(inst.b, TraceRep::F64)?;
+                    builder.emit1(
+                        TraceInst::BoxF64 { value },
+                        TraceType::Num,
+                        TraceRep::Tagged,
+                    )
+                }
+                INeg | IBitNot => {
+                    let value = scalar(inst.b, TraceRep::Int32)?;
+                    let op = if inst.opcode == INeg {
+                        IntUnaryOp::Neg
+                    } else {
+                        IntUnaryOp::BitNot
+                    };
+                    builder.emit1(
+                        TraceInst::IntUnary { op, value },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    )
+                }
+                IAdd | ISub | IMul | IBitAnd | IBitOr | IBitXor | IShl | IShrU | ISar => {
+                    let lhs = scalar(inst.b, TraceRep::Int32)?;
+                    let rhs = scalar(inst.c, TraceRep::Int32)?;
+                    let op = match inst.opcode {
+                        IAdd => IntBinOp::Add,
+                        ISub => IntBinOp::Sub,
+                        IMul => IntBinOp::Mul,
+                        IBitAnd => IntBinOp::BitAnd,
+                        IBitOr => IntBinOp::BitOr,
+                        IBitXor => IntBinOp::BitXor,
+                        IShl => IntBinOp::Shl,
+                        IShrU => IntBinOp::ShrU,
+                        ISar => IntBinOp::Sar,
+                        _ => unreachable!(),
+                    };
+                    builder.emit1(
+                        TraceInst::IntBinary { op, lhs, rhs },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    )
+                }
+                IDivS | IRemS => {
+                    let lhs = scalar(inst.b, TraceRep::Int32)?;
+                    let rhs = scalar(inst.c, TraceRep::Int32)?;
+                    let op = if inst.opcode == IDivS {
+                        IntBinOp::DivS
+                    } else {
+                        IntBinOp::RemS
+                    };
+                    builder.emit1(
+                        TraceInst::IntBinaryChecked { op, lhs, rhs, exit },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    )
+                }
+                FNeg => {
+                    let value = scalar(inst.b, TraceRep::F64)?;
+                    builder.emit1(
+                        TraceInst::F64Unary {
+                            op: F64UnaryOp::Neg,
+                            value,
+                        },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    )
+                }
+                FAdd | FSub | FMul | FDiv | FRem => {
+                    let lhs = scalar(inst.b, TraceRep::F64)?;
+                    let rhs = scalar(inst.c, TraceRep::F64)?;
+                    let op = match inst.opcode {
+                        FAdd => F64BinOp::Add,
+                        FSub => F64BinOp::Sub,
+                        FMul => F64BinOp::Mul,
+                        FDiv => F64BinOp::Div,
+                        FRem => F64BinOp::Rem,
+                        _ => unreachable!(),
+                    };
+                    builder.emit1(
+                        TraceInst::F64Binary { op, lhs, rhs },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    )
+                }
+                ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe => {
+                    let lhs = scalar(inst.b, TraceRep::Int32)?;
+                    let rhs = scalar(inst.c, TraceRep::Int32)?;
+                    let raw = builder.emit1(
+                        TraceInst::IntCompare {
+                            op: cmp_from_opcode(inst.opcode),
+                            lhs,
+                            rhs,
+                        },
+                        TraceType::Bool,
+                        TraceRep::Bool,
+                    );
+                    self.tagged_bool(builder, raw)
+                }
+                FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe => {
+                    let lhs = scalar(inst.b, TraceRep::F64)?;
+                    let rhs = scalar(inst.c, TraceRep::F64)?;
+                    let raw = builder.emit1(
+                        TraceInst::F64Compare {
+                            op: cmp_from_opcode(inst.opcode),
+                            lhs,
+                            rhs,
+                        },
+                        TraceType::Bool,
+                        TraceRep::Bool,
+                    );
+                    self.tagged_bool(builder, raw)
+                }
+                RefEq => {
+                    let lhs = scalar(inst.b, TraceRep::Tagged)?;
+                    let rhs = scalar(inst.c, TraceRep::Tagged)?;
+                    let raw = builder.emit1(
+                        TraceInst::RefEq { lhs, rhs },
+                        TraceType::Bool,
+                        TraceRep::Bool,
+                    );
+                    self.tagged_bool(builder, raw)
+                }
+                Invoke if runtime.trace_standard_numeric_method(target, inst.x) => {
+                    let cache = callee
+                        .chunk
+                        .inline_caches
+                        .get(inst.x as usize)
+                        .ok_or(RecordingAbort::UnsupportedCall)?;
+                    let signature = program
+                        .metadata
+                        .method(cache.method)
+                        .ok_or(RecordingAbort::UnsupportedCall)?;
+                    if signature.kind != MethodKind::Method
+                        || signature.arity != 1
+                        || inst.args.len() != 1
+                    {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                    let op = match program.metadata.string(signature.name) {
+                        Some("+") => F64BinOp::Add,
+                        Some("-") => F64BinOp::Sub,
+                        Some("*") => F64BinOp::Mul,
+                        Some("/") => F64BinOp::Div,
+                        Some("%") => F64BinOp::Rem,
+                        _ => return Err(RecordingAbort::UnsupportedCall),
+                    };
+                    let left = scalar(inst.b, TraceRep::Tagged)?;
+                    let right = scalar(inst.args[0].0, TraceRep::Tagged)?;
+                    let lhs = builder.emit1(
+                        TraceInst::GuardF64 { value: left, exit },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    );
+                    let rhs = builder.emit1(
+                        TraceInst::GuardF64 { value: right, exit },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    );
+                    let result = builder.emit1(
+                        TraceInst::F64Binary { op, lhs, rhs },
+                        TraceType::F64,
+                        TraceRep::F64,
+                    );
+                    builder.emit1(
+                        TraceInst::BoxF64 { value: result },
+                        TraceType::Num,
+                        TraceRep::Tagged,
+                    )
+                }
+                Return => {
+                    let result = scalar(inst.a, TraceRep::Tagged)?;
+                    self.write_gpr(builder, op.a, result);
+                    builder.write_slot(FrameSlot::Return(ReturnReg(0)), result);
+                    builder.trace_mut().stats.inlined_calls += 1;
+                    builder.trace_mut().stats.devirtualized_calls += 1;
+                    builder.trace_mut().stats.spread_inlined_calls += 1;
+                    return Ok(ExpectedStep::Inlined {
+                        next: TraceLocation::new(op.location.function, op.next_pc),
+                        callee: target,
+                        steps: count,
+                    });
+                }
+                _ => return Err(RecordingAbort::UnsupportedCall),
+            };
+
+            registers[inst.a as usize] = Some(value);
+            pc = inst.next_pc;
+        }
+
+        Err(RecordingAbort::UnsupportedCall)
     }
 
     fn translate_native<R: TraceRuntime>(
@@ -3134,14 +3646,17 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
+            InvokeSpread => self.inline_spread_or_runtime_call(runtime, program, op, builder),
+
             Breakpoint => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
             // Full call boundaries remain inside the native trace. The runtime
             // helper executes a synchronous bytecode callee until it returns to
             // this frame, or reports a terminal/frame-changing condition. This
             // removes the tier-manager round trip without pretending that host
-            // or foreign calls are pure or non-GC.
-            InvokeSpread | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign | ImportModule => {
+            // or foreign calls are pure or non-GC. CallDirect is handled above by
+            // the bounded inliner and therefore does not belong in this fallback.
+            InvokeSuper | CallClosure | CallPrimitive | CallForeign | ImportModule => {
                 builder.runtime_call(op.location, op.next_pc);
                 Ok(ExpectedStep::RuntimeCall)
             }
@@ -6938,6 +7453,7 @@ impl TracingJit {
                 self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
                 self.stats.inlined_calls += trace.stats.inlined_calls as u64;
                 self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
+                self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
                 self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
@@ -7073,6 +7589,7 @@ impl TracingJit {
         self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
+        self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
         self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
         self.stats.promoted_u32_loop_phis += trace.stats.promoted_u32_loop_phis as u64;
@@ -7311,6 +7828,7 @@ impl TracingJit {
         self.stats.recordings_succeeded = self.stats.recordings_succeeded.saturating_add(1);
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
+        self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.recorded_bytecodes = self
             .stats
             .recorded_bytecodes

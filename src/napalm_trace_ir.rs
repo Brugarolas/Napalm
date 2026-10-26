@@ -387,6 +387,9 @@ pub struct TraceStats {
     pub loop_loads_reused: usize,
     pub inlined_calls: usize,
     pub devirtualized_calls: usize,
+    /// InvokeSpread sites specialized to an observed argument-list arity and
+    /// successfully inlined as ordinary bytecode calls.
+    pub spread_inlined_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
 }
