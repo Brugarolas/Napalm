@@ -220,6 +220,10 @@ pub const TRACE_RUNTIME_MODE_LIST_REMOVE: u32 = 8 << TRACE_RUNTIME_MODE_SHIFT;
 pub const TRACE_RUNTIME_MODE_MAP_REMOVE: u32 = 9 << TRACE_RUNTIME_MODE_SHIFT;
 pub const TRACE_RUNTIME_MODE_MAP_GET: u32 = 10 << TRACE_RUNTIME_MODE_SHIFT;
 pub const TRACE_RUNTIME_MODE_MAP_SET: u32 = 11 << TRACE_RUNTIME_MODE_SHIFT;
+/// Known synchronous bytecode call. Receiver/arguments are materialized by
+/// generated code into TraceActivation scratch storage; the runtime helper only
+/// pushes the already-resolved callee and runs it back to the caller.
+pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
 
 /// Maximum number of distinct dynamic values one side-exit snapshot may
 /// describe. Native exits now commit these values directly to architectural
@@ -329,6 +333,17 @@ pub struct TraceActivation {
     /// Non-allocating StickyImmix post-barrier slow path.
     pub heap_write_barrier: HeapWriteBarrierFn,
 
+    /// Scratch call frame used only by TRACE_RUNTIME_MODE_DIRECT_CALL. The values
+    /// are not GC roots by themselves: the helper performs no collection between
+    /// reading this scratch area and copying it into the freshly pushed callee
+    /// frame, after which the normal precise stack map owns them.
+    pub direct_call_function: u32,
+    pub direct_call_destination: u32,
+    pub direct_call_arity: u32,
+    pub direct_call_reserved: u32,
+    pub direct_call_receiver: RegisterWord,
+    pub direct_call_args: [RegisterWord; MAX_WREN_ARITY],
+
     /// Dense native entry table and per-trace link-table pointers. The Cranelift
     /// dispatcher uses these to follow stitched trace-tree edges without returning
     /// to the Rust tiering manager. They remain stable for one dispatcher call.
@@ -362,6 +377,12 @@ impl TraceActivation {
             execute: inputs.execute,
             heap_chunks: inputs.heap_chunks,
             heap_write_barrier: inputs.heap_write_barrier,
+            direct_call_function: u32::MAX,
+            direct_call_destination: u32::MAX,
+            direct_call_arity: 0,
+            direct_call_reserved: 0,
+            direct_call_receiver: RegisterWord(0),
+            direct_call_args: [RegisterWord(0); MAX_WREN_ARITY],
             trace_entries: std::ptr::null(),
             trace_link_tables: std::ptr::null(),
             current_links: std::ptr::null(),
@@ -484,6 +505,10 @@ pub trait TraceRuntime {
     ) -> Option<(FuncId, Vec<u64>)> {
         None
     }
+
+    /// Translate a stable FuncId to the interpreter's prepared-function index.
+    /// This is recording-only metadata used by direct known-bytecode calls.
+    fn trace_prepared_function_index(&self, _function: FuncId) -> Option<u32> { None }
 
     /// Observe the length of a List while recording. Generated code must still
     /// guard both List kind and exact length before reusing the observation.
@@ -733,6 +758,8 @@ pub struct TracingJitStats {
     pub inlined_calls: u64,
     pub devirtualized_calls: u64,
     pub spread_inlined_calls: u64,
+    pub spread_direct_calls: u64,
+    pub invoke_direct_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
@@ -1681,20 +1708,120 @@ impl<'a> TraceRecorder<'a> {
         op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
-        // Inlining is preferable, but it is speculative. If the callee is too
-        // large/complex (or contains an opcode the bounded inliner refuses), roll
-        // back every emitted guard/node and keep the call inside the native trace
-        // as a synchronized RuntimeCall instead of aborting the whole trace.
+        // Inlining is preferable, but it is speculative. Ordinary Invoke has a
+        // second tier before generic RuntimeCall: when the observed receiver-class
+        // set resolves to one synchronous bytecode target, keep dispatch native and
+        // enter that prepared function directly even if bounded inlining refuses
+        // the callee. CallDirect keeps its existing generic call fallback here; its
+        // calling convention is intentionally handled separately.
         let checkpoint = builder.clone();
         match self.inline_call(runtime, program, op, builder) {
             Ok(step) => Ok(step),
-            Err(RecordingAbort::UnsupportedCall | RecordingAbort::UnsupportedOpcode(_)) => {
-                *builder = checkpoint;
+            Err(
+                RecordingAbort::UnsupportedCall
+                | RecordingAbort::UnsupportedOpcode(_)
+                | RecordingAbort::UnsupportedConstant
+                | RecordingAbort::RepresentationConflict,
+            ) => {
+                *builder = checkpoint.clone();
+                if op.opcode == Opcode::Invoke {
+                    match self.direct_invoke_call(runtime, program, op, builder) {
+                        Ok(step) => return Ok(step),
+                        Err(
+                            RecordingAbort::UnsupportedCall
+                            | RecordingAbort::UnsupportedOpcode(_)
+                            | RecordingAbort::UnsupportedConstant
+                            | RecordingAbort::RepresentationConflict,
+                        ) => {
+                            *builder = checkpoint;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    *builder = checkpoint;
+                }
                 builder.runtime_call(op.location, op.next_pc);
                 Ok(ExpectedStep::RuntimeCall)
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Direct known-target fallback for an ordinary dynamic Invoke. The inline
+    /// cache observation is only used to choose the target/class set while
+    /// recording; generated code rechecks method_epoch and receiver class before
+    /// entering the prepared bytecode function. Argument values stay fully dynamic
+    /// SSA values and are materialized into TraceActivation scratch on every call.
+    fn direct_invoke_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::Invoke
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.args.len() > MAX_WREN_ARITY
+            || op.c as usize != op.args.len()
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let (target, classes) = runtime
+            .trace_inline_target(op.location.function, op.x, receiver_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if classes.is_empty() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
+        if callee.is_async
+            || callee.capture_count != 0
+            || callee.frame.return_kind != RegisterKind::Value
+            || !crate::napalm_bytecode::function_kind_uses_this(callee.kind)
+            || callee.arity as usize != op.args.len()
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let function_index = runtime
+            .trace_prepared_function_index(target)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+
+        // Every guard resumes before the original Invoke. No callee effect has
+        // happened yet, so a changed method table or receiver class replays exact
+        // baseline dispatch and can naturally seed a side trace for that case.
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+        let receiver = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let receiver = builder.emit1(
+            TraceInst::GuardClass { value: receiver, classes, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+
+        let mut args = Vec::with_capacity(op.args.len());
+        for reg in &op.args {
+            args.push(self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)?);
+        }
+
+        let result = builder.runtime_direct_call(
+            op.location,
+            op.next_pc,
+            function_index,
+            Reg(op.a),
+            receiver,
+            args,
+        );
+        self.write_gpr(builder, op.a, result);
+        builder.trace_mut().stats.devirtualized_calls += 1;
+        builder.trace_mut().stats.invoke_direct_calls += 1;
+        Ok(ExpectedStep::RuntimeCall)
     }
 
     fn inline_spread_or_runtime_call<R: TraceRuntime>(
@@ -1714,14 +1841,134 @@ impl<'a> TraceRecorder<'a> {
             Err(
                 RecordingAbort::UnsupportedCall
                 | RecordingAbort::UnsupportedOpcode(_)
-                | RecordingAbort::UnsupportedConstant,
+                | RecordingAbort::UnsupportedConstant
+                | RecordingAbort::RepresentationConflict,
             ) => {
-                *builder = checkpoint;
-                builder.runtime_call(op.location, op.next_pc);
-                Ok(ExpectedStep::RuntimeCall)
+                // A large/complex synchronous bytecode callee still benefits from
+                // observed-arity specialization. Roll back the failed bounded
+                // inline, rebuild only the dispatch/arity guards and emit a direct
+                // known-target call that bypasses h_invoke_spread entirely.
+                *builder = checkpoint.clone();
+                match self.direct_spread_call(runtime, program, op, builder) {
+                    Ok(step) => Ok(step),
+                    Err(
+                        RecordingAbort::UnsupportedCall
+                        | RecordingAbort::UnsupportedOpcode(_)
+                        | RecordingAbort::UnsupportedConstant
+                        | RecordingAbort::RepresentationConflict,
+                    ) => {
+                        *builder = checkpoint;
+                        builder.runtime_call(op.location, op.next_pc);
+                        Ok(ExpectedStep::RuntimeCall)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn direct_spread_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::InvokeSpread
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let argument_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.c)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let arity = runtime
+            .trace_list_len(argument_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if arity > MAX_WREN_ARITY {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let method = spread_method_for_arity(program, MethodSymbol(op.x), arity)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let home_class = (op.y != u32::MAX).then_some(ClassId(op.y));
+        let (target, classes) = runtime
+            .trace_inline_method_target(receiver_word, method, home_class)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if classes.is_empty() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
+        let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
+        if callee.is_async
+            || callee.capture_count != 0
+            || callee.frame.return_kind != RegisterKind::Value
+            || !crate::napalm_bytecode::function_kind_uses_this(callee.kind)
+            || callee.arity as usize != arity
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let function_index = runtime
+            .trace_prepared_function_index(target)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+
+        let receiver = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let receiver = builder.emit1(
+            TraceInst::GuardClass { value: receiver, classes, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+
+        let arguments = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+        let arguments = self.guard_heap_object(
+            builder,
+            arguments,
+            TraceHeapObjectKind::List,
+            exit,
+        );
+        let length = builder.emit1(
+            TraceInst::HeapListLen { list: arguments, exit },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let observed_length = builder.constant(TraceConstant::Int32(arity as i32));
+        builder.emit0(TraceInst::GuardEq { lhs: length, rhs: observed_length, exit });
+
+        // Load the current elements every native execution. The specialization is
+        // only on arity/dispatch; argument values remain fully dynamic.
+        let mut args = Vec::with_capacity(arity);
+        for index in 0..arity {
+            let index = builder.constant(TraceConstant::Int32(index as i32));
+            args.push(builder.emit1(
+                TraceInst::HeapListGet { list: arguments, index, exit },
+                TraceType::Any,
+                TraceRep::Tagged,
+            ));
+        }
+
+        let result = builder.runtime_direct_call(
+            op.location,
+            op.next_pc,
+            function_index,
+            Reg(op.a),
+            receiver,
+            args,
+        );
+        self.write_gpr(builder, op.a, result);
+        builder.trace_mut().stats.devirtualized_calls += 1;
+        builder.trace_mut().stats.spread_direct_calls += 1;
+        Ok(ExpectedStep::RuntimeCall)
     }
 
     fn inline_spread_call<R: TraceRuntime>(
@@ -6176,10 +6423,64 @@ impl CraneliftLoweringState<'_, '_> {
                 location,
                 next,
                 terminal,
+                direct_call,
             } => {
                 // A full runtime boundary may collect and move objects. Do not let
                 // any backend-local moving address flow past this epoch.
                 self.invalidate_heap_proofs();
+
+                let encoded_next = if let Some(direct) = direct_call {
+                    if *terminal || next.0 & TRACE_RUNTIME_MODE_MASK != 0
+                        || direct.args.len() > MAX_WREN_ARITY
+                    {
+                        return Err(self.error("invalid direct bytecode call runtime payload"));
+                    }
+                    let store_i32 = |state: &mut Self, offset: i32, value: u32| {
+                        let value = state.builder.ins().iconst(types::I32, value as i64);
+                        state.builder.ins().store(
+                            Self::trusted_mem(),
+                            value,
+                            state.activation,
+                            offset,
+                        );
+                    };
+                    store_i32(
+                        self,
+                        offset_of!(TraceActivation, direct_call_function) as i32,
+                        direct.function_index,
+                    );
+                    store_i32(
+                        self,
+                        offset_of!(TraceActivation, direct_call_destination) as i32,
+                        direct.destination.0 as u32,
+                    );
+                    store_i32(
+                        self,
+                        offset_of!(TraceActivation, direct_call_arity) as i32,
+                        direct.args.len() as u32,
+                    );
+                    let receiver = self.lower_value(direct.receiver)?;
+                    self.builder.ins().store(
+                        Self::trusted_mem(),
+                        receiver,
+                        self.activation,
+                        offset_of!(TraceActivation, direct_call_receiver) as i32,
+                    );
+                    let args_base = offset_of!(TraceActivation, direct_call_args) as i32;
+                    for (index, argument) in direct.args.iter().copied().enumerate() {
+                        let argument = self.lower_value(argument)?;
+                        self.builder.ins().store(
+                            Self::trusted_mem(),
+                            argument,
+                            self.activation,
+                            args_base + (index * std::mem::size_of::<RegisterWord>()) as i32,
+                        );
+                    }
+                    next.0 | TRACE_RUNTIME_MODE_DIRECT_CALL
+                } else {
+                    next.0
+                };
+
                 let callee = self.builder.ins().load(
                     self.pointer_type,
                     Self::trusted_mem(),
@@ -6194,7 +6495,7 @@ impl CraneliftLoweringState<'_, '_> {
                     .builder
                     .ins()
                     .iconst(types::I32, location.pc.0 as i64);
-                let next = self.builder.ins().iconst(types::I32, next.0 as i64);
+                let next = self.builder.ins().iconst(types::I32, encoded_next as i64);
                 let call = self.builder.ins().call_indirect(
                     self.runtime_signature,
                     callee,
@@ -7454,6 +7755,8 @@ impl TracingJit {
                 self.stats.inlined_calls += trace.stats.inlined_calls as u64;
                 self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
                 self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
+                self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
+                self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
                 self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
@@ -7590,6 +7893,8 @@ impl TracingJit {
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
+        self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
+        self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
         self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
         self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
         self.stats.promoted_u32_loop_phis += trace.stats.promoted_u32_loop_phis as u64;
@@ -7829,6 +8134,8 @@ impl TracingJit {
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
+        self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
+        self.stats.invoke_direct_calls += trace.stats.invoke_direct_calls as u64;
         self.stats.recorded_bytecodes = self
             .stats
             .recorded_bytecodes
@@ -8643,6 +8950,75 @@ mod tests {
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
         assert_eq!(general[2].0 as u32 as i32, 46);
+    }
+
+    #[test]
+    fn direct_bytecode_call_lowers_activation_scratch_and_preserves_caller_ssa() {
+        unsafe extern "C" fn direct_call_runtime(
+            activation: *mut TraceActivation,
+            function: u32,
+            pc: u32,
+            next: u32,
+        ) -> u32 {
+            let activation = unsafe { &mut *activation };
+            assert_eq!(function, 0);
+            assert_eq!(pc, 0);
+            assert_eq!(next & TRACE_RUNTIME_MODE_MASK, TRACE_RUNTIME_MODE_DIRECT_CALL);
+            assert_eq!(next & !TRACE_RUNTIME_MODE_MASK, 1);
+            assert_eq!(activation.direct_call_function, 7);
+            assert_eq!(activation.direct_call_destination, 1);
+            assert_eq!(activation.direct_call_arity, 2);
+            assert_eq!(activation.direct_call_receiver, RegisterWord(0x2222));
+            assert_eq!(activation.direct_call_args[0], RegisterWord(0x3333));
+            assert_eq!(activation.direct_call_args[1], RegisterWord(0x4444));
+            unsafe { *activation.general.add(1) = RegisterWord(0xdead_beef) };
+            TRACE_RESULT_CONTINUE
+        }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::napalm_trace_ir::TraceBuilder::new(
+            TraceId(77),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let preserved = builder.constant(TraceConstant::StableTagged(0x1111));
+        let receiver = builder.constant(TraceConstant::StableTagged(0x2222));
+        let arg0 = builder.constant(TraceConstant::StableTagged(0x3333));
+        let arg1 = builder.constant(TraceConstant::StableTagged(0x4444));
+        builder.write_slot(FrameSlot::General(Reg(0)), preserved);
+        let result = builder.runtime_direct_call(
+            location,
+            BytecodePc(1),
+            7,
+            Reg(1),
+            receiver,
+            vec![arg0, arg1],
+        );
+        assert_eq!(builder.slot_value(FrameSlot::General(Reg(1))), Some(result));
+        builder.write_slot(FrameSlot::General(Reg(2)), preserved);
+        let success = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(2));
+        builder.set_terminator(TraceTerminator::Exit(success));
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+        let mut general = [RegisterWord(0); 4];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: direct_call_runtime,
+            heap_chunks: std::ptr::null(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, success.0);
+        assert_eq!(general[0], RegisterWord(0x1111));
+        assert_eq!(general[1], RegisterWord(0xdead_beef));
+        assert_eq!(general[2], RegisterWord(0x1111));
     }
 
     #[test]

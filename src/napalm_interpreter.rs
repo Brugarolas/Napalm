@@ -9069,6 +9069,10 @@ impl TraceRuntime for Interpreter<'_> {
         Some((function, vec![class.0]))
     }
 
+    fn trace_prepared_function_index(&self, function: FuncId) -> Option<u32> {
+        self.prepared.function_by_id.get(&function).copied()
+    }
+
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
         let Some(function) = self.program.function(function) else { return false; };
         let Some(cache) = function.chunk.inline_caches.get(cache as usize) else { return false; };
@@ -9460,6 +9464,105 @@ unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, ob
 }
 
 impl Interpreter<'_> {
+    /// Execute a bytecode target already proven by the native trace. This skips
+    /// ordinary Invoke dispatch and InvokeSpread signature scanning/lookup.
+    /// Cranelift has materialized receiver/arguments directly into the activation
+    /// scratch frame after guarding method epoch and receiver class.
+    /// InvokeSpread additionally guards exact argument-list arity in native code.
+    fn trace_execute_direct_bytecode_call(
+        &mut self,
+        activation: &TraceActivation,
+    ) -> Result<TraceStep, RuntimeError> {
+        let before = self.trace_current_location();
+        if self.hot_frame.is_null() {
+            return Err(RuntimeError::new("direct trace call has no active caller frame"));
+        }
+
+        let caller_fiber = self.current_fiber;
+        let caller_depth = self.fiber(caller_fiber).frames.len();
+        let caller_function = self.current_frame().function;
+        let caller_id = self.current_prepared().id;
+        let op = *self
+            .current_prepared()
+            .original_ops
+            .get(self.hot_pc as usize)
+            .ok_or_else(|| RuntimeError::new("direct trace call PC is out of bounds"))?;
+        let opcode = self
+            .program
+            .function(caller_id)
+            .and_then(|function| function.chunk.code.get(op.raw_pc as usize))
+            .and_then(|word| word.opcode())
+            .ok_or_else(|| RuntimeError::new("direct trace call opcode is invalid"))?;
+        if !matches!(opcode, Opcode::Invoke | Opcode::InvokeSpread) {
+            return Err(RuntimeError::new("direct trace call used outside Invoke/InvokeSpread"));
+        }
+
+        let function_index = activation.direct_call_function;
+        let destination = activation.direct_call_destination;
+        let arity = activation.direct_call_arity as usize;
+        if destination > u8::MAX as u32
+            || destination as u8 != op.a
+            || arity > ARGUMENT_REGISTER_COUNT
+            || (opcode == Opcode::Invoke && op.c as usize != arity)
+        {
+            return Err(RuntimeError::new("invalid direct trace call metadata"));
+        }
+        let callee = self
+            .prepared
+            .functions
+            .get(function_index as usize)
+            .ok_or_else(|| RuntimeError::new("direct trace call target is unavailable"))?;
+        if callee.is_async
+            || callee.capture_count != 0
+            || !function_kind_uses_this(callee.kind)
+            || callee.arity as usize != arity
+            || callee.return_kind != RegisterKind::Value
+        {
+            return Err(RuntimeError::new("direct trace call target contract changed"));
+        }
+
+        // Scratch values are copied before any operation capable of collecting.
+        // enter_bytecode_call only publishes the caller safepoint and pushes the
+        // new frame for synchronous bytecode callees; subsequent GC sees these
+        // values in the callee's precise architectural registers.
+        let receiver = activation.direct_call_receiver;
+        let mut args = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+        args[..arity].copy_from_slice(&activation.direct_call_args[..arity]);
+        self.enter_bytecode_call(
+            &op,
+            function_index,
+            Some(receiver),
+            &args[..arity],
+            None,
+        );
+
+        while self.run_state == RunState::Running
+            && self.current_fiber == caller_fiber
+            && self.fiber(caller_fiber).frames.len() > caller_depth
+        {
+            if self.hot_frame.is_null() {
+                break;
+            }
+            let pc = self.hot_pc as usize;
+            let prepared = unsafe { &*self.hot_function };
+            if pc >= prepared.ops.len() {
+                self.fail(RuntimeError::new("program counter is outside function"));
+                break;
+            }
+            let handler = unsafe { *self.hot_handlers.add(pc) };
+            let op = unsafe { self.hot_ops.add(pc) };
+            unsafe { handler(self, op); }
+        }
+
+        let running = self.run_state == RunState::Running;
+        let after = self.trace_current_location();
+        let frame_changed = self.current_fiber != caller_fiber
+            || self.hot_frame.is_null()
+            || self.fiber(self.current_fiber).frames.len() != caller_depth
+            || self.current_frame().function != caller_function;
+        Ok(TraceStep { before, after, frame_changed, running })
+    }
+
     /// Execute a same-frame collection helper without redispatching the original
     /// bytecode. The trace has already guarded operand kinds and committed every
     /// dirty root. GC-capable modes own their precise safepoint here; non-GC
@@ -9618,6 +9721,9 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
             0 => vm.trace_execute_unfused_step(),
             crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_CALL => {
                 vm.trace_execute_call_to_return()
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_DIRECT_CALL => {
+                vm.trace_execute_direct_bytecode_call(activation)
             }
             crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_SPREAD
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SPREAD
@@ -9793,6 +9899,210 @@ return result
                 assert!(stats.spread_inlined_calls > 0, "{stats:?}");
                 assert!(stats.inlined_calls >= stats.spread_inlined_calls, "{stats:?}");
                 assert!(stats.devirtualized_calls >= stats.spread_inlined_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_direct_calls_large_ordinary_invoke() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  combine(a, b) {
+    var total = _x + a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    return total
+  }
+}
+var box = Box.new(1)
+var result = 0
+var i = 0
+while (i < 200) {
+  result = result + box.combine(i, 3)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // combine(i, 3) = 1 + i + 3 + (0 + 1 + 2 + 3) = i + 10.
+            assert_eq!(result.as_num(), Some(21900.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_direct_calls > 0, "{stats:?}");
+                assert!(stats.devirtualized_calls >= stats.invoke_direct_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_ordinary_invoke_unwinds_into_caller_catch() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  combine(a, b) {
+    var total = _x + a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    if (a == 190) { throw 7 }
+    return total
+  }
+}
+class Runner {
+static run() {
+  var box = Box.new(1)
+  var result = 0
+  var i = 0
+  try {
+    while (i < 200) {
+      result = result + box.combine(i, 3)
+      i = i + 1
+    }
+  } catch (error) {
+    result = result + error * 1000
+  }
+  return result
+}
+}
+var result = Runner.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // Successful iterations 0..189 contribute sum(i + 10) = 19_855.
+            // Iteration 190 throws before the assignment, then the caller adds 7_000.
+            assert_eq!(source_result(&vm), 26855.0);
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.invoke_direct_calls > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_direct_calls_large_invoke_spread_at_observed_arity() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  combine(a, b) {
+    var total = _x + a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    return total
+  }
+}
+var box = Box.new(1)
+var args = [0, 3]
+var result = 0
+var i = 0
+while (i < 200) {
+  args[0] = i
+  result = result + box.combine(...args)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // combine(i, 3) = 1 + i + 3 + (0 + 1 + 2 + 3) = i + 10.
+            assert_eq!(result.as_num(), Some(21900.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.spread_direct_calls > 0, "{stats:?}");
+                assert!(stats.devirtualized_calls >= stats.spread_direct_calls, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_spread_call_unwinds_into_caller_catch_without_replaying_effects() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  combine(a, b) {
+    var total = _x + a + b
+    var j = 0
+    while (j < 4) {
+      total = total + j
+      j = j + 1
+    }
+    if (a == 190) { throw 7 }
+    return total
+  }
+}
+class Runner {
+static run() {
+  var box = Box.new(1)
+  var args = [0, 3]
+  var result = 0
+  var i = 0
+  try {
+    while (i < 200) {
+      args[0] = i
+      result = result + box.combine(...args)
+      i = i + 1
+    }
+  } catch (error) {
+    result = result + error * 1000
+  }
+  return result
+}
+}
+var result = Runner.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            // Successful iterations 0..189 contribute sum(i + 10) = 19_855.
+            // Iteration 190 throws before the assignment, then the caller adds 7_000.
+            assert_eq!(source_result(&vm), 26855.0);
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.spread_direct_calls > 0, "{stats:?}");
             }
         }
     }

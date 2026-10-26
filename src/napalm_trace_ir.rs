@@ -6,7 +6,7 @@
 //! slots are explicitly reloaded afterwards.
 
 use hashbrown::{HashMap, HashSet};
-use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg};
+use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_WREN_ARITY};
 use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId};
 
 macro_rules! id {
@@ -95,14 +95,33 @@ pub enum TraceSwitchGuard { Case(i64), Default { excluded: Vec<i64> } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceMathOp { Abs, Floor, Ceil, Sqrt, Round, Sin, Cos, Tan, Log, Exp }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TraceDirectCall {
+    /// Prepared bytecode-function index resolved while recording. It is stable for
+    /// the lifetime of the Interpreter/JIT instance that owns this trace.
+    pub function_index: u32,
+    pub destination: Reg,
+    pub receiver: TraceValueId,
+    pub args: Vec<TraceValueId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TraceInst {
     Nop,
     Copy { value: TraceValueId },
     Reinterpret { value: TraceValueId },
     LoadFrameSlot { slot: FrameSlot },
     CommitFrameSlot { slot: FrameSlot, value: TraceValueId },
-    /// Executes precisely one original opcode, with synchronized VM registers.
-    Runtime { location: TraceLocation, next: BytecodePc, terminal: bool },
+    /// Executes one synchronized runtime boundary. `direct_call` is used after
+    /// dynamic dispatch has been specialized to a known synchronous bytecode
+    /// target. Generated code has already guarded the method-table epoch and
+    /// receiver class set (plus exact List arity for InvokeSpread), then materializes
+    /// receiver/arguments directly into TraceActivation scratch storage.
+    Runtime {
+        location: TraceLocation,
+        next: BytecodePc,
+        terminal: bool,
+        direct_call: Option<TraceDirectCall>,
+    },
     /// Executes a call-like bytecode and, on the successful synchronous path,
     /// runs the callee until control returns to the same caller frame at `next`.
     /// This is a full GC/memory epoch: no heap address or cached register value
@@ -209,7 +228,11 @@ impl TraceInst {
     pub fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
         use TraceInst::*;
         match self {
-            Nop | LoadFrameSlot { .. } | Runtime { .. } | RuntimeCall { .. }
+            Runtime { direct_call: Some(call), .. } => {
+                f(&mut call.receiver);
+                for arg in &mut call.args { f(arg); }
+            }
+            Nop | LoadFrameSlot { .. } | Runtime { direct_call: None, .. } | RuntimeCall { .. }
             | LoadAbsoluteValue { .. } | IncrementProfileCounter { .. }
             | GuardMethodEpoch { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
@@ -390,6 +413,13 @@ pub struct TraceStats {
     /// InvokeSpread sites specialized to an observed argument-list arity and
     /// successfully inlined as ordinary bytecode calls.
     pub spread_inlined_calls: usize,
+    /// InvokeSpread sites whose observed arity/dispatch were specialized into a
+    /// direct known-bytecode call because the callee could not be bounded-inline.
+    pub spread_direct_calls: usize,
+    /// Ordinary Invoke sites whose guarded receiver-class set resolves to one
+    /// synchronous bytecode target and therefore bypasses dynamic dispatch even
+    /// when the callee is too large or complex for bounded inlining.
+    pub invoke_direct_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
 }
@@ -541,7 +571,7 @@ impl TraceBuilder {
     /// the slot cache and loop-carried SSA state alive across the call.
     pub fn runtime_leaf(&mut self, location: TraceLocation, next: BytecodePc) {
         self.commit_preserving_ssa();
-        self.emit0(TraceInst::Runtime { location, next, terminal: false });
+        self.emit0(TraceInst::Runtime { location, next, terminal: false, direct_call: None });
     }
 
     /// Emit a synchronized same-frame runtime step which may allocate or collect,
@@ -554,7 +584,7 @@ impl TraceBuilder {
     /// refreshed activation instead of being treated as trace-entry values.
     pub fn runtime_gc_leaf(&mut self, location: TraceLocation, next: BytecodePc) {
         self.commit_preserving_ssa();
-        self.emit0(TraceInst::Runtime { location, next, terminal: false });
+        self.emit0(TraceInst::Runtime { location, next, terminal: false, direct_call: None });
         self.memory_epoch = true;
     }
 
@@ -576,9 +606,56 @@ impl TraceBuilder {
         value
     }
 
+    /// Synchronized direct bytecode call used after Invoke/InvokeSpread has proven
+    /// a concrete bytecode target. Unlike a generic RuntimeCall, caller register
+    /// SSA survives because a synchronous callee cannot reassign caller locals.
+    /// Heap/memory facts still die at the boundary, and the destination/return
+    /// banks are reloaded from the refreshed activation after the call returns.
+    pub fn runtime_direct_call(
+        &mut self,
+        location: TraceLocation,
+        next: BytecodePc,
+        function_index: u32,
+        destination: Reg,
+        receiver: TraceValueId,
+        args: Vec<TraceValueId>,
+    ) -> TraceValueId {
+        self.commit_preserving_ssa();
+        self.emit0(TraceInst::Runtime {
+            location,
+            next,
+            terminal: false,
+            direct_call: Some(TraceDirectCall {
+                function_index,
+                destination,
+                receiver,
+                args,
+            }),
+        });
+        self.memory_epoch = true;
+
+        // The call writes the destination and the return bank. They are already
+        // synchronized by the runtime helper, so discard any pre-call SSA view
+        // before loading the actual result. Other caller locals remain valid SSA.
+        for slot in [
+            FrameSlot::General(destination),
+            FrameSlot::Return(ReturnReg(0)),
+            FrameSlot::Return(ReturnReg(1)),
+        ] {
+            self.slots.remove(&slot);
+            self.dirty.retain(|dirty| *dirty != slot);
+        }
+
+        self.reload_slot_after_runtime(
+            FrameSlot::General(destination),
+            TraceType::Any,
+            TraceRep::Tagged,
+        )
+    }
+
     pub fn runtime(&mut self, location: TraceLocation, next: BytecodePc, terminal: bool) {
         self.commit();
-        self.emit0(TraceInst::Runtime { location, next, terminal });
+        self.emit0(TraceInst::Runtime { location, next, terminal, direct_call: None });
         self.slots.clear();
         self.memory_epoch = true;
     }
@@ -649,6 +726,34 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     }
     for (index, node) in t.nodes.iter().enumerate() {
         if node.id != index { errors.push("noncanonical node ID".into()); }
+        if let TraceInst::Runtime {
+            next,
+            terminal,
+            direct_call: Some(call),
+            ..
+        } = &node.kind
+        {
+            if *terminal {
+                errors.push("direct bytecode call cannot be terminal".into());
+            }
+            if call.args.len() > MAX_WREN_ARITY {
+                errors.push("direct bytecode call exceeds argument ABI".into());
+            }
+            if t.value(t.canonical_value(call.receiver))
+                .is_some_and(|value| value.rep != TraceRep::Tagged)
+                || call.args.iter().any(|arg| {
+                    t.value(t.canonical_value(*arg))
+                        .is_some_and(|value| value.rep != TraceRep::Tagged)
+                })
+            {
+                errors.push("direct bytecode call requires tagged receiver/arguments".into());
+            }
+            // Runtime mode flags are backend-private and must not be pre-encoded
+            // into a direct call continuation by the recorder.
+            if next.0 >= (1u32 << 28) {
+                errors.push("direct bytecode call continuation uses reserved runtime bits".into());
+            }
+        }
     }
     let is_available = |v: TraceValueId, available: &[bool]| {
         available.get(t.canonical_value(v).0 as usize).copied().unwrap_or(false)
@@ -1034,7 +1139,7 @@ mod optimizer_tests {
         )));
         assert!(builder.trace.nodes.iter().any(|node| matches!(
             node.kind,
-            TraceInst::Runtime { location: at, next, terminal: false }
+            TraceInst::Runtime { location: at, next, terminal: false, direct_call: None }
                 if at == location && next == BytecodePc(8)
         )));
 
@@ -1047,6 +1152,52 @@ mod optimizer_tests {
         assert!(builder.dirty.contains(&output));
         assert!(matches!(
             builder.trace.value(loaded).map(|value| &value.origin),
+            Some(TraceValueOrigin::InstResult { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_direct_call_preserves_unaffected_ssa_and_reloads_destination() {
+        let location = TraceLocation::new(FuncId(0), BytecodePc(20));
+        let mut builder = TraceBuilder::new(
+            TraceId(101),
+            TraceAnchor { kind: TraceKind::Loop, location },
+        );
+        let preserved_slot = FrameSlot::General(Reg(1));
+        let destination = Reg(4);
+        let preserved = builder.constant(TraceConstant::StableTagged(0x1234));
+        let receiver = builder.constant(TraceConstant::StableTagged(0x5678));
+        let argument = builder.constant(TraceConstant::StableTagged(0x9abc));
+        builder.write_slot(preserved_slot, preserved);
+
+        let result = builder.runtime_direct_call(
+            location,
+            BytecodePc(23),
+            7,
+            destination,
+            receiver,
+            vec![argument],
+        );
+
+        assert_eq!(builder.slot_value(preserved_slot), Some(preserved));
+        assert_eq!(builder.slot_value(FrameSlot::General(destination)), Some(result));
+        assert!(builder.has_runtime_calls());
+        assert!(builder.trace.nodes.iter().any(|node| matches!(
+            &node.kind,
+            TraceInst::Runtime {
+                location: at,
+                next,
+                terminal: false,
+                direct_call: Some(call),
+            } if *at == location
+                && *next == BytecodePc(23)
+                && call.function_index == 7
+                && call.destination == destination
+                && call.receiver == receiver
+                && call.args == vec![argument]
+        )));
+        assert!(matches!(
+            builder.trace.value(result).map(|value| &value.origin),
             Some(TraceValueOrigin::InstResult { .. })
         ));
     }
