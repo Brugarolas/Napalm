@@ -185,9 +185,9 @@ fn map_entries(heap: &Heap, source: Value) -> Result<Vec<(MapKey, Value)>, Runti
         return Err(RuntimeError::new("object spread/destructuring requires a Map"));
     };
     Ok(match &map.storage {
-        NapalmMapStorage::Shaped { shape, values } => heap.map_shapes.keys(*shape).unwrap_or(&[])
+        NapalmMapStorage::Shaped { shape, values } => heap.map_shapes.keys(*shape)
             .iter().cloned().zip(values.iter().copied())
-            .map(|(key, value)| (MapKey::String(MapStringKey::new(key)), value)).collect(),
+            .map(|(key, value)| (MapKey::String(key), value)).collect(),
         NapalmMapStorage::Dictionary(entries) => entries.iter().map(|(key, &value)| (key.clone(), value)).collect(),
     })
 }

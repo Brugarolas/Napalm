@@ -20,7 +20,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -77,13 +77,25 @@ use crate::napalm_ir::{
 pub struct Value(u64);
 
 /// Napalm bitwise operands are truncated to unsigned 32 bits, not signed i64.
-#[inline]
+#[inline(always)]
 pub(crate) fn num_to_u32(number: f64) -> u32 {
-    if number >= 0.0 && number < 4294967296.0 {
-        number as u32
-    } else {
-        number.trunc().rem_euclid(4294967296.0) as u32
+    const U32_MODULUS: f64 = 4_294_967_296.0;
+    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_MAX_PLUS_ONE_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    if number >= 0.0 && number < U32_MODULUS {
+        return number as u32;
     }
+    // JS-style bitwise coercions frequently see small negative numbers. Casting
+    // through i64 implements truncation plus modulo 2^32 without the expensive
+    // floating-point remainder used by the fully general slow path.
+    if number >= I64_MIN_F64 && number < I64_MAX_PLUS_ONE_F64 {
+        return number as i64 as u32;
+    }
+    if !number.is_finite() {
+        return 0;
+    }
+    number.trunc().rem_euclid(U32_MODULUS) as u32
 }
 
 const TAG_BASE: u64 = 0x7ffc_0000_0000_0000;
@@ -93,7 +105,6 @@ const TAG_FALSE: u64 = TAG_BASE | 0x02;
 const TAG_TRUE: u64 = TAG_BASE | 0x03;
 const TAG_HEAP: u64 = 0xfffc_0000_0000_0000;
 const TAG_HEAP_MASK: u64 = 0xffff_0000_0000_0000;
-const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 impl Value {
@@ -114,7 +125,7 @@ impl Value {
 
     #[inline(always)]
     pub const fn from_bool(value: bool) -> Self {
-        if value { Self::TRUE } else { Self::FALSE }
+        Self(TAG_FALSE + value as u64)
     }
 
     #[inline(always)]
@@ -130,13 +141,14 @@ impl Value {
     pub const fn is_null(self) -> bool { self.0 == TAG_NULL }
 
     #[inline(always)]
-    pub const fn is_bool(self) -> bool { self.0 == TAG_FALSE || self.0 == TAG_TRUE }
+    pub const fn is_bool(self) -> bool {
+        self.0.wrapping_sub(TAG_FALSE) <= 1
+    }
 
     #[inline(always)]
     pub const fn as_bool(self) -> Option<bool> {
-        if self.0 == TAG_FALSE { Some(false) }
-        else if self.0 == TAG_TRUE { Some(true) }
-        else { None }
+        let delta = self.0.wrapping_sub(TAG_FALSE);
+        if delta <= 1 { Some(delta != 0) } else { None }
     }
 
     #[inline(always)]
@@ -144,11 +156,15 @@ impl Value {
 
     #[inline(always)]
     pub const fn heap_handle(self) -> Option<u32> {
-        if self.is_heap() { Some((self.0 & PAYLOAD_MASK) as u32) } else { None }
+        if self.is_heap() { Some(self.0 as u32) } else { None }
     }
 
     #[inline(always)]
-    pub const fn is_num(self) -> bool { (self.0 & TAG_MASK) != TAG_BASE && !self.is_heap() }
+    pub const fn is_num(self) -> bool {
+        // Heap values intentionally share TAG_BASE under TAG_MASK, so this one
+        // mask/compare rejects null, bool and heap tags at once.
+        (self.0 & TAG_MASK) != TAG_BASE
+    }
 
     #[inline(always)]
     pub fn as_num(self) -> Option<f64> {
@@ -156,7 +172,9 @@ impl Value {
     }
 
     #[inline(always)]
-    pub const fn is_falsey(self) -> bool { self.0 == TAG_FALSE || self.0 == TAG_NULL }
+    pub const fn is_falsey(self) -> bool {
+        self.0.wrapping_sub(TAG_NULL) <= 1
+    }
 
     #[inline(always)]
     pub const fn word(self) -> RegisterWord { RegisterWord(self.0) }
@@ -207,49 +225,719 @@ fn f64_word(value: f64) -> RegisterWord {
 // Runtime heap and map keys
 // =============================================================================
 
-#[derive(Default)]
-struct FastHasher(u64);
+// The PRNG and both hardware backends live here, in the interpreter file.
+// This module deliberately has no dependency on the collection wrappers in utils.rs.
+mod runtime_hash {
+    use std::hash::{BuildHasher, Hasher};
+    #[cfg(test)]
+    use std::hash::Hash;
 
-impl Hasher for FastHasher {
-    #[inline]
-    fn finish(&self) -> u64 { self.0 }
+    /// ------------------------
+    /// TLS PRNG with no explicit OS calls or allocations in the generation path.
+    /// TLS setup itself remains platform-dependent.
+    /// ------------------------
+    mod tls_prng {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 { 0x517c_c1b7_2722_0a95 } else { self.0 };
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
-            hash ^= word.wrapping_mul(0x9e37_79b1_85eb_ca87);
-            hash = hash.rotate_left(27).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        static THREAD_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        const STEP: u64 = 0xA076_1D64_78BD_642F;
+
+        #[inline]
+        fn splitmix64_stateless(mut z: u64) -> u64 {
+            z ^= z >> 30;
+            z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^= z >> 27;
+            z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
         }
-        for &byte in chunks.remainder() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
+
+        #[inline]
+        fn rdcycle_best_effort() -> u64 {
+            let mut v: u64 = 0;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                v ^= core::arch::x86_64::_rdtsc();
+            }
+            #[cfg(all(target_arch = "x86", not(target_arch = "x86_64")))]
+            unsafe {
+                v ^= core::arch::x86::_rdtsc() as u64;
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                let cntvct: u64;
+                core::arch::asm!("mrs {0}, cntvct_el0", out(reg) cntvct, options(nomem, nostack, preserves_flags));
+                v ^= cntvct;
+            }
+            v
         }
-        self.0 = hash;
+
+        #[inline]
+        fn addr_noise() -> u64 {
+            let stack_addr = {
+                let local = 0u8;
+                &local as *const u8 as usize as u64
+            };
+            let code_addr = fast_two_u64 as *const() as usize as u64;
+            stack_addr.rotate_left(17) ^ code_addr.rotate_left(31)
+        }
+
+        thread_local! {
+            static TL_SEED: Cell<u64> = const { Cell::new(0) };
+            static TL_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn initial_seed() -> u64 {
+            // The counter distinguishes initialization events within this process.
+            // It is not an entropy source or a guarantee of unique mixed seeds.
+            let ticket = THREAD_SEQUENCE.fetch_add(1, Ordering::Relaxed) as u64;
+            let serial = splitmix64_stateless(ticket.wrapping_add(0x9E37_79B9_7F4A_7C15));
+            splitmix64_stateless(rdcycle_best_effort() ^ addr_noise() ^ serial)
+        }
+
+        #[inline]
+        fn output(s: u64) -> u64 {
+            let product = (s as u128) * ((s ^ 0xE703_7ED1_A0B4_28DB) as u128);
+            (product as u64) ^ ((product >> 64) as u64)
+        }
+
+        /// Return two outputs from the per-thread 64-bit-state generator.
+        #[inline]
+        pub fn fast_two_u64() -> (u64, u64) {
+            TL_SEED.with(|seed| {
+                TL_INITIALIZED.with(|initialized| {
+                    if !initialized.get() {
+                        seed.set(initial_seed());
+                        initialized.set(true);
+                    }
+                });
+                // Zero is an ordinary state. Update TLS only once for the pair.
+                let first = seed.get().wrapping_add(STEP);
+                let second = first.wrapping_add(STEP);
+                seed.set(second);
+                (output(first), output(second))
+            })
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn zero_state_does_not_reseed() {
+                TL_SEED.with(|seed| TL_INITIALIZED.with(|initialized| {
+                    let previous_seed = seed.replace(0);
+                    let previous_initialized = initialized.replace(true);
+                    let actual = fast_two_u64();
+                    let after = seed.get();
+                    seed.set(previous_seed);
+                    initialized.set(previous_initialized);
+                    assert_eq!(actual, (output(STEP), output(STEP.wrapping_add(STEP))));
+                    assert_eq!(after, STEP.wrapping_add(STEP));
+                }));
+            }
+        }
+
+    }
+    use tls_prng::fast_two_u64;
+
+    /// ------------------------
+    /// Non-cryptographic AES-backed hashers.
+    /// Backends intentionally produce different hashes. Hash values are not stable
+    /// across architectures, target features, dependency versions, or this module's
+    /// revisions. Never persist them as identifiers.
+    /// AES is selected at compile time: enable the target AES feature for native
+    /// builds. Generic builds use the seeded aHash fallback, without runtime dispatch.
+    /// ------------------------
+    #[cfg(all(target_arch = "x86_64", target_feature = "aes"))]
+    mod hasher_impl {
+        use super::*;
+        use core::arch::x86_64::{
+            __m128i, _mm_aesenc_si128, _mm_aesenclast_si128, _mm_loadu_si128, _mm_set_epi64x,
+            _mm_storeu_si128, _mm_xor_si128,
+        };
+
+        pub struct AesHasher {
+            hash: [__m128i; 4],
+            next_lane: usize,
+            used_lanes: usize,
+            buffer: [u8; 16],
+            len: usize,
+        }
+
+        impl AesHasher {
+            #[inline]
+            pub fn with_keys(k0: u64, k1: u64) -> Self {
+                // The first lane holds this map's seed.
+                unsafe {
+                    Self {
+                        hash: [
+                            _mm_set_epi64x(k0 as i64, k1 as i64),
+                            _mm_set_epi64x((k0 ^ 0x243F_6A88_85A3_08D3) as i64, (k1 ^ 0x1319_8A2E_0370_7344) as i64),
+                            _mm_set_epi64x((k0 ^ 0xA409_3822_299F_31D0) as i64, (k1 ^ 0x082E_FA98_EC4E_6C89) as i64),
+                            _mm_set_epi64x((k0 ^ 0x4528_21E6_38D0_1377) as i64, (k1 ^ 0xBE54_66CF_34E9_0C6C) as i64),
+                        ],
+                        next_lane: 0,
+                        used_lanes: 0,
+                        buffer: [0; 16],
+                        len: 0,
+                    }
+                }
+            }
+
+            #[inline]
+            unsafe fn round(&mut self, block_ptr: *const u8) {
+                // SAFETY: The caller supplies at least 16 readable bytes.
+                let block = unsafe { _mm_loadu_si128(block_ptr.cast()) };
+                let lane = self.next_lane;
+                self.hash[lane] = unsafe { _mm_aesenc_si128(self.hash[lane], block) };
+                self.next_lane = (lane + 1) & 3;
+                self.used_lanes = (self.used_lanes + 1).min(4);
+            }
+
+            #[inline]
+            unsafe fn stripe(&mut self, ptr: *const u8) {
+                debug_assert_eq!(self.next_lane, 0);
+                // SAFETY: The caller supplies 64 readable bytes. Each lane is
+                // independent, allowing the processor to overlap AES instructions.
+                unsafe {
+                    self.hash[0] = _mm_aesenc_si128(self.hash[0], _mm_loadu_si128(ptr.cast()));
+                    self.hash[1] = _mm_aesenc_si128(self.hash[1], _mm_loadu_si128(ptr.add(16).cast()));
+                    self.hash[2] = _mm_aesenc_si128(self.hash[2], _mm_loadu_si128(ptr.add(32).cast()));
+                    self.hash[3] = _mm_aesenc_si128(self.hash[3], _mm_loadu_si128(ptr.add(48).cast()));
+                }
+                self.used_lanes = 4;
+            }
+
+            #[inline]
+            fn fold128(x: __m128i) -> u64 {
+                unsafe {
+                    let mut tmp = core::mem::MaybeUninit::<[u8; 16]>::uninit();
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, x);
+                    let bytes = tmp.assume_init();
+                    let a = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+                    let b = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+                    a ^ b
+                }
+            }
+        }
+
+        impl AesHasher {
+            #[inline]
+            fn write_small<const N: usize>(&mut self, bytes: &[u8; N]) {
+                let pos = self.len & 15;
+                if N < 16 - pos {
+                    self.buffer[pos..pos + N].copy_from_slice(bytes);
+                    self.len = self.len.wrapping_add(N);
+                } else {
+                    self.write(bytes);
+                }
+            }
+        }
+
+        impl Hasher for AesHasher {
+            #[inline]
+            fn write(&mut self, mut bytes: &[u8]) {
+                let buf_pos = self.len & 15;
+                self.len = self.len.wrapping_add(bytes.len());
+                if buf_pos != 0 {
+                    let take = (16 - buf_pos).min(bytes.len());
+                    self.buffer[buf_pos..buf_pos + take].copy_from_slice(&bytes[..take]);
+                    if buf_pos + take < 16 {
+                        return;
+                    }
+                    bytes = &bytes[take..];
+                    // SAFETY: The buffer contains a complete initialized block.
+                    unsafe {
+                        self.round(self.buffer.as_ptr());
+                    }
+                }
+                // Align the logical block number, not the input address.
+                while self.next_lane != 0 && bytes.len() >= 16 {
+                    unsafe {
+                        self.round(bytes.as_ptr());
+                    }
+                    bytes = &bytes[16..];
+                }
+                while bytes.len() >= 64 {
+                    unsafe {
+                        self.stripe(bytes.as_ptr());
+                    }
+                    bytes = &bytes[64..];
+                }
+                while bytes.len() >= 16 {
+                    unsafe {
+                        self.round(bytes.as_ptr());
+                    }
+                    bytes = &bytes[16..];
+                }
+                self.buffer[..bytes.len()].copy_from_slice(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.write_small(&i.to_ne_bytes());
+            }
+            #[inline]
+            fn write_u32(&mut self, i: u32) {
+                self.write_small(&i.to_ne_bytes());
+            }
+            #[inline]
+            fn write_u8(&mut self, i: u8) {
+                self.write_small(&[i]);
+            }
+
+            #[inline]
+            fn finish(&self) -> u64 {
+                unsafe {
+                    let mut cur = self.hash[0];
+                    // Merge only lanes that have absorbed complete blocks.
+                    for lane in 1..self.used_lanes {
+                        cur = _mm_aesenc_si128(cur, self.hash[lane]);
+                    }
+                    let rem = self.len & 15;
+                    if rem != 0 {
+                        let mut tail = [0u8; 16];
+                        tail[..rem].copy_from_slice(&self.buffer[..rem]);
+                        let block = _mm_loadu_si128(tail.as_ptr() as *const __m128i);
+                        cur = _mm_aesenc_si128(cur, block);
+                    }
+
+                    // length mixing
+                    let len = self.len as u64;
+                    let len_vec = _mm_set_epi64x(!(len) as i64, len as i64);
+                    cur = _mm_xor_si128(cur, len_vec);
+
+                    // Finalization
+                    let final_key =
+                        _mm_set_epi64x(0x8E51EF21FABB4522u64 as i64, 0xE43D7A0656954B6Cu64 as i64);
+                    // Two full rounds diffuse the final input across all 16 bytes;
+                    // the last substitution adds nonlinearity before folding.
+                    cur = _mm_aesenc_si128(cur, final_key);
+                    cur = _mm_aesenc_si128(cur, final_key);
+                    cur = _mm_aesenclast_si128(cur, final_key);
+
+                    Self::fold128(cur)
+                }
+            }
+        }
     }
 
-    #[inline]
-    fn write_u64(&mut self, value: u64) {
-        let mut hash = if self.0 == 0 { 0x517c_c1b7_2722_0a95 } else { self.0 };
-        hash ^= value.wrapping_mul(0x9e37_79b1_85eb_ca87);
-        self.0 = hash.rotate_left(27).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    mod hasher_impl {
+        use super::*;
+        use core::arch::aarch64::*;
+
+        #[inline]
+        unsafe fn aes_round_arm(state: uint8x16_t, rk: uint8x16_t) -> uint8x16_t {
+            // ARM absorbs the input before substitution and column mixing.
+            unsafe { vaesmcq_u8(vaeseq_u8(state, rk)) }
+        }
+        #[inline]
+        unsafe fn aes_last_round_arm(state: uint8x16_t, rk: uint8x16_t) -> uint8x16_t {
+            // Final round without MixColumns
+            unsafe { vaeseq_u8(state, rk) }
+        }
+
+        pub struct AesHasher {
+            hash: [uint8x16_t; 4],
+            next_lane: usize,
+            used_lanes: usize,
+            buffer: [u8; 16],
+            len: usize,
+        }
+
+        impl AesHasher {
+            #[inline]
+            pub fn with_keys(k0: u64, k1: u64) -> Self {
+                // lanes: [lo bytes of k1][lo bytes of k0]
+                let mut key = [0u8; 16];
+                key[..8].copy_from_slice(&k1.to_ne_bytes());
+                key[8..].copy_from_slice(&k0.to_ne_bytes());
+                unsafe {
+                    Self {
+                        hash: {
+                            let base = vld1q_u8(key.as_ptr());
+                            [base,
+                             veorq_u8(base, vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(0x1319_8A2E_0370_7344), vcreate_u64(0x243F_6A88_85A3_08D3)))),
+                             veorq_u8(base, vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(0x082E_FA98_EC4E_6C89), vcreate_u64(0xA409_3822_299F_31D0)))),
+                             veorq_u8(base, vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(0xBE54_66CF_34E9_0C6C), vcreate_u64(0x4528_21E6_38D0_1377))))]
+                        },
+                        next_lane: 0,
+                        used_lanes: 0,
+                        buffer: [0; 16],
+                        len: 0,
+                    }
+                }
+            }
+        }
+
+        impl AesHasher {
+            #[inline]
+            unsafe fn round(&mut self, ptr: *const u8) {
+                let lane = self.next_lane;
+                // SAFETY: The caller supplies at least 16 readable bytes.
+                self.hash[lane] = unsafe { aes_round_arm(self.hash[lane], vld1q_u8(ptr)) };
+                self.next_lane = (lane + 1) & 3;
+                self.used_lanes = (self.used_lanes + 1).min(4);
+            }
+
+            #[inline]
+            unsafe fn stripe(&mut self, ptr: *const u8) {
+                debug_assert_eq!(self.next_lane, 0);
+                // SAFETY: The caller supplies at least 64 readable bytes.
+                unsafe {
+                    self.hash[0] = aes_round_arm(self.hash[0], vld1q_u8(ptr));
+                    self.hash[1] = aes_round_arm(self.hash[1], vld1q_u8(ptr.add(16)));
+                    self.hash[2] = aes_round_arm(self.hash[2], vld1q_u8(ptr.add(32)));
+                    self.hash[3] = aes_round_arm(self.hash[3], vld1q_u8(ptr.add(48)));
+                }
+                self.used_lanes = 4;
+            }
+        }
+
+        impl AesHasher {
+            #[inline]
+            fn write_small<const N: usize>(&mut self, bytes: &[u8; N]) {
+                let pos = self.len & 15;
+                if N < 16 - pos {
+                    self.buffer[pos..pos + N].copy_from_slice(bytes);
+                    self.len = self.len.wrapping_add(N);
+                } else {
+                    self.write(bytes);
+                }
+            }
+        }
+
+        impl Hasher for AesHasher {
+            #[inline]
+            fn write(&mut self, mut bytes: &[u8]) {
+                let buf_pos = self.len & 15;
+                self.len = self.len.wrapping_add(bytes.len());
+                if buf_pos != 0 {
+                    let take = (16 - buf_pos).min(bytes.len());
+                    self.buffer[buf_pos..buf_pos + take].copy_from_slice(&bytes[..take]);
+                    if buf_pos + take < 16 {
+                        return;
+                    }
+                    bytes = &bytes[take..];
+                    // SAFETY: The buffer contains a complete initialized block.
+                    unsafe {
+                        self.round(self.buffer.as_ptr());
+                    }
+                }
+                // Align the logical block number, not the input address.
+                while self.next_lane != 0 && bytes.len() >= 16 {
+                    unsafe {
+                        self.round(bytes.as_ptr());
+                    }
+                    bytes = &bytes[16..];
+                }
+                while bytes.len() >= 64 {
+                    unsafe {
+                        self.stripe(bytes.as_ptr());
+                    }
+                    bytes = &bytes[64..];
+                }
+                while bytes.len() >= 16 {
+                    unsafe {
+                        self.round(bytes.as_ptr());
+                    }
+                    bytes = &bytes[16..];
+                }
+                self.buffer[..bytes.len()].copy_from_slice(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.write_small(&i.to_ne_bytes());
+            }
+            #[inline]
+            fn write_u32(&mut self, i: u32) {
+                self.write_small(&i.to_ne_bytes());
+            }
+            #[inline]
+            fn write_u8(&mut self, i: u8) {
+                self.write_small(&[i]);
+            }
+
+            #[inline]
+            fn finish(&self) -> u64 {
+                unsafe {
+                    let mut cur = self.hash[0];
+                    for lane in 1..self.used_lanes {
+                        cur = aes_round_arm(cur, self.hash[lane]);
+                    }
+                    let rem = self.len & 15;
+                    if rem != 0 {
+                        let mut tail = [0u8; 16];
+                        tail[..rem].copy_from_slice(&self.buffer[..rem]);
+                        let block = vld1q_u8(tail.as_ptr());
+                        cur = aes_round_arm(cur, block);
+                    }
+
+                    // length mixing
+                    let mut len_block = [0u8; 16];
+                    len_block[..8].copy_from_slice(&(self.len as u64).to_ne_bytes());
+                    len_block[8..].copy_from_slice(&(!(self.len as u64)).to_ne_bytes());
+                    let len_vec = vld1q_u8(len_block.as_ptr());
+                    cur = veorq_u8(cur, len_vec);
+
+                    // Finalization
+                    let final_key: [u8; 16] = [
+                        0x8E, 0x51, 0xEF, 0x21, 0xFA, 0xBB, 0x45, 0x22, 0xE4, 0x3D, 0x7A, 0x06, 0x56,
+                        0x95, 0x4B, 0x6C,
+                    ];
+                    let fk = vld1q_u8(final_key.as_ptr());
+                    cur = aes_round_arm(cur, fk);
+                    cur = aes_round_arm(cur, fk);
+                    cur = aes_last_round_arm(cur, fk);
+
+                    let mut out = [0u8; 16];
+                    vst1q_u8(out.as_mut_ptr(), cur);
+                    let a = u64::from_ne_bytes(out[0..8].try_into().unwrap());
+                    let b = u64::from_ne_bytes(out[8..16].try_into().unwrap());
+                    a ^ b
+                }
+            }
+        }
     }
 
-    #[inline]
-    fn write_u32(&mut self, value: u32) { self.write_u64(value as u64); }
-    #[inline]
-    fn write_usize(&mut self, value: usize) { self.write_u64(value as u64); }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "aes"),
+        all(target_arch = "aarch64", target_feature = "aes")
+    )))]
+    mod hasher_impl {
+        use super::*;
+        use ahash::AHasher;
+
+        #[derive(Default)]
+        pub struct AesHasher(pub AHasher);
+
+        impl AesHasher {
+            #[inline]
+            pub fn with_keys(k0: u64, k1: u64) -> Self {
+                Self(ahash::RandomState::with_seeds(k0, k1, 0, 0).build_hasher())
+            }
+        }
+
+        impl Hasher for AesHasher {
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.write(bytes)
+            }
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.0.write_u64(i)
+            }
+            #[inline]
+            fn write_u32(&mut self, i: u32) {
+                self.0.write_u32(i)
+            }
+            #[inline]
+            fn write_u8(&mut self, i: u8) {
+                self.0.write_u8(i)
+            }
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0.finish()
+            }
+        }
+    }
+
+    use hasher_impl::AesHasher;
+
+    /// ------------------------
+    /// BuildHasher with per-map keys generated by the thread-local PRNG.
+    /// ------------------------
+    #[derive(Clone, Copy, Debug)]
+    pub struct AesBuildHasher {
+        k0: u64,
+        k1: u64,
+    }
+    impl AesBuildHasher {
+        #[inline]
+        pub fn new() -> Self {
+            let (k0, k1) = fast_two_u64();
+            Self { k0, k1 }
+        }
+        #[inline]
+        pub fn from_seed(k0: u64, k1: u64) -> Self {
+            Self { k0, k1 }
+        }
+    }
+    impl Default for AesBuildHasher {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl BuildHasher for AesBuildHasher {
+        type Hasher = AesHasher;
+        #[inline]
+        fn build_hasher(&self) -> Self::Hasher {
+            AesHasher::with_keys(self.k0, self.k1)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn equal_values_use_equal_hashes() {
+            let builder = AesBuildHasher::from_seed(123, 456);
+            let mut a = builder.build_hasher();
+            let mut b = builder.build_hasher();
+            (17u64, "example", vec![1u8, 2, 3]).hash(&mut a);
+            (17u64, "example", vec![1u8, 2, 3]).hash(&mut b);
+            assert_eq!(a.finish(), b.finish());
+            assert_eq!(a.finish(), a.finish());
+        }
+
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "aes"),
+            all(target_arch = "aarch64", target_feature = "aes")
+        ))]
+        #[test]
+        fn native_streaming_and_unaligned_inputs() {
+            let data: Vec<u8> = (0..1100).map(|i| (i * 37 + i / 7) as u8).collect();
+            for offset in 0..16 {
+                for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 47, 48, 63, 64, 65, 127, 128, 129, 1024] {
+                    let input = &data[offset..offset + len];
+                    let mut whole = AesHasher::with_keys(123, 456);
+                    whole.write(input);
+                    let expected = whole.finish();
+                    for split in 0..=len {
+                        let mut fragmented = AesHasher::with_keys(123, 456);
+                        fragmented.write(&input[..split]);
+                        let checkpoint = fragmented.finish();
+                        assert_eq!(checkpoint, fragmented.finish());
+                        fragmented.write(&[]);
+                        fragmented.write(&input[split..]);
+                        assert_eq!(fragmented.finish(), expected, "offset={offset}, len={len}, split={split}");
+                    }
+                    for width in [1, 3, 7, 16, 17, 63, 64, 65] {
+                        let mut fragmented = AesHasher::with_keys(123, 456);
+                        for part in input.chunks(width) {
+                            fragmented.write(part);
+                        }
+                        assert_eq!(fragmented.finish(), expected);
+                    }
+                }
+            }
+        }
+
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "aes"),
+            all(target_arch = "aarch64", target_feature = "aes")
+        ))]
+        #[test]
+        fn native_integer_writes_match_bytes() {
+            for prefix in 0..80 {
+                let mut typed = AesHasher::with_keys(123, 456);
+                let mut raw = AesHasher::with_keys(123, 456);
+                let bytes = vec![42; prefix];
+                typed.write(&bytes);
+                raw.write(&bytes);
+                typed.write_u64(0x0123_4567_89AB_CDEF);
+                raw.write(&0x0123_4567_89AB_CDEFu64.to_ne_bytes());
+                typed.write_u32(0x1020_3040);
+                raw.write(&0x1020_3040u32.to_ne_bytes());
+                typed.write_u8(255);
+                raw.write(&[255]);
+                assert_eq!(typed.finish(), raw.finish(), "prefix={prefix}");
+            }
+        }
+
+        #[test]
+        fn sequential_integer_distribution_regression() {
+            let mut high = [0usize; 128];
+            let mut low = [0usize; 256];
+            for value in 0..65536u64 {
+                let mut hasher = AesHasher::with_keys(123, 456);
+                hasher.write_u64(value);
+                let hash = hasher.finish();
+                high[(hash >> 57) as usize] += 1;
+                low[(hash & 255) as usize] += 1;
+            }
+            assert!(high.iter().all(|&n| n > 256 && n < 768));
+            assert!(low.iter().all(|&n| n > 128 && n < 384));
+        }
+
+        #[test]
+        fn collections_round_trip() {
+            let mut map = hashbrown::HashMap::with_capacity_and_hasher(4096, AesBuildHasher::new());
+            let mut set = hashbrown::HashSet::with_capacity_and_hasher(4096, AesBuildHasher::new());
+            for value in 0..4096u64 {
+                map.insert(value, value ^ 0x55AA);
+                set.insert(value);
+            }
+            for value in 0..4096u64 {
+                assert_eq!(map.get(&value), Some(&(value ^ 0x55AA)));
+                assert!(set.contains(&value));
+            }
+        }
+    }
 }
 
-type FastMap<K, V> = HashMap<K, V>;
+use self::runtime_hash::AesBuildHasher;
+
+type FastMap<K, V> = HashMap<K, V, AesBuildHasher>;
+type FastSet<K> = HashSet<K, AesBuildHasher>;
+
+// Cached string hashes must use one seed across every thread and interpreter
+// instance in this process. Per-map seeds apply when hashing those cached values
+// into a dictionary, never when constructing the cached content hash itself.
+static STRING_HASH_BUILDER: OnceLock<AesBuildHasher> = OnceLock::new();
 
 #[inline]
 fn fast_hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = FastHasher::default();
+    let builder = STRING_HASH_BUILDER.get_or_init(AesBuildHasher::new);
+    let mut hasher = builder.build_hasher();
     hasher.write(bytes);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod aes_hash_integration_tests {
+    use super::*;
+
+    #[test]
+    fn cached_string_hashes_are_shared_across_threads() {
+        let bytes = Arc::<[u8]>::from(&b"same property name"[..]);
+        let local = MapStringKey::new(bytes.clone());
+        let remote = std::thread::spawn(move || MapStringKey::new(bytes)).join().unwrap();
+        assert_eq!(local, remote);
+        let string = NapalmString::new(local.bytes.clone());
+        assert_eq!(local, MapStringKey::from_napalm(&string));
+        assert_eq!(string.hash, fast_hash_bytes(string.as_ref()));
+    }
+
+    #[test]
+    fn dictionaries_accept_independently_created_string_keys() {
+        let make_key = || MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"field"[..])));
+        let mut first = FastMap::default();
+        let mut second = FastMap::default();
+        first.insert(make_key(), 11u32);
+        second.insert(make_key(), 22u32);
+        assert_eq!(first.get(&make_key()), Some(&11));
+        assert_eq!(second.get(&make_key()), Some(&22));
+        let cloned = first.clone();
+        assert_eq!(cloned.get(&make_key()), Some(&11));
+    }
+
+    #[test]
+    fn collected_maps_and_sets_use_the_new_builder() {
+        let map: FastMap<u32, u32> = (0..4096).map(|i| (i, i ^ 0x55AA)).collect();
+        let set: FastSet<u32> = (0..4096).collect();
+        for i in 0..4096 {
+            assert_eq!(map.get(&i), Some(&(i ^ 0x55AA)));
+            assert!(set.contains(&i));
+        }
+    }
 }
 
 /// Immutable Napalm string payload with its content hash computed once. Strings are
@@ -299,9 +987,6 @@ impl MapStringKey {
     fn from_napalm(value: &NapalmString) -> Self {
         Self { bytes: value.bytes.clone(), hash: value.hash }
     }
-
-    #[inline]
-    fn arc(&self) -> Arc<[u8]> { self.bytes.clone() }
 }
 
 impl AsRef<[u8]> for MapStringKey {
@@ -350,21 +1035,28 @@ const MAX_MAP_SHAPES: usize = 1 << 15;
 
 #[derive(Debug)]
 struct MapShape {
-    /// Property order is also the physical value-slot order.
-    keys: Box<[Arc<[u8]>]>,
+    /// Property order is also the physical value-slot order. Keep the prehashed
+    /// key so PIC probes can reject unequal strings before comparing bytes.
+    keys: Box<[MapStringKey]>,
     /// Shared hidden-class transitions. Only string keys participate.
     transitions: FastMap<MapStringKey, u32>,
 }
 
 impl MapShape {
     #[inline(always)]
-    fn slot(&self, key: &[u8]) -> Option<u16> {
-        // Shaped maps are deliberately tiny. On an IC miss a linear scan is
-        // cheaper than building another hash-table lookup and remains bounded.
-        self.keys
-            .iter()
-            .position(|candidate| candidate.as_ref() == key)
-            .map(|slot| slot as u16)
+    fn slot_hashed(&self, hash: u64, key: &[u8]) -> Option<u16> {
+        // Shaped maps are deliberately tiny. Keep the miss scan as a simple
+        // counted loop so the compiler can eliminate iterator bookkeeping and
+        // bounds checks; hash mismatches avoid touching the string bytes.
+        let mut slot = 0usize;
+        while slot < self.keys.len() {
+            let candidate = unsafe { self.keys.get_unchecked(slot) };
+            if candidate.hash == hash && candidate.as_ref() == key {
+                return Some(slot as u16);
+            }
+            slot += 1;
+        }
+        None
     }
 }
 
@@ -377,7 +1069,7 @@ impl Default for MapShapeTable {
     fn default() -> Self {
         Self {
             shapes: vec![MapShape {
-                keys: Vec::<Arc<[u8]>>::new().into_boxed_slice(),
+                keys: Vec::<MapStringKey>::new().into_boxed_slice(),
                 transitions: FastMap::default(),
             }],
         }
@@ -386,39 +1078,47 @@ impl Default for MapShapeTable {
 
 impl MapShapeTable {
     #[inline(always)]
-    fn slot(&self, shape: u32, key: &[u8]) -> Option<u16> {
-        self.shapes.get(shape as usize)?.slot(key)
+    fn slot_hashed(&self, shape: u32, hash: u64, key: &[u8]) -> Option<u16> {
+        debug_assert!((shape as usize) < self.shapes.len());
+        unsafe { self.shapes.get_unchecked(shape as usize) }.slot_hashed(hash, key)
     }
 
     #[inline(always)]
-    fn key_at(&self, shape: u32, slot: u16) -> Option<&Arc<[u8]>> {
-        self.shapes.get(shape as usize)?.keys.get(slot as usize)
+    fn key_at(&self, shape: u32, slot: u16) -> &MapStringKey {
+        debug_assert!((shape as usize) < self.shapes.len());
+        let keys = &unsafe { self.shapes.get_unchecked(shape as usize) }.keys;
+        debug_assert!((slot as usize) < keys.len());
+        unsafe { keys.get_unchecked(slot as usize) }
     }
 
     #[inline(always)]
-    fn keys(&self, shape: u32) -> Option<&[Arc<[u8]>]> {
-        Some(&self.shapes.get(shape as usize)?.keys)
+    fn keys(&self, shape: u32) -> &[MapStringKey] {
+        debug_assert!((shape as usize) < self.shapes.len());
+        &unsafe { self.shapes.get_unchecked(shape as usize) }.keys
     }
 
     /// Return the shared child shape and the slot introduced by `key`.
     fn transition(&mut self, shape: u32, key: MapStringKey) -> Option<(u32, u16)> {
         let parent_index = shape as usize;
-        if let Some(slot) = self.shapes.get(parent_index)?.slot(key.as_ref()) {
+        debug_assert!(parent_index < self.shapes.len());
+        if let Some(slot) = unsafe { self.shapes.get_unchecked(parent_index) }
+            .slot_hashed(key.hash, key.as_ref())
+        {
             return Some((shape, slot));
         }
-        let slot = self.shapes.get(parent_index)?.keys.len();
+        let slot = unsafe { self.shapes.get_unchecked(parent_index) }.keys.len();
         if key.as_ref().len() > MAX_SHAPED_MAP_KEY_BYTES
             || slot >= MAX_SHAPED_MAP_SLOTS
             || self.shapes.len() >= MAX_MAP_SHAPES
         {
             return None;
         }
-        if let Some(&child) = self.shapes.get(parent_index)?.transitions.get(&key) {
+        if let Some(&child) = unsafe { self.shapes.get_unchecked(parent_index) }.transitions.get(&key) {
             return Some((child, slot as u16));
         }
 
-        let mut keys = self.shapes.get(parent_index)?.keys.to_vec();
-        keys.push(key.arc());
+        let mut keys = unsafe { self.shapes.get_unchecked(parent_index) }.keys.to_vec();
+        keys.push(key.clone());
         let child = self.shapes.len() as u32;
         self.shapes.push(MapShape {
             keys: keys.into_boxed_slice(),
@@ -487,8 +1187,9 @@ impl NapalmMap {
     fn get(&self, shapes: &MapShapeTable, key: &MapKey) -> Option<Value> {
         match (&self.storage, key) {
             (NapalmMapStorage::Shaped { shape, values }, MapKey::String(bytes)) => {
-                let slot = shapes.slot(*shape, bytes.as_ref())? as usize;
-                values.get(slot).copied()
+                let slot = shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref())? as usize;
+                debug_assert!(slot < values.len());
+                Some(unsafe { *values.get_unchecked(slot) })
             }
             (NapalmMapStorage::Shaped { .. }, _) => None,
             (NapalmMapStorage::Dictionary(entries), _) => entries.get(key).copied(),
@@ -505,12 +1206,12 @@ impl NapalmMap {
                 self.storage = NapalmMapStorage::Dictionary(entries);
             }
             NapalmMapStorage::Shaped { shape, values } => {
-                let keys = shapes.keys(shape).unwrap_or(&[]);
+                let keys = shapes.keys(shape);
                 debug_assert_eq!(keys.len(), values.len());
                 let mut entries = FastMap::default();
                 entries.reserve(values.len());
                 for (key, value) in keys.iter().cloned().zip(values.into_iter()) {
-                    entries.insert(MapKey::String(MapStringKey::new(key)), value);
+                    entries.insert(MapKey::String(key), value);
                 }
                 self.storage = NapalmMapStorage::Dictionary(entries);
             }
@@ -523,11 +1224,9 @@ impl NapalmMap {
                 if index >= values.len() {
                     return None;
                 }
-                shapes
-                    .keys(*shape)?
-                    .get(index)
-                    .cloned()
-                    .map(|key| MapKey::String(MapStringKey::new(key)))
+                let keys = shapes.keys(*shape);
+                debug_assert!(index < keys.len());
+                Some(MapKey::String(unsafe { keys.get_unchecked(index) }.clone()))
             }
             NapalmMapStorage::Dictionary(entries) => entries.keys().nth(index).cloned(),
         }
@@ -676,7 +1375,7 @@ enum HeapObject {
     Closure {
         function_index: u32,
         captures: Box<[RegisterWord]>,
-        reference_indices: Box<[u16]>,
+        reference_indices: Arc<[u16]>,
     },
     ClassObject {
         class_slot: u32,
@@ -1130,7 +1829,7 @@ unsafe fn trace_fiber_state(
         };
         for reg in 0..frame.reg_count as usize {
             if map.general_is_reference(Reg(reg as u8)) {
-                if let Some(&word) = state.registers.get(frame.reg_base + reg) {
+                if let Some(&word) = state.registers.get(frame.reg_base as usize + reg) {
                     visit_word(word, visitor);
                 }
             }
@@ -1266,9 +1965,10 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
-        HeapObject::Closure { captures, reference_indices, .. } => {
+        HeapObject::Closure { captures, .. } => {
+            // Capture-reference metadata is shared per function through Arc and
+            // therefore does not grow with each closure instance.
             captures.len() * std::mem::size_of::<RegisterWord>()
-                + reference_indices.len() * std::mem::size_of::<u16>()
         },
         HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
@@ -1371,7 +2071,7 @@ fn collect_fiber_state_handles(
         let Some(banks) = state.banks.get(depth) else { continue; };
         for reg in 0..frame.reg_count as usize {
             if map.general_is_reference(Reg(reg as u8)) {
-                if let Some(&word) = state.registers.get(frame.reg_base + reg) {
+                if let Some(&word) = state.registers.get(frame.reg_base as usize + reg) {
                     push_value_handle(Value::from_word(word), roots);
                 }
             }
@@ -1473,6 +2173,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
 
 struct Heap {
     collector: &'static GcCollector,
+    handle_table: &'static HandleTable,
     mutator: GcMutator,
     allocation_roots: Arc<AllocationRootBuffer>,
     _allocation_root_registration: GcRootRegistration,
@@ -1511,12 +2212,14 @@ fn napalm_gc_config() -> GcConfig {
 impl Default for Heap {
     fn default() -> Self {
         let collector = GcCollector::initialize(napalm_gc_config());
+        let handle_table = handles();
         let mut mutator = collector.attach();
         let allocation_roots = Arc::new(AllocationRootBuffer::new());
         let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
         let allocation_root_registration = mutator.register_roots(provider);
         Self {
             collector,
+            handle_table,
             mutator,
             allocation_roots,
             _allocation_root_registration: allocation_root_registration,
@@ -1535,7 +2238,7 @@ impl Heap {
         // being constructed. Mutator::allocate() may rendezvous for GC before it
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
-        let handle = handles().allocate_handle();
+        let handle = self.handle_table.allocate_handle();
         let receiver_class = heap_object_receiver_class(&object);
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
@@ -1553,7 +2256,7 @@ impl Heap {
                 },
             );
         }
-        handles().publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
+        self.handle_table.publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
         self.allocation_roots.clear();
         if external != 0 {
             unsafe { self.mutator.set_external_bytes(gc_object, external) };
@@ -1569,7 +2272,7 @@ impl Heap {
 
     #[inline(always)]
     fn object(&self, value: Value) -> Option<GcObject> {
-        handles().resolve(value.heap_handle()?)
+        self.handle_table.resolve(value.heap_handle()?)
     }
 
     #[inline(always)]
@@ -1584,7 +2287,7 @@ impl Heap {
         Some(unsafe { &mut managed_object_mut(object).object })
     }
 
-    #[inline]
+    #[inline(always)]
     fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
         if value.is_null() { return Ok(MapKey::Null); }
         if let Some(value) = value.as_bool() { return Ok(MapKey::Bool(value)); }
@@ -1643,18 +2346,20 @@ impl Heap {
                 Some(HeapObject::String(bytes)) => bytes,
                 _ => return Ok(Value::NULL),
             };
-            if let Some(slot) = cache.probe(&self.map_shapes, shape, bytes.as_ref()) {
+            if let Some(slot) = cache.probe(&self.map_shapes, shape, bytes.hash, bytes.as_ref()) {
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
-            if let Some(slot) = self.map_shapes.slot(shape, bytes.as_ref()) {
+            if let Some(slot) = self.map_shapes.slot_hashed(shape, bytes.hash, bytes.as_ref()) {
                 cache.insert(shape, slot);
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
             return Ok(Value::NULL);
         }
 
+        // `map` is already resolved above. Reuse it for dictionary lookup rather
+        // than paying a second stable-handle table lookup for the same receiver.
         let key = self.map_key(key_value)?;
-        self.map_get_encoded(map_value, &key)
+        Ok(map.get(&self.map_shapes, &key).unwrap_or(Value::NULL))
     }
 
     /// Insert/update a map entry. The boolean reports a structural mutation
@@ -1681,8 +2386,8 @@ impl Heap {
             if let MapKey::String(bytes) = &key {
                 let cached = cache
                     .as_deref()
-                    .and_then(|cache| cache.probe(&self.map_shapes, *shape, bytes.as_ref()));
-                let slot = cached.or_else(|| self.map_shapes.slot(*shape, bytes.as_ref()));
+                    .and_then(|cache| cache.probe(&self.map_shapes, *shape, bytes.hash, bytes.as_ref()));
+                let slot = cached.or_else(|| self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()));
                 if let Some(slot) = slot {
                     unsafe { *values.get_unchecked_mut(slot as usize) = item; }
                     if cached.is_none() {
@@ -1722,8 +2427,93 @@ impl Heap {
         item: Value,
         cache: &mut MapInlineCacheState,
     ) -> Result<bool, RuntimeError> {
-        let key = self.map_key(key_value)?;
-        self.map_set_encoded(map_value, key, item, Some(cache))
+        // Classify the key before taking a mutable view of the map. For shaped
+        // string properties keep only a raw pointer to the immutable string so a
+        // PIC hit does not clone Arc<[u8]> or build/hash a temporary MapKey.
+        let mut encoded_key = None;
+        let string_key = if key_value.is_null() {
+            encoded_key = Some(MapKey::Null);
+            None
+        } else if let Some(value) = key_value.as_bool() {
+            encoded_key = Some(MapKey::Bool(value));
+            None
+        } else if let Some(number) = key_value.as_num() {
+            let bits = if number == 0.0 {
+                0.0f64.to_bits()
+            } else if number.is_nan() {
+                CANONICAL_NAN
+            } else {
+                number.to_bits()
+            };
+            encoded_key = Some(MapKey::Num(bits));
+            None
+        } else if let Some(handle) = key_value.heap_handle() {
+            match self.get(key_value) {
+                Some(HeapObject::String(string)) => Some(string as *const NapalmString),
+                Some(_) => {
+                    encoded_key = Some(MapKey::Object(handle));
+                    None
+                }
+                None => return Err(RuntimeError::new("value cannot be used as a map key")),
+            }
+        } else {
+            return Err(RuntimeError::new("value cannot be used as a map key"));
+        };
+
+        let object = self
+            .object(map_value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
+        let map = match &mut unsafe { managed_object_mut(object) }.object {
+            HeapObject::Map(map) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+
+        if let NapalmMapStorage::Shaped { shape, values } = &mut map.storage {
+            if let Some(string_key) = string_key {
+                // SAFETY: NapalmString payloads are immutable. No GC-capable
+                // operation occurs in this method, and a String cannot alias the
+                // Map payload currently borrowed mutably.
+                let bytes = unsafe { &*string_key };
+                if let Some(slot) = cache.probe(&self.map_shapes, *shape, bytes.hash, bytes.as_ref()) {
+                    unsafe { *values.get_unchecked_mut(slot as usize) = item; }
+                    return Ok(false);
+                }
+                if let Some(slot) = self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()) {
+                    cache.insert(*shape, slot);
+                    unsafe { *values.get_unchecked_mut(slot as usize) = item; }
+                    return Ok(false);
+                }
+
+                let key = MapStringKey::from_napalm(bytes);
+                if let Some((next_shape, slot)) = self.map_shapes.transition(*shape, key) {
+                    debug_assert_eq!(slot as usize, values.len());
+                    values.push(item);
+                    *shape = next_shape;
+                    cache.insert(next_shape, slot);
+                    return Ok(true);
+                }
+
+                // Shape budget exhausted: keep the already-created key for the
+                // dictionary insertion after promotion.
+                encoded_key = Some(MapKey::String(MapStringKey::from_napalm(bytes)));
+            }
+
+            // Non-string keys, shape-budget exhaustion and maps that grow past
+            // the small-object threshold become ordinary dictionaries forever.
+            map.promote_to_dictionary(&self.map_shapes);
+        }
+
+        let key = if let Some(key) = encoded_key {
+            key
+        } else {
+            // String keys reach here only when the map was already a dictionary.
+            let bytes = unsafe { &*string_key.unwrap_unchecked() };
+            MapKey::String(MapStringKey::from_napalm(bytes))
+        };
+        let NapalmMapStorage::Dictionary(entries) = &mut map.storage else {
+            unsafe { std::hint::unreachable_unchecked() }
+        };
+        Ok(entries.insert(key, item).is_none())
     }
 
     fn map_remove_encoded(
@@ -1742,7 +2532,7 @@ impl Heap {
 
         if let NapalmMapStorage::Shaped { shape, .. } = &map.storage {
             let exists = match key {
-                MapKey::String(bytes) => self.map_shapes.slot(*shape, bytes.as_ref()).is_some(),
+                MapKey::String(bytes) => self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()).is_some(),
                 _ => false,
             };
             if !exists {
@@ -1807,14 +2597,16 @@ impl Heap {
             HeapObject::String(bytes) => bytes,
             _ => return None,
         };
-        let slot = self.map_shapes.slot(shape, runtime_key.as_ref())?;
-        let canonical = self.map_shapes.key_at(shape, slot)?;
+        let slot = self
+            .map_shapes
+            .slot_hashed(shape, runtime_key.hash, runtime_key.as_ref())?;
+        let canonical = self.map_shapes.key_at(shape, slot);
         Some((shape, slot, canonical.as_ref().to_vec()))
     }
 
     #[inline(always)]
     fn receiver_class(&self, value: Value) -> Option<ReceiverClass> {
-        let entry = handles().existing_entry(value.heap_handle()?)?;
+        let entry = self.handle_table.existing_entry(value.heap_handle()?)?;
         let class = entry.receiver_class.load(Ordering::Relaxed);
         (class != 0).then_some(ReceiverClass(class))
     }
@@ -1823,11 +2615,11 @@ impl Heap {
     fn refresh_jit_view(&self, value: Value) {
         let Some(handle) = value.heap_handle() else { return; };
         if let Some(object) = self.get(value) {
-            handles().refresh(handle, object);
+            self.handle_table.refresh(handle, object);
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn remember_if_reference(&mut self, owner: Value, value: Value) {
         if !value.is_heap() {
             return;
@@ -2229,11 +3021,11 @@ impl HostContext<'_> {
     }
 
     pub fn format_value(&self, value: Value) -> String {
-        let mut seen = HashSet::new();
+        let mut seen = FastSet::default();
         self.format_value_inner(value, &mut seen)
     }
 
-    fn format_value_inner(&self, value: Value, seen: &mut HashSet<u32>) -> String {
+    fn format_value_inner(&self, value: Value, seen: &mut FastSet<u32>) -> String {
         if value.is_null() { return "null".to_owned(); }
         if let Some(value) = value.as_bool() { return value.to_string(); }
         if let Some(value) = value.as_num() {
@@ -2387,6 +3179,8 @@ pub enum ExecutionResult {
 
 type Handler = unsafe fn(&mut Interpreter, *const PreparedOp);
 const NO_INDEX: u32 = u32::MAX;
+const NO_REG: u16 = u16::MAX;
+const GC_BACKEDGE_POLL_MASK: u8 = 31;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2400,7 +3194,6 @@ struct PreparedOp {
     next: u32,
     args_offset: u32,
     raw_pc: u32,
-    gc_map: u32,
 }
 
 impl Default for PreparedOp {
@@ -2415,7 +3208,6 @@ impl Default for PreparedOp {
             next: 0,
             args_offset: 0,
             raw_pc: 0,
-            gc_map: NO_INDEX,
         }
     }
 }
@@ -2457,9 +3249,16 @@ impl PreparedSwitch {
                 min,
                 targets,
             } => {
-                let index = value.wrapping_sub(*min);
-                if index >= 0 && (index as usize) < targets.len() {
-                    targets[index as usize]
+                // Check signed ordering before wrapping subtraction. Without the
+                // guard, an extreme negative value can wrap into a small positive
+                // delta and spuriously hit the dense table.
+                if value >= *min {
+                    let index = value.wrapping_sub(*min) as u64;
+                    if index < targets.len() as u64 {
+                        unsafe { *targets.get_unchecked(index as usize) }
+                    } else {
+                        *default_target
+                    }
                 } else {
                     *default_target
                 }
@@ -2493,12 +3292,17 @@ struct PreparedFunction {
     /// probes the JIT manager's HashMap.
     jit_entry_hotness: Vec<u32>,
     jit_entry_disabled: Vec<bool>,
-    jit_loop_headers: HashSet<u32>,
+    /// Dense loop-header bitmap indexed by prepared-op PC. Entry-hook checks run
+    /// on frame switches, so avoid a hash-table probe at every call/return.
+    jit_loop_headers: Vec<u8>,
     ops: Vec<PreparedOp>,
     original_ops: Vec<PreparedOp>,
     call_args: Vec<Reg>,
     switches: Vec<PreparedSwitch>,
     gc_maps: Vec<ReferenceMap>,
+    /// Dense cold metadata indexed by prepared-op PC. Keeping this out of
+    /// PreparedOp makes the hot op exactly 24 bytes instead of 28 bytes.
+    gc_map_by_op: Vec<u32>,
     /// Synthetic precise map for a frame that has been initialized but has not
     /// executed its first GC-capable opcode yet. Async tasks can remain queued in
     /// exactly this state, so NO_INDEX would make their entry values invisible.
@@ -2541,13 +3345,14 @@ struct PreparedFunction {
     needs_return_bank: bool,
     module_slot: u32,
     kind: FunctionKind,
+    uses_this: bool,
     is_async: bool,
     arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
     /// Capture indices whose physical register words contain tagged Napalm Values.
-    /// The Box keeps this table at a stable address for moving GC object tracing.
-    capture_reference_indices: Box<[u16]>,
+    /// Shared immutable storage avoids cloning this metadata for every closure.
+    capture_reference_indices: Arc<[u16]>,
 }
 
 struct PreparedProgram {
@@ -2581,14 +3386,21 @@ impl PreparedFunction {
         }
     }
 
+    #[inline]
     fn install_entry_hook(&mut self, index: usize) {
-        if index < self.handlers.len()
-            && !self.jit_loop_headers.contains(&(index as u32))
-            && self.jit_entry_handlers[index].is_none()
-            && self.handlers[index] as usize != h_unreachable_fused as Handler as usize
-        {
-            self.jit_entry_handlers[index] = Some(self.handlers[index]);
-            self.handlers[index] = h_jit_entry;
+        if index >= self.handlers.len() {
+            return;
+        }
+        unsafe {
+            if *self.jit_loop_headers.get_unchecked(index) == 0
+                && self.jit_entry_handlers.get_unchecked(index).is_none()
+                && *self.handlers.get_unchecked(index) as usize
+                    != h_unreachable_fused as Handler as usize
+            {
+                *self.jit_entry_handlers.get_unchecked_mut(index) =
+                    Some(*self.handlers.get_unchecked(index));
+                *self.handlers.get_unchecked_mut(index) = h_jit_entry;
+            }
         }
     }
 
@@ -2794,7 +3606,6 @@ impl PreparedProgram {
                 next: (index + 1) as u32,
                 args_offset: temp.args_offset,
                 raw_pc: temp.raw_pc,
-                gc_map: temp.gc_map,
             };
 
             match temp.opcode {
@@ -2835,7 +3646,7 @@ impl PreparedProgram {
         // Superinstructions are installed only when the second instruction is
         // not a branch/switch/deopt/resume target. They keep the same op index
         // space, so no target patching is required.
-        let mut target_ops = HashSet::<u32>::new();
+        let mut target_ops = FastSet::<u32>::default();
         for (index, op) in ops.iter().enumerate() {
             if matches!(temps[index].opcode, Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue) {
                 target_ops.insert(op.x);
@@ -2868,10 +3679,13 @@ impl PreparedProgram {
             if let Ok(target) = map_word_target(resume.pc.0) { target_ops.insert(target); }
         }
 
-        let mut jit_loop_headers = HashSet::new();
+        let mut jit_loop_headers = vec![0u8; ops.len()];
         for (index, op) in ops.iter().enumerate() {
             let mut add = |target: u32| {
-                if target <= index as u32 { jit_loop_headers.insert(target); }
+                if target <= index as u32 {
+                    debug_assert!((target as usize) < jit_loop_headers.len());
+                    unsafe { *jit_loop_headers.get_unchecked_mut(target as usize) = 1; }
+                }
             };
             match temps[index].opcode {
                 Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => add(op.x),
@@ -2917,6 +3731,7 @@ impl PreparedProgram {
             RuntimeError::new(format!("unknown module {:?} for {:?}", function.module, function.id))
         })?;
         let op_count = ops.len();
+        let uses_this = function_kind_uses_this(function.kind);
         let jit_disabled_headers = vec![0; op_count];
         let jit_trace_headers = vec![NO_INDEX; op_count];
         let jit_entry_handlers = vec![None; op_count];
@@ -2950,7 +3765,7 @@ impl PreparedProgram {
                 entry_references.set_general(binding.destination, true);
             }
         }
-        if function_kind_uses_this(function.kind) {
+        if uses_this {
             entry_references.special |= 1u16 << SpecialReg::This.index();
         }
         if function.kind == FunctionKind::Closure {
@@ -2976,14 +3791,16 @@ impl PreparedProgram {
             matches!(temp.opcode, Opcode::MoveFromRet | Opcode::MoveToRet)
         }) || gc_maps.iter().any(|map| map.returns != 0) || deopt_uses_return;
 
-        let capture_reference_indices = function
-            .frame
-            .captures
-            .iter()
-            .filter(|binding| binding.kind == RegisterKind::Value)
-            .map(|binding| binding.capture_index)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let capture_reference_indices: Arc<[u16]> = Arc::from(
+            function
+                .frame
+                .captures
+                .iter()
+                .filter(|binding| binding.kind == RegisterKind::Value)
+                .map(|binding| binding.capture_index)
+                .collect::<Vec<_>>(),
+        );
+        let gc_map_by_op = temps.iter().map(|temp| temp.gc_map).collect();
 
         Ok(PreparedFunction {
             handlers,
@@ -2997,6 +3814,7 @@ impl PreparedProgram {
             call_args,
             switches,
             gc_maps,
+            gc_map_by_op,
             entry_gc_map,
             word_to_op,
             deopt_resume,
@@ -3018,6 +3836,7 @@ impl PreparedProgram {
             needs_return_bank,
             module_slot,
             kind: function.kind,
+            uses_this,
             is_async: function.is_async,
             arity: function.arity,
             return_kind: function.frame.return_kind,
@@ -3064,7 +3883,7 @@ fn install_superinstructions(
     temps: &[TempOp],
     handlers: &mut [Handler],
     ops: &mut [PreparedOp],
-    target_ops: &HashSet<u32>,
+    target_ops: &FastSet<u32>,
 ) {
     if temps.len() < 2 { return; }
     for index in 0..temps.len() - 1 {
@@ -3079,12 +3898,44 @@ fn install_superinstructions(
             && matches!(second, Opcode::JumpIfFalse | Opcode::JumpIfTrue)
             && temps[index].a == temps[index + 1].a
         {
-            ops[index].y = ops[index + 1].x;
+            // Keep the real branch opcode in the adjacent token. The fused handler
+            // executes it without dispatch, but retaining its raw_pc makes tracing
+            // and backedge accounting observe the exact logical branch source.
             ops[index].flags = if second == Opcode::JumpIfTrue { 1 } else { 0 };
-            ops[index].next = (index + 2) as u32;
             handlers[index] = fused_compare_branch_handler(first);
             handlers[index + 1] = h_unreachable_fused;
             continue;
+        }
+
+        // Parallel-copy lowering often produces 3+ MOVE runs. Pack two extra
+        // copies into x/y and execute all three sequentially in one dispatch.
+        // The target checks preserve the ability to enter at every real CFG edge.
+        if first == Opcode::Move
+            && second == Opcode::Move
+            && index + 2 < temps.len()
+            && temps[index + 2].opcode == Opcode::Move
+            && !target_ops.contains(&((index + 2) as u32))
+        {
+            ops[index].x = (temps[index + 1].a as u32)
+                | ((temps[index + 1].b as u32) << 8);
+            ops[index].y = (temps[index + 2].a as u32)
+                | ((temps[index + 2].b as u32) << 8);
+            ops[index].next = (index + 3) as u32;
+            handlers[index] = h_move_move_move;
+            handlers[index + 1] = h_unreachable_fused;
+            handlers[index + 2] = h_unreachable_fused;
+            continue;
+        }
+
+        // A cheap ALU operation immediately followed by a jump is a common loop
+        // latch shape (increment/decrement + backedge). Fuse it so each baseline
+        // iteration pays one indirect dispatch less.
+        if second == Opcode::Jump {
+            if let Some(handler) = fused_alu_jump_handler(first) {
+                handlers[index] = handler;
+                handlers[index + 1] = h_unreachable_fused;
+                continue;
+            }
         }
 
         // Parallel-copy lowering can leave short MOVE runs after register
@@ -3109,7 +3960,6 @@ fn install_superinstructions(
         // Edge-copy tails frequently end in MOVE; JUMP. Fuse the final copy
         // with the branch so block-parameter lowering pays one less dispatch.
         if first == Opcode::Move && second == Opcode::Jump {
-            ops[index].y = ops[index + 1].x;
             handlers[index] = h_move_jump;
             handlers[index + 1] = h_unreachable_fused;
             continue;
@@ -3125,12 +3975,14 @@ fn install_superinstructions(
                 Opcode::LoadI8 => Some(h_load_i8_return as Handler),
                 Opcode::LoadI32 => Some(h_load_i32_return as Handler),
                 Opcode::LoadConst => Some(h_load_const_return as Handler),
+                Opcode::MoveFromArg => Some(h_move_from_arg_return as Handler),
+                Opcode::MoveFromRet => Some(h_move_from_ret_return as Handler),
                 Opcode::MoveFromSpecial => Some(h_move_from_special_return as Handler),
                 Opcode::LoadField => Some(h_load_field_return as Handler),
                 Opcode::LoadStaticField => Some(h_load_static_field_return as Handler),
                 Opcode::LoadModuleVar => Some(h_load_module_var_return as Handler),
                 Opcode::LoadCell => Some(h_load_cell_return as Handler),
-                _ => None,
+                _ => fused_alu_return_handler(first),
             };
             if let Some(handler) = fused {
                 handlers[index] = handler;
@@ -3139,26 +3991,30 @@ fn install_superinstructions(
             }
         }
 
-        // Managed mutation handlers execute StickyImmix's object barrier
-        // directly. Root-table stores (module/static fields) need no remembered
-        // set entry because VM roots are scanned on every collection. Therefore
-        // the following explicit WriteBarrier is redundant in the prepared
-        // stream and can still be folded away without weakening generational GC.
-        if second == Opcode::WriteBarrier
-            && matches!(
-                first,
-                Opcode::StoreField
-                    | Opcode::StoreStaticField
-                    | Opcode::StoreModuleVar
-                    | Opcode::StoreCell
-                    | Opcode::ListSet
-                    | Opcode::ListAppend
-                    | Opcode::ListInsert
-                    | Opcode::MapSet
-            )
-        {
-            ops[index].next = (index + 2) as u32;
-            handlers[index + 1] = h_unreachable_fused;
+        // Managed mutation handlers already execute the StickyImmix barrier. Fold
+        // an immediately following explicit WriteBarrier only when its owner/value
+        // operands exactly describe an edge the first opcode already records.
+        // This keeps arbitrary hand-authored bytecode semantically intact.
+        if second == Opcode::WriteBarrier {
+            let barrier = &temps[index + 1];
+            let redundant = match first {
+                Opcode::StoreField | Opcode::StoreStaticField | Opcode::StoreCell
+                | Opcode::ListAppend => {
+                    barrier.a == temps[index].a && barrier.b == temps[index].b
+                }
+                Opcode::ListSet | Opcode::ListInsert => {
+                    barrier.a == temps[index].a && barrier.b == temps[index].c
+                }
+                Opcode::MapSet => {
+                    barrier.a == temps[index].a
+                        && (barrier.b == temps[index].b || barrier.b == temps[index].c)
+                }
+                _ => false,
+            };
+            if redundant {
+                ops[index].next = (index + 2) as u32;
+                handlers[index + 1] = h_unreachable_fused;
+            }
         }
     }
 }
@@ -3477,32 +4333,44 @@ impl Default for MapInlineCacheState {
 
 impl MapInlineCacheState {
     #[inline(always)]
-    fn probe(&self, shapes: &MapShapeTable, shape: u32, key: &[u8]) -> Option<u16> {
+    fn probe(&self, shapes: &MapShapeTable, shape: u32, hash: u64, key: &[u8]) -> Option<u16> {
         // A cache entry needs only shape+slot. Comparing the runtime key against
         // the canonical shape key supports equal-but-not-identical String objects
         // without storing an Arc or rehashing the key on a hit.
         if self.len > 0 {
             let entry = unsafe { *self.entries.get_unchecked(0) };
             if entry.shape == shape
-                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+                && {
+                    let candidate = shapes.key_at(shape, entry.slot);
+                    candidate.hash == hash && candidate.as_ref() == key
+                }
             { return Some(entry.slot); }
         }
         if self.len > 1 {
             let entry = unsafe { *self.entries.get_unchecked(1) };
             if entry.shape == shape
-                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+                && {
+                    let candidate = shapes.key_at(shape, entry.slot);
+                    candidate.hash == hash && candidate.as_ref() == key
+                }
             { return Some(entry.slot); }
         }
         if self.len > 2 {
             let entry = unsafe { *self.entries.get_unchecked(2) };
             if entry.shape == shape
-                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+                && {
+                    let candidate = shapes.key_at(shape, entry.slot);
+                    candidate.hash == hash && candidate.as_ref() == key
+                }
             { return Some(entry.slot); }
         }
         if self.len > 3 {
             let entry = unsafe { *self.entries.get_unchecked(3) };
             if entry.shape == shape
-                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+                && {
+                    let candidate = shapes.key_at(shape, entry.slot);
+                    candidate.hash == hash && candidate.as_ref() == key
+                }
             { return Some(entry.slot); }
         }
         None
@@ -3616,24 +4484,26 @@ impl Default for FrameBanks {
 struct Frame {
     function: u32,
     pc: u32,
-    reg_base: usize,
+    reg_base: u32,
     reg_count: u16,
-    return_dst: Option<Reg>,
-    /// Raw bytecode PC of the call opcode in the parent frame, if any.
-    caller_pc: Option<u32>,
+    /// u16::MAX means no return destination. Using a sentinel keeps Frame compact
+    /// and avoids Option<Reg> layout/padding in the hottest push/pop structure.
+    return_dst: u16,
+    /// Raw bytecode PC of the call opcode in the parent frame; NO_INDEX means none.
+    caller_pc: u32,
     root_map: u32,
 }
 
 impl Frame {
     #[inline(always)]
-    fn new(function: u32, reg_base: usize, reg_count: u16, return_dst: Option<Reg>) -> Self {
+    fn new(function: u32, reg_base: u32, reg_count: u16, return_dst: Option<Reg>) -> Self {
         Self {
             function,
             pc: 0,
             reg_base,
             reg_count,
-            return_dst,
-            caller_pc: None,
+            return_dst: return_dst.map_or(NO_REG, |reg| reg.0 as u16),
+            caller_pc: NO_INDEX,
             root_map: NO_INDEX,
         }
     }
@@ -3744,6 +4614,7 @@ enum RunState {
 
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
+    jit_entry_threshold: u32,
     method_epoch: u64,
     program: &'p BytecodeProgram,
     prepared: Box<PreparedProgram>,
@@ -3790,6 +4661,8 @@ pub struct Interpreter<'p> {
     persistent_roots: Arc<HandleRootSet>,
     _persistent_root_registration: GcRootRegistration,
     gc_enabled: bool,
+    /// Amortizes the cross-thread collection-request poll in allocation-free loops.
+    gc_backedge_poll: u8,
     last_gc_collections: u64,
 
     // Hot execution cache. These pointers are refreshed only when frames or
@@ -3798,6 +4671,7 @@ pub struct Interpreter<'p> {
     hot_banks: *mut FrameBanks,
     hot_registers: *mut RegisterWord,
     hot_function: *const PreparedFunction,
+    hot_function_index: u32,
     hot_ops: *const PreparedOp,
     hot_handlers: *const Handler,
     hot_constants: *const RegisterWord,
@@ -4055,9 +4929,12 @@ impl<'p> Interpreter<'p> {
         ))));
         init_roots.push(cancelled_error);
         let last_gc_collections = heap.collection_count();
+        let jit = Box::new(TracingJit::default());
+        let jit_entry_threshold = jit.options().hot_entry_threshold;
 
         Ok(Self {
-            jit: Some(Box::new(TracingJit::default())),
+            jit: Some(jit),
+            jit_entry_threshold,
             method_epoch: 0,
             program,
             prepared,
@@ -4090,11 +4967,13 @@ impl<'p> Interpreter<'p> {
             persistent_roots: init_roots,
             _persistent_root_registration: persistent_root_registration,
             gc_enabled: true,
+            gc_backedge_poll: 0,
             last_gc_collections,
             hot_frame: std::ptr::null_mut(),
             hot_banks: std::ptr::null_mut(),
             hot_registers: std::ptr::null_mut(),
             hot_function: std::ptr::null(),
+            hot_function_index: NO_INDEX,
             hot_ops: std::ptr::null(),
             hot_handlers: std::ptr::null(),
             hot_constants: std::ptr::null(),
@@ -4177,12 +5056,13 @@ impl<'p> Interpreter<'p> {
             function.jit_entry_disabled.fill(false);
         }
 
-        let enable_entries = options
+        let entry_threshold = options
             .as_ref()
-            .is_some_and(|options| options.hot_entry_threshold != 0);
+            .map_or(0, |options| options.hot_entry_threshold);
+        self.jit_entry_threshold = entry_threshold;
         self.jit = options.map(|options| Box::new(TracingJit::new(options)));
 
-        if enable_entries {
+        if entry_threshold != 0 {
             for function in &mut self.prepared.functions {
                 if !function.handlers.is_empty() {
                     function.install_entry_hook(0);
@@ -4411,7 +5291,7 @@ impl<'p> Interpreter<'p> {
         if let Some(dst) = dst {
             let fiber = self.fiber_mut(current);
             let frame = fiber.frames.last().ok_or_else(|| RuntimeError::new("suspended fiber has no frame"))?;
-            let index = frame.reg_base + dst.index();
+            let index = frame.reg_base as usize + dst.index();
             unsafe {
                 *fiber.registers.get_unchecked_mut(index) = value.word();
             }
@@ -4443,18 +5323,19 @@ impl<'p> Interpreter<'p> {
     fn dispatch_loop(&mut self) {
         loop {
             while self.run_state == RunState::Running {
-                if self.hot_frame.is_null() {
-                    self.fail(RuntimeError::new("running fiber has no frame"));
-                    break;
-                }
+                // Running always implies a live hot frame. Every path that clears
+                // the cached frame either changes run_state first or immediately
+                // installs another runnable frame. Keep this invariant free in
+                // release builds instead of branching on every bytecode dispatch.
+                debug_assert!(!self.hot_frame.is_null(), "running fiber has no frame");
 
                 let pc = self.hot_pc as usize;
+                // Verification plus preparation guarantee that every fallthrough,
+                // branch, deopt and exception target is a valid prepared-op index.
+                // Keep the invariant checked in debug builds without paying one
+                // bounds branch on every interpreted instruction in release.
+                debug_assert!(pc < unsafe { &*self.hot_function }.ops.len());
 
-                let prepared = unsafe { &*self.hot_function };
-                if pc >= prepared.ops.len() {
-                    self.fail(RuntimeError::new("program counter is outside function"));
-                    break;
-                }
                 // The vector bases are cached when a frame becomes hot, mirroring
                 // Napalm's cached ip/fn/stackStart locals. Normal dispatch is now two
                 // pointer adds and one indirect call, with no Vec traversal.
@@ -4527,8 +5408,48 @@ impl<'p> Interpreter<'p> {
         *self.hot_registers.add(reg as usize) = value;
     }
 
-    /// Refresh the cached frame and GPR base after any operation that can move
-    /// the register/frame vectors or switch the current fiber.
+    /// Install hot pointers when the caller has already proven that the current
+    /// fiber exists and owns at least one frame. Calls and returns use this path.
+    #[inline(always)]
+    unsafe fn refresh_hot_frame_live(&mut self) {
+        let current = self.current_fiber as usize;
+        debug_assert!(current < self.fibers.len());
+        let cell = self.fibers.get_unchecked(current).as_ref().unwrap_unchecked();
+        let fiber = cell.get_mut();
+        let depth = fiber.frames.len();
+        debug_assert!(depth != 0);
+        debug_assert!(depth <= fiber.banks.len());
+        let frame = fiber.frames.get_unchecked_mut(depth - 1);
+        let banks = fiber.banks.get_unchecked_mut(depth - 1);
+        self.hot_pc = frame.pc;
+        self.hot_frame = frame as *mut Frame;
+        self.hot_banks = banks as *mut FrameBanks;
+        self.hot_registers = fiber.registers.as_mut_ptr().add(frame.reg_base as usize);
+        self.hot_function_index = frame.function;
+        self.hot_function = self.prepared.functions.as_ptr().add(frame.function as usize);
+
+        if self.jit_entry_threshold != 0 {
+            self.prepared
+                .functions
+                .get_unchecked_mut(frame.function as usize)
+                .install_entry_hook(self.hot_pc as usize);
+        }
+
+        let prepared = &*self.hot_function;
+        self.hot_ops = prepared.ops.as_ptr();
+        self.hot_handlers = prepared.handlers.as_ptr();
+        self.hot_constants = self
+            .resolved_constants
+            .get_unchecked(frame.function as usize)
+            .as_ptr();
+        self.hot_inline_caches = self
+            .inline_caches
+            .get_unchecked_mut(frame.function as usize)
+            .as_mut_ptr();
+    }
+
+    /// Refresh the cached frame and GPR base after a potentially empty fiber
+    /// switch. The branchy validation is kept for scheduler/event-loop paths.
     #[inline]
     fn refresh_hot_frame(&mut self) {
         let current = self.current_fiber as usize;
@@ -4536,37 +5457,11 @@ impl<'p> Interpreter<'p> {
             self.clear_hot_frame();
             return;
         };
-        let fiber = unsafe { cell.get_mut() };
-        let depth = fiber.frames.len();
-        if depth == 0 {
+        if unsafe { cell.get() }.frames.is_empty() {
             self.clear_hot_frame();
             return;
         }
-        let frame = unsafe { fiber.frames.get_unchecked_mut(depth - 1) };
-        let banks = unsafe { fiber.banks.get_unchecked_mut(depth - 1) };
-        self.hot_pc = frame.pc;
-        self.hot_frame = frame as *mut Frame;
-        self.hot_banks = banks as *mut FrameBanks;
-        self.hot_registers = unsafe { fiber.registers.as_mut_ptr().add(frame.reg_base) };
-        self.hot_function = unsafe { self.prepared.functions.as_ptr().add(frame.function as usize) };
-        let prepared = unsafe { &*self.hot_function };
-        self.hot_ops = prepared.ops.as_ptr();
-        self.hot_handlers = prepared.handlers.as_ptr();
-        self.hot_constants = unsafe {
-            self.resolved_constants.get_unchecked(frame.function as usize).as_ptr()
-        };
-        self.hot_inline_caches = unsafe {
-            self.inline_caches.get_unchecked_mut(frame.function as usize).as_mut_ptr()
-        };
-
-        // Frame/fiber switches are exactly the places where continuation regions
-        // become visible. Install a hook lazily at the resumed PC instead of
-        // burdening every bytecode dispatch site.
-        if self.jit.as_ref().is_some_and(|jit| jit.options().hot_entry_threshold != 0) {
-            let function_index = frame.function as usize;
-            let pc = self.hot_pc as usize;
-            self.prepared.functions[function_index].install_entry_hook(pc);
-        }
+        unsafe { self.refresh_hot_frame_live(); }
     }
 
     /// Synchronize the cached PC only at boundaries which expose Frame state to
@@ -4587,6 +5482,7 @@ impl<'p> Interpreter<'p> {
         self.hot_banks = std::ptr::null_mut();
         self.hot_registers = std::ptr::null_mut();
         self.hot_function = std::ptr::null();
+        self.hot_function_index = NO_INDEX;
         self.hot_ops = std::ptr::null();
         self.hot_handlers = std::ptr::null();
         self.hot_constants = std::ptr::null();
@@ -4598,6 +5494,12 @@ impl<'p> Interpreter<'p> {
     fn current_prepared(&self) -> &PreparedFunction {
         debug_assert!(!self.hot_function.is_null());
         unsafe { &*self.hot_function }
+    }
+
+    #[inline(always)]
+    fn current_function_index(&self) -> usize {
+        debug_assert_ne!(self.hot_function_index, NO_INDEX);
+        self.hot_function_index as usize
     }
 
     #[inline(always)]
@@ -4616,16 +5518,12 @@ impl<'p> Interpreter<'p> {
     #[inline(never)]
     unsafe fn take_backedge(&mut self, op: &PreparedOp, target: u32) {
         let from_index = self.hot_pc;
-        let function_index = self.current_frame().function as usize;
+        let function_index = self.current_function_index();
         debug_assert!(target < from_index);
 
-        let cached_trace = self
-            .prepared
-            .functions
-            .get(function_index)
-            .and_then(|function| function.jit_trace_headers.get(target as usize))
-            .copied()
-            .unwrap_or(NO_INDEX);
+        let function_ptr = self.prepared.functions.as_mut_ptr().add(function_index);
+        let cached_trace = *(&(*function_ptr).jit_trace_headers)
+            .get_unchecked(target as usize);
 
         self.set_pc(target);
 
@@ -4640,18 +5538,10 @@ impl<'p> Interpreter<'p> {
             // construction nor a loop-state hash probe.
             (jit.enter_trace(self, TraceId(cached_trace)), None)
         } else {
-            let function = self.prepared.functions[function_index].id;
-            let target_raw_pc = match self.prepared.functions[function_index]
-                .original_ops
-                .get(target as usize)
-            {
-                Some(target_op) => target_op.raw_pc,
-                None => {
-                    self.jit = Some(jit);
-                    self.fail(RuntimeError::new("invalid prepared backedge target"));
-                    return;
-                }
-            };
+            let function = (*function_ptr).id;
+            let target_raw_pc = (&(*function_ptr).original_ops)
+                .get_unchecked(target as usize)
+                .raw_pc;
             let from = TraceLocation::new(function, BytecodePc(op.raw_pc));
             let to = TraceLocation::new(function, BytecodePc(target_raw_pc));
             (jit.on_backedge(self, from, to), Some(to))
@@ -4675,24 +5565,20 @@ impl<'p> Interpreter<'p> {
         };
         self.jit = Some(jit);
 
-        if let Some(function) = self.prepared.functions.get_mut(function_index) {
-            if disable_header {
-                if let Some(disabled) = function.jit_disabled_headers.get_mut(target as usize) {
-                    *disabled = u8::MAX;
-                }
-                if let Some(cached) = function.jit_trace_headers.get_mut(target as usize) {
-                    *cached = NO_INDEX;
-                }
-            } else if cached_trace == NO_INDEX {
-                if let Some(trace) = newly_compiled {
-                    if let Some(cached) = function.jit_trace_headers.get_mut(target as usize) {
-                        *cached = trace;
-                    }
-                }
+        if disable_header {
+            *(&mut (*function_ptr).jit_disabled_headers)
+                .get_unchecked_mut(target as usize) = u8::MAX;
+            *(&mut (*function_ptr).jit_trace_headers)
+                .get_unchecked_mut(target as usize) = NO_INDEX;
+        } else if cached_trace == NO_INDEX {
+            if let Some(trace) = newly_compiled {
+                *(&mut (*function_ptr).jit_trace_headers)
+                    .get_unchecked_mut(target as usize) = trace;
             }
-            if matches!(&result, Ok(JitAction::CoolingDown { .. })) {
-                function.jit_disabled_headers[target as usize] = 64;
-            }
+        }
+        if matches!(&result, Ok(JitAction::CoolingDown { .. })) {
+            *(&mut (*function_ptr).jit_disabled_headers)
+                .get_unchecked_mut(target as usize) = 64;
         }
 
         if let Err(error) = result {
@@ -4703,21 +5589,25 @@ impl<'p> Interpreter<'p> {
     #[inline(always)]
     unsafe fn branch_to(&mut self, op: &PreparedOp, target: u32) {
         let backwards = target < self.hot_pc;
-        if target < self.hot_pc && self.jit.is_some() {
-            // Once a loop has been blacklisted, never enter the tiering manager
-            // from this header again. A byte lookup is substantially cheaper than
-            // taking/moving the JIT manager and probing its loop-state HashMap on
-            // every baseline iteration.
-            let cooldown = self
-                .current_prepared()
+        if backwards && self.jit.is_some() {
+            // Every prepared CFG target is validated during construction, so the
+            // dense header tables can be indexed without a release-mode bounds
+            // check on every loop iteration.
+            let function_index = self.current_function_index();
+            let cooldown = *self
+                .prepared
+                .functions
+                .get_unchecked(function_index)
                 .jit_disabled_headers
-                .get(target as usize)
-                .copied()
-                .unwrap_or(0);
+                .get_unchecked(target as usize);
             if cooldown != 0 {
                 if cooldown != u8::MAX {
-                    let function = self.current_frame().function as usize;
-                    self.prepared.functions[function].jit_disabled_headers[target as usize] -= 1;
+                    *self
+                        .prepared
+                        .functions
+                        .get_unchecked_mut(function_index)
+                        .jit_disabled_headers
+                        .get_unchecked_mut(target as usize) = cooldown - 1;
                 }
                 self.set_pc(target);
             } else {
@@ -4726,13 +5616,25 @@ impl<'p> Interpreter<'p> {
         } else {
             self.set_pc(target);
         }
-        if backwards && self.heap.mutator.collection_requested()
-            && self.run_state == RunState::Running && !self.hot_frame.is_null()
-        {
-            let current = self.current_prepared().original_ops[self.hot_pc as usize];
-            if current.gc_map != NO_INDEX {
-                self.mark_gc_point(&current);
-                self.maybe_collect();
+        if backwards {
+            // A relaxed/atomic collection-request read on every tight-loop
+            // backedge is measurable, especially on AArch64. Poll periodically
+            // instead; allocation and explicit safepoints still poll normally.
+            self.gc_backedge_poll = self.gc_backedge_poll.wrapping_add(1);
+            if (self.gc_backedge_poll & GC_BACKEDGE_POLL_MASK) == 0
+                && self.run_state == RunState::Running
+                && !self.hot_frame.is_null()
+                && self.heap.mutator.collection_requested()
+            {
+                let gc_map = *self
+                    .current_prepared()
+                    .gc_map_by_op
+                    .get_unchecked(self.hot_pc as usize);
+                if gc_map != NO_INDEX {
+                    self.flush_hot_pc();
+                    self.current_frame_mut().root_map = gc_map;
+                    self.maybe_collect();
+                }
             }
         }
     }
@@ -4743,20 +5645,29 @@ impl<'p> Interpreter<'p> {
     }
 
     #[inline(always)]
-    fn mark_gc_point(&mut self, op: &PreparedOp) {
-        // Frame state becomes externally observable at GC/runtime boundaries.
+    fn mark_gc_point(&mut self, _op: &PreparedOp) {
+        // GC maps are cold metadata kept out of the 24-byte hot PreparedOp.
         self.flush_hot_pc();
-        if op.gc_map != NO_INDEX {
-            self.current_frame_mut().root_map = op.gc_map;
+        let gc_map = unsafe {
+            *self
+                .current_prepared()
+                .gc_map_by_op
+                .get_unchecked(self.hot_pc as usize)
+        };
+        if gc_map != NO_INDEX {
+            self.current_frame_mut().root_map = gc_map;
         }
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
     fn fail_terminal(&mut self, error: RuntimeError) {
         self.error = Some(error);
         self.run_state = RunState::Failed;
     }
 
+    #[cold]
+    #[inline(never)]
     fn find_structured_handler(
         &self,
         op: &PreparedOp,
@@ -4783,14 +5694,16 @@ impl<'p> Interpreter<'p> {
             if depth == 0 {
                 break;
             }
-            let Some(caller_pc) = frame.caller_pc else {
+            if frame.caller_pc == NO_INDEX {
                 break;
-            };
-            probe_pc = caller_pc;
+            }
+            probe_pc = frame.caller_pc;
         }
         None
     }
 
+    #[cold]
+    #[inline(never)]
     fn unwind_to_structured_handler(
         &mut self,
         op: &PreparedOp,
@@ -4819,7 +5732,7 @@ impl<'p> Interpreter<'p> {
         let (reg_top, target_function) = {
             let fiber = self.fiber(current);
             let frame = &fiber.frames[target_depth];
-            (frame.reg_base + frame.reg_count as usize, frame.function)
+            (frame.reg_base as usize + frame.reg_count as usize, frame.function)
         };
 
         {
@@ -4834,7 +5747,7 @@ impl<'p> Interpreter<'p> {
                 debug_assert_eq!(frame.function, target_function);
                 frame.pc = handler.handler_op;
                 frame.root_map = NO_INDEX;
-                frame.reg_base
+                frame.reg_base as usize
             };
 
             // Catch is a GC safepoint because a VM RuntimeError is materialized
@@ -4861,11 +5774,15 @@ impl<'p> Interpreter<'p> {
         true
     }
 
+    #[cold]
+    #[inline(never)]
     fn raise_value_exception(&mut self, op: &PreparedOp, error: Value) -> bool {
         self.pending_native_exception = None;
         self.unwind_to_structured_handler(op, Some(error), None)
     }
 
+    #[cold]
+    #[inline(never)]
     fn raise_runtime_exception(&mut self, op: &PreparedOp, error: RuntimeError) -> bool {
         self.unwind_to_structured_handler(op, None, Some(error))
     }
@@ -4877,6 +5794,8 @@ impl<'p> Interpreter<'p> {
     /// already published. Allocating the String at the original failing opcode
     /// would be unsound because arbitrary non-GC bytecodes do not carry stack
     /// maps for a collection triggered by that allocation.
+    #[cold]
+    #[inline(never)]
     fn catch_runtime_error_in_fiber(&mut self, error: &RuntimeError) -> bool {
         let start = self.current_fiber;
         if start == 0 || self.fiber(start).async_promise.is_some() {
@@ -4945,7 +5864,7 @@ impl<'p> Interpreter<'p> {
             {
                 let caller = self.fiber_mut(link.caller);
                 if let Some(frame) = caller.frames.last() {
-                    let index = frame.reg_base + link.dst.index();
+                    let index = frame.reg_base as usize + link.dst.index();
                     caller.registers[index] = error_value.word();
                 }
             }
@@ -4958,6 +5877,8 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn fail(&mut self, error: RuntimeError) {
         if self.catch_runtime_error_in_fiber(&error) {
             return;
@@ -4965,6 +5886,8 @@ impl<'p> Interpreter<'p> {
         self.fail_terminal(error);
     }
 
+    #[cold]
+    #[inline(never)]
     fn fail_at(&mut self, op: &PreparedOp, message: impl Into<String>) {
         let (function, pc) = self.current_location(op);
         let error = RuntimeError::new(message).at(function, pc);
@@ -5037,6 +5960,7 @@ impl<'p> Interpreter<'p> {
         count
     }
 
+    #[inline(always)]
     fn push_frame_direct(
         &mut self,
         function_index: u32,
@@ -5044,9 +5968,8 @@ impl<'p> Interpreter<'p> {
         closure: Option<Value>,
         return_dst: Option<Reg>,
     ) -> Result<(), RuntimeError> {
-        let prepared = &self.prepared.functions[function_index as usize];
-        let uses_this = function_kind_uses_this(prepared.kind);
-        let (receiver, args) = if uses_this {
+        let prepared = unsafe { self.prepared.functions.get_unchecked(function_index as usize) };
+        let (receiver, args) = if prepared.uses_this {
             let (first, rest) = sources.split_first().ok_or_else(|| RuntimeError::new("method-like call has no receiver"))?;
             (Some(*first), rest)
         } else {
@@ -5081,6 +6004,8 @@ impl<'p> Interpreter<'p> {
         capture_words: Option<&[RegisterWord]>,
         return_dst: Option<Reg>,
     ) -> Result<(), RuntimeError> {
+        // Keep dynamic/spread/native entry paths memory-safe. Fixed-arity verified
+        // bytecode calls make this branch trivially predictable in the hot path.
         if args.len() > ARGUMENT_REGISTER_COUNT {
             return Err(RuntimeError::new("too many call arguments"));
         }
@@ -5094,7 +6019,9 @@ impl<'p> Interpreter<'p> {
         let prepared = unsafe { &*prepared_ptr };
         let layout = &prepared.frame;
         let reg_count = layout.general_register_count as usize;
-        let module_value = self.modules[prepared.module_slot as usize].module_value;
+        let module_value = unsafe {
+            self.modules.get_unchecked(prepared.module_slot as usize).module_value
+        };
         let fiber_value = self.fiber(self.current_fiber).object;
 
         // Native direct-closure calls can stage the immutable capture array in
@@ -5120,7 +6047,13 @@ impl<'p> Interpreter<'p> {
         };
 
         let current = self.current_fiber;
-        let cell = self.fibers[current as usize].as_ref().expect("live fiber");
+        debug_assert!((current as usize) < self.fibers.len());
+        let cell = unsafe {
+            self.fibers
+                .get_unchecked(current as usize)
+                .as_ref()
+                .unwrap_unchecked()
+        };
         let fiber = unsafe { cell.get_mut() };
         let depth = fiber.frames.len();
         let base = fiber.register_top;
@@ -5179,21 +6112,28 @@ impl<'p> Interpreter<'p> {
             }
         }
 
-        // Captures are less common and may have arbitrary sparse destinations;
-        // retain the compact precomputed binding list for them.
+        // Closure creation and staged native calls validate the capture count once.
+        // Frame entry can therefore copy sparse captures without one bounds branch
+        // per binding.
+        debug_assert!(layout
+            .captures
+            .iter()
+            .all(|binding| (binding.capture_index as usize) < captures.len()));
         for binding in &layout.captures {
-            let value = captures
-                .get(binding.capture_index as usize)
-                .copied()
-                .ok_or_else(|| RuntimeError::new("closure capture binding is out of range"))?;
+            let value = unsafe { *captures.get_unchecked(binding.capture_index as usize) };
             unsafe {
                 *fiber.registers.get_unchecked_mut(base + binding.destination.index()) = value;
             }
         }
 
+        // Compact Frames use a u32 register offset (32 GiB of 8-byte register
+        // storage). Keep the representation safe even under pathological host
+        // workloads; this branch is perfectly predictable on ordinary calls.
+        let base_u32 = u32::try_from(base)
+            .map_err(|_| RuntimeError::new("register stack exceeds u32 frame offset space"))?;
         let mut frame = Frame::new(
             function_index,
-            base,
+            base_u32,
             reg_count as u16,
             return_dst,
         );
@@ -5205,7 +6145,7 @@ impl<'p> Interpreter<'p> {
         if let Some((owner, bytes)) = external_update {
             self.heap.set_external_bytes(owner, bytes);
         }
-        self.refresh_hot_frame();
+        unsafe { self.refresh_hot_frame_live(); }
         Ok(())
     }
 
@@ -5213,11 +6153,12 @@ impl<'p> Interpreter<'p> {
         let current = self.current_fiber;
         let (return_dst, base, finished_function) = {
             let fiber = self.fiber_mut(current);
-            let frame = match fiber.frames.pop() {
-                Some(frame) => frame,
-                None => { self.fail(RuntimeError::new("return with empty frame stack")); return; }
-            };
-            (frame.return_dst, frame.reg_base, frame.function)
+            // Return is reachable only with a live verified frame. Keep malformed
+            // internal state diagnosable in debug builds without a release branch
+            // on every function return.
+            debug_assert!(!fiber.frames.is_empty(), "return with empty frame stack");
+            let frame = unsafe { fiber.frames.pop().unwrap_unchecked() };
+            (frame.return_dst, frame.reg_base as usize, frame.function)
         };
 
         // A module becomes initialized exactly when its ModuleBody returns.
@@ -5244,16 +6185,18 @@ impl<'p> Interpreter<'p> {
             let depth = fiber.frames.len();
             if depth != 0 {
                 let caller = unsafe { fiber.frames.get_unchecked(depth - 1) };
-                let caller_base = caller.reg_base;
+                let caller_base = caller.reg_base as usize;
                 let caller_function = caller.function as usize;
                 if unsafe { (*prepared_functions.add(caller_function)).needs_return_bank } {
                     let banks = unsafe { fiber.banks.get_unchecked_mut(depth - 1) };
                     banks.returns[0] = value0;
                     if let Some(value1) = value1 { banks.returns[1] = value1; }
                 }
-                if let Some(dst) = return_dst {
+                if return_dst != NO_REG {
                     unsafe {
-                        *fiber.registers.get_unchecked_mut(caller_base + dst.index()) = value0;
+                        *fiber
+                            .registers
+                            .get_unchecked_mut(caller_base + return_dst as usize) = value0;
                     }
                 }
                 true
@@ -5262,7 +6205,7 @@ impl<'p> Interpreter<'p> {
             }
         };
         if has_caller {
-            self.refresh_hot_frame();
+            unsafe { self.refresh_hot_frame_live(); }
             return;
         }
 
@@ -5480,7 +6423,7 @@ impl<'p> Interpreter<'p> {
                 Some(Reg(op.a)),
             ) {
                 Ok(()) => {
-                    self.current_frame_mut().caller_pc = Some(op.raw_pc);
+                    self.current_frame_mut().caller_pc = op.raw_pc;
                 }
                 Err(error) => self.fail_at(op, error.message),
             }
@@ -5510,12 +6453,13 @@ impl<'p> Interpreter<'p> {
             function, None, args, Some(closure), Some(captures), Some(Reg(op.a)),
         ) {
             Ok(()) => {
-                self.current_frame_mut().caller_pc = Some(op.raw_pc);
+                self.current_frame_mut().caller_pc = op.raw_pc;
             }
             Err(error) => self.fail_at(op, error.message),
         }
     }
 
+    #[inline(always)]
     fn enter_direct_bytecode_call(
         &mut self,
         op: &PreparedOp,
@@ -5523,17 +6467,45 @@ impl<'p> Interpreter<'p> {
         sources: &[RegisterWord],
         closure: Option<Value>,
     ) {
-        let uses_this = function_kind_uses_this(self.prepared.functions[function as usize].kind);
-        let (receiver, args) = if uses_this {
-            let Some((first, rest)) = sources.split_first() else {
-                self.fail_at(op, "method-like call has no receiver");
-                return;
-            };
-            (Some(*first), rest)
+        let prepared = unsafe { self.prepared.functions.get_unchecked(function as usize) };
+        let (receiver, args) = if prepared.uses_this {
+            // Direct-call arity/source layout is verified before preparation.
+            debug_assert!(!sources.is_empty());
+            unsafe {
+                (
+                    Some(*sources.get_unchecked(0)),
+                    sources.get_unchecked(1..),
+                )
+            }
         } else {
             (None, sources)
         };
         self.enter_bytecode_call(op, function, receiver, args, closure);
+    }
+
+    /// Closure-call fast path. Synchronous closures reuse the capture payload
+    /// already resolved by the handler, avoiding a second stable-handle lookup.
+    /// Async callees keep the ordinary path because task creation can collect.
+    #[inline(always)]
+    unsafe fn enter_closure_bytecode_call(
+        &mut self,
+        op: &PreparedOp,
+        function: u32,
+        args: &[RegisterWord],
+        closure: Value,
+        captures_ptr: *const RegisterWord,
+        capture_len: usize,
+    ) {
+        let prepared = self.prepared.functions.get_unchecked(function as usize);
+        if prepared.is_async {
+            self.enter_bytecode_call(op, function, None, args, Some(closure));
+            return;
+        }
+
+        // No GC-capable operation occurs before push_frame_with_capture_words()
+        // copies these immutable closure words into the callee register stack.
+        let captures = std::slice::from_raw_parts(captures_ptr, capture_len);
+        self.enter_bytecode_call_with_capture_words(op, function, args, closure, captures);
     }
 
     fn resume_promise_waiter(
@@ -5560,7 +6532,7 @@ impl<'p> Interpreter<'p> {
             return;
         }
         let Some(frame) = state.frames.last() else { return; };
-        let index = frame.reg_base + dst.index();
+        let index = frame.reg_base as usize + dst.index();
         if index >= state.registers.len() { return; }
         state.registers[index] = value.word();
         state.awaiting_promise = None;
@@ -6265,7 +7237,7 @@ impl<'p> Interpreter<'p> {
             let caller = self.fiber_mut(link.caller);
             caller.status = FiberStatus::Running;
             if let Some(frame) = caller.frames.last() {
-                let index = frame.reg_base + link.dst.index();
+                let index = frame.reg_base as usize + link.dst.index();
                 caller.registers[index] = value.word();
             }
             self.refresh_hot_frame();
@@ -6278,7 +7250,6 @@ impl<'p> Interpreter<'p> {
 }
 
 impl Interpreter<'_> {
-    #[inline(always)]
     #[inline(always)]
     fn receiver_matches_class(&self, value: Value, expected: ReceiverClass) -> bool {
         let kind = expected.0 >> 56;
@@ -6316,6 +7287,8 @@ impl Interpreter<'_> {
     ///
     /// This performs both of Napalm's cheap-object optimizations in one cold
     /// class-linking step: copy-down inheritance and fixed-layout field relocation.
+    #[cold]
+    #[inline(never)]
     fn link_class_layout(
         &mut self,
         class_slot: u32,
@@ -7577,6 +8550,8 @@ impl Interpreter<'_> {
         set.contains(id)
     }
 
+    #[cold]
+    #[inline(never)]
     fn deopt(&mut self, op: &PreparedOp, deopt_id: u32) {
         if let Some(&resume) = self.current_prepared().deopt_resume.get(&deopt_id) {
             unsafe { self.set_pc(resume); }
@@ -7814,7 +8789,7 @@ impl Interpreter<'_> {
         if let Some(dst) = suspend_dst {
             let fiber = self.fiber_mut(target);
             if let Some(frame) = fiber.frames.last() {
-                let index = frame.reg_base + dst.index();
+                let index = frame.reg_base as usize + dst.index();
                 unsafe {
                     *fiber.registers.get_unchecked_mut(index) = argument.word();
                 }
@@ -7889,7 +8864,7 @@ impl Interpreter<'_> {
             self.fiber_mut(link.caller).status = FiberStatus::Running;
             let caller = self.fiber_mut(link.caller);
             if let Some(frame) = caller.frames.last() {
-                let index = frame.reg_base + link.dst.index();
+                let index = frame.reg_base as usize + link.dst.index();
                 unsafe {
                     *caller.registers.get_unchecked_mut(index) = value.word();
                 }
@@ -7941,7 +8916,7 @@ impl Interpreter<'_> {
         if link.catch_error {
             let caller = self.fiber_mut(link.caller);
             if let Some(frame) = caller.frames.last() {
-                let index = frame.reg_base + link.dst.index();
+                let index = frame.reg_base as usize + link.dst.index();
                 caller.registers[index] = error.word();
             }
         } else {
@@ -8155,6 +9130,67 @@ fn fused_compare_branch_handler(opcode: Opcode) -> Handler {
     }
 }
 
+#[inline]
+fn fused_alu_jump_handler(opcode: Opcode) -> Option<Handler> {
+    Some(match opcode {
+        Opcode::INeg => h_ineg_jump,
+        Opcode::IBitNot => h_ibitnot_jump,
+        Opcode::IAdd => h_iadd_jump,
+        Opcode::ISub => h_isub_jump,
+        Opcode::IMul => h_imul_jump,
+        Opcode::IBitAnd => h_iand_jump,
+        Opcode::IBitOr => h_ior_jump,
+        Opcode::IBitXor => h_ixor_jump,
+        Opcode::IShl => h_ishl_jump,
+        Opcode::IShrU => h_ishru_jump,
+        Opcode::ISar => h_isar_jump,
+        Opcode::FNeg => h_fneg_jump,
+        Opcode::FAdd => h_fadd_jump,
+        Opcode::FSub => h_fsub_jump,
+        Opcode::FMul => h_fmul_jump,
+        Opcode::FDiv => h_fdiv_jump,
+        Opcode::FRem => h_frem_jump,
+        _ => return None,
+    })
+}
+
+#[inline]
+fn fused_alu_return_handler(opcode: Opcode) -> Option<Handler> {
+    Some(match opcode {
+        Opcode::INeg => h_ineg_return,
+        Opcode::IBitNot => h_ibitnot_return,
+        Opcode::IAdd => h_iadd_return,
+        Opcode::ISub => h_isub_return,
+        Opcode::IMul => h_imul_return,
+        Opcode::IBitAnd => h_iand_return,
+        Opcode::IBitOr => h_ior_return,
+        Opcode::IBitXor => h_ixor_return,
+        Opcode::IShl => h_ishl_return,
+        Opcode::IShrU => h_ishru_return,
+        Opcode::ISar => h_isar_return,
+        Opcode::FNeg => h_fneg_return,
+        Opcode::FAdd => h_fadd_return,
+        Opcode::FSub => h_fsub_return,
+        Opcode::FMul => h_fmul_return,
+        Opcode::FDiv => h_fdiv_return,
+        Opcode::FRem => h_frem_return,
+        Opcode::ICmpEq => h_icmp_eq_return,
+        Opcode::ICmpNe => h_icmp_ne_return,
+        Opcode::ICmpLt => h_icmp_lt_return,
+        Opcode::ICmpLe => h_icmp_le_return,
+        Opcode::ICmpGt => h_icmp_gt_return,
+        Opcode::ICmpGe => h_icmp_ge_return,
+        Opcode::FCmpEq => h_fcmp_eq_return,
+        Opcode::FCmpNe => h_fcmp_ne_return,
+        Opcode::FCmpLt => h_fcmp_lt_return,
+        Opcode::FCmpLe => h_fcmp_le_return,
+        Opcode::FCmpGt => h_fcmp_gt_return,
+        Opcode::FCmpGe => h_fcmp_ge_return,
+        Opcode::RefEq => h_ref_eq_return,
+        _ => return None,
+    })
+}
+
 // =============================================================================
 // Tiny hot handlers
 // =============================================================================
@@ -8199,14 +9235,25 @@ unsafe fn h_switch(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.reg(op.a);vm.return_from_frame(v,None)}
 unsafe fn h_return2(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let a=vm.reg(op.a);let b=vm.reg(op.b);vm.return_from_frame(a,Some(b))}
 unsafe fn h_move_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.reg(op.b);vm.return_from_frame(v,None)}
-unsafe fn h_move_jump(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.reg(op.b);vm.set_reg(op.a,v);vm.branch_to(op,op.y)}
+#[inline(always)]
+unsafe fn fused_unconditional_branch(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = &*ptr;
+    let branch = &*ptr.add(1);
+    debug_assert_eq!(op.next, vm.hot_pc + 1);
+    vm.set_pc(op.next);
+    vm.branch_to(branch, branch.x);
+}
+unsafe fn h_move_jump(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.reg(op.b);vm.set_reg(op.a,v);fused_unconditional_branch(vm,ptr)}
 unsafe fn h_move_move(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let first=vm.reg(op.b);vm.set_reg(op.a,first);let dst=(op.x&0xff)as u8;let src=((op.x>>8)&0xff)as u8;let second=vm.reg(src);vm.set_reg(dst,second);vm.advance(op)}
+unsafe fn h_move_move_move(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let first=vm.reg(op.b);vm.set_reg(op.a,first);let dst1=(op.x&0xff)as u8;let src1=((op.x>>8)&0xff)as u8;let second=vm.reg(src1);vm.set_reg(dst1,second);let dst2=(op.y&0xff)as u8;let src2=((op.y>>8)&0xff)as u8;let third=vm.reg(src2);vm.set_reg(dst2,third);vm.advance(op)}
 unsafe fn h_load_null_return(vm:&mut Interpreter, _ptr:*const PreparedOp){vm.return_from_frame(Value::NULL.word(),None)}
 unsafe fn h_load_false_return(vm:&mut Interpreter, _ptr:*const PreparedOp){vm.return_from_frame(Value::FALSE.word(),None)}
 unsafe fn h_load_true_return(vm:&mut Interpreter, _ptr:*const PreparedOp){vm.return_from_frame(Value::TRUE.word(),None)}
 unsafe fn h_load_i8_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(i32_word(op.b as i8 as i32),None)}
 unsafe fn h_load_i32_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(i32_word(op.x as i32),None)}
 unsafe fn h_load_const_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.hot_constant_word_unchecked(op.x);vm.return_from_frame(v,None)}
+unsafe fn h_move_from_arg_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*vm.current_banks().arguments.get_unchecked(op.b as usize);vm.return_from_frame(v,None)}
+unsafe fn h_move_from_ret_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*vm.current_banks().returns.get_unchecked(op.b as usize);vm.return_from_frame(v,None)}
 unsafe fn h_move_from_special_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*vm.current_banks().special.get_unchecked(op.b as usize);vm.return_from_frame(v,None)}
 
 unsafe fn h_safepoint(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -8218,34 +9265,39 @@ unsafe fn h_osr_point(vm:&mut Interpreter, ptr:*const PreparedOp){
 
 /// Only entry points pay for tiering. Ordinary bytecode dispatch stays unchanged.
 unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
-    let function = vm.current_frame().function as usize;
+    let function = vm.current_function_index();
     let index = vm.hot_pc as usize;
 
-    let Some(threshold) = vm
-        .jit
-        .as_ref()
-        .map(|jit| jit.options().hot_entry_threshold)
-        .filter(|threshold| *threshold != 0)
-    else {
+    let threshold = vm.jit_entry_threshold;
+    if threshold == 0 {
         let prepared = vm.current_prepared();
-        let handler = prepared.jit_entry_handlers[index].unwrap_or(prepared.handlers[index]);
+        let handler = unsafe {
+            prepared
+                .jit_entry_handlers
+                .get_unchecked(index)
+                .unwrap_or(*prepared.handlers.get_unchecked(index))
+        };
         let op = vm.hot_ops.add(index);
         handler(vm, op);
         return;
-    };
+    }
 
-    if !vm.prepared.functions[function].jit_entry_disabled[index] {
-        let cached = vm.prepared.functions[function].jit_entry_traces[index];
+    let function_ptr = vm.prepared.functions.as_mut_ptr().add(function);
+    if !*(&(*function_ptr).jit_entry_disabled).get_unchecked(index) {
+        let cached = *(&(*function_ptr).jit_entry_traces).get_unchecked(index);
 
         // Keep cold entry traffic entirely out of the manager HashMap. A compiled
         // trace bypasses this counter; failed recordings reset it for a bounded
         // retry interval.
         if cached == NO_INDEX {
-            let hotness = &mut vm.prepared.functions[function].jit_entry_hotness[index];
+            let hotness = (&mut (*function_ptr).jit_entry_hotness).get_unchecked_mut(index);
             *hotness = hotness.saturating_add(1);
             if *hotness < threshold {
                 let prepared = vm.current_prepared();
-                let handler = prepared.jit_entry_handlers[index].unwrap_or(prepared.handlers[index]);
+                let handler = prepared
+                    .jit_entry_handlers
+                    .get_unchecked(index)
+                    .unwrap_or(*prepared.handlers.get_unchecked(index));
                 let op = vm.hot_ops.add(index);
                 handler(vm, op);
                 return;
@@ -8264,12 +9316,12 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         };
 
         if cached == NO_INDEX {
-            vm.prepared.functions[function].jit_entry_traces[index] =
+            *(&mut (*function_ptr).jit_entry_traces).get_unchecked_mut(index) =
                 jit.entry_trace(location).map_or(NO_INDEX, |id| id.0);
-            vm.prepared.functions[function].jit_entry_disabled[index] =
+            *(&mut (*function_ptr).jit_entry_disabled).get_unchecked_mut(index) =
                 jit.entry_blacklisted(location);
             if matches!(&result, Ok(JitAction::RecordingAborted { .. })) {
-                vm.prepared.functions[function].jit_entry_hotness[index] = 0;
+                *(&mut (*function_ptr).jit_entry_hotness).get_unchecked_mut(index) = 0;
             }
         }
         vm.jit = Some(jit);
@@ -8284,13 +9336,13 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         // continuation without installing hooks after every numeric Invoke.
         if vm.trace_current_location() != location {
             let current = vm.current_prepared().original_ops[vm.hot_pc as usize];
-            let opcode = vm.program.functions[vm.current_frame().function as usize]
+            let opcode = vm.program.functions[vm.hot_function_index as usize]
                 .chunk.code[current.raw_pc as usize].opcode().unwrap();
             if matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallDirect
                 | Opcode::CallClosure | Opcode::CallPrimitive | Opcode::CallForeign | Opcode::Await)
             {
                 let next = current.next as usize;
-                let function = vm.current_frame().function as usize;
+                let function = vm.current_function_index();
                 vm.prepared.functions[function].install_entry_hook(next);
             }
         }
@@ -8300,24 +9352,32 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     // This guarantees progress and avoids recursively entering the same trace.
     let index = vm.hot_pc as usize;
     let prepared = vm.current_prepared();
-    let handler = prepared.jit_entry_handlers[index].unwrap_or(prepared.handlers[index]);
+    let handler = prepared
+        .jit_entry_handlers
+        .get_unchecked(index)
+        .unwrap_or(*prepared.handlers.get_unchecked(index));
     let op = vm.hot_ops.add(index);
     handler(vm, op);
 }
 
 unsafe fn h_guard_type(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr; let f=vm.current_frame().function as usize; let desc:&TypeGuardDescriptor=&vm.program.functions[f].chunk.type_guards[op.x as usize]; let src=vm.reg(op.b);
+    let op=&*ptr; let f=vm.current_function_index(); let desc:&TypeGuardDescriptor=vm.program.functions.get_unchecked(f).chunk.type_guards.get_unchecked(op.x as usize); let src=vm.reg(op.b);
     if vm.type_matches(src,&desc.expected){vm.set_reg(op.a,src);vm.advance(op)}else{vm.deopt(op,op.y)}
 }
 unsafe fn h_guard_class(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr; let f=vm.current_frame().function as usize; let desc:&ClassGuardDescriptor=&vm.program.functions[f].chunk.class_guards[op.x as usize]; let value=Value::from_word(vm.reg(op.b));
-    let ok=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes[*class_slot as usize].id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes[*class_slot as usize].id)}},_=>false};
+    let op=&*ptr; let f=vm.current_function_index(); let desc:&ClassGuardDescriptor=vm.program.functions.get_unchecked(f).chunk.class_guards.get_unchecked(op.x as usize); let value=Value::from_word(vm.reg(op.b));
+    let ok=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},_=>false};
     if ok{vm.set_reg(op.a,value.word());vm.advance(op)}else{vm.deopt(op,op.y)}
 }
 unsafe fn h_guard_bounds(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let i=word_i32(vm.reg(op.a));let n=word_i32(vm.reg(op.b));if i>=0&&i<n{vm.advance(op)}else{vm.deopt(op,op.x)}}
 unsafe fn h_guard_not_null(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=vm.reg(op.b);if !Value::from_word(v).is_null(){vm.set_reg(op.a,v);vm.advance(op)}else{vm.deopt(op,op.x)}}
 unsafe fn h_guard_int32(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr; let v=Value::from_word(vm.reg(op.b)); if let Some(n)=v.as_num(){if n.is_finite()&&n.fract()==0.0&&n>=i32::MIN as f64&&n<=i32::MAX as f64{vm.set_reg(op.a,i32_word(n as i32));vm.advance(op);return;}} vm.deopt(op,op.x)
+    let op=&*ptr;
+    if let Some(n)=Value::from_word(vm.reg(op.b)).as_num(){
+        let value=n as i32;
+        if value as f64==n{vm.set_reg(op.a,i32_word(value));vm.advance(op);return;}
+    }
+    vm.deopt(op,op.x)
 }
 unsafe fn h_guard_f64(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=Value::from_word(vm.reg(op.b));if let Some(n)=v.as_num(){vm.set_reg(op.a,f64_word(n));vm.advance(op)}else{vm.deopt(op,op.x)}}
 unsafe fn h_bailout(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let _reason=decode_bailout_reason(op.a).unwrap_or(BailoutReason::Explicit);vm.deopt(op,op.x)}
@@ -8326,7 +9386,7 @@ unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
     // Copy the descriptor so quickening may mutate the prepared opcode/handler
     // without aliasing the currently executing PreparedOp reference.
     let op=*ptr;
-    let function=(*vm.hot_frame).function;
+    let function=vm.hot_function_index;
     let op_index=vm.hot_pc;
     let receiver=vm.reg(op.b);
     let receiver_value=Value::from_word(receiver);
@@ -8341,7 +9401,12 @@ unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
             Err(error)=>{vm.fail_at(&op,error.message);return;}
         },
     };
-    if !vm.maybe_quicken_numeric_invoke(function,op_index,op.x,class,target) {
+    // flags != 0 means the site is already specialized or was deliberately
+    // disabled after becoming polymorphic. Do not redo metadata/host quickening
+    // work on every generic fallback.
+    if op.flags == 0
+        && !vm.maybe_quicken_numeric_invoke(function,op_index,op.x,class,target)
+    {
         vm.maybe_quicken_monomorphic_invoke(function,op_index,class,target);
     }
     if op.c <= 4 {
@@ -8590,12 +9655,12 @@ unsafe fn h_call_direct_small<const N: usize>(vm:&mut Interpreter, ptr:*const Pr
 unsafe fn h_call_closure_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let closure=Value::from_word(vm.reg(op.b));
-    let function=match vm.heap.get(closure){
-        Some(HeapObject::Closure{function_index,..})=>*function_index,
+    let (function,captures_ptr,capture_len)=match vm.heap.get(closure){
+        Some(HeapObject::Closure{function_index,captures,..})=>(*function_index,captures.as_ptr(),captures.len()),
         _=>{vm.fail_at(op,"CallClosure operand is not a closure");return;}
     };
     let words=vm.gather_call_words_const::<N>(op);
-    vm.enter_bytecode_call(op,function,None,&words[..N],Some(closure));
+    vm.enter_closure_bytecode_call(op,function,&words[..N],closure,captures_ptr,capture_len);
 }
 
 unsafe fn h_call_direct(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -8613,18 +9678,18 @@ unsafe fn h_call_direct(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_call_closure(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let closure=Value::from_word(vm.reg(op.b));
-    let function=match vm.heap.get(closure){
-        Some(HeapObject::Closure{function_index,..})=>*function_index,
+    let (function,captures_ptr,capture_len)=match vm.heap.get(closure){
+        Some(HeapObject::Closure{function_index,captures,..})=>(*function_index,captures.as_ptr(),captures.len()),
         _=>{vm.fail_at(op,"CallClosure operand is not a closure");return;}
     };
     if op.c <= 4 {
         let mut words=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(op,&mut words);
-        vm.enter_bytecode_call(op,function,None,&words[..count],Some(closure));
+        vm.enter_closure_bytecode_call(op,function,&words[..count],closure,captures_ptr,capture_len);
     } else {
         let mut words=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(op,&mut words);
-        vm.enter_bytecode_call(op,function,None,&words[..count],Some(closure));
+        vm.enter_closure_bytecode_call(op,function,&words[..count],closure,captures_ptr,capture_len);
     }
 }
 unsafe fn h_call_primitive(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -8676,10 +9741,8 @@ unsafe fn h_alloc_instance(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     vm.mark_gc_point(op);
     vm.maybe_collect();
-    let Some(class)=vm.classes.get(op.x as usize) else{
-        vm.fail_at(op,"AllocInstance class slot out of range");
-        return;
-    };
+    debug_assert!((op.x as usize)<vm.classes.len(),"prepared AllocInstance class slot out of range");
+    let class=vm.classes.get_unchecked(op.x as usize);
     if !class.layout_finalized{
         vm.fail_at(op,"AllocInstance used before class layout was finalized");
         return;
@@ -8753,7 +9816,7 @@ unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     } else {
         // Module initialization is a real call boundary for structured
         // exception unwinding even though it has no return destination.
-        vm.current_frame_mut().caller_pc = Some(op.raw_pc);
+        vm.current_frame_mut().caller_pc = op.raw_pc;
     }
 }
 unsafe fn h_import_variable(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let module=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(module){Some(HeapObject::ModuleObject{module_slot})=>*module_slot,_=>{vm.fail_at(op,"ImportVariable operand is not module");return;}};let name=StringId(op.x);let index=vm.modules[slot as usize].exports.get(&name).copied();match index.and_then(|i|vm.modules[slot as usize].variables.get(i as usize).copied()){Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"imported variable name is not bound")}}
@@ -8770,12 +9833,16 @@ unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;
 unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,**value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
 unsafe fn h_load_cell_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>vm.return_from_frame(**value,None),_=>vm.fail_at(op,"LoadCell operand is not cell")}}
 unsafe fn h_store_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.a));let word=vm.reg(op.b);let value=Value::from_word(word);vm.heap.remember_if_reference(cell,value);match vm.heap.get_mut(cell){Some(HeapObject::Cell(slot))=>{**slot=word;vm.advance(op)},_=>vm.fail_at(op,"StoreCell operand is not cell")}}
-unsafe fn h_make_closure(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let count=((op.b as u16)|((op.c as u16)<<8)) as usize;let current=vm.current_frame().function as usize;let start=op.args_offset as usize;let mut captures=Vec::with_capacity(count);for index in 0..count{let reg=vm.prepared.functions[current].call_args[start+index];captures.push(vm.reg(reg.0));}let reference_indices=vm.prepared.functions[op.x as usize].capture_reference_indices.clone();let value=vm.heap.alloc(HeapObject::Closure{function_index:op.x,captures:captures.into_boxed_slice(),reference_indices});vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_make_closure(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let count=((op.b as u16)|((op.c as u16)<<8)) as usize;let current=vm.current_function_index();let start=op.args_offset as usize;let current_function=vm.prepared.functions.get_unchecked(current);let mut captures=Vec::with_capacity(count);for index in 0..count{let reg=*current_function.call_args.get_unchecked(start+index);captures.push(vm.reg(reg.0));}let reference_indices=vm.prepared.functions.get_unchecked(op.x as usize).capture_reference_indices.clone();let value=vm.heap.alloc(HeapObject::Closure{function_index:op.x,captures:captures.into_boxed_slice(),reference_indices});vm.set_reg(op.a,value.word());vm.advance(op)}
 
-#[inline]
+#[inline(always)]
 fn normalize_index(index: i32, len: usize) -> Option<usize> {
-    let index = if index < 0 { len as i64 + index as i64 } else { index as i64 };
-    if index >= 0 && (index as usize) < len { Some(index as usize) } else { None }
+    if index >= 0 {
+        let index = index as usize;
+        return (index < len).then_some(index);
+    }
+    let distance = index.unsigned_abs() as usize;
+    (distance <= len).then_some(len - distance)
 }
 
 unsafe fn h_alloc_list(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::List(Vec::new()));vm.set_reg(op.a,v.word());vm.advance(op)}
@@ -8824,13 +9891,16 @@ fn map_get_value(
     key: Value,
     cache_index: usize,
 ) -> Result<Value, RuntimeError> {
-    let function = vm.current_frame().function as usize;
-    let cache = {
-        let caches = &mut vm.prepared.functions[function].map_inline_caches;
-        if cache_index >= caches.len() {
-            return Err(RuntimeError::new("MapGet inline cache is out of range"));
-        }
-        unsafe { caches.as_mut_ptr().add(cache_index) }
+    let function = vm.current_function_index();
+    let cache = unsafe {
+        // Preparation assigns MapGet a dense cache index and bytecode verification
+        // makes that association immutable for the lifetime of the function.
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .map_inline_caches
+            .as_mut_ptr()
+            .add(cache_index)
     };
     vm.heap.map_get_with_pic(map, key, unsafe { &mut *cache })
 }
@@ -8844,13 +9914,14 @@ fn map_set_value(
 ) -> Result<(), RuntimeError> {
     vm.heap.remember_if_reference(map, key);
     vm.heap.remember_if_reference(map, value);
-    let function = vm.current_frame().function as usize;
-    let cache = {
-        let caches = &mut vm.prepared.functions[function].map_inline_caches;
-        if cache_index >= caches.len() {
-            return Err(RuntimeError::new("MapSet inline cache is out of range"));
-        }
-        unsafe { caches.as_mut_ptr().add(cache_index) }
+    let function = vm.current_function_index();
+    let cache = unsafe {
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .map_inline_caches
+            .as_mut_ptr()
+            .add(cache_index)
     };
     let structural = vm.heap.map_set_with_pic(map, key, value, unsafe { &mut *cache })?;
     if structural {
@@ -8892,9 +9963,10 @@ unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){
     }
 }
 
-#[inline]
+#[inline(always)]
 fn decode_napalm_code_point(bytes: &[u8], index: usize) -> (u32, usize) {
-    let first = bytes[index];
+    debug_assert!(index < bytes.len());
+    let first = unsafe { *bytes.get_unchecked(index) };
     if first < 0x80 { return (first as u32, 1); }
     let (needed, mut code, min) = match first {
         0xC2..=0xDF => (2usize, (first & 0x1f) as u32, 0x80u32),
@@ -8904,7 +9976,7 @@ fn decode_napalm_code_point(bytes: &[u8], index: usize) -> (u32, usize) {
     };
     if index + needed > bytes.len() { return (first as u32, 1); }
     for offset in 1..needed {
-        let byte = bytes[index + offset];
+        let byte = unsafe { *bytes.get_unchecked(index + offset) };
         if (byte & 0xC0) != 0x80 { return (first as u32, 1); }
         code = (code << 6) | (byte & 0x3f) as u32;
     }
@@ -8927,11 +9999,15 @@ fn napalm_code_point_count(bytes: &[u8]) -> usize {
     count
 }
 
-#[inline]
+#[inline(always)]
 fn normalize_byte_index(index: i32, len: usize, allow_end: bool) -> Option<usize> {
-    let index = if index < 0 { len as i64 + index as i64 } else { index as i64 };
-    let upper = if allow_end { len as i64 } else { len.saturating_sub(1) as i64 };
-    if index >= 0 && index <= upper && (allow_end || index < len as i64) { Some(index as usize) } else { None }
+    if index >= 0 {
+        let index = index as usize;
+        let valid = if allow_end { index <= len } else { index < len };
+        return valid.then_some(index);
+    }
+    let distance = index.unsigned_abs() as usize;
+    (distance <= len).then_some(len - distance)
 }
 
 unsafe fn h_string_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));match vm.heap.get(string){Some(HeapObject::String(s))=>{vm.set_reg(op.a,i32_word(s.code_points as i32));vm.advance(op)},_=>vm.fail_at(op,"StringLen operand is not string")}}
@@ -8963,10 +10039,109 @@ i_cmp_handler!(h_icmp_eq,==);i_cmp_handler!(h_icmp_ne,!=);i_cmp_handler!(h_icmp_
 macro_rules! f_cmp_handler {($name:ident,$op:tt)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_f64(vm.reg(i.b));let b=word_f64(vm.reg(i.c));vm.set_reg(i.a,Value::from_bool(a $op b).word());vm.advance(i)}}}
 f_cmp_handler!(h_fcmp_eq,==);f_cmp_handler!(h_fcmp_ne,!=);f_cmp_handler!(h_fcmp_lt,<);f_cmp_handler!(h_fcmp_le,<=);f_cmp_handler!(h_fcmp_gt,>);f_cmp_handler!(h_fcmp_ge,>=);
 unsafe fn h_ref_eq(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.set_reg(op.a,Value::from_bool(vm.reg(op.b).0==vm.reg(op.c).0).word());vm.advance(op)}
-unsafe fn h_num_to_i32(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;match Value::from_word(vm.reg(op.b)).as_num(){Some(v)if v.is_finite()&&v.fract()==0.0&&v>=i32::MIN as f64&&v<=i32::MAX as f64=>{vm.set_reg(op.a,i32_word(v as i32));vm.advance(op)},_=>vm.fail_at(op,"NumToInt32 conversion failed")}}
+unsafe fn h_num_to_i32(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;if let Some(v)=Value::from_word(vm.reg(op.b)).as_num(){let value=v as i32;if value as f64==v{vm.set_reg(op.a,i32_word(value));vm.advance(op);return;}}vm.fail_at(op,"NumToInt32 conversion failed")}
 unsafe fn h_num_to_f64(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;match Value::from_word(vm.reg(op.b)).as_num(){Some(v)=>{vm.set_reg(op.a,f64_word(v));vm.advance(op)},None=>vm.fail_at(op,"NumToF64 operand is not Num")}}
 unsafe fn h_i32_to_num(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let v=word_i32(vm.reg(op.b));vm.set_reg(op.a,Value::from_num(v as f64).word());vm.advance(op)}
 unsafe fn h_f64_to_num(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let v=word_f64(vm.reg(op.b));vm.set_reg(op.a,Value::from_num(v).word());vm.advance(op)}
+
+// ALU+jump and ALU+return superinstructions. These are deliberately limited to
+// operations that cannot raise a language-level error, so fusion never changes
+// exception/diagnostic boundaries.
+macro_rules! fused_i_bin_jump_handler {
+    ($name:ident, $expr:expr) => {
+        unsafe fn $name(vm: &mut Interpreter, ptr: *const PreparedOp) {
+            let op = &*ptr;
+            let a = word_i32(vm.reg(op.b));
+            let b = word_i32(vm.reg(op.c));
+            let result: i32 = ($expr)(a, b);
+            vm.set_reg(op.a, i32_word(result));
+            fused_unconditional_branch(vm, ptr);
+        }
+    };
+}
+macro_rules! fused_i_bin_return_handler {
+    ($name:ident, $expr:expr) => {
+        unsafe fn $name(vm: &mut Interpreter, ptr: *const PreparedOp) {
+            let op = &*ptr;
+            let a = word_i32(vm.reg(op.b));
+            let b = word_i32(vm.reg(op.c));
+            let result: i32 = ($expr)(a, b);
+            vm.return_from_frame(i32_word(result), None);
+        }
+    };
+}
+
+unsafe fn h_ineg_jump(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let v=word_i32(vm.reg(op.b)).wrapping_neg();vm.set_reg(op.a,i32_word(v));fused_unconditional_branch(vm,ptr)}
+unsafe fn h_ibitnot_jump(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let v=!word_i32(vm.reg(op.b));vm.set_reg(op.a,i32_word(v));fused_unconditional_branch(vm,ptr)}
+fused_i_bin_jump_handler!(h_iadd_jump,|a:i32,b:i32|a.wrapping_add(b));
+fused_i_bin_jump_handler!(h_isub_jump,|a:i32,b:i32|a.wrapping_sub(b));
+fused_i_bin_jump_handler!(h_imul_jump,|a:i32,b:i32|a.wrapping_mul(b));
+fused_i_bin_jump_handler!(h_iand_jump,|a:i32,b:i32|a&b);
+fused_i_bin_jump_handler!(h_ior_jump,|a:i32,b:i32|a|b);
+fused_i_bin_jump_handler!(h_ixor_jump,|a:i32,b:i32|a^b);
+fused_i_bin_jump_handler!(h_ishl_jump,|a:i32,b:i32|a.wrapping_shl((b as u32)&31));
+fused_i_bin_jump_handler!(h_ishru_jump,|a:i32,b:i32|((a as u32)>>((b as u32)&31)) as i32);
+fused_i_bin_jump_handler!(h_isar_jump,|a:i32,b:i32|a>>((b as u32)&31));
+
+unsafe fn h_ineg_return(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(i32_word(word_i32(vm.reg(op.b)).wrapping_neg()),None)}
+unsafe fn h_ibitnot_return(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(i32_word(!word_i32(vm.reg(op.b))),None)}
+fused_i_bin_return_handler!(h_iadd_return,|a:i32,b:i32|a.wrapping_add(b));
+fused_i_bin_return_handler!(h_isub_return,|a:i32,b:i32|a.wrapping_sub(b));
+fused_i_bin_return_handler!(h_imul_return,|a:i32,b:i32|a.wrapping_mul(b));
+fused_i_bin_return_handler!(h_iand_return,|a:i32,b:i32|a&b);
+fused_i_bin_return_handler!(h_ior_return,|a:i32,b:i32|a|b);
+fused_i_bin_return_handler!(h_ixor_return,|a:i32,b:i32|a^b);
+fused_i_bin_return_handler!(h_ishl_return,|a:i32,b:i32|a.wrapping_shl((b as u32)&31));
+fused_i_bin_return_handler!(h_ishru_return,|a:i32,b:i32|((a as u32)>>((b as u32)&31)) as i32);
+fused_i_bin_return_handler!(h_isar_return,|a:i32,b:i32|a>>((b as u32)&31));
+
+macro_rules! fused_f_bin_jump_handler {
+    ($name:ident, $op:tt) => {
+        unsafe fn $name(vm: &mut Interpreter, ptr: *const PreparedOp) {
+            let i = &*ptr;
+            let a = word_f64(vm.reg(i.b));
+            let b = word_f64(vm.reg(i.c));
+            vm.set_reg(i.a, f64_word(a $op b));
+            fused_unconditional_branch(vm, ptr);
+        }
+    };
+}
+macro_rules! fused_f_bin_return_handler {
+    ($name:ident, $op:tt) => {
+        unsafe fn $name(vm: &mut Interpreter, ptr: *const PreparedOp) {
+            let i = &*ptr;
+            let a = word_f64(vm.reg(i.b));
+            let b = word_f64(vm.reg(i.c));
+            vm.return_from_frame(f64_word(a $op b), None);
+        }
+    };
+}
+unsafe fn h_fneg_jump(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let v=-word_f64(vm.reg(op.b));vm.set_reg(op.a,f64_word(v));fused_unconditional_branch(vm,ptr)}
+unsafe fn h_frem_jump(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let a=word_f64(vm.reg(op.b));let b=word_f64(vm.reg(op.c));vm.set_reg(op.a,f64_word(a%b));fused_unconditional_branch(vm,ptr)}
+fused_f_bin_jump_handler!(h_fadd_jump,+);
+fused_f_bin_jump_handler!(h_fsub_jump,-);
+fused_f_bin_jump_handler!(h_fmul_jump,*);
+fused_f_bin_jump_handler!(h_fdiv_jump,/);
+unsafe fn h_fneg_return(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(f64_word(-word_f64(vm.reg(op.b))),None)}
+unsafe fn h_frem_return(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let a=word_f64(vm.reg(op.b));let b=word_f64(vm.reg(op.c));vm.return_from_frame(f64_word(a%b),None)}
+fused_f_bin_return_handler!(h_fadd_return,+);
+fused_f_bin_return_handler!(h_fsub_return,-);
+fused_f_bin_return_handler!(h_fmul_return,*);
+fused_f_bin_return_handler!(h_fdiv_return,/);
+
+macro_rules! fused_i_cmp_return {
+    ($name:ident, $op:tt) => {
+        unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_i32(vm.reg(i.b));let b=word_i32(vm.reg(i.c));vm.return_from_frame(Value::from_bool(a $op b).word(),None)}
+    };
+}
+macro_rules! fused_f_cmp_return {
+    ($name:ident, $op:tt) => {
+        unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_f64(vm.reg(i.b));let b=word_f64(vm.reg(i.c));vm.return_from_frame(Value::from_bool(a $op b).word(),None)}
+    };
+}
+fused_i_cmp_return!(h_icmp_eq_return,==);fused_i_cmp_return!(h_icmp_ne_return,!=);fused_i_cmp_return!(h_icmp_lt_return,<);fused_i_cmp_return!(h_icmp_le_return,<=);fused_i_cmp_return!(h_icmp_gt_return,>);fused_i_cmp_return!(h_icmp_ge_return,>=);
+fused_f_cmp_return!(h_fcmp_eq_return,==);fused_f_cmp_return!(h_fcmp_ne_return,!=);fused_f_cmp_return!(h_fcmp_lt_return,<);fused_f_cmp_return!(h_fcmp_le_return,<=);fused_f_cmp_return!(h_fcmp_gt_return,>);fused_f_cmp_return!(h_fcmp_ge_return,>=);
+unsafe fn h_ref_eq_return(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.return_from_frame(Value::from_bool(vm.reg(op.b).0==vm.reg(op.c).0).word(),None)}
 
 unsafe fn h_make_fiber(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let closure=Value::from_word(vm.reg(op.b));vm.mark_gc_point(op);vm.maybe_collect();match vm.allocate_fiber(closure){Ok(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},Err(e)=>vm.fail_at(op,e.message)}}
 unsafe fn h_fiber_call(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let fiber=Value::from_word(vm.reg(op.b));let arg=Value::from_word(vm.reg(op.c));vm.activate_fiber(op,fiber,arg,true,false)}
@@ -8979,8 +10154,8 @@ unsafe fn h_fiber_abort(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;
 
 unsafe fn h_write_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let owner=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));vm.heap.remember_if_reference(owner,value);vm.advance(op)}
 unsafe fn h_read_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let value=vm.reg(op.b);vm.set_reg(op.a,value);vm.advance(op)}
-unsafe fn h_profile_block(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
-unsafe fn h_profile_numeric(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
+unsafe fn h_profile_block(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_function_index();let counter=vm.profile_counters.get_unchecked_mut(f).get_unchecked_mut(op.x as usize);*counter=counter.saturating_add(1);vm.advance(op)}
+unsafe fn h_profile_numeric(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_function_index();let counter=vm.profile_counters.get_unchecked_mut(f).get_unchecked_mut(op.x as usize);*counter=counter.saturating_add(1);vm.advance(op)}
 unsafe fn h_breakpoint(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let(f,pc)=vm.current_location(op);match vm.host.breakpoint(f,pc){Ok(())=>vm.advance(op),Err(e)=>vm.fail_at(op,e.message)}}
 unsafe fn h_await(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let promise=Value::from_word(vm.reg(op.b));vm.await_promise(op,promise,Reg(op.a))}
 
@@ -9003,12 +10178,12 @@ unsafe fn h_catch(vm: &mut Interpreter, ptr: *const PreparedOp) {
 
 
 #[inline(always)]
-unsafe fn fused_branch(vm:&mut Interpreter,op:&PreparedOp,condition:bool){let take=if op.flags!=0{condition}else{!condition};let target=if take{op.y}else{op.next};vm.branch_to(op,target)}
-macro_rules! fused_i_cmp {($name:ident,$op:tt)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_i32(vm.reg(i.b));let b=word_i32(vm.reg(i.c));let condition=a $op b;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,i,condition)}}}
+unsafe fn fused_branch(vm:&mut Interpreter,ptr:*const PreparedOp,condition:bool){let op=&*ptr;let branch=&*ptr.add(1);let take=if op.flags!=0{condition}else{!condition};debug_assert_eq!(op.next,vm.hot_pc+1);vm.set_pc(op.next);if take{vm.branch_to(branch,branch.x)}else{vm.set_pc(branch.next)}}
+macro_rules! fused_i_cmp {($name:ident,$op:tt)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_i32(vm.reg(i.b));let b=word_i32(vm.reg(i.c));let condition=a $op b;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,ptr,condition)}}}
 fused_i_cmp!(h_fused_icmp_eq_branch,==);fused_i_cmp!(h_fused_icmp_ne_branch,!=);fused_i_cmp!(h_fused_icmp_lt_branch,<);fused_i_cmp!(h_fused_icmp_le_branch,<=);fused_i_cmp!(h_fused_icmp_gt_branch,>);fused_i_cmp!(h_fused_icmp_ge_branch,>=);
-macro_rules! fused_f_cmp {($name:ident,$op:tt)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_f64(vm.reg(i.b));let b=word_f64(vm.reg(i.c));let condition=a $op b;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,i,condition)}}}
+macro_rules! fused_f_cmp {($name:ident,$op:tt)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let a=word_f64(vm.reg(i.b));let b=word_f64(vm.reg(i.c));let condition=a $op b;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,ptr,condition)}}}
 fused_f_cmp!(h_fused_fcmp_eq_branch,==);fused_f_cmp!(h_fused_fcmp_ne_branch,!=);fused_f_cmp!(h_fused_fcmp_lt_branch,<);fused_f_cmp!(h_fused_fcmp_le_branch,<=);fused_f_cmp!(h_fused_fcmp_gt_branch,>);fused_f_cmp!(h_fused_fcmp_ge_branch,>=);
-unsafe fn h_fused_ref_eq_branch(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let condition=vm.reg(i.b).0==vm.reg(i.c).0;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,i,condition)}
+unsafe fn h_fused_ref_eq_branch(vm:&mut Interpreter,ptr:*const PreparedOp){let i=&*ptr;let condition=vm.reg(i.b).0==vm.reg(i.c).0;vm.set_reg(i.a,Value::from_bool(condition).word());fused_branch(vm,ptr,condition)}
 
 // =============================================================================
 // Introspection / diagnostics
@@ -9230,8 +10405,17 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_is_loop_header(&self, location: TraceLocation) -> bool {
         let prepared = self.current_prepared();
-        prepared.id == location.function && prepared.word_to_op.get(location.pc.0 as usize)
-            .is_some_and(|pc| prepared.jit_loop_headers.contains(pc))
+        prepared.id == location.function
+            && prepared
+                .word_to_op
+                .get(location.pc.0 as usize)
+                .is_some_and(|pc| {
+                    *pc != NO_INDEX
+                        && prepared
+                            .jit_loop_headers
+                            .get(*pc as usize)
+                            .is_some_and(|header| *header != 0)
+                })
     }
 
     fn trace_field_slot(&self, location: TraceLocation, local_slot: u32) -> u32 {
@@ -9357,7 +10541,7 @@ impl TraceRuntime for Interpreter<'_> {
         let before = self.trace_current_location();
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
-        let function = self.current_frame().function;
+        let function = self.hot_function_index;
         let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
         let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
@@ -9391,7 +10575,7 @@ impl TraceRuntime for Interpreter<'_> {
         let running = self.run_state == RunState::Running;
         let after = self.trace_current_location();
         let frame_changed = self.current_fiber != fiber || self.fiber(self.current_fiber).frames.len() != depth
-            || self.hot_frame.is_null() || self.current_frame().function != function;
+            || self.hot_function_index != function;
         Ok(TraceStep { before, after, frame_changed, running })
     }
 
@@ -9404,7 +10588,7 @@ impl TraceRuntime for Interpreter<'_> {
 
         let caller_fiber = self.current_fiber;
         let caller_depth = self.fiber(caller_fiber).frames.len();
-        let caller_function = self.current_frame().function;
+        let caller_function = self.hot_function_index;
         let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
         let opcode = self.program.functions[caller_function as usize]
             .chunk
@@ -9462,11 +10646,7 @@ impl TraceRuntime for Interpreter<'_> {
                 break;
             }
             let pc = self.hot_pc as usize;
-            let prepared = unsafe { &*self.hot_function };
-            if pc >= prepared.ops.len() {
-                self.fail(RuntimeError::new("program counter is outside function"));
-                break;
-            }
+            debug_assert!(pc < unsafe { &*self.hot_function }.ops.len());
             let handler = unsafe { *self.hot_handlers.add(pc) };
             let op = unsafe { self.hot_ops.add(pc) };
             unsafe { handler(self, op); }
@@ -9477,7 +10657,7 @@ impl TraceRuntime for Interpreter<'_> {
         let frame_changed = self.current_fiber != caller_fiber
             || self.hot_frame.is_null()
             || self.fiber(self.current_fiber).frames.len() != caller_depth
-            || self.current_frame().function != caller_function;
+            || self.hot_function_index != caller_function;
 
         Ok(TraceStep {
             before,
@@ -9586,7 +10766,7 @@ impl Interpreter<'_> {
 
         let caller_fiber = self.current_fiber;
         let caller_depth = self.fiber(caller_fiber).frames.len();
-        let caller_function = self.current_frame().function;
+        let caller_function = self.hot_function_index;
         let caller_id = self.current_prepared().id;
         let op = *self
             .current_prepared()
@@ -9625,7 +10805,7 @@ impl Interpreter<'_> {
                 callee.arity as usize,
                 callee.return_kind,
                 callee.capture_count as usize,
-                function_kind_uses_this(callee.kind),
+                callee.uses_this,
             )
         };
         let closure_call =
@@ -9693,11 +10873,7 @@ impl Interpreter<'_> {
                 break;
             }
             let pc = self.hot_pc as usize;
-            let prepared = unsafe { &*self.hot_function };
-            if pc >= prepared.ops.len() {
-                self.fail(RuntimeError::new("program counter is outside function"));
-                break;
-            }
+            debug_assert!(pc < unsafe { &*self.hot_function }.ops.len());
             let handler = unsafe { *self.hot_handlers.add(pc) };
             let op = unsafe { self.hot_ops.add(pc) };
             unsafe { handler(self, op); }
@@ -9708,7 +10884,7 @@ impl Interpreter<'_> {
         let frame_changed = self.current_fiber != caller_fiber
             || self.hot_frame.is_null()
             || self.fiber(self.current_fiber).frames.len() != caller_depth
-            || self.current_frame().function != caller_function;
+            || self.hot_function_index != caller_function;
         Ok(TraceStep { before, after, frame_changed, running })
     }
 
@@ -9724,13 +10900,13 @@ impl Interpreter<'_> {
         let before = self.trace_current_location();
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
-        let function = self.current_frame().function;
+        let function = self.hot_function_index;
         let op = *self
             .current_prepared()
             .original_ops
             .get(self.hot_pc as usize)
             .ok_or_else(|| RuntimeError::new("specialized collection PC is out of bounds"))?;
-        let function_index = self.current_frame().function as usize;
+        let function_index = self.current_function_index();
         let opcode = self
             .program
             .functions
@@ -9849,8 +11025,7 @@ impl Interpreter<'_> {
         let after = self.trace_current_location();
         let frame_changed = self.current_fiber != fiber
             || self.fiber(self.current_fiber).frames.len() != depth
-            || self.hot_frame.is_null()
-            || self.current_frame().function != function;
+            || self.hot_function_index != function;
         Ok(TraceStep { before, after, frame_changed, running })
     }
 }
@@ -9992,7 +11167,7 @@ mod tests {
         let closure = HeapObject::Closure {
             function_index: 37,
             captures,
-            reference_indices: vec![0u16].into_boxed_slice(),
+            reference_indices: Arc::from(vec![0u16]),
         };
 
         HandleTable::refresh_entry(&entry, &closure);
@@ -12401,7 +13576,7 @@ var result = CallLoop.run()
         let closure = vm.heap.alloc(HeapObject::Closure {
             function_index: 0,
             captures: vec![child.word(), RegisterWord(TAG_HEAP | u32::MAX as u64)].into_boxed_slice(),
-            reference_indices: vec![0].into_boxed_slice(),
+            reference_indices: Arc::from(vec![0u16]),
         });
         let closure_root = vm.add_root(closure);
         vm.release_root(list_root);

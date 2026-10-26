@@ -453,6 +453,12 @@ pub struct TraceStats {
     pub closure_capture_staged_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
+    /// Reserved for the aggressive native backend passes. These counters make it
+    /// possible to promote profitable backend discoveries into Trace IR passes
+    /// later without changing the public stats shape again.
+    pub coalesced_side_exit_stubs: usize,
+    pub reused_bounds_proofs: usize,
+    pub reused_constant_index_proofs: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Trace {
@@ -483,13 +489,28 @@ impl Trace {
 #[derive(Clone)]
 pub struct TraceBuilder {
     trace: Trace, source: TraceLocation, slots: HashMap<FrameSlot, TraceValueId>,
-    dirty: Vec<FrameSlot>, memory_epoch: bool,
+    /// Ordered dirty slots for deterministic snapshots plus O(1) membership for
+    /// the recorder's very hot write/reload paths.
+    dirty: Vec<FrameSlot>, dirty_set: HashSet<FrameSlot>, memory_epoch: bool,
 }
 impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
-            slots: HashMap::new(), dirty: vec![], memory_epoch: false }
+            slots: HashMap::new(), dirty: vec![], dirty_set: HashSet::new(), memory_epoch: false }
+    }
+    /// Reserve the arenas used by one bounded recording up front. Tracing is hot
+    /// enough that repeated Vec/HashMap growth is measurable, while the reservation
+    /// is temporary and released with the builder after compilation.
+    pub fn reserve_for_recording(&mut self, max_steps: usize) {
+        let steps = max_steps.max(16);
+        self.trace.nodes.reserve(steps);
+        self.trace.values.reserve(steps.saturating_mul(2));
+        self.trace.exits.reserve((steps / 8).max(8));
+        self.trace.preheader.reserve((steps / 16).max(8));
+        self.slots.reserve(64);
+        self.dirty.reserve(64);
+        self.dirty_set.reserve(64);
     }
     pub fn trace(&self) -> &Trace { &self.trace }
     pub fn trace_mut(&mut self) -> &mut Trace { &mut self.trace }
@@ -513,7 +534,7 @@ impl TraceBuilder {
     }
     pub fn write_slot(&mut self, slot: FrameSlot, v: TraceValueId) {
         self.slots.insert(slot, v);
-        if !self.dirty.contains(&slot) { self.dirty.push(slot); }
+        if self.dirty_set.insert(slot) { self.dirty.push(slot); }
     }
     pub fn emit0(&mut self, kind: TraceInst) {
         let id = self.trace.nodes.len();
@@ -527,12 +548,13 @@ impl TraceBuilder {
     pub fn add_side_exit(&mut self, _reason: ExitReason, pc: BytecodePc) -> SideExitId {
         let writes = self.dirty.iter().map(|slot| {
             let value = self.slots[slot];
-            let kind = match self.trace.value(value).unwrap().rep {
+            let rep = self.trace.value(value).unwrap().rep;
+            let kind = match rep {
                 TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => RegisterKind::Int32,
                 TraceRep::F64 => RegisterKind::F64,
                 _ => RegisterKind::Value,
             };
-            SnapshotWrite { slot: *slot, kind, target_rep: self.trace.value(value).unwrap().rep, value: SnapshotValue::Value(value) }
+            SnapshotWrite { slot: *slot, kind, target_rep: rep, value: SnapshotValue::Value(value) }
         }).collect();
         let id = SideExitId(self.trace.exits.len() as u32);
         self.trace.exits.push(SideExit { id, target: ExitTarget::Interpreter(TraceLocation::new(self.source.function, pc)),
@@ -580,6 +602,7 @@ impl TraceBuilder {
         phi.backedge = Some(backedge); Ok(())
     }
     pub fn commit(&mut self) {
+        self.dirty_set.clear();
         for slot in std::mem::take(&mut self.dirty) {
             self.emit0(TraceInst::CommitFrameSlot { slot, value: self.slots[&slot] });
         }
@@ -591,9 +614,12 @@ impl TraceBuilder {
     /// frame, while the successful native path can keep unaffected values live in
     /// native registers.
     pub fn commit_preserving_ssa(&mut self) {
-        let dirty = self.dirty.clone();
-        for slot in dirty {
-            self.emit0(TraceInst::CommitFrameSlot { slot, value: self.slots[&slot] });
+        // Avoid cloning the dirty-slot vector at every leaf/runtime boundary.
+        // FrameSlot is Copy, so take each slot by index before mutating the node arena.
+        for index in 0..self.dirty.len() {
+            let slot = self.dirty[index];
+            let value = self.slots[&slot];
+            self.emit0(TraceInst::CommitFrameSlot { slot, value });
         }
     }
 
@@ -631,7 +657,7 @@ impl TraceBuilder {
     ) -> TraceValueId {
         let value = self.emit1(TraceInst::LoadFrameSlot { slot }, ty, rep);
         self.slots.insert(slot, value);
-        if !self.dirty.contains(&slot) {
+        if self.dirty_set.insert(slot) {
             self.dirty.push(slot);
         }
         value
@@ -670,14 +696,18 @@ impl TraceBuilder {
         // The call writes the destination and the return bank. They are already
         // synchronized by the runtime helper, so discard any pre-call SSA view
         // before loading the actual result. Other caller locals remain valid SSA.
-        for slot in [
-            FrameSlot::General(destination),
-            FrameSlot::Return(ReturnReg(0)),
-            FrameSlot::Return(ReturnReg(1)),
-        ] {
-            self.slots.remove(&slot);
-            self.dirty.retain(|dirty| *dirty != slot);
-        }
+        let destination_slot = FrameSlot::General(destination);
+        let return0 = FrameSlot::Return(ReturnReg(0));
+        let return1 = FrameSlot::Return(ReturnReg(1));
+        self.slots.remove(&destination_slot);
+        self.slots.remove(&return0);
+        self.slots.remove(&return1);
+        self.dirty_set.remove(&destination_slot);
+        self.dirty_set.remove(&return0);
+        self.dirty_set.remove(&return1);
+        self.dirty.retain(|dirty| {
+            *dirty != destination_slot && *dirty != return0 && *dirty != return1
+        });
 
         self.reload_slot_after_runtime(
             FrameSlot::General(destination),
@@ -717,14 +747,18 @@ impl TraceBuilder {
         });
         self.memory_epoch = true;
 
-        for slot in [
-            FrameSlot::General(destination),
-            FrameSlot::Return(ReturnReg(0)),
-            FrameSlot::Return(ReturnReg(1)),
-        ] {
-            self.slots.remove(&slot);
-            self.dirty.retain(|dirty| *dirty != slot);
-        }
+        let destination_slot = FrameSlot::General(destination);
+        let return0 = FrameSlot::Return(ReturnReg(0));
+        let return1 = FrameSlot::Return(ReturnReg(1));
+        self.slots.remove(&destination_slot);
+        self.slots.remove(&return0);
+        self.slots.remove(&return1);
+        self.dirty_set.remove(&destination_slot);
+        self.dirty_set.remove(&return0);
+        self.dirty_set.remove(&return1);
+        self.dirty.retain(|dirty| {
+            *dirty != destination_slot && *dirty != return0 && *dirty != return1
+        });
 
         self.reload_slot_after_runtime(
             FrameSlot::General(destination),
@@ -752,8 +786,17 @@ impl TraceBuilder {
     }
     pub fn has_runtime_calls(&self) -> bool { self.memory_epoch }
     pub fn ensure_loop_entries(&mut self) {
-        for slot in self.dirty.clone() {
-            if !self.trace.values.iter().any(|v| matches!(&v.origin, TraceValueOrigin::EntrySlot { slot: s, .. } if *s == slot)) {
+        // Build the set once instead of rescanning the complete value arena for
+        // every dirty slot. This matters for long traces with many SSA temporaries.
+        let mut entry_slots: HashSet<FrameSlot> = self.trace.values.iter().filter_map(|value| {
+            match &value.origin {
+                TraceValueOrigin::EntrySlot { slot, .. } => Some(*slot),
+                _ => None,
+            }
+        }).collect();
+        for index in 0..self.dirty.len() {
+            let slot = self.dirty[index];
+            if entry_slots.insert(slot) {
                 // A register written without being read still carries its previous
                 // iteration value into exits which precede that write.
                 self.value(TraceType::Any, TraceRep::Tagged,
@@ -766,7 +809,10 @@ impl TraceBuilder {
     /// a native-loop invariant in the JIT backend.
     pub fn prepare_memory_loop(&mut self) {
         self.commit();
-        let mut prefix = vec![];
+        let entry_count = self.trace.values.iter().filter(|value| {
+            matches!(&value.origin, TraceValueOrigin::EntrySlot { .. })
+        }).count();
+        let mut prefix = Vec::with_capacity(entry_count + self.trace.nodes.len());
         for value in &mut self.trace.values {
             let slot = match &value.origin {
                 TraceValueOrigin::EntrySlot { slot, .. } => Some(*slot),

@@ -6,7 +6,7 @@
 //! keeps the same spirit while using Rust's ownership model.
 
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of, MaybeUninit};
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr;
 
 /// Alignment offered by the inline buffer.
@@ -73,7 +73,9 @@ struct InlineStorage<const N: usize> {
 impl<const N: usize> InlineStorage<N> {
     #[inline(always)]
     const fn new() -> Self {
-        Self { bytes: [MaybeUninit::uninit(); N] }
+        Self {
+            bytes: [MaybeUninit::uninit(); N],
+        }
     }
 
     #[inline(always)]
@@ -260,7 +262,10 @@ impl_call_helpers! {
 #[cfg(test)]
 mod tests {
     use super::Function;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn small_closure_is_inline() {
@@ -282,13 +287,17 @@ mod tests {
     fn destructor_runs_exactly_once() {
         struct DropCounter(Arc<AtomicUsize>);
         impl Drop for DropCounter {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         let c = Arc::new(AtomicUsize::new(0));
         {
             let d = DropCounter(c.clone());
-            let _f = Function::<(), ()>::new(move || { let _ = &d; });
+            let _f = Function::<(), ()>::new(move || {
+                let _ = &d;
+            });
         }
         assert_eq!(c.load(Ordering::SeqCst), 1);
     }

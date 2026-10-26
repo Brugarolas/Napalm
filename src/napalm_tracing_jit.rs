@@ -57,7 +57,7 @@ mod heap_proof_tests;
 
 use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
-use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Module};
+use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Linkage, Module};
 use cranelift::prelude::*;
 
 use crate::napalm_bytecode::{
@@ -427,8 +427,15 @@ pub struct TraceActivationInputs {
     pub heap_write_barrier: HeapWriteBarrierFn,
 }
 
-pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
+pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation, *const u32) -> u32;
+pub type NativeDispatcherFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
 pub type RuntimeTraceFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32) -> u32;
+
+#[inline]
+unsafe fn invoke_native_trace(entry: NativeTraceFn, activation: &mut TraceActivation) -> u32 {
+    let current_links = activation.current_links;
+    unsafe { entry(activation, current_links) }
+}
 
 // =============================================================================
 // Interpreter adapter
@@ -4539,10 +4546,11 @@ impl<'a> TraceRecorder<'a> {
                 location: self.anchor,
             },
         );
+        builder.reserve_for_recording(self.options.max_trace_steps);
 
         let mut steps = 0usize;
         let mut runtime_end = false;
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::with_capacity(self.options.max_trace_steps.min(4096));
 
         loop {
             if steps >= self.options.max_trace_steps {
@@ -4995,7 +5003,9 @@ struct CraneliftBackend {
     module: JITModule,
     context: codegen::Context,
     function_context: FunctionBuilderContext,
-    dispatcher: NativeTraceFn,
+    dispatcher: NativeDispatcherFn,
+    /// Directly imported scalar helpers keyed by their native address.
+    scalar_helpers: HashMap<usize, ClifFuncId>,
 }
 
 impl CraneliftBackend {
@@ -5029,23 +5039,64 @@ impl CraneliftBackend {
             .finish(settings::Flags::new(flag_builder))
             .map_err(|error| format!("cannot build Cranelift host ISA: {error}"))?;
 
-        let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+        let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
+        let scalar_symbols: [(&str, usize); 7] = [
+            ("napalm_jit_frem", native_frem as usize),
+            ("napalm_jit_round", native_round as usize),
+            ("napalm_jit_sin", native_sin as usize),
+            ("napalm_jit_cos", native_cos as usize),
+            ("napalm_jit_tan", native_tan as usize),
+            ("napalm_jit_log", native_log as usize),
+            ("napalm_jit_exp", native_exp as usize),
+        ];
+        for &(name, address) in &scalar_symbols {
+            jit_builder.symbol(name, address as *const u8);
+        }
+
+        let mut module = JITModule::new(jit_builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("NapalmJIT's NaN-boxed native tier currently requires a 64-bit host".to_owned());
+        }
+
+        let mut unary_signature = module.make_signature();
+        unary_signature.params.push(AbiParam::new(types::F64));
+        unary_signature.returns.push(AbiParam::new(types::F64));
+        let mut binary_signature = module.make_signature();
+        binary_signature.params.push(AbiParam::new(types::F64));
+        binary_signature.params.push(AbiParam::new(types::F64));
+        binary_signature.returns.push(AbiParam::new(types::F64));
+
+        let mut scalar_helpers = HashMap::with_capacity(scalar_symbols.len());
+        for &(name, address) in &scalar_symbols {
+            let signature = if address == native_frem as usize {
+                &binary_signature
+            } else {
+                &unary_signature
+            };
+            let id = module
+                .declare_function(name, Linkage::Import, signature)
+                .map_err(|error| format!("cannot declare scalar helper {name}: {error}"))?;
+            scalar_helpers.insert(address, id);
         }
 
         let dispatcher = Self::compile_dispatcher(&mut module)?;
         let context = module.make_context();
         let function_context = FunctionBuilderContext::new();
-        Ok(Self { module, context, function_context, dispatcher })
+        Ok(Self {
+            module,
+            context,
+            function_context,
+            dispatcher,
+            scalar_helpers,
+        })
     }
 
     /// Native trace-tree dispatcher. Individual traces keep the simple C ABI
-    /// `fn(*mut TraceActivation) -> u32`; linked exits return TRACE_RESULT_LINK
+    /// `fn(*mut TraceActivation, *const u32) -> u32`; linked exits return TRACE_RESULT_LINK
     /// after writing `next_trace`. This loop immediately calls the child trace in
     /// generated code, avoiding a Rust-manager round trip and avoiding recursive
     /// native calls for root <-> side cycles.
-    fn compile_dispatcher(module: &mut JITModule) -> Result<NativeTraceFn, String> {
+    fn compile_dispatcher(module: &mut JITModule) -> Result<NativeDispatcherFn, String> {
         let pointer_type = module.target_config().pointer_type();
         let mut signature = module.make_signature();
         signature.params.push(AbiParam::new(pointer_type));
@@ -5054,7 +5105,10 @@ impl CraneliftBackend {
             .declare_anonymous_function(&signature)
             .map_err(|error| format!("cannot declare native trace dispatcher: {error}"))?;
 
-        let trace_signature = signature.clone();
+        let mut trace_signature = module.make_signature();
+        trace_signature.params.push(AbiParam::new(pointer_type));
+        trace_signature.params.push(AbiParam::new(pointer_type));
+        trace_signature.returns.push(AbiParam::new(types::I32));
         let mut context = module.make_context();
         context.func.signature = signature;
         context.func.name = UserFuncName::user(0, function.as_u32());
@@ -5069,16 +5123,57 @@ impl CraneliftBackend {
             let budgeted_link = builder.create_block();
             let done = builder.create_block();
             builder.append_block_params_for_function_params(entry);
+
+            // Dispatcher-invariant pointers and the link budget stay in SSA across
+            // trace-to-trace transitions. Only next_trace/current_links are truly
+            // per-trace mutable state.
+            builder.append_block_param(dispatch, pointer_type); // trace_entries
+            builder.append_block_param(dispatch, pointer_type); // link_tables
+            builder.append_block_param(dispatch, types::I32);   // remaining fuel
+
             builder.append_block_param(linked_result, types::I32);
+            builder.append_block_param(linked_result, pointer_type);
+            builder.append_block_param(linked_result, pointer_type);
+            builder.append_block_param(linked_result, types::I32);
+
             builder.append_block_param(budgeted_link, types::I32);
+            builder.append_block_param(budgeted_link, pointer_type);
+            builder.append_block_param(budgeted_link, pointer_type);
+            builder.append_block_param(budgeted_link, types::I32);
+
+            builder.append_block_param(done, types::I32);
             builder.append_block_param(done, types::I32);
 
             builder.switch_to_block(entry);
             let activation = builder.block_params(entry)[0];
             let trace_signature = builder.import_signature(trace_signature);
-            builder.ins().jump(dispatch, &[]);
+            let entries = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, trace_entries) as i32,
+            );
+            let link_tables = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, trace_link_tables) as i32,
+            );
+            let remaining = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
+            builder.ins().jump(
+                dispatch,
+                &[entries.into(), link_tables.into(), remaining.into()],
+            );
 
             builder.switch_to_block(dispatch);
+            let entries = builder.block_params(dispatch)[0];
+            let link_tables = builder.block_params(dispatch)[1];
+            let remaining = builder.block_params(dispatch)[2];
             let trace_id = builder.ins().load(
                 types::I32,
                 MemFlagsData::trusted(),
@@ -5088,12 +5183,6 @@ impl CraneliftBackend {
             let trace_index = builder.ins().uextend(types::I64, trace_id);
             let byte_offset = builder.ins().ishl_imm(trace_index, 3);
 
-            let entries = builder.ins().load(
-                pointer_type,
-                MemFlagsData::trusted(),
-                activation,
-                offset_of!(TraceActivation, trace_entries) as i32,
-            );
             let entry_addr = builder.ins().iadd(entries, byte_offset);
             let callee = builder.ins().load(
                 pointer_type,
@@ -5102,12 +5191,6 @@ impl CraneliftBackend {
                 0,
             );
 
-            let link_tables = builder.ins().load(
-                pointer_type,
-                MemFlagsData::trusted(),
-                activation,
-                offset_of!(TraceActivation, trace_link_tables) as i32,
-            );
             let link_addr = builder.ins().iadd(link_tables, byte_offset);
             let current_links = builder.ins().load(
                 pointer_type,
@@ -5115,56 +5198,68 @@ impl CraneliftBackend {
                 link_addr,
                 0,
             );
-            builder.ins().store(
-                MemFlagsData::trusted(),
-                current_links,
-                activation,
-                offset_of!(TraceActivation, current_links) as i32,
+            // Pass the per-trace link table in SSA instead of storing it into
+            // TraceActivation only for the callee to reload it on a side exit.
+            let call = builder.ins().call_indirect(
+                trace_signature,
+                callee,
+                &[activation, current_links],
             );
-
-            let call = builder.ins().call_indirect(trace_signature, callee, &[activation]);
             let result = builder.inst_results(call)[0];
             let linked = builder.ins().icmp_imm(
                 IntCC::Equal,
                 result,
                 TRACE_RESULT_LINK as i64,
             );
-            builder.ins().brif(linked, linked_result, &[result.into()], done, &[result.into()]);
+            builder.ins().brif(
+                linked,
+                linked_result,
+                &[result.into(), entries.into(), link_tables.into(), remaining.into()],
+                done,
+                &[result.into(), remaining.into()],
+            );
 
             // A trace-tree cycle can otherwise remain in generated code forever
-            // while each individual trace resets its own loop watchdog. Bound the
-            // number of native-to-native links as a second cooperative safepoint.
+            // while each individual trace resets its own loop watchdog. Keep the
+            // budget in SSA and materialize it only when the dispatcher returns.
             builder.switch_to_block(linked_result);
             let result = builder.block_params(linked_result)[0];
-            let remaining = builder.ins().load(
-                types::I32,
-                MemFlagsData::trusted(),
-                activation,
-                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
-            );
+            let entries = builder.block_params(linked_result)[1];
+            let link_tables = builder.block_params(linked_result)[2];
+            let remaining = builder.block_params(linked_result)[3];
             let unlimited = builder.ins().icmp_imm(IntCC::Equal, remaining, -1);
-            builder.ins().brif(unlimited, dispatch, &[], budgeted_link, &[result.into()]);
+            builder.ins().brif(
+                unlimited,
+                dispatch,
+                &[entries.into(), link_tables.into(), remaining.into()],
+                budgeted_link,
+                &[result.into(), entries.into(), link_tables.into(), remaining.into()],
+            );
 
             builder.switch_to_block(budgeted_link);
             let result = builder.block_params(budgeted_link)[0];
-            let remaining = builder.ins().load(
-                types::I32,
-                MemFlagsData::trusted(),
-                activation,
-                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
-            );
+            let entries = builder.block_params(budgeted_link)[1];
+            let link_tables = builder.block_params(budgeted_link)[2];
+            let remaining = builder.block_params(budgeted_link)[3];
             let remaining = builder.ins().iadd_imm(remaining, -1);
+            let exhausted = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
+            builder.ins().brif(
+                exhausted,
+                done,
+                &[result.into(), remaining.into()],
+                dispatch,
+                &[entries.into(), link_tables.into(), remaining.into()],
+            );
+
+            builder.switch_to_block(done);
+            let result = builder.block_params(done)[0];
+            let remaining = builder.block_params(done)[1];
             builder.ins().store(
                 MemFlagsData::trusted(),
                 remaining,
                 activation,
                 offset_of!(TraceActivation, dispatch_links_remaining) as i32,
             );
-            let exhausted = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
-            builder.ins().brif(exhausted, done, &[result.into()], dispatch, &[]);
-
-            builder.switch_to_block(done);
-            let result = builder.block_params(done)[0];
             builder.ins().return_(&[result]);
             builder.seal_all_blocks();
             builder.finalize(target_config);
@@ -5177,7 +5272,8 @@ impl CraneliftBackend {
             .finalize_definitions()
             .map_err(|error| format!("cannot finalize native trace dispatcher: {error}"))?;
         let code_ptr = module.get_finalized_function(function);
-        Ok(unsafe { std::mem::transmute(code_ptr) })
+        let dispatcher: NativeDispatcherFn = unsafe { std::mem::transmute(code_ptr) };
+        Ok(dispatcher)
     }
 }
 
@@ -5187,13 +5283,26 @@ struct CraneliftTraceCompiler<'a> {
     exit_plans: Vec<CompiledExitPlan>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ForwardedHeapLocation {
+    Field { entry: Value, slot: u32 },
+    Cell { entry: Value },
+    Indexed { entry: Value, index: Value },
+    ShapedMap { entry: Value, slot: u32 },
+}
+
 struct CraneliftLoweringState<'a, 'p> {
     builder: FunctionBuilder<'a>,
     trace: &'p Trace,
     activation: Value,
+    /// Per-trace child-link table passed directly by the native dispatcher.
+    /// Keeping it in SSA removes a TraceActivation store/load on every stitched edge.
+    current_links: Value,
     pointer_type: ClifType,
     runtime_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
+    /// Direct CLIF references to JITModule-imported scalar helpers.
+    scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
     values: Vec<Option<Value>>,
     /// Current moving-object address for a GuardHeapObject result. Valid only
     /// until the next full runtime/GC epoch. This is a backend-local lowering
@@ -5202,15 +5311,106 @@ struct CraneliftLoweringState<'a, 'p> {
     /// Dominating kind/liveness proofs for tagged operands within a GC epoch.
     /// Metadata is reloaded separately because promise state can change.
     heap_entries: HashMap<(TraceValueId, u32), (Value, Value)>,
+    /// Generic epoch-local proof that a tagged TraceValue is a live heap handle.
+    /// This sits below kind-specific proofs so GuardClass/IsInstance/GuardHeapObject
+    /// can share the expensive tag -> handle -> chunk -> entry -> liveness chain.
+    heap_live_entries: HashMap<TraceValueId, (Value, Value)>,
+    /// Epoch-local sidecar field cache. These fields are immutable for native
+    /// operations that do not cross a full runtime boundary; list/map structural
+    /// mutations go through Runtime and therefore invalidate the cache.
+    heap_data: HashMap<Value, Value>,
+    heap_len: HashMap<Value, Value>,
+    heap_metadata: HashMap<Value, Value>,
+    heap_receiver_class: HashMap<Value, Value>,
     /// Successful normalized list indices. Native element stores preserve length;
     /// all runtime calls invalidate these facts, including non-GC leaf calls.
     list_indices: HashMap<(TraceValueId, TraceValueId), Value>,
     list_lengths: HashMap<TraceValueId, TraceValueId>,
+    /// Pure numeric bounds facts already proven in this trace. These are keyed by
+    /// canonical SSA values, so duplicate GuardBounds nodes can disappear even if
+    /// an earlier Trace IR pass failed to CSE them.
+    bounds_proofs: HashSet<(TraceValueId, TraceValueId)>,
+    /// Constant-index bounds facts over one epoch-local length SSA value.
+    /// Repeated fixed field/shape slot accesses therefore pay the guard once.
+    constant_index_proofs: HashSet<(Value, u32)>,
+    /// Shared cold stubs for exits whose snapshots contain no dynamic SSA values.
+    /// The current watchdog SSA value is part of the key so preheader and loop-body
+    /// exits never accidentally share different native-iteration accounting.
+    shared_constant_exit_blocks: HashMap<(u32, Option<Value>), Block>,
+    /// Alias-safe load forwarding. Every heap store kills all old heap load facts
+    /// before publishing its own exact location.
+    forwarded_heap_loads: HashMap<ForwardedHeapLocation, Value>,
+    /// Absolute VM slots have stable, exact addresses and can therefore be
+    /// forwarded precisely until a full runtime boundary.
+    forwarded_absolute_loads: HashMap<u64, Value>,
+    /// TraceActivation fields that are invariant for one native entry. Caching
+    /// them explicitly keeps indirect-call and sidecar plumbing out of hot loops
+    /// even when backend alias analysis must conservatively forget loads across
+    /// calls. `heap_chunks_base` is epoch-local and is invalidated after any full
+    /// runtime/GC boundary because the chunk-pointer array may be refreshed.
+    runtime_context: Option<Value>,
+    execute_callee: Option<Value>,
+    heap_barrier_callee: Option<Value>,
+    heap_chunks_base: Option<Value>,
+    method_epoch_value: Option<Value>,
     exit_plans: &'p [CompiledExitPlan],
     /// Current loop budget block parameter. The manager derives completed native
     /// iterations from it only when a side exit is materialized.
     native_budget_remaining: Option<Value>,
     native_budget_initial: u32,
+}
+
+#[inline]
+fn trace_value_available_in_preheader(
+    trace: &Trace,
+    mut value: TraceValueId,
+    preheader_nodes: &[bool],
+) -> bool {
+    for _ in 0..trace.values.len() {
+        let Some(info) = trace.value(value) else { return false; };
+        match &info.origin {
+            TraceValueOrigin::EntrySlot { .. }
+            | TraceValueOrigin::GuardedEntry { .. }
+            | TraceValueOrigin::Constant(_) => return true,
+            TraceValueOrigin::Alias(next) => value = *next,
+            TraceValueOrigin::InstResult { node } => {
+                return preheader_nodes.get(*node).copied().unwrap_or(false);
+            }
+            TraceValueOrigin::LoopPhi { .. } | TraceValueOrigin::LoopTemporary => return false,
+        }
+    }
+    false
+}
+
+fn trace_inst_available_in_preheader(
+    trace: &Trace,
+    inst: &TraceInst,
+    preheader_nodes: &[bool],
+) -> bool {
+    let mut inst = inst.clone();
+    let mut available = true;
+    inst.visit_operands(|value| {
+        if available && !trace_value_available_in_preheader(trace, *value, preheader_nodes) {
+            available = false;
+        }
+    });
+    available
+}
+
+fn trace_exit_available_in_preheader(
+    trace: &Trace,
+    exit: SideExitId,
+    preheader_nodes: &[bool],
+) -> bool {
+    let Some(exit) = trace.exits.get(exit.0 as usize) else { return false; };
+    exit.frames.iter().all(|frame| {
+        frame.writes.iter().all(|write| match write.value {
+            SnapshotValue::Constant(_) => true,
+            SnapshotValue::Value(value) => {
+                trace_value_available_in_preheader(trace, value, preheader_nodes)
+            }
+        })
+    })
 }
 
 impl<'a> CraneliftTraceCompiler<'a> {
@@ -5254,11 +5454,13 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
     fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
+        let scalar_helpers = backend.scalar_helpers.clone();
         let CraneliftBackend { module, context, function_context, .. } = backend;
         context.clear();
         let pointer_type = module.target_config().pointer_type();
 
         let mut signature = module.make_signature();
+        signature.params.push(AbiParam::new(pointer_type));
         signature.params.push(AbiParam::new(pointer_type));
         signature.returns.push(AbiParam::new(types::I32));
 
@@ -5297,36 +5499,62 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
             builder.switch_to_block(entry_block);
             let activation = builder.block_params(entry_block)[0];
+            let current_links = builder.block_params(entry_block)[1];
             let runtime_signature = builder.import_signature(runtime_signature);
             let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
+            let scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef> = scalar_helpers
+                .iter()
+                .map(|(&address, &id)| {
+                    (address, module.declare_func_in_func(id, builder.func))
+                })
+                .collect();
 
             let mut state = CraneliftLoweringState {
                 builder,
                 trace: self.trace,
                 activation,
+                current_links,
                 pointer_type,
                 runtime_signature,
                 heap_barrier_signature,
+                scalar_helper_refs,
                 values: vec![None; self.trace.values.len()],
                 heap_addresses: vec![None; self.trace.values.len()],
                 heap_entries: HashMap::new(),
+                heap_live_entries: HashMap::new(),
+                heap_data: HashMap::new(),
+                heap_len: HashMap::new(),
+                heap_metadata: HashMap::new(),
+                heap_receiver_class: HashMap::new(),
                 list_indices: HashMap::new(),
                 list_lengths: HashMap::new(),
+                bounds_proofs: HashSet::new(),
+                constant_index_proofs: HashSet::new(),
+                shared_constant_exit_blocks: HashMap::new(),
+                forwarded_heap_loads: HashMap::new(),
+                forwarded_absolute_loads: HashMap::new(),
+                runtime_context: None,
+                execute_callee: None,
+                heap_barrier_callee: None,
+                heap_chunks_base: None,
+                method_epoch_value: None,
                 exit_plans: &self.exit_plans,
                 native_budget_remaining: None,
                 native_budget_initial: self.options.native_loop_iteration_budget,
             };
 
             // Entry loads/constants are invariant unless represented by a LoopPhi.
-            let value_ids: Vec<_> = self.trace.values.iter().map(|value| value.id).collect();
-            for id in value_ids {
-                let origin = self.trace.value(id).unwrap().origin.clone();
-                if matches!(
-                    origin,
+            // Walk by index so lowering does not require a temporary Vec<TraceValueId>.
+            for index in 0..self.trace.values.len() {
+                let value = &self.trace.values[index];
+                let id = value.id;
+                let should_lower = matches!(
+                    &value.origin,
                     TraceValueOrigin::EntrySlot { .. }
                         | TraceValueOrigin::GuardedEntry { .. }
                         | TraceValueOrigin::Constant(_)
-                ) {
+                );
+                if should_lower {
                     let _ = state.lower_value(id)?;
                 }
             }
@@ -5337,6 +5565,36 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 let node = &self.trace.nodes[id];
                 if !matches!(node.kind, TraceInst::Nop) {
                     state.lower_node(node)?;
+                }
+            }
+
+            // Backend safety-net LICM for an invariant guard prefix. Trace-IR
+            // optimization normally performs this, but keeping this conservative
+            // fallback here ensures missed monomorphic entry guards never become
+            // per-iteration work. We preserve guard order, require snapshots to be
+            // materializable before the loop, and forbid the transform across any
+            // runtime/GC epoch that could invalidate an entry observation.
+            let epoch_free_loop = matches!(self.trace.terminator, TraceTerminator::LoopBack)
+                && !self.trace.nodes.iter().any(|node| matches!(
+                    node.kind,
+                    TraceInst::Runtime { .. }
+                        | TraceInst::RuntimeCall { .. }
+                        | TraceInst::ReadBarrier { .. }
+                ));
+            if epoch_free_loop {
+                for node in &self.trace.nodes {
+                    if preheader_nodes[node.id] || matches!(node.kind, TraceInst::Nop) {
+                        continue;
+                    }
+                    let Some(exit) = node.kind.exit() else { break; };
+                    if !node.kind.is_entry_guard()
+                        || !trace_inst_available_in_preheader(self.trace, &node.kind, &preheader_nodes)
+                        || !trace_exit_available_in_preheader(self.trace, exit, &preheader_nodes)
+                    {
+                        break;
+                    }
+                    state.lower_node(node)?;
+                    preheader_nodes[node.id] = true;
                 }
             }
 
@@ -5570,6 +5828,89 @@ impl CraneliftLoweringState<'_, '_> {
     #[inline]
     fn plain_mem() -> MemFlagsData {
         MemFlagsData::new()
+    }
+
+    #[inline(always)]
+    fn cached_activation_pointer(
+        &mut self,
+        cached: Option<Value>,
+        offset: i32,
+    ) -> Value {
+        cached.unwrap_or_else(|| {
+            self.builder.ins().load(
+                self.pointer_type,
+                Self::trusted_mem(),
+                self.activation,
+                offset,
+            )
+        })
+    }
+
+    #[inline(always)]
+    fn runtime_context(&mut self) -> Value {
+        if let Some(value) = self.runtime_context {
+            return value;
+        }
+        let value = self.cached_activation_pointer(
+            self.runtime_context,
+            offset_of!(TraceActivation, runtime) as i32,
+        );
+        self.runtime_context = Some(value);
+        value
+    }
+
+    #[inline(always)]
+    fn execute_callee(&mut self) -> Value {
+        if let Some(value) = self.execute_callee {
+            return value;
+        }
+        let value = self.cached_activation_pointer(
+            self.execute_callee,
+            offset_of!(TraceActivation, execute) as i32,
+        );
+        self.execute_callee = Some(value);
+        value
+    }
+
+    #[inline(always)]
+    fn heap_barrier_callee(&mut self) -> Value {
+        if let Some(value) = self.heap_barrier_callee {
+            return value;
+        }
+        let value = self.cached_activation_pointer(
+            self.heap_barrier_callee,
+            offset_of!(TraceActivation, heap_write_barrier) as i32,
+        );
+        self.heap_barrier_callee = Some(value);
+        value
+    }
+
+    #[inline(always)]
+    fn heap_chunks_base(&mut self) -> Value {
+        if let Some(value) = self.heap_chunks_base {
+            return value;
+        }
+        let value = self.cached_activation_pointer(
+            self.heap_chunks_base,
+            offset_of!(TraceActivation, heap_chunks) as i32,
+        );
+        self.heap_chunks_base = Some(value);
+        value
+    }
+
+    #[inline(always)]
+    fn method_epoch_value(&mut self) -> Value {
+        if let Some(value) = self.method_epoch_value {
+            return value;
+        }
+        let value = self.builder.ins().load(
+            types::I64,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, method_epoch) as i32,
+        );
+        self.method_epoch_value = Some(value);
+        value
     }
 
     fn error(&self, message: impl Into<String>) -> TracingJitError {
@@ -5873,13 +6214,15 @@ impl CraneliftLoweringState<'_, '_> {
     }
 
     fn tagged_falsey(&mut self, bits: Value) -> Value {
-        let null = self.builder.ins().iconst(types::I64, TAG_NULL as i64);
-        let false_ = self.builder.ins().iconst(types::I64, TAG_FALSE as i64);
-        let is_null = self.builder.ins().icmp(IntCC::Equal, bits, null);
-        let is_false = self.builder.ins().icmp(IntCC::Equal, bits, false_);
-        let is_null = self.bool32(is_null);
-        let is_false = self.bool32(is_false);
-        self.bool_or(is_null, is_false)
+        // TAG_NULL and TAG_FALSE are consecutive. Subtracting TAG_NULL and doing
+        // one unsigned range check recognizes exactly those two values; every
+        // other tagged/number bit-pattern wraps or lands above 1.
+        let shifted = self.builder.ins().iadd_imm(bits, -(TAG_NULL as i64));
+        let falsey = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, shifted, 1);
+        self.bool32(falsey)
     }
 
     fn box_bool(&mut self, condition: Value) -> Value {
@@ -5931,7 +6274,6 @@ impl CraneliftLoweringState<'_, '_> {
             .ins()
             .icmp(IntCC::Equal, tagged, negative_zero);
         let is_negative_zero = self.bool32(is_negative_zero);
-        self.emit_side_exit(exit, is_negative_zero)?;
 
         let min = self
             .builder
@@ -5952,7 +6294,8 @@ impl CraneliftLoweringState<'_, '_> {
         let ge_min = self.bool32(ge_min);
         let le_max = self.bool32(le_max);
         let in_range = self.bool_and(ge_min, le_max);
-        let failure = self.bool_not(in_range);
+        let out_of_range = self.bool_not(in_range);
+        let failure = self.bool_or(is_negative_zero, out_of_range);
         self.emit_side_exit(exit, failure)?;
 
         // This conversion is non-trapping on the surviving path because the
@@ -6010,10 +6353,38 @@ impl CraneliftLoweringState<'_, '_> {
             .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
             .clone();
 
-        let stop = self.builder.create_block();
-        let resume = self.builder.create_block();
-        self.builder.set_cold_block(stop);
         let failure_condition = self.bool32(failure_condition);
+        let resume = self.builder.create_block();
+
+        // If the snapshot contains no dynamic SSA values, every guard using this
+        // exit can share one cold materialization stub. This removes duplicated
+        // side-exit code without introducing block parameters or extending live
+        // ranges on the hot path.
+        if plan.dynamic_values.is_empty() {
+            let key = (exit_id.0, self.native_budget_remaining);
+            if let Some(&stop) = self.shared_constant_exit_blocks.get(&key) {
+                self.builder
+                    .ins()
+                    .brif(failure_condition, stop, &[], resume, &[]);
+                self.builder.switch_to_block(resume);
+                return Ok(());
+            }
+
+            let stop = self.builder.create_block();
+            self.builder.set_cold_block(stop);
+            self.shared_constant_exit_blocks.insert(key, stop);
+            self.builder
+                .ins()
+                .brif(failure_condition, stop, &[], resume, &[]);
+
+            self.builder.switch_to_block(stop);
+            self.materialize_exit_or_native_link(&plan)?;
+            self.builder.switch_to_block(resume);
+            return Ok(());
+        }
+
+        let stop = self.builder.create_block();
+        self.builder.set_cold_block(stop);
         self.builder
             .ins()
             .brif(failure_condition, stop, &[], resume, &[]);
@@ -6052,16 +6423,10 @@ impl CraneliftLoweringState<'_, '_> {
         // probes its own exit slot directly; u32::MAX means the edge still needs
         // manager-level processing. Once stitched, frame state is materialized and
         // TRACE_RESULT_LINK returns to the native dispatcher, not to Rust.
-        let links = self.builder.ins().load(
-            self.pointer_type,
-            Self::trusted_mem(),
-            self.activation,
-            offset_of!(TraceActivation, current_links) as i32,
-        );
         let child = self.builder.ins().load(
             types::I32,
             Self::trusted_mem(),
-            links,
+            self.current_links,
             (plan.id.0 as i32).saturating_mul(std::mem::size_of::<u32>() as i32),
         );
         let linked = self.builder.ins().icmp_imm(IntCC::NotEqual, child, -1);
@@ -6195,12 +6560,11 @@ impl CraneliftLoweringState<'_, '_> {
     }
 
     fn call_scalar_helper(&mut self, address: usize, args: &[Value]) -> Value {
-        let mut signature = Signature::new(self.builder.func.signature.call_conv);
-        signature.params.extend(args.iter().map(|_| AbiParam::new(types::F64)));
-        signature.returns.push(AbiParam::new(types::F64));
-        let signature = self.builder.import_signature(signature);
-        let callee = self.builder.ins().iconst(self.pointer_type, address as i64);
-        let call = self.builder.ins().call_indirect(signature, callee, args);
+        let func_ref = *self
+            .scalar_helper_refs
+            .get(&address)
+            .unwrap_or_else(|| panic!("unregistered scalar helper at {address:#x}"));
+        let call = self.builder.ins().call(func_ref, args);
         self.builder.inst_results(call)[0]
     }
 
@@ -6213,6 +6577,29 @@ impl CraneliftLoweringState<'_, '_> {
     /// `(entry_ptr, current_gc_object_address, packed_metadata)`. The handle-table
     /// entry is stable; the MMTk object address itself is reloaded on every native
     /// operation.
+    fn guard_heap_entry_kind(
+        &mut self,
+        entry: Value,
+        expected: TraceHeapKind,
+        exit: SideExitId,
+    ) -> Result<Value, TracingJitError> {
+        let metadata = self.heap_entry_metadata(
+            entry,
+            expected != TraceHeapKind::Promise,
+        );
+        let kind_mask = self
+            .builder
+            .ins()
+            .iconst(types::I32, TRACE_HEAP_KIND_MASK as i64);
+        let kind = self.builder.ins().band(metadata, kind_mask);
+        let wrong_kind = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, kind, expected as i64);
+        self.emit_side_exit(exit, wrong_kind)?;
+        Ok(metadata)
+    }
+
     fn guard_heap_entry_with_metadata(
         &mut self,
         tagged: Value,
@@ -6220,24 +6607,7 @@ impl CraneliftLoweringState<'_, '_> {
         exit: SideExitId,
     ) -> Result<(Value, Value, Value), TracingJitError> {
         let (entry, address) = self.guard_live_heap_entry(tagged, exit)?;
-        let metadata = self.builder.ins().load(
-            types::I32,
-            Self::trusted_mem(),
-            entry,
-            offset_of!(TraceHeapEntry, kind) as i32,
-        );
-        let kind_mask = self
-            .builder
-            .ins()
-            .iconst(types::I32, TRACE_HEAP_KIND_MASK as i64);
-        let kind = self.builder.ins().band(metadata, kind_mask);
-        let matches_kind = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, kind, expected as i64);
-        let matches_kind = self.bool32(matches_kind);
-        let wrong_kind = self.bool_not(matches_kind);
-        self.emit_side_exit(exit, wrong_kind)?;
+        let metadata = self.guard_heap_entry_kind(entry, expected, exit)?;
         Ok((entry, address, metadata))
     }
 
@@ -6281,6 +6651,51 @@ impl CraneliftLoweringState<'_, '_> {
         }
     }
 
+    /// Resolve only the generic heap proof for a TraceValue. Kind-specific users
+    /// layer their own proof on top of this cache. This avoids repeating tag tests,
+    /// handle-table addressing and the liveness load when the same dynamic value is
+    /// consumed by GuardClass, IsInstance and a concrete heap operation.
+    fn live_heap_entry_for_value(
+        &mut self,
+        value: TraceValueId,
+        exit: SideExitId,
+    ) -> Result<(Value, Value), TracingJitError> {
+        let canonical = self.trace.canonical_value(value);
+        if let Some(&entry) = self.heap_live_entries.get(&canonical) {
+            return Ok(entry);
+        }
+
+        // A GuardHeapObject result is itself the stable TraceHeapEntry pointer.
+        if self.proven_heap_entry_kind(canonical).is_some() {
+            let entry = self.lower_value(canonical)?;
+            let address = if let Some(address) = self
+                .heap_addresses
+                .get(canonical.0 as usize)
+                .and_then(|address| *address)
+            {
+                address
+            } else {
+                let address = self.builder.ins().load(
+                    self.pointer_type,
+                    Self::trusted_mem(),
+                    entry,
+                    offset_of!(TraceHeapEntry, address) as i32,
+                );
+                let dead = self.builder.ins().icmp_imm_u(IntCC::Equal, address, 0);
+                self.emit_side_exit(exit, dead)?;
+                address
+            };
+            let result = (entry, address);
+            self.heap_live_entries.insert(canonical, result);
+            return Ok(result);
+        }
+
+        let tagged = self.lower_value(canonical)?;
+        let result = self.guard_live_heap_entry(tagged, exit)?;
+        self.heap_live_entries.insert(canonical, result);
+        Ok(result)
+    }
+
     /// Resolve a heap operand that may already be a stable sidecar entry produced
     /// by GuardHeapObject. The backend may reuse the current moving address inside
     /// one GC epoch; every full runtime/call boundary invalidates that local cache.
@@ -6294,37 +6709,18 @@ impl CraneliftLoweringState<'_, '_> {
         if let Some(&entry) = self.heap_entries.get(&(canonical, expected as u32)) {
             return Ok(entry);
         }
+
         let proven = self
             .proven_heap_entry_kind(canonical)
             .map(Self::runtime_heap_kind)
             == Some(expected);
-        if proven {
-            let entry = self.lower_value(canonical)?;
-            if let Some(address) = self
-                .heap_addresses
-                .get(canonical.0 as usize)
-                .and_then(|address| *address)
-            {
-                return Ok((entry, address));
-            }
-            // This path is used only when a structural transform separated the
-            // proof from its consumer without an available backend cache. Reload
-            // and validate liveness from the stable handle-table entry.
-            let address = self.builder.ins().load(
-                self.pointer_type,
-                Self::trusted_mem(),
-                entry,
-                offset_of!(TraceHeapEntry, address) as i32,
-            );
-            let dead = self.builder.ins().icmp_imm_u(IntCC::Equal, address, 0);
-            let dead = self.bool32(dead);
-            self.emit_side_exit(exit, dead)?;
-            return Ok((entry, address));
+        let (entry, address) = self.live_heap_entry_for_value(canonical, exit)?;
+        if !proven {
+            let _ = self.guard_heap_entry_kind(entry, expected, exit)?;
         }
-        let tagged = self.lower_value(canonical)?;
-        let entry = self.guard_heap_entry(tagged, expected, exit)?;
-        self.heap_entries.insert((canonical, expected as u32), entry);
-        Ok(entry)
+        let result = (entry, address);
+        self.heap_entries.insert((canonical, expected as u32), result);
+        Ok(result)
     }
 
     fn heap_entry_with_metadata_for_value(
@@ -6334,8 +6730,10 @@ impl CraneliftLoweringState<'_, '_> {
         exit: SideExitId,
     ) -> Result<(Value, Value, Value), TracingJitError> {
         let (entry, address) = self.heap_entry_for_value(value, expected, exit)?;
-        let metadata = self.builder.ins().load(types::I32, Self::trusted_mem(), entry,
-            offset_of!(TraceHeapEntry, kind) as i32);
+        let metadata = self.heap_entry_metadata(
+            entry,
+            expected != TraceHeapKind::Promise,
+        );
         Ok((entry, address, metadata))
     }
 
@@ -6359,17 +6757,10 @@ impl CraneliftLoweringState<'_, '_> {
             .iconst(types::I64, TRACE_HEAP_CHUNK_MASK as i64);
         let entry_index = self.builder.ins().band(handle, entry_index_mask);
 
-        let chunk_stride = self
-            .builder
-            .ins()
-            .iconst(types::I64, std::mem::size_of::<usize>() as i64);
-        let chunk_offset = self.builder.ins().imul(chunk_index, chunk_stride);
-        let chunks = self.builder.ins().load(
-            self.pointer_type,
-            Self::trusted_mem(),
-            self.activation,
-            offset_of!(TraceActivation, heap_chunks) as i32,
-        );
+        // 64-bit hosts are required by this JIT. Make the addressing-mode
+        // strength reduction explicit instead of relying on backend legalization.
+        let chunk_offset = self.builder.ins().ishl_imm(chunk_index, 3);
+        let chunks = self.heap_chunks_base();
         let chunk_slot = self.builder.ins().iadd(chunks, chunk_offset);
         let chunk = self.builder.ins().load(
             self.pointer_type,
@@ -6378,11 +6769,19 @@ impl CraneliftLoweringState<'_, '_> {
             0,
         );
 
-        let entry_stride = self
-            .builder
-            .ins()
-            .iconst(types::I64, std::mem::size_of::<TraceHeapEntry>() as i64);
-        let entry_offset = self.builder.ins().imul(entry_index, entry_stride);
+        let entry_offset = if std::mem::size_of::<TraceHeapEntry>() == 48 {
+            // entry * 48 == entry * (32 + 16). This maps directly to two shifts
+            // and an add on every supported 64-bit backend.
+            let x32 = self.builder.ins().ishl_imm(entry_index, 5);
+            let x16 = self.builder.ins().ishl_imm(entry_index, 4);
+            self.builder.ins().iadd(x32, x16)
+        } else {
+            let stride = self.builder.ins().iconst(
+                types::I64,
+                std::mem::size_of::<TraceHeapEntry>() as i64,
+            );
+            self.builder.ins().imul(entry_index, stride)
+        };
         let entry = self.builder.ins().iadd(chunk, entry_offset);
 
         let address = self.builder.ins().load(
@@ -6428,12 +6827,10 @@ impl CraneliftLoweringState<'_, '_> {
         exit: SideExitId,
     ) -> Result<(), TracingJitError> {
         let shape = self.heap_metadata_payload(metadata);
-        let matches = self
+        let fail = self
             .builder
             .ins()
-            .icmp_imm_u(IntCC::Equal, shape, expected as i64);
-        let matches = self.bool32(matches);
-        let fail = self.bool_not(matches);
+            .icmp_imm_u(IntCC::NotEqual, shape, expected as i64);
         self.emit_side_exit(exit, fail)
     }
 
@@ -6451,16 +6848,27 @@ impl CraneliftLoweringState<'_, '_> {
         let (entry, _, metadata) =
             self.guard_heap_entry_with_metadata(tagged, TraceHeapKind::String, exit)?;
         let byte_len = self.heap_metadata_payload(metadata);
-        let same_len = self
+        let wrong_len = self
             .builder
             .ins()
-            .icmp_imm_u(IntCC::Equal, byte_len, expected.len() as i64);
-        let same_len = self.bool32(same_len);
-        let wrong_len = self.bool_not(same_len);
+            .icmp_imm_u(IntCC::NotEqual, byte_len, expected.len() as i64);
         self.emit_side_exit(exit, wrong_len)?;
 
+        // Fold the complete key comparison into one integer mismatch accumulator:
+        //     mismatch |= load(chunk) ^ expected(chunk)
+        // followed by one cold branch. This avoids one icmp + boolean AND per
+        // chunk and gives Cranelift a compact straight-line sequence to schedule.
         let data = self.heap_entry_data(entry);
+        let mut mismatch: Option<Value> = None;
         let mut offset = 0usize;
+
+        let mut accumulate = |state: &mut Self, diff: Value| {
+            mismatch = Some(match mismatch {
+                Some(previous) => state.builder.ins().bor(previous, diff),
+                None => diff,
+            });
+        };
+
         while offset + 8 <= expected.len() {
             let mut chunk = [0u8; 8];
             chunk.copy_from_slice(&expected[offset..offset + 8]);
@@ -6474,47 +6882,133 @@ impl CraneliftLoweringState<'_, '_> {
                 .builder
                 .ins()
                 .iconst(types::I64, u64::from_ne_bytes(chunk) as i64);
-            let equal = self.builder.ins().icmp(IntCC::Equal, actual, wanted);
-            let equal = self.bool32(equal);
-            let fail = self.bool_not(equal);
-            self.emit_side_exit(exit, fail)?;
+            let diff = self.builder.ins().bxor(actual, wanted);
+            accumulate(self, diff);
             offset += 8;
         }
-        while offset < expected.len() {
+
+        if offset + 4 <= expected.len() {
+            let mut chunk = [0u8; 4];
+            chunk.copy_from_slice(&expected[offset..offset + 4]);
+            let actual = self.builder.ins().load(
+                types::I32,
+                Self::trusted_mem(),
+                data,
+                offset as i32,
+            );
+            let actual = self.builder.ins().uextend(types::I64, actual);
+            let wanted = self
+                .builder
+                .ins()
+                .iconst(types::I64, u32::from_ne_bytes(chunk) as i64);
+            let diff = self.builder.ins().bxor(actual, wanted);
+            accumulate(self, diff);
+            offset += 4;
+        }
+
+        if offset + 2 <= expected.len() {
+            let mut chunk = [0u8; 2];
+            chunk.copy_from_slice(&expected[offset..offset + 2]);
+            let actual = self.builder.ins().load(
+                types::I16,
+                Self::trusted_mem(),
+                data,
+                offset as i32,
+            );
+            let actual = self.builder.ins().uextend(types::I64, actual);
+            let wanted = self
+                .builder
+                .ins()
+                .iconst(types::I64, u16::from_ne_bytes(chunk) as i64);
+            let diff = self.builder.ins().bxor(actual, wanted);
+            accumulate(self, diff);
+            offset += 2;
+        }
+
+        if offset < expected.len() {
             let actual = self.builder.ins().load(
                 types::I8,
                 Self::trusted_mem(),
                 data,
                 offset as i32,
             );
-            let equal = self
+            let actual = self.builder.ins().uextend(types::I64, actual);
+            let wanted = self
                 .builder
                 .ins()
-                .icmp_imm_u(IntCC::Equal, actual, expected[offset] as i64);
-            let equal = self.bool32(equal);
-            let fail = self.bool_not(equal);
-            self.emit_side_exit(exit, fail)?;
-            offset += 1;
+                .iconst(types::I64, expected[offset] as i64);
+            let diff = self.builder.ins().bxor(actual, wanted);
+            accumulate(self, diff);
+        }
+
+        if let Some(mismatch) = mismatch {
+            let failure = self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::NotEqual, mismatch, 0);
+            self.emit_side_exit(exit, failure)?;
         }
         Ok(())
     }
 
     fn heap_entry_data(&mut self, entry: Value) -> Value {
-        self.builder.ins().load(
+        if let Some(&value) = self.heap_data.get(&entry) {
+            return value;
+        }
+        let value = self.builder.ins().load(
             self.pointer_type,
             Self::trusted_mem(),
             entry,
             offset_of!(TraceHeapEntry, data) as i32,
-        )
+        );
+        self.heap_data.insert(entry, value);
+        value
     }
 
     fn heap_entry_len(&mut self, entry: Value) -> Value {
-        self.builder.ins().load(
+        if let Some(&value) = self.heap_len.get(&entry) {
+            return value;
+        }
+        let value = self.builder.ins().load(
             self.pointer_type,
             Self::trusted_mem(),
             entry,
             offset_of!(TraceHeapEntry, len) as i32,
-        )
+        );
+        self.heap_len.insert(entry, value);
+        value
+    }
+
+    fn heap_entry_metadata(&mut self, entry: Value, cacheable: bool) -> Value {
+        if cacheable {
+            if let Some(&value) = self.heap_metadata.get(&entry) {
+                return value;
+            }
+        }
+        let value = self.builder.ins().load(
+            types::I32,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, kind) as i32,
+        );
+        if cacheable {
+            self.heap_metadata.insert(entry, value);
+        }
+        value
+    }
+
+    fn heap_entry_receiver_class(&mut self, entry: Value) -> Value {
+        if let Some(&value) = self.heap_receiver_class.get(&entry) {
+            return value;
+        }
+        let value = self.builder.ins().load(
+            types::I64,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, receiver_class) as i32,
+        );
+        self.heap_receiver_class.insert(entry, value);
+        value
     }
 
     fn heap_entry_promise_value(&mut self, entry: Value) -> Value {
@@ -6532,13 +7026,14 @@ impl CraneliftLoweringState<'_, '_> {
         index: u32,
         exit: SideExitId,
     ) -> Result<(), TracingJitError> {
-        let in_bounds = self
+        if !self.constant_index_proofs.insert((len, index)) {
+            return Ok(());
+        }
+        let failure = self
             .builder
             .ins()
-            .icmp_imm_u(IntCC::UnsignedGreaterThan, len, index as i64);
-        let in_bounds = self.bool32(in_bounds);
-        let fail = self.bool_not(in_bounds);
-        self.emit_side_exit(exit, fail)
+            .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, len, index as i64);
+        self.emit_side_exit(exit, failure)
     }
 
     fn normalize_list_index(
@@ -6552,27 +7047,45 @@ impl CraneliftLoweringState<'_, '_> {
         let from_end = self.builder.ins().iadd(len, index);
         let normalized = self.builder.ins().select(negative, from_end, index);
 
-        let non_negative = self
+        // One unsigned comparison checks both conditions: a still-negative
+        // normalized index appears as a huge u64 and therefore also fails < len.
+        let fail = self
             .builder
             .ins()
-            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, normalized, 0);
-        let below_len = self
-            .builder
-            .ins()
-            .icmp(IntCC::UnsignedLessThan, normalized, len);
-        let non_negative = self.bool32(non_negative);
-        let below_len = self.bool32(below_len);
-        let in_bounds = self.bool_and(non_negative, below_len);
-        let fail = self.bool_not(in_bounds);
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, normalized, len);
         self.emit_side_exit(exit, fail)?;
         Ok(normalized)
+    }
+
+    #[inline]
+    fn forwarded_heap_load(&self, location: ForwardedHeapLocation) -> Option<Value> {
+        self.forwarded_heap_loads.get(&location).copied()
+    }
+
+    #[inline]
+    fn remember_heap_load(&mut self, location: ForwardedHeapLocation, value: Value) {
+        self.forwarded_heap_loads.insert(location, value);
+    }
+
+    #[inline]
+    fn publish_heap_store(&mut self, location: ForwardedHeapLocation, value: Value) {
+        self.forwarded_heap_loads.clear();
+        self.forwarded_heap_loads.insert(location, value);
     }
 
     fn invalidate_heap_proofs(&mut self) {
         self.heap_addresses.fill(None);
         self.heap_entries.clear();
+        self.heap_live_entries.clear();
+        self.heap_data.clear();
+        self.heap_len.clear();
+        self.heap_metadata.clear();
+        self.heap_receiver_class.clear();
         self.list_indices.clear();
         self.list_lengths.clear();
+        self.forwarded_heap_loads.clear();
+        self.forwarded_absolute_loads.clear();
+        self.heap_chunks_base = None;
     }
 
     fn validated_list_index(
@@ -6590,8 +7103,15 @@ impl CraneliftLoweringState<'_, '_> {
     }
 
     fn heap_element_address(&mut self, data: Value, index: Value) -> Value {
-        let scale = self.builder.ins().iconst(types::I64, std::mem::size_of::<RegisterWord>() as i64);
-        let offset = self.builder.ins().imul(index, scale);
+        let offset = if std::mem::size_of::<RegisterWord>() == 8 {
+            self.builder.ins().ishl_imm(index, 3)
+        } else {
+            let scale = self.builder.ins().iconst(
+                types::I64,
+                std::mem::size_of::<RegisterWord>() as i64,
+            );
+            self.builder.ins().imul(index, scale)
+        };
         self.builder.ins().iadd(data, offset)
     }
 
@@ -6617,18 +7137,8 @@ impl CraneliftLoweringState<'_, '_> {
         self.builder.ins().brif(is_heap, barrier, &[], done, &[]);
 
         self.builder.switch_to_block(barrier);
-        let callee = self.builder.ins().load(
-            self.pointer_type,
-            Self::trusted_mem(),
-            self.activation,
-            offset_of!(TraceActivation, heap_write_barrier) as i32,
-        );
-        let runtime = self.builder.ins().load(
-            self.pointer_type,
-            Self::trusted_mem(),
-            self.activation,
-            offset_of!(TraceActivation, runtime) as i32,
-        );
+        let callee = self.heap_barrier_callee();
+        let runtime = self.runtime_context();
         self.builder.ins().call_indirect(
             self.heap_barrier_signature,
             callee,
@@ -6676,9 +7186,13 @@ impl CraneliftLoweringState<'_, '_> {
                     {
                         return Err(self.error("invalid direct bytecode call runtime payload"));
                     }
-                    let mut staged_capture_values = Vec::new();
                     let stage_captures = direct.closure_guard_exit.is_some()
                         && direct.args.len() + direct.closure_capture_count as usize <= MAX_WREN_ARITY;
+                    let mut staged_capture_values = Vec::with_capacity(if stage_captures {
+                        direct.closure_capture_count as usize
+                    } else {
+                        0
+                    });
                     if direct.closure_guard_exit.is_none() && direct.closure_capture_count != 0 {
                         return Err(self.error("non-closure direct call carries capture metadata"));
                     }
@@ -6790,12 +7304,7 @@ impl CraneliftLoweringState<'_, '_> {
                     next.0
                 };
 
-                let callee = self.builder.ins().load(
-                    self.pointer_type,
-                    Self::trusted_mem(),
-                    self.activation,
-                    offset_of!(TraceActivation, execute) as i32,
-                );
+                let callee = self.execute_callee();
                 let function = self
                     .builder
                     .ins()
@@ -6811,6 +7320,10 @@ impl CraneliftLoweringState<'_, '_> {
                     &[self.activation, function, pc, next],
                 );
                 let status = self.builder.inst_results(call)[0];
+                // A runtime helper may allocate/collect or refresh the heap-chunk
+                // pointer array. Any proof created while staging a direct call is
+                // therefore dead on the successful continuation as well.
+                self.invalidate_heap_proofs();
 
                 let stop = self.builder.create_block();
                 let resume = self.builder.create_block();
@@ -6841,12 +7354,7 @@ impl CraneliftLoweringState<'_, '_> {
                 if next.0 & TRACE_RUNTIME_MODE_MASK != 0 {
                     return Err(self.error("RuntimeCall continuation PC uses reserved runtime-mode bits"));
                 }
-                let callee = self.builder.ins().load(
-                    self.pointer_type,
-                    Self::trusted_mem(),
-                    self.activation,
-                    offset_of!(TraceActivation, execute) as i32,
-                );
+                let callee = self.execute_callee();
                 let function = self.builder.ins().iconst(types::I32, location.function.0 as i64);
                 let pc = self.builder.ins().iconst(types::I32, location.pc.0 as i64);
                 let next = self.builder.ins().iconst(
@@ -6859,6 +7367,10 @@ impl CraneliftLoweringState<'_, '_> {
                     &[self.activation, function, pc, next],
                 );
                 let status = self.builder.inst_results(call)[0];
+                // A runtime helper may allocate/collect or refresh the heap-chunk
+                // pointer array. Any proof created while staging a direct call is
+                // therefore dead on the successful continuation as well.
+                self.invalidate_heap_proofs();
 
                 let stop = self.builder.create_block();
                 let resume = self.builder.create_block();
@@ -6873,22 +7385,29 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             LoadAbsoluteValue { address } => {
-                let address = self.builder.ins().iconst(self.pointer_type, *address as i64);
-                let value = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    address,
-                    0,
-                );
+                let value = if let Some(&value) = self.forwarded_absolute_loads.get(address) {
+                    value
+                } else {
+                    let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                    let value = self.builder.ins().load(
+                        types::I64,
+                        Self::trusted_mem(),
+                        pointer,
+                        0,
+                    );
+                    self.forwarded_absolute_loads.insert(*address, value);
+                    value
+                };
                 self.cache_value(one_result(node)?, value);
             }
 
             StoreAbsoluteValue { address, value } => {
                 let value = self.lower_value(*value)?;
-                let address = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
                 self.builder
                     .ins()
-                    .store(Self::trusted_mem(), value, address, 0);
+                    .store(Self::trusted_mem(), value, pointer, 0);
+                self.forwarded_absolute_loads.insert(*address, value);
             }
 
             IncrementProfileCounter { address } => {
@@ -6911,24 +7430,13 @@ impl CraneliftLoweringState<'_, '_> {
                 // First guard the dynamic class operand against the class object
                 // observed while recording. If it changes, baseline owns the
                 // full dynamic semantics.
-                let class = self.lower_value(*class)?;
-                let (class_entry, _) = self.guard_live_heap_entry(class, *exit)?;
-                let class_key = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    class_entry,
-                    offset_of!(TraceHeapEntry, receiver_class) as i32,
+                let (class_entry, _) = self.live_heap_entry_for_value(*class, *exit)?;
+                let class_key = self.heap_entry_receiver_class(class_entry);
+                let wrong_class = self.builder.ins().icmp_imm_u(
+                    IntCC::NotEqual,
+                    class_key,
+                    *expected_class as i64,
                 );
-                let expected = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, *expected_class as i64);
-                let same_class = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::Equal, class_key, expected);
-                let same_class = self.bool32(same_class);
-                let wrong_class = self.bool_not(same_class);
                 self.emit_side_exit(*exit, wrong_class)?;
 
                 let tagged = self.lower_value(*value)?;
@@ -6954,20 +7462,27 @@ impl CraneliftLoweringState<'_, '_> {
                 self.builder.ins().jump(done, &[false_value.into()]);
 
                 self.builder.switch_to_block(heap_block);
+                // Do not publish this proof into the path-insensitive lowering cache:
+                // the non-heap branch reaches `done` without defining `entry`.
                 let (entry, _) = self.live_heap_entry_from_heap_tagged(tagged, *exit)?;
-                let actual = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    entry,
-                    offset_of!(TraceHeapEntry, receiver_class) as i32,
-                );
-                let mut matches = self.builder.ins().iconst(types::I32, 0);
-                for &candidate in instance_classes {
-                    let candidate = self
-                        .builder
-                        .ins()
-                        .iconst(types::I64, candidate as i64);
-                    let equal = self.builder.ins().icmp(IntCC::Equal, actual, candidate);
+                let actual = self.heap_entry_receiver_class(entry);
+                let mut candidates = instance_classes.iter().copied();
+                let mut matches = if let Some(candidate) = candidates.next() {
+                    let equal = self.builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        actual,
+                        candidate as i64,
+                    );
+                    self.bool32(equal)
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                for candidate in candidates {
+                    let equal = self.builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        actual,
+                        candidate as i64,
+                    );
                     let equal = self.bool32(equal);
                     matches = self.bool_or(matches, equal);
                 }
@@ -6975,10 +7490,23 @@ impl CraneliftLoweringState<'_, '_> {
                 // Existing finalized classes have immutable superclass links. If
                 // a class is linked after recording, its receiver-class key is not
                 // in `known_classes`; side-exit rather than returning a stale false.
-                let mut known = self.builder.ins().iconst(types::I32, 0);
-                for &candidate in known_classes {
-                    let candidate = self.builder.ins().iconst(types::I64, candidate as i64);
-                    let equal = self.builder.ins().icmp(IntCC::Equal, actual, candidate);
+                let mut known_candidates = known_classes.iter().copied();
+                let mut known = if let Some(candidate) = known_candidates.next() {
+                    let equal = self.builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        actual,
+                        candidate as i64,
+                    );
+                    self.bool32(equal)
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                for candidate in known_candidates {
+                    let equal = self.builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        actual,
+                        candidate as i64,
+                    );
                     let equal = self.bool32(equal);
                     known = self.bool_or(known, equal);
                 }
@@ -7086,19 +7614,27 @@ impl CraneliftLoweringState<'_, '_> {
             } => {
                 let index_id = self.trace.canonical_value(*index);
                 let length_id = self.trace.canonical_value(*length);
-                let index = self.lower_value(*index)?;
-                let length = self.lower_value(*length)?;
-                let negative = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, index, 0);
-                let too_large = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::SignedGreaterThanOrEqual, index, length);
-                let negative = self.bool32(negative);
-                let too_large = self.bool32(too_large);
-                let failure = self.bool_or(negative, too_large);
-                self.emit_side_exit(*exit, failure)?;
+                let index_value = self.lower_value(*index)?;
+                let length_value = self.lower_value(*length)?;
+
+                if self.bounds_proofs.insert((index_id, length_id)) {
+                    let negative = self
+                        .builder
+                        .ins()
+                        .icmp_imm_s(IntCC::SignedLessThan, index_value, 0);
+                    let too_large = self.builder.ins().icmp(
+                        IntCC::SignedGreaterThanOrEqual,
+                        index_value,
+                        length_value,
+                    );
+                    let negative = self.bool32(negative);
+                    let too_large = self.bool32(too_large);
+                    let failure = self.bool_or(negative, too_large);
+                    self.emit_side_exit(*exit, failure)?;
+                }
+
                 if let Some(&list) = self.list_lengths.get(&length_id) {
-                    let normalized = self.builder.ins().uextend(types::I64, index);
+                    let normalized = self.builder.ins().uextend(types::I64, index_value);
                     self.list_indices.insert((list, index_id), normalized);
                 }
             }
@@ -7107,16 +7643,13 @@ impl CraneliftLoweringState<'_, '_> {
                 let lhs_value = self.lower_value(*lhs)?;
                 let rhs_value = self.lower_value(*rhs)?;
                 let rep = self.value_rep(*lhs)?;
-                let equal = if rep == TraceRep::F64 {
-                    self.f64_compare(CmpKind::Eq, lhs_value, rhs_value)
+                let failure = if rep == TraceRep::F64 {
+                    self.f64_compare(CmpKind::Ne, lhs_value, rhs_value)
                 } else {
-                    let equal = self
-                        .builder
+                    self.builder
                         .ins()
-                        .icmp(IntCC::Equal, lhs_value, rhs_value);
-                    self.bool32(equal)
+                        .icmp(IntCC::NotEqual, lhs_value, rhs_value)
                 };
-                let failure = self.bool_not(equal);
                 self.emit_side_exit(*exit, failure)?;
             }
 
@@ -7133,13 +7666,11 @@ impl CraneliftLoweringState<'_, '_> {
 
                 match observed {
                     TraceSwitchGuard::Case(case) => {
-                        let equal = self.builder.ins().icmp_imm_s(
-                            IntCC::Equal,
+                        let failure = self.builder.ins().icmp_imm_s(
+                            IntCC::NotEqual,
                             tag_value,
                             *case,
                         );
-                        let equal = self.bool32(equal);
-                        let failure = self.bool_not(equal);
                         self.emit_side_exit(*exit, failure)?;
                     }
                     TraceSwitchGuard::Default { excluded } => {
@@ -7172,18 +7703,22 @@ impl CraneliftLoweringState<'_, '_> {
                         self.emit_side_exit(*exit, failure)?;
                     }
                     TraceType::Null => {
-                        let ok = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_NULL as i64);
-                        let ok = self.bool32(ok);
-                        let failure = self.bool_not(ok);
+                        let failure = self.builder.ins().icmp_imm_s(
+                            IntCC::NotEqual,
+                            value,
+                            TAG_NULL as i64,
+                        );
                         self.emit_side_exit(*exit, failure)?;
                     }
                     TraceType::Bool => {
-                        let false_ = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_FALSE as i64);
-                        let true_ = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_TRUE as i64);
-                        let false_ = self.bool32(false_);
-                        let true_ = self.bool32(true_);
-                        let ok = self.bool_or(false_, true_);
-                        let failure = self.bool_not(ok);
+                        // TAG_FALSE/TAG_TRUE are consecutive; one unsigned range
+                        // check replaces two equality tests plus an OR.
+                        let shifted = self.builder.ins().iadd_imm(value, -(TAG_FALSE as i64));
+                        let failure = self.builder.ins().icmp_imm_u(
+                            IntCC::UnsignedGreaterThan,
+                            shifted,
+                            1,
+                        );
                         self.emit_side_exit(*exit, failure)?;
                     }
                     _ => {
@@ -7199,25 +7734,45 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             GuardClass { value, classes, exit } => {
+                let (entry, _) = self.live_heap_entry_for_value(*value, *exit)?;
                 let value = self.lower_value(*value)?;
-                let (entry, _) = self.guard_live_heap_entry(value, *exit)?;
-                let class = self.builder.ins().load(types::I64, Self::trusted_mem(),
-                    entry, offset_of!(TraceHeapEntry, receiver_class) as i32);
-                let mut matches = self.builder.ins().iconst(types::I32, 0);
-                for &expected in classes {
-                    let expected = self.builder.ins().iconst(types::I64, expected as i64);
-                    let equal = self.builder.ins().icmp(IntCC::Equal, class, expected);
-                    let equal = self.bool32(equal);
-                    matches = self.bool_or(matches, equal);
+                let class = self.heap_entry_receiver_class(entry);
+                if classes.len() == 1 {
+                    let failure = self.builder.ins().icmp_imm_u(
+                        IntCC::NotEqual,
+                        class,
+                        classes[0] as i64,
+                    );
+                    self.emit_side_exit(*exit, failure)?;
+                } else {
+                    let mut classes = classes.iter().copied();
+                    let mut matches = if let Some(expected) = classes.next() {
+                        let equal = self.builder.ins().icmp_imm_u(
+                            IntCC::Equal,
+                            class,
+                            expected as i64,
+                        );
+                        self.bool32(equal)
+                    } else {
+                        self.builder.ins().iconst(types::I32, 0)
+                    };
+                    for expected in classes {
+                        let equal = self.builder.ins().icmp_imm_u(
+                            IntCC::Equal,
+                            class,
+                            expected as i64,
+                        );
+                        let equal = self.bool32(equal);
+                        matches = self.bool_or(matches, equal);
+                    }
+                    let failure = self.bool_not(matches);
+                    self.emit_side_exit(*exit, failure)?;
                 }
-                let failure = self.bool_not(matches);
-                self.emit_side_exit(*exit, failure)?;
                 self.cache_value(one_result(node)?, value);
             }
 
             GuardMethodEpoch { expected, exit } => {
-                let epoch = self.builder.ins().load(types::I64, Self::trusted_mem(), self.activation,
-                    offset_of!(TraceActivation, method_epoch) as i32);
+                let epoch = self.method_epoch_value();
                 let expected = self.builder.ins().iconst(types::I64, *expected as i64);
                 let failure = self.builder.ins().icmp(IntCC::NotEqual, epoch, expected);
                 self.emit_side_exit(*exit, failure)?;
@@ -7538,15 +8093,22 @@ impl CraneliftLoweringState<'_, '_> {
                 let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
-                let data = self.heap_entry_data(entry);
-                let index = self.builder.ins().iconst(types::I64, *slot as i64);
-                let address = self.heap_element_address(data, index);
-                let result = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    address,
-                    0,
-                );
+                let location = ForwardedHeapLocation::Field { entry, slot: *slot };
+                let result = if let Some(value) = self.forwarded_heap_load(location) {
+                    value
+                } else {
+                    let data = self.heap_entry_data(entry);
+                    let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                    let address = self.heap_element_address(data, index);
+                    let value = self.builder.ins().load(
+                        types::I64,
+                        Self::trusted_mem(),
+                        address,
+                        0,
+                    );
+                    self.remember_heap_load(location, value);
+                    value
+                };
                 self.cache_value(one_result(node)?, result);
             }
 
@@ -7561,17 +8123,28 @@ impl CraneliftLoweringState<'_, '_> {
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
+                self.publish_heap_store(
+                    ForwardedHeapLocation::Field { entry, slot: *slot },
+                    tagged_value,
+                );
             }
 
             HeapLoadCell { cell, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
-                let data = self.heap_entry_data(entry);
-                let result = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    data,
-                    0,
-                );
+                let location = ForwardedHeapLocation::Cell { entry };
+                let result = if let Some(value) = self.forwarded_heap_load(location) {
+                    value
+                } else {
+                    let data = self.heap_entry_data(entry);
+                    let value = self.builder.ins().load(
+                        types::I64,
+                        Self::trusted_mem(),
+                        data,
+                        0,
+                    );
+                    self.remember_heap_load(location, value);
+                    value
+                };
                 self.cache_value(one_result(node)?, result);
             }
 
@@ -7582,6 +8155,10 @@ impl CraneliftLoweringState<'_, '_> {
                 let data = self.heap_entry_data(entry);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, data, 0);
+                self.publish_heap_store(
+                    ForwardedHeapLocation::Cell { entry },
+                    tagged_value,
+                );
             }
 
             HeapWriteBarrier { object, value, exit } => {
@@ -7597,20 +8174,14 @@ impl CraneliftLoweringState<'_, '_> {
                     self.builder.ins().brif(is_heap, barrier, &[], done, &[]);
 
                     self.builder.switch_to_block(barrier);
+                    // This block is conditional on the *stored value* being a heap
+                    // reference. Keep the owner proof local: publishing it into the
+                    // path-insensitive cache would make a branch-local SSA value
+                    // visible after `done` when the barrier branch was not taken.
                     let tagged_object = self.lower_value(*object)?;
                     let (_, owner_address) = self.guard_live_heap_entry(tagged_object, *exit)?;
-                    let callee = self.builder.ins().load(
-                        self.pointer_type,
-                        Self::trusted_mem(),
-                        self.activation,
-                        offset_of!(TraceActivation, heap_write_barrier) as i32,
-                    );
-                    let runtime = self.builder.ins().load(
-                        self.pointer_type,
-                        Self::trusted_mem(),
-                        self.activation,
-                        offset_of!(TraceActivation, runtime) as i32,
-                    );
+                    let callee = self.heap_barrier_callee();
+                    let runtime = self.runtime_context();
                     self.builder.ins().call_indirect(
                         self.heap_barrier_signature,
                         callee,
@@ -7632,14 +8203,21 @@ impl CraneliftLoweringState<'_, '_> {
             HeapListGet { list, index, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let index = self.validated_list_index(*list, *index, entry, *exit)?;
-                let data = self.heap_entry_data(entry);
-                let address = self.heap_element_address(data, index);
-                let result = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    address,
-                    0,
-                );
+                let location = ForwardedHeapLocation::Indexed { entry, index };
+                let result = if let Some(value) = self.forwarded_heap_load(location) {
+                    value
+                } else {
+                    let data = self.heap_entry_data(entry);
+                    let address = self.heap_element_address(data, index);
+                    let value = self.builder.ins().load(
+                        types::I64,
+                        Self::trusted_mem(),
+                        address,
+                        0,
+                    );
+                    self.remember_heap_load(location, value);
+                    value
+                };
                 self.cache_value(one_result(node)?, result);
             }
 
@@ -7652,6 +8230,10 @@ impl CraneliftLoweringState<'_, '_> {
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
+                self.publish_heap_store(
+                    ForwardedHeapLocation::Indexed { entry, index },
+                    tagged_value,
+                );
             }
 
             HeapMapLen { map, exit } => {
@@ -7669,15 +8251,22 @@ impl CraneliftLoweringState<'_, '_> {
                 self.guard_string_bytes(tagged_key, expected_key, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
-                let data = self.heap_entry_data(entry);
-                let index = self.builder.ins().iconst(types::I64, *slot as i64);
-                let address = self.heap_element_address(data, index);
-                let result = self.builder.ins().load(
-                    types::I64,
-                    Self::trusted_mem(),
-                    address,
-                    0,
-                );
+                let location = ForwardedHeapLocation::ShapedMap { entry, slot: *slot };
+                let result = if let Some(value) = self.forwarded_heap_load(location) {
+                    value
+                } else {
+                    let data = self.heap_entry_data(entry);
+                    let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                    let address = self.heap_element_address(data, index);
+                    let value = self.builder.ins().load(
+                        types::I64,
+                        Self::trusted_mem(),
+                        address,
+                        0,
+                    );
+                    self.remember_heap_load(location, value);
+                    value
+                };
                 self.cache_value(one_result(node)?, result);
             }
 
@@ -7695,6 +8284,10 @@ impl CraneliftLoweringState<'_, '_> {
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
+                self.publish_heap_store(
+                    ForwardedHeapLocation::ShapedMap { entry, slot: *slot },
+                    tagged_value,
+                );
             }
 
             HeapStringLen { string, exit } => {
@@ -7795,13 +8388,11 @@ impl CraneliftLoweringState<'_, '_> {
                     *exit,
                 )?;
                 let state = self.heap_metadata_payload(metadata);
-                let fulfilled = self.builder.ins().icmp_imm_u(
-                    IntCC::Equal,
+                let not_fulfilled = self.builder.ins().icmp_imm_u(
+                    IntCC::NotEqual,
                     state,
                     TRACE_PROMISE_FULFILLED as i64,
                 );
-                let fulfilled = self.bool32(fulfilled);
-                let not_fulfilled = self.bool_not(fulfilled);
                 self.emit_side_exit(*exit, not_fulfilled)?;
                 let value = self.heap_entry_promise_value(entry);
                 self.cache_value(one_result(node)?, value);
@@ -8880,7 +9471,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         activation.exit_id
     }
 
@@ -8970,7 +9561,7 @@ mod tests {
                 for initial in [42.0f64, -10.0] {
                     cell.0 = initial.to_bits();
                     activation.reset_result();
-                    assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     assert_eq!(f64::from_bits(cell.0), 7.0);
                     assert_eq!(f64::from_bits(registers[1].0), if budget == 1 { initial } else { 7.0 });
                 }
@@ -9061,7 +9652,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
-                    assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     let actual = f64::from_bits(general[1].0);
                     assert!(if expected.is_nan() { actual.is_nan() }
                         else { actual.to_bits() == expected.to_bits() },
@@ -9109,7 +9700,7 @@ mod tests {
                         // Failed entry specialization must leave all VM state intact.
                         general[0] = RegisterWord(TAG_TRUE);
                         let before = general.map(|v| v.0);
-                        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                         assert_eq!(general.map(|v| v.0), before);
                         general[0] = RegisterWord(0.0f64.to_bits());
                     }
@@ -9117,7 +9708,7 @@ mod tests {
                     // Finite test bound also catches a broken loop-carried PRE value.
                     for _ in 0..6 {
                         activation.reset_result();
-                        let result = unsafe { (compiled.entry)(&mut activation) };
+                        let result = unsafe { invoke_native_trace(compiled.entry, &mut activation) };
                         assert_eq!(result, TRACE_RESULT_SIDE_EXIT);
                         snapshots.push(general.map(|v| v.0));
                         let counter = if tagged { f64::from_bits(general[0].0) as u64 }
@@ -9266,7 +9857,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
@@ -9336,7 +9927,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0], RegisterWord(0x1111));
         assert_eq!(general[1], RegisterWord(0xdead_beef));
@@ -9421,7 +10012,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2], RegisterWord(0xfeed_face));
 
@@ -9433,7 +10024,7 @@ mod tests {
         );
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
         entry.kind.store(
@@ -9447,7 +10038,7 @@ mod tests {
         entry.len.store(10, Ordering::Relaxed);
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
 
@@ -9456,7 +10047,7 @@ mod tests {
         entry.len.store(9, Ordering::Relaxed);
         entry.kind.store(TraceHeapKind::List as u32, Ordering::Release);
         activation.reset_result();
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
     }
@@ -9517,7 +10108,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[1], answer);
 
@@ -9528,7 +10119,7 @@ mod tests {
         );
         activation.reset_result();
         general[1] = RegisterWord(0);
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
     }
 
@@ -9586,7 +10177,7 @@ mod tests {
 
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(3);
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2].0 as u32 as i32, 7);
 
@@ -9594,7 +10185,7 @@ mod tests {
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(0);
         general[2] = RegisterWord(0xdead_beef);
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, invalid.0);
         assert_eq!(general[2].0, 0xdead_beef);
     }

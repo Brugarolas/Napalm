@@ -28,13 +28,13 @@ compile_error!("nano_runtime::fiber supports Unix x86_64/AArch64 only");
 compile_error!("nano_runtime::fiber currently supports Windows x86_64 only");
 
 const MIN_STACK_SIZE: usize = 16 * 1024;
-const STACK_ALIGN: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FiberRunState {
     New,
     Running,
     Suspended,
+    Blocked,
     Completed,
     Panicked,
 }
@@ -52,7 +52,10 @@ impl fmt::Display for FiberError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StackTooSmall { requested, minimum } => {
-                write!(f, "fiber stack is too small: {requested} bytes (minimum {minimum})")
+                write!(
+                    f,
+                    "fiber stack is too small: {requested} bytes (minimum {minimum})"
+                )
             }
             Self::AllocationFailed => f.write_str("fiber stack allocation failed"),
             Self::Finished => f.write_str("cannot resume a completed/panicked fiber"),
@@ -87,7 +90,11 @@ impl FiberLocalStorage {
     }
 
     pub fn remove<T: 'static>(&mut self, key: &str) -> Option<T> {
-        self.values.remove(key)?.downcast::<T>().ok().map(|boxed| *boxed)
+        self.values
+            .remove(key)?
+            .downcast::<T>()
+            .ok()
+            .map(|boxed| *boxed)
     }
 
     pub fn contains(&self, key: &str) -> bool {
@@ -169,11 +176,17 @@ mod unix_context {
             let mapping = NonNull::new(raw.cast::<u8>()).ok_or(FiberError::AllocationFailed)?;
 
             if unsafe { mprotect(raw, page, PROT_NONE) } != 0 {
-                unsafe { let _ = munmap(raw, mapping_size); }
+                unsafe {
+                    let _ = munmap(raw, mapping_size);
+                }
                 return Err(FiberError::Platform("mprotect guard page failed"));
             }
 
-            Ok(Self { mapping, mapping_size, usable_size })
+            Ok(Self {
+                mapping,
+                mapping_size,
+                usable_size,
+            })
         }
 
         #[inline(always)]
@@ -191,7 +204,9 @@ mod unix_context {
 
     impl Drop for Stack {
         fn drop(&mut self) {
-            unsafe { let _ = munmap(self.mapping.as_ptr().cast(), self.mapping_size); }
+            unsafe {
+                let _ = munmap(self.mapping.as_ptr().cast(), self.mapping_size);
+            }
         }
     }
 
@@ -251,9 +266,9 @@ mod unix_context {
     }
 
     #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
-    core::arch::global_asm!(r#"
+    core::arch::global_asm!(
+        r#"
         .text
-        .att_syntax
         .p2align 4
         .globl nano_switch_fiber
         .type nano_switch_fiber,@function
@@ -283,12 +298,14 @@ mod unix_context {
         movq 64(%rax), %rdi
         movq 48(%rax), %rsp
         jmp *56(%rax)
-    "#);
+    "#,
+        options(att_syntax)
+    );
 
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    core::arch::global_asm!(r#"
+    core::arch::global_asm!(
+        r#"
         .text
-        .att_syntax
         .p2align 4
         .globl _nano_switch_fiber
     _nano_switch_fiber:
@@ -317,12 +334,14 @@ mod unix_context {
         movq 64(%rax), %rdi
         movq 48(%rax), %rsp
         jmp *56(%rax)
-    "#);
+    "#,
+        options(att_syntax)
+    );
 
     #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-    core::arch::global_asm!(r#"
+    core::arch::global_asm!(
+        r#"
         .text
-        .att_syntax
         .p2align 4
         .globl nano_switch_fiber
         .type nano_switch_fiber,%function
@@ -363,12 +382,13 @@ mod unix_context {
         msr fpsr, x10
         ldr x0, [x9, #104]
         ret
-    "#);
+    "#
+    );
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    core::arch::global_asm!(r#"
+    core::arch::global_asm!(
+        r#"
         .text
-        .att_syntax
         .p2align 4
         .globl _nano_switch_fiber
     _nano_switch_fiber:
@@ -408,12 +428,14 @@ mod unix_context {
         msr fpsr, x10
         ldr x0, [x9, #104]
         ret
-    "#);
+    "#
+    );
 
     unsafe extern "C" {
         fn nano_switch_fiber(from: *mut Context, to: *const Context);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     extern "C" fn return_trap() -> ! {
         std::process::abort();
@@ -434,7 +456,7 @@ mod unix_context {
             // SAFETY: rsp is inside the allocated stack and aligned as a SysV
             // function entry (RSP % 16 == 8). The fake return address catches an
             // impossible accidental return from the trampoline.
-            unsafe { rsp.write(return_trap as usize) };
+            unsafe { rsp.write(return_trap as *const () as usize) };
             context.rsp = rsp as u64;
             context.rip = entry as usize as u64;
             context.arg0 = arg as usize as u64;
@@ -467,7 +489,7 @@ mod unix_context {
     }
 
     #[inline(always)]
-    pub unsafe fn switch(from: &mut Context, to: &Context) {
+    pub unsafe fn switch(from: *mut Context, to: *const Context) {
         // SAFETY: caller guarantees both contexts belong to live stacks.
         unsafe { nano_switch_fiber(from, to) };
     }
@@ -508,7 +530,9 @@ mod windows_context {
         fn drop(&mut self) {
             if self.converted_by_us {
                 // SAFETY: this TLS object belongs to the converted thread.
-                unsafe { let _ = ConvertFiberToThread(); }
+                unsafe {
+                    let _ = ConvertFiberToThread();
+                }
             }
         }
     }
@@ -563,7 +587,10 @@ mod windows_context {
 
     impl Default for PlatformFiber {
         fn default() -> Self {
-            Self { handle: ptr::null_mut(), caller: ptr::null_mut() }
+            Self {
+                handle: ptr::null_mut(),
+                caller: ptr::null_mut(),
+            }
         }
     }
 
@@ -575,19 +602,24 @@ mod windows_context {
             if handle.is_null() {
                 return Err(FiberError::Platform("CreateFiberEx failed"));
             }
-            Ok(Self { handle, caller: ptr::null_mut() })
+            Ok(Self {
+                handle,
+                caller: ptr::null_mut(),
+            })
         }
 
-        pub unsafe fn resume(&mut self) -> Result<(), FiberError> {
+        pub unsafe fn resume_raw(this: *mut Self) -> Result<(), FiberError> {
             let _ = ensure_root()?;
-            self.caller = unsafe { get_current_fiber() };
-            unsafe { SwitchToFiber(self.handle) };
+            unsafe {
+                (*this).caller = get_current_fiber();
+            }
+            unsafe { SwitchToFiber((*this).handle) };
             Ok(())
         }
 
-        pub unsafe fn yield_to_caller(&mut self) {
-            debug_assert!(!self.caller.is_null());
-            unsafe { SwitchToFiber(self.caller) };
+        pub unsafe fn yield_raw(this: *mut Self) {
+            debug_assert!(unsafe { !(*this).caller.is_null() });
+            unsafe { SwitchToFiber((*this).caller) };
         }
     }
 
@@ -610,6 +642,8 @@ pub(crate) struct FiberCore {
     entry: Option<Box<dyn FnOnce()>>,
     panic: Option<Box<dyn Any + Send>>,
     locals: FiberLocalStorage,
+    task: Option<crate::scheduler::TaskHandle>,
+    locals_borrowed: bool,
 
     #[cfg(not(windows))]
     context: unix_context::Context,
@@ -650,6 +684,8 @@ impl Fiber {
                 entry: Some(Box::new(entry)),
                 panic: None,
                 locals: FiberLocalStorage::default(),
+                task: None,
+                locals_borrowed: false,
                 context: unix_context::Context::default(),
                 caller_context: unix_context::Context::default(),
                 stack,
@@ -658,7 +694,10 @@ impl Fiber {
             unsafe {
                 unix_context::initialize(&mut core.context, &core.stack, fiber_entry, ptr);
             }
-            Ok(Self { core, _thread_affine: PhantomData })
+            Ok(Self {
+                core,
+                _thread_affine: PhantomData,
+            })
         }
 
         #[cfg(windows)]
@@ -668,12 +707,40 @@ impl Fiber {
                 entry: Some(Box::new(entry)),
                 panic: None,
                 locals: FiberLocalStorage::default(),
+                task: None,
+                locals_borrowed: false,
                 platform: windows_context::PlatformFiber::default(),
             });
             let ptr = &mut *core as *mut FiberCore;
             core.platform = windows_context::PlatformFiber::create(stack_size, ptr)?;
-            Ok(Self { core, _thread_affine: PhantomData })
+            Ok(Self {
+                core,
+                _thread_affine: PhantomData,
+            })
         }
+    }
+
+    pub(crate) fn current_task_id() -> Option<u64> {
+        CURRENT_FIBER.with(|slot| {
+            let ptr = slot.get();
+            if ptr.is_null() {
+                None
+            } else {
+                unsafe { (*ptr).task.as_ref().map(|task| task.id()) }
+            }
+        })
+    }
+
+    /// Metadata for the task whose callable runs on this fiber's stack.
+    pub fn task(&self) -> Option<&crate::scheduler::TaskHandle> {
+        self.core.task.as_ref()
+    }
+    pub(crate) fn attach_task(&mut self, task: crate::scheduler::TaskHandle) {
+        assert_eq!(self.state(), FiberRunState::New);
+        self.core.task = Some(task);
+    }
+    pub(crate) fn mark_blocked(&mut self) {
+        self.core.state = FiberRunState::Blocked;
     }
 
     #[inline(always)]
@@ -683,7 +750,10 @@ impl Fiber {
 
     #[inline(always)]
     pub fn is_finished(&self) -> bool {
-        matches!(self.core.state, FiberRunState::Completed | FiberRunState::Panicked)
+        matches!(
+            self.core.state,
+            FiberRunState::Completed | FiberRunState::Panicked
+        )
     }
 
     pub fn locals(&self) -> &FiberLocalStorage {
@@ -710,11 +780,15 @@ impl Fiber {
 
         #[cfg(not(windows))]
         unsafe {
-            unix_context::switch(&mut self.core.caller_context, &self.core.context);
+            unix_context::switch(
+                &raw mut (*core_ptr).caller_context,
+                &raw const (*core_ptr).context,
+            );
         }
 
         #[cfg(windows)]
-        let platform_result = unsafe { self.core.platform.resume() };
+        let platform_result =
+            unsafe { windows_context::PlatformFiber::resume_raw(&raw mut (*core_ptr).platform) };
 
         CURRENT_FIBER.with(|slot| slot.set(previous));
 
@@ -737,6 +811,11 @@ impl Fiber {
 
     /// Cooperatively suspend the currently running nano fiber.
     pub fn yield_now() -> Result<(), FiberError> {
+        if std::thread::panicking() {
+            return Err(FiberError::Platform(
+                "cannot suspend during panic unwinding",
+            ));
+        }
         CURRENT_FIBER.with(|slot| {
             let ptr = slot.get();
             if ptr.is_null() {
@@ -746,20 +825,26 @@ impl Fiber {
             // SAFETY: CURRENT_FIBER is installed only while this Fiber is running
             // on the current thread. Fiber is !Send, so there is no cross-thread
             // concurrent mutation.
-            let core = unsafe { &mut *ptr };
-            core.state = FiberRunState::Suspended;
+            if unsafe { (*ptr).locals_borrowed } {
+                return Err(FiberError::Platform(
+                    "cannot yield while fiber locals are borrowed",
+                ));
+            }
+            unsafe {
+                (*ptr).state = FiberRunState::Suspended;
+            }
 
             #[cfg(not(windows))]
             unsafe {
-                unix_context::switch(&mut core.context, &core.caller_context);
+                unix_context::switch(&raw mut (*ptr).context, &raw const (*ptr).caller_context);
             }
-
             #[cfg(windows)]
             unsafe {
-                core.platform.yield_to_caller();
+                windows_context::PlatformFiber::yield_raw(&raw mut (*ptr).platform);
             }
-
-            core.state = FiberRunState::Running;
+            unsafe {
+                (*ptr).state = FiberRunState::Running;
+            }
             Ok(())
         })
     }
@@ -774,8 +859,22 @@ impl Fiber {
             if ptr.is_null() {
                 return Err(FiberError::NotInsideFiber);
             }
-            let core = unsafe { &mut *ptr };
-            Ok(f(&mut core.locals))
+            if unsafe { (*ptr).locals_borrowed } {
+                return Err(FiberError::Platform("fiber locals already borrowed"));
+            }
+            struct Reset(*mut FiberCore);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    unsafe {
+                        (*self.0).locals_borrowed = false;
+                    }
+                }
+            }
+            unsafe {
+                (*ptr).locals_borrowed = true;
+            }
+            let _reset = Reset(ptr);
+            Ok(f(unsafe { &mut (*ptr).locals }))
         })
     }
 
@@ -796,27 +895,29 @@ unsafe fn fiber_entry(core: *mut FiberCore) -> ! {
 }
 
 unsafe fn run_fiber_entry(core: *mut FiberCore) -> ! {
-    let core = unsafe { &mut *core };
-    core.state = FiberRunState::Running;
-
-    let entry = core.entry.take().expect("fiber entry already consumed");
+    unsafe {
+        (*core).state = FiberRunState::Running;
+    }
+    let entry = unsafe { (*core).entry.take().expect("fiber entry already consumed") };
+    // Never keep a reference to FiberCore across execution/suspension: the
+    // caller and yield_now access the same allocation while we are dormant.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(entry));
     match result {
-        Ok(()) => core.state = FiberRunState::Completed,
-        Err(payload) => {
-            core.panic = Some(payload);
-            core.state = FiberRunState::Panicked;
-        }
+        Ok(()) => unsafe {
+            (*core).state = FiberRunState::Completed;
+        },
+        Err(payload) => unsafe {
+            (*core).panic = Some(payload);
+            (*core).state = FiberRunState::Panicked;
+        },
     }
-
     #[cfg(not(windows))]
     unsafe {
-        unix_context::switch(&mut core.context, &core.caller_context);
+        unix_context::switch(&raw mut (*core).context, &raw const (*core).caller_context);
     }
-
     #[cfg(windows)]
     unsafe {
-        core.platform.yield_to_caller();
+        windows_context::PlatformFiber::yield_raw(&raw mut (*core).platform);
     }
 
     // Completed fibers are never legally resumed.
@@ -837,7 +938,8 @@ mod tests {
             out.borrow_mut().push(1);
             Fiber::yield_now().unwrap();
             out.borrow_mut().push(3);
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(fiber.resume().unwrap(), FiberRunState::Suspended);
         trace.borrow_mut().push(2);
@@ -852,8 +954,10 @@ mod tests {
             Fiber::yield_now().unwrap();
             Fiber::with_current_locals(|locals| {
                 *locals.get_mut::<u32>("answer").unwrap() += 1;
-            }).unwrap();
-        }).unwrap();
+            })
+            .unwrap();
+        })
+        .unwrap();
 
         assert_eq!(fiber.resume().unwrap(), FiberRunState::Suspended);
         assert_eq!(fiber.locals().get::<u32>("answer"), Some(&41));

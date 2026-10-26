@@ -12,169 +12,202 @@ use crate::function::Function;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-const VOW_PENDING: u8 = 0;
-const VOW_RESOLVED: u8 = 1;
-const VOW_CANCELLED: u8 = 2;
-
+/// A terminal state describes completion, not merely a cancellation request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VowState {
     Pending,
     Resolved,
     Cancelled,
+    Interrupted,
 }
 
+struct VowData {
+    state: VowState,
+    callbacks: Vec<Function<(), ()>>,
+    observers: HashMap<u64, Function<(), ()>>,
+    next_observer: u64,
+}
 struct VowInner {
-    state: AtomicU8,
-    callbacks: Mutex<Vec<Function<(), ()>>>,
+    data: Mutex<VowData>,
+    wake: Condvar,
 }
 
-/// Completion/cancellation token returned by the event loop.
-///
-/// A one-shot timer or microtask resolves when it runs. Cancelling leaves it in
-/// `Cancelled`, and `.then(...)` callbacks are not invoked for cancellation.
 #[derive(Clone)]
 pub struct Vow {
     inner: Arc<VowInner>,
 }
 
+/// Dropping a subscription unregisters an observer that has not run yet.
+pub struct VowSubscription {
+    inner: std::sync::Weak<VowInner>,
+    id: u64,
+}
+impl Drop for VowSubscription {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            let removed = inner
+                .data
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observers
+                .remove(&self.id);
+            drop(removed);
+        }
+    }
+}
 impl fmt::Debug for Vow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Vow").field("state", &self.state()).finish()
     }
 }
-
 impl Default for Vow {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Vow {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(VowInner {
-                state: AtomicU8::new(VOW_PENDING),
-                callbacks: Mutex::new(Vec::new()),
+                data: Mutex::new(VowData {
+                    state: VowState::Pending,
+                    callbacks: Vec::new(),
+                    observers: HashMap::new(),
+                    next_observer: 0,
+                }),
+                wake: Condvar::new(),
             }),
         }
     }
-
-    #[inline(always)]
     pub fn state(&self) -> VowState {
-        match self.inner.state.load(Ordering::Acquire) {
-            VOW_PENDING => VowState::Pending,
-            VOW_RESOLVED => VowState::Resolved,
-            VOW_CANCELLED => VowState::Cancelled,
-            _ => unreachable!("invalid Vow state"),
-        }
+        self.inner
+            .data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
     }
-
-    #[inline(always)]
     pub fn is_pending(&self) -> bool {
         self.state() == VowState::Pending
     }
-
-    #[inline(always)]
     pub fn is_resolved(&self) -> bool {
         self.state() == VowState::Resolved
     }
-
-    #[inline(always)]
     pub fn is_cancelled(&self) -> bool {
         self.state() == VowState::Cancelled
     }
-
-    /// Register a callback to execute when this Vow resolves.
-    /// If it has already resolved, the callback runs immediately.
-    pub fn then<F>(&self, callback: F)
-    where
-        F: FnOnce() + Send + Unpin + 'static,
-    {
-        if self.is_resolved() {
-            callback();
-            return;
-        }
-        if self.is_cancelled() {
-            return;
-        }
-
+    pub fn is_interrupted(&self) -> bool {
+        self.state() == VowState::Interrupted
+    }
+    /// Resolution-only callback. Callback panics are isolated during settlement.
+    pub fn then<F: FnOnce() + Send + Unpin + 'static>(&self, callback: F) {
         let mut callback = Some(callback);
-        let mut callbacks = self.inner.callbacks.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Close the race with resolve()/cancel() between the optimistic check
-        // above and acquiring the callback list.
-        match self.state() {
-            VowState::Pending => {
-                let mut cb = callback;
-                callbacks.push(Function::new(move || {
-                    if let Some(f) = cb.take() {
-                        f();
-                    }
-                }));
-            }
-            VowState::Resolved => {
-                drop(callbacks);
+        let mut data = self.inner.data.lock().unwrap_or_else(|e| e.into_inner());
+        match data.state {
+            VowState::Pending => data.callbacks.push(Function::new(move || {
                 if let Some(f) = callback.take() {
                     f();
                 }
+            })),
+            VowState::Resolved => {
+                drop(data);
+                callback.take().unwrap()();
             }
-            VowState::Cancelled => {}
+            _ => {}
         }
     }
-
-    /// Resolve exactly once. Returns true for the thread that won settlement.
-    pub fn resolve(&self) -> bool {
-        if self
-            .inner
-            .state
-            .compare_exchange(
-                VOW_PENDING,
-                VOW_RESOLVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-
-        let callbacks = {
-            let mut locked = self.inner.callbacks.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *locked)
+    /// Observe every terminal outcome. Keep the subscription alive while waiting.
+    pub fn on_settle<F: FnOnce() + Send + Unpin + 'static>(&self, callback: F) -> VowSubscription {
+        let mut data = self.inner.data.lock().unwrap_or_else(|e| e.into_inner());
+        let id = data.next_observer;
+        data.next_observer = id.checked_add(1).expect("Vow observer ID exhausted");
+        let subscription = VowSubscription {
+            inner: Arc::downgrade(&self.inner),
+            id,
         };
-
-        for mut callback in callbacks {
-            callback.call0();
+        if data.state != VowState::Pending {
+            drop(data);
+            callback();
+            return subscription;
+        }
+        let mut callback = Some(callback);
+        data.observers.insert(
+            id,
+            Function::new(move || {
+                if let Some(f) = callback.take() {
+                    f();
+                }
+            }),
+        );
+        subscription
+    }
+    fn settle(&self, state: VowState) -> bool {
+        let (callbacks, observers) = {
+            let mut data = self.inner.data.lock().unwrap_or_else(|e| e.into_inner());
+            if data.state != VowState::Pending {
+                return false;
+            }
+            data.state = state;
+            (
+                std::mem::take(&mut data.callbacks),
+                std::mem::take(&mut data.observers),
+            )
+        };
+        self.inner.wake.notify_all();
+        // Wake scheduler waiters before running arbitrary resolution callbacks.
+        for mut callback in observers.into_values() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call0()));
+        }
+        if state == VowState::Resolved {
+            for mut callback in callbacks {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call0()));
+            }
         }
         true
     }
-
-    /// Cancel exactly once. Resolution callbacks are discarded, not run.
+    pub fn resolve(&self) -> bool {
+        self.settle(VowState::Resolved)
+    }
     pub fn cancel(&self) -> bool {
-        if self
-            .inner
-            .state
-            .compare_exchange(
-                VOW_PENDING,
-                VOW_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
+        self.settle(VowState::Cancelled)
+    }
+    pub fn interrupt(&self) -> bool {
+        self.settle(VowState::Interrupted)
+    }
+    /// Park a scheduler fiber, or block an external OS thread, until settlement.
+    pub fn wait(&self) -> VowState {
+        if crate::scheduler::Thread::is_current() {
+            return crate::scheduler::Thread::wait(self);
         }
-
-        self.inner
-            .callbacks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        true
+        assert!(
+            !crate::scheduler::in_runtime(),
+            "blocking wait in a runtime callback"
+        );
+        let mut data = self.inner.data.lock().unwrap_or_else(|e| e.into_inner());
+        while data.state == VowState::Pending {
+            data = self
+                .inner
+                .wake
+                .wait(data)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        data.state
+    }
+    /// External-thread timed wait. Scheduler fibers should use timers and wait().
+    pub fn wait_timeout(&self, timeout: Duration) -> VowState {
+        assert!(
+            !crate::scheduler::in_runtime(),
+            "timed OS wait inside the runtime"
+        );
+        let data = self.inner.data.lock().unwrap_or_else(|e| e.into_inner());
+        let (data, _) = self
+            .inner
+            .wake
+            .wait_timeout_while(data, timeout, |data| data.state == VowState::Pending)
+            .unwrap_or_else(|e| e.into_inner());
+        data.state
     }
 }
 
@@ -301,7 +334,14 @@ impl EventLoop {
             vow: vow.clone(),
         };
 
-        self.lock_state().microtasks.push_back(task);
+        let mut state = self.lock_state();
+        if state.stop_requested {
+            drop(state);
+            vow.cancel();
+            return vow;
+        }
+        state.microtasks.push_back(task);
+        drop(state);
         self.inner.wake.notify_one();
         vow
     }
@@ -353,8 +393,16 @@ impl EventLoop {
         callback: Function<(), ()>,
     ) -> Vow {
         let vow = Vow::new();
-        let deadline = Instant::now() + delay;
+        let Some(deadline) = Instant::now().checked_add(delay) else {
+            vow.interrupt();
+            return vow;
+        };
         let mut state = self.lock_state();
+        if state.stop_requested {
+            drop(state);
+            vow.cancel();
+            return vow;
+        }
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1).max(1);
         let sequence = state.next_sequence;
@@ -370,7 +418,11 @@ impl EventLoop {
                 vow: vow.clone(),
             },
         );
-        state.timer_heap.push(Reverse(TimerKey { deadline, sequence, id }));
+        state.timer_heap.push(Reverse(TimerKey {
+            deadline,
+            sequence,
+            id,
+        }));
         drop(state);
         self.inner.wake.notify_one();
         vow
@@ -394,13 +446,36 @@ impl EventLoop {
     pub fn stop(&self) {
         let mut state = self.lock_state();
         state.stop_requested = true;
+        let microtasks = std::mem::take(&mut state.microtasks);
+        let timers = std::mem::take(&mut state.timers);
+        state.timer_heap.clear();
         drop(state);
         self.inner.wake.notify_all();
+        for task in microtasks {
+            task.vow.cancel();
+        }
+        for task in timers.into_values() {
+            task.vow.cancel();
+        }
     }
 
     /// Execute queued microtasks and timers that are already due, without
     /// waiting for future deadlines. Returns the number of callbacks run.
     pub fn run_until_idle(&self) -> usize {
+        {
+            let mut state = self.lock_state();
+            if state.running {
+                return 0;
+            }
+            state.running = true;
+        }
+        struct Reset<'a>(&'a EventLoop);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.lock_state().running = false;
+            }
+        }
+        let _reset = Reset(self);
         let mut count = 0;
         loop {
             let action = {
@@ -411,9 +486,15 @@ impl EventLoop {
 
             match action {
                 Some(Action::Micro(mut task)) => {
-                    if !task.vow.is_cancelled() {
-                        task.callback.call0();
-                        task.vow.resolve();
+                    if task.vow.is_pending() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            task.callback.call0()
+                        }));
+                        if result.is_ok() {
+                            task.vow.resolve();
+                        } else {
+                            task.vow.interrupt();
+                        }
                     }
                     count += 1;
                 }
@@ -444,7 +525,6 @@ impl EventLoop {
         {
             let mut state = self.lock_state();
             state.running = false;
-            state.stop_requested = false;
         }
 
         if let Err(payload) = result {
@@ -479,7 +559,11 @@ impl EventLoop {
                             state = new_state;
                         }
                         None => {
-                            state = self.inner.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                            state = self
+                                .inner
+                                .wake
+                                .wait(state)
+                                .unwrap_or_else(|e| e.into_inner());
                         }
                     }
                 }
@@ -487,9 +571,15 @@ impl EventLoop {
 
             match action {
                 Action::Micro(mut task) => {
-                    if !task.vow.is_cancelled() {
-                        task.callback.call0();
-                        task.vow.resolve();
+                    if task.vow.is_pending() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            task.callback.call0()
+                        }));
+                        if result.is_ok() {
+                            task.vow.resolve();
+                        } else {
+                            task.vow.interrupt();
+                        }
                     }
                 }
                 Action::Timer(task) => self.execute_timer(task),
@@ -499,7 +589,7 @@ impl EventLoop {
 
     fn take_ready_action(state: &mut State, now: Instant) -> Option<Action> {
         while let Some(task) = state.microtasks.pop_front() {
-            if task.vow.is_cancelled() {
+            if !task.vow.is_pending() {
                 continue;
             }
             return Some(Action::Micro(task));
@@ -513,7 +603,7 @@ impl EventLoop {
 
             let stale_or_cancelled = match state.timers.get(&key.id) {
                 None => true,
-                Some(task) => task.deadline != key.deadline || task.vow.is_cancelled(),
+                Some(task) => task.deadline != key.deadline || !task.vow.is_pending(),
             };
 
             if stale_or_cancelled {
@@ -521,7 +611,7 @@ impl EventLoop {
                 if state
                     .timers
                     .get(&key.id)
-                    .is_some_and(|task| task.vow.is_cancelled())
+                    .is_some_and(|task| !task.vow.is_pending())
                 {
                     state.timers.remove(&key.id);
                 }
@@ -544,7 +634,7 @@ impl EventLoop {
                 None => return None,
             };
             match state.timers.get(&key.id) {
-                Some(task) if !task.vow.is_cancelled() && task.deadline == key.deadline => {
+                Some(task) if task.vow.is_pending() && task.deadline == key.deadline => {
                     return Some(key.deadline);
                 }
                 _ => {
@@ -552,7 +642,7 @@ impl EventLoop {
                     if state
                         .timers
                         .get(&key.id)
-                        .is_some_and(|task| task.vow.is_cancelled())
+                        .is_some_and(|task| !task.vow.is_pending())
                     {
                         state.timers.remove(&key.id);
                     }
@@ -562,31 +652,47 @@ impl EventLoop {
     }
 
     fn execute_timer(&self, mut task: TimerTask) {
-        if task.vow.is_cancelled() {
+        if !task.vow.is_pending() {
             return;
         }
 
-        task.callback.call0();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.callback.call0())).is_err()
+        {
+            task.vow.interrupt();
+            return;
+        }
 
         match task.interval {
             None => {
                 task.vow.resolve();
             }
             Some(period) => {
-                if task.vow.is_cancelled() {
+                if !task.vow.is_pending() {
                     return;
                 }
 
                 // Fixed-rate scheduling without a catch-up storm: preserve the
                 // original phase, but skip missed periods if a callback ran late.
                 let now = Instant::now();
-                let mut next = task.deadline + period;
-                while next <= now {
-                    next += period;
-                }
+                let elapsed = now.saturating_duration_since(task.deadline).as_nanos();
+                let remainder = elapsed % period.as_nanos();
+                let remaining = period.as_nanos() - remainder;
+                let delay = Duration::new(
+                    (remaining / 1_000_000_000) as u64,
+                    (remaining % 1_000_000_000) as u32,
+                );
+                let Some(next) = now.checked_add(delay) else {
+                    task.vow.interrupt();
+                    return;
+                };
                 task.deadline = next;
 
                 let mut state = self.lock_state();
+                if state.stop_requested {
+                    drop(state);
+                    task.vow.cancel();
+                    return;
+                }
                 let sequence = state.next_sequence;
                 state.next_sequence = state.next_sequence.wrapping_add(1);
                 let id = task.id;
@@ -611,7 +717,10 @@ enum Action {
 #[cfg(test)]
 mod tests {
     use super::{EventLoop, VowState};
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     #[test]
@@ -619,7 +728,9 @@ mod tests {
         let loop_ = EventLoop::new();
         let value = Arc::new(AtomicUsize::new(0));
         let out = value.clone();
-        let vow = loop_.next_tick(move || { out.store(42, Ordering::SeqCst); });
+        let vow = loop_.next_tick(move || {
+            out.store(42, Ordering::SeqCst);
+        });
         assert_eq!(loop_.run_until_idle(), 1);
         assert_eq!(value.load(Ordering::SeqCst), 42);
         assert_eq!(vow.state(), VowState::Resolved);
@@ -645,7 +756,9 @@ mod tests {
         let value = Arc::new(AtomicUsize::new(0));
         let out = value.clone();
         let vow = loop_.set_timeout(Duration::ZERO, || {});
-        vow.then(move || { out.store(1, Ordering::SeqCst); });
+        vow.then(move || {
+            out.store(1, Ordering::SeqCst);
+        });
         loop_.run_until_idle();
         assert_eq!(value.load(Ordering::SeqCst), 1);
     }

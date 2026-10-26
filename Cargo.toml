@@ -13,7 +13,7 @@ ariadne = "0.6" # For painting nice error logs
 logos = "0.16" # Create ridiculously fast and easy tokenizers
 
 smallvec = "1.16.4" # Fast hash map
-#ahash = "0.8.12" # Fast hash map
+ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 #papaya = "0.2.5" # Concurrent hash map
 #small-map = "0.1.5" # Small map optimization
