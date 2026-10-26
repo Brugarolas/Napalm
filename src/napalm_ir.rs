@@ -974,7 +974,8 @@ impl Inst {
 
         match self {
             ListSpread { .. } | MapSpread { .. } => B::Chain(E::Write),
-            DestructureRest { .. } | DestructureCheck { .. } => B::Chain(E::Alloc),
+            DestructureRest { .. } => B::Chain(E::Alloc),
+            DestructureCheck { .. } => B::Chain(E::Guard),
             DestructureGet { .. } => B::Chain(E::Read),
             InvokeSpread { .. } => B::Chain(E::Call),
             Return(_) | Unreachable => B::Sink(E::Control),

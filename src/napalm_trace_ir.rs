@@ -36,10 +36,33 @@ pub enum TraceClass { Builtin(BuiltinId) }
 /// sidecar's concrete enum definition. Cross-node guard optimization is left to
 /// the dedicated Trace IR optimization pass work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TraceHeapObjectKind { String, List, Map, Cell, Instance, Promise }
+pub enum TraceHeapObjectKind {
+    String,
+    List,
+    Map,
+    Cell,
+    Instance,
+    Promise,
+    Range,
+    Closure,
+    Fiber,
+    Module,
+    Class,
+    Foreign,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceConstant {
-    Null, Bool(bool), NumBits(u64), Int32(i32), F64Bits(u64), String(StringId), BuiltinClass(BuiltinId),
+    Null,
+    Bool(bool),
+    NumBits(u64),
+    Int32(i32),
+    F64Bits(u64),
+    /// VM-lifetime-stable tagged value materialized while recording. Interned
+    /// strings and builtin class objects are persistent GC roots, so embedding
+    /// their handle word is safe across collections and removes runtime loads.
+    StableTagged(u64),
+    String(StringId),
+    BuiltinClass(BuiltinId),
 }
 impl TraceConstant {
     pub(crate) fn layout(self) -> (TraceType, TraceRep) {
@@ -91,6 +114,8 @@ pub enum TraceInst {
     /// addresses are stable for the lifetime of one Interpreter/JIT instance.
     LoadAbsoluteValue { address: u64 },
     StoreAbsoluteValue { address: u64, value: TraceValueId },
+    /// Saturating increment of a lifetime-stable u64 profile counter.
+    IncrementProfileCounter { address: u64 },
     /// Specialized `IsInstance`: the class operand is guarded against the
     /// observed class object and the tested value is compared against the
     /// immutable runtime receiver-class keys of that class and its subclasses.
@@ -141,6 +166,9 @@ pub enum TraceInst {
     HeapStoreField { object: TraceValueId, value: TraceValueId, slot: u32, exit: SideExitId },
     HeapLoadCell { cell: TraceValueId, exit: SideExitId },
     HeapStoreCell { cell: TraceValueId, value: TraceValueId, exit: SideExitId },
+    /// Explicit GC post-barrier. Non-heap values are a native no-op; a heap value
+    /// validates the owner handle before invoking the non-allocating barrier.
+    HeapWriteBarrier { object: TraceValueId, value: TraceValueId, exit: SideExitId },
     HeapListLen { list: TraceValueId, exit: SideExitId },
     HeapListGet { list: TraceValueId, index: TraceValueId, exit: SideExitId },
     HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId },
@@ -165,6 +193,13 @@ pub enum TraceInst {
         exit: SideExitId,
     },
     HeapStringLen { string: TraceValueId, exit: SideExitId },
+    /// ASCII fast path for StringCodePointAt. Strings are immutable; generated
+    /// code dynamically proves byte_len == code_point_len before loading one byte.
+    HeapStringAsciiCodePointAt { string: TraceValueId, index: TraceValueId, exit: SideExitId },
+    /// General UTF-8/byte-sequence code-point lookup. Generated code validates
+    /// the String and byte offset, then calls a pure native decoder with no VM
+    /// synchronization or GC boundary.
+    HeapStringCodePointAt { string: TraceValueId, index: TraceValueId, exit: SideExitId },
     /// Fast path for `await` when the observed Promise is already fulfilled.
     /// Pending/rejected/non-Promise values side-exit to the original Await opcode.
     HeapAwaitFulfilled { promise: TraceValueId, exit: SideExitId },
@@ -175,7 +210,8 @@ impl TraceInst {
         use TraceInst::*;
         match self {
             Nop | LoadFrameSlot { .. } | Runtime { .. } | RuntimeCall { .. }
-            | LoadAbsoluteValue { .. } | GuardMethodEpoch { .. } => {},
+            | LoadAbsoluteValue { .. } | IncrementProfileCounter { .. }
+            | GuardMethodEpoch { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | GuardClass { value, .. } | IntUnary { value, .. }
@@ -197,8 +233,11 @@ impl TraceInst {
             | IsInstanceObserved { value: lhs, class: rhs, .. }
             | HeapStoreField { object: lhs, value: rhs, .. }
             | HeapStoreCell { cell: lhs, value: rhs, .. }
+            | HeapWriteBarrier { object: lhs, value: rhs, .. }
             | HeapListGet { list: lhs, index: rhs, .. }
-            | HeapMapGetShaped { map: lhs, key: rhs, .. } => { f(lhs); f(rhs); },
+            | HeapMapGetShaped { map: lhs, key: rhs, .. }
+            | HeapStringAsciiCodePointAt { string: lhs, index: rhs, .. }
+            | HeapStringCodePointAt { string: lhs, index: rhs, .. } => { f(lhs); f(rhs); },
             HeapListSet { list, index, value, .. }
             | HeapMapSetShaped { map: list, key: index, value, .. } => { f(list); f(index); f(value); },
             Select { condition, if_true, if_false } => { f(condition); f(if_true); f(if_false); },
@@ -232,9 +271,12 @@ impl TraceInst {
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
+            | HeapWriteBarrier { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
+            | HeapStringAsciiCodePointAt { exit, .. }
+            | HeapStringCodePointAt { exit, .. }
             | HeapAwaitFulfilled { exit, .. } | IsInstanceObserved { exit, .. } => Some(*exit),
             _ => None,
         }
@@ -254,7 +296,8 @@ impl TraceInst {
         matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. }
             | Self::HeapListLen { .. } | Self::HeapListGet { .. }
             | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. }
-            | Self::HeapStringLen { .. })
+            | Self::HeapStringLen { .. } | Self::HeapStringAsciiCodePointAt { .. }
+            | Self::HeapStringCodePointAt { .. })
     }
 
     pub fn set_exit(&mut self, new: SideExitId) {
@@ -268,7 +311,8 @@ impl TraceInst {
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
-            | HeapStringLen { exit, .. } => *exit = new,
+            | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
+            | HeapStringCodePointAt { exit, .. } => *exit = new,
             _ => panic!("instruction does not support entry exit replacement"),
         }
     }

@@ -891,6 +891,12 @@ impl HandleTable {
                 fields.len(),
                 0,
             ),
+            HeapObject::Range { .. } => (TraceHeapKind::Range, 0, 0, 0),
+            HeapObject::Closure { .. } => (TraceHeapKind::Closure, 0, 0, 0),
+            HeapObject::FiberObject { .. } => (TraceHeapKind::Fiber, 0, 0, 0),
+            HeapObject::ModuleObject { .. } => (TraceHeapKind::Module, 0, 0, 0),
+            HeapObject::ClassObject { .. } => (TraceHeapKind::Class, 0, 0, 0),
+            HeapObject::Foreign { .. } => (TraceHeapKind::Foreign, 0, 0, 0),
             HeapObject::Promise { state } => {
                 let metadata = match unsafe { state.get() } {
                     PromiseState::Pending { .. } => TRACE_PROMISE_PENDING,
@@ -8719,43 +8725,89 @@ unsafe fn h_list_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;le
 unsafe fn h_list_get(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let value=match vm.heap.get(list){Some(HeapObject::List(values))=>normalize_index(index,values.len()).map(|i|*values.get_unchecked(i)),_=>None};match value{Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"list index out of bounds")}}
 unsafe fn h_list_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));vm.heap.remember_if_reference(list,value);match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){*values.get_unchecked_mut(i)=value;vm.advance(op)}else{vm.fail_at(op,"list index out of bounds")},_=>vm.fail_at(op,"ListSet operand is not list")}}
 unsafe fn h_list_append(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
-    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(list,value);
-    let resized=match vm.heap.get_mut(list){
-        Some(HeapObject::List(values))=>{let old=values.capacity();values.push(value);(values.capacity()!=old).then_some(values.capacity())},
-        _=>{vm.fail_at(op,"ListAppend operand is not list");return;}
-    };
-    if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
-    vm.heap.refresh_jit_view(list);
-    vm.advance(op)
+    let op=&*ptr;
+    let list=Value::from_word(vm.reg(op.a));
+    let value=Value::from_word(vm.reg(op.b));
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    match list_append_value(vm,list,value){
+        Ok(())=>vm.advance(op),
+        Err(error)=>vm.fail_at(op,error.message),
+    }
 }
 unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));
-    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(list,value);
-    let resized=match vm.heap.get_mut(list){
-        Some(HeapObject::List(values))=>{
-            let mut i=index as i64;if i<0{i=values.len() as i64+i+1;}
-            if i<0||i>values.len() as i64{vm.fail_at(op,"list insertion index out of bounds");return;}
-            let old=values.capacity();values.insert(i as usize,value);(values.capacity()!=old).then_some(values.capacity())
-        },
-        _=>{vm.fail_at(op,"ListInsert operand is not list");return;}
-    };
-    if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
-    vm.heap.refresh_jit_view(list);
-    vm.advance(op)
+    let op=&*ptr;
+    let list=Value::from_word(vm.reg(op.a));
+    let index=word_i32(vm.reg(op.b));
+    let value=Value::from_word(vm.reg(op.c));
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    match list_insert_value(vm,list,index,value){
+        Ok(())=>vm.advance(op),
+        Err(error)=>vm.fail_at(op,error.message),
+    }
 }
-unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let removed=match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){Some(values.remove(i))}else{vm.fail_at(op,"list removal index out of bounds");None},_=>{vm.fail_at(op,"ListRemoveAt operand is not list");None}};if let Some(value)=removed{vm.heap.refresh_jit_view(list);vm.set_reg(op.a,value.word());vm.advance(op)}}
+unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    let list=Value::from_word(vm.reg(op.b));
+    let index=word_i32(vm.reg(op.c));
+    match list_remove_at_value(vm,list,index){
+        Ok(value)=>{vm.set_reg(op.a,value.word());vm.advance(op)},
+        Err(error)=>vm.fail_at(op,error.message),
+    }
+}
 
 unsafe fn h_alloc_map(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::Map(NapalmMap::default()));vm.set_reg(op.a,v.word());vm.advance(op)}
 unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.map_len(map){Some(len)=>{vm.set_reg(op.a,i32_word(len as i32));vm.advance(op)},None=>vm.fail_at(op,"MapLen operand is not map")}}
+fn map_get_value(
+    vm: &mut Interpreter<'_>,
+    map: Value,
+    key: Value,
+    cache_index: usize,
+) -> Result<Value, RuntimeError> {
+    let function = vm.current_frame().function as usize;
+    let cache = {
+        let caches = &mut vm.prepared.functions[function].map_inline_caches;
+        if cache_index >= caches.len() {
+            return Err(RuntimeError::new("MapGet inline cache is out of range"));
+        }
+        unsafe { caches.as_mut_ptr().add(cache_index) }
+    };
+    vm.heap.map_get_with_pic(map, key, unsafe { &mut *cache })
+}
+
+fn map_set_value(
+    vm: &mut Interpreter<'_>,
+    map: Value,
+    key: Value,
+    value: Value,
+    cache_index: usize,
+) -> Result<(), RuntimeError> {
+    vm.heap.remember_if_reference(map, key);
+    vm.heap.remember_if_reference(map, value);
+    let function = vm.current_frame().function as usize;
+    let cache = {
+        let caches = &mut vm.prepared.functions[function].map_inline_caches;
+        if cache_index >= caches.len() {
+            return Err(RuntimeError::new("MapSet inline cache is out of range"));
+        }
+        unsafe { caches.as_mut_ptr().add(cache_index) }
+    };
+    let structural = vm.heap.map_set_with_pic(map, key, value, unsafe { &mut *cache })?;
+    if structural {
+        if let Some(bytes) = vm.heap.map_external_bytes(map) {
+            vm.heap.set_external_bytes(map, bytes);
+        }
+        vm.heap.refresh_jit_view(map);
+    }
+    Ok(())
+}
+
 unsafe fn h_map_get(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let map=Value::from_word(vm.reg(op.b));
     let key=Value::from_word(vm.reg(op.c));
-    let function=(*vm.hot_frame).function as usize;
-    let cache_index=op.x as usize;
-    let cache_ptr=vm.prepared.functions[function].map_inline_caches.as_mut_ptr().add(cache_index);
-    match vm.heap.map_get_with_pic(map,key,&mut *cache_ptr){
+    match map_get_value(vm,map,key,op.x as usize){
         Ok(value)=>{vm.set_reg(op.a,value.word());vm.advance(op)},
         Err(error)=>vm.fail_at(op,error.message),
     }
@@ -8766,33 +8818,17 @@ unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
     let key=Value::from_word(vm.reg(op.b));
     let value=Value::from_word(vm.reg(op.c));
     vm.mark_gc_point(op);vm.maybe_collect();
-    vm.heap.remember_if_reference(map,key);
-    vm.heap.remember_if_reference(map,value);
-    let function=(*vm.hot_frame).function as usize;
-    let cache_index=op.x as usize;
-    let cache_ptr=vm.prepared.functions[function].map_inline_caches.as_mut_ptr().add(cache_index);
-    match vm.heap.map_set_with_pic(map,key,value,&mut *cache_ptr){
-        Ok(structural)=>{
-            if structural {
-                if let Some(bytes)=vm.heap.map_external_bytes(map){vm.heap.set_external_bytes(map,bytes);}
-                vm.heap.refresh_jit_view(map);
-            }
-            vm.advance(op)
-        },
+    match map_set_value(vm,map,key,value,op.x as usize){
+        Ok(())=>vm.advance(op),
         Err(error)=>vm.fail_at(op,error.message),
     }
 }
 unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr;let map=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));
-    let key=match vm.value_to_map_key(key_value){Ok(key)=>key,Err(error)=>{vm.fail_at(op,error.message);return;}};
-    match vm.heap.map_remove_encoded(map,&key){
-        Ok((value,structural))=>{
-            if structural {
-                if let Some(bytes)=vm.heap.map_external_bytes(map){vm.heap.set_external_bytes(map,bytes);}
-                vm.heap.refresh_jit_view(map);
-            }
-            vm.set_reg(op.a,value.word());vm.advance(op)
-        },
+    let op=&*ptr;
+    let map=Value::from_word(vm.reg(op.b));
+    let key=Value::from_word(vm.reg(op.c));
+    match map_remove_value(vm,map,key){
+        Ok(value)=>{vm.set_reg(op.a,value.word());vm.advance(op)},
         Err(error)=>vm.fail_at(op,error.message),
     }
 }
@@ -8982,6 +9018,12 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_program(&self) -> &BytecodeProgram { self.program }
 
+    fn trace_profile_counter_address(&self, function: FuncId, counter: u32) -> Option<usize> {
+        let function = *self.prepared.function_by_id.get(&function)? as usize;
+        let counter = self.profile_counters.get(function)?.get(counter as usize)?;
+        Some(counter as *const u64 as usize)
+    }
+
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
 
     fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
@@ -9083,6 +9125,22 @@ impl TraceRuntime for Interpreter<'_> {
         let op = prepared.ops.get(index as usize)?;
         let raw = (op.x as u64) | ((op.y as u64) << 32);
         (raw != 0).then_some(raw as usize)
+    }
+
+    fn trace_import_variable_access(
+        &self,
+        module: RegisterWord,
+        name: StringId,
+    ) -> Option<(RegisterWord, usize)> {
+        let module_value = Value::from_word(module);
+        let slot = match self.heap.get(module_value)? {
+            HeapObject::ModuleObject { module_slot } => *module_slot as usize,
+            _ => return None,
+        };
+        let runtime = self.modules.get(slot)?;
+        let variable = *runtime.exports.get(&name)? as usize;
+        let address = unsafe { runtime.variables.as_ptr().add(variable) } as usize;
+        Some((module, address))
     }
 
     fn trace_static_field_access(
@@ -9319,8 +9377,21 @@ impl TraceRuntime for Interpreter<'_> {
             HeapObject::Cell(_) => Some(TraceHeapObjectKind::Cell),
             HeapObject::Instance { .. } => Some(TraceHeapObjectKind::Instance),
             HeapObject::Promise { .. } => Some(TraceHeapObjectKind::Promise),
+            HeapObject::Range { .. } => Some(TraceHeapObjectKind::Range),
+            HeapObject::Closure { .. } => Some(TraceHeapObjectKind::Closure),
+            HeapObject::FiberObject { .. } => Some(TraceHeapObjectKind::Fiber),
+            HeapObject::ModuleObject { .. } => Some(TraceHeapObjectKind::Module),
+            HeapObject::ClassObject { .. } => Some(TraceHeapObjectKind::Class),
+            HeapObject::Foreign { .. } => Some(TraceHeapObjectKind::Foreign),
             _ => None,
         }
+    }
+
+    fn trace_string_is_ascii(&self, value: RegisterWord) -> bool {
+        matches!(
+            self.heap.get(Value::from_word(value)),
+            Some(HeapObject::String(bytes)) if bytes.as_ref().is_ascii()
+        )
     }
 
     fn trace_shaped_map_access(
@@ -9339,6 +9410,7 @@ impl TraceRuntime for Interpreter<'_> {
             TraceConstant::Bool(v) => Value::from_bool(v).word(),
             TraceConstant::NumBits(v) | TraceConstant::F64Bits(v) => RegisterWord(v),
             TraceConstant::Int32(v) => i32_word(v),
+            TraceConstant::StableTagged(bits) => RegisterWord(bits),
             TraceConstant::String(id) => self.strings.get(id.0 as usize).ok_or_else(|| RuntimeError::new("unknown string"))?.word(),
             TraceConstant::BuiltinClass(id) => self.builtin_value(id).word(),
         })
@@ -9359,20 +9431,179 @@ unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, ob
     unsafe { vm.heap.mutator.probable_write(object) };
 }
 
+impl Interpreter<'_> {
+    /// Execute a same-frame collection helper without redispatching the original
+    /// bytecode. The trace has already guarded operand kinds and committed every
+    /// dirty root. GC-capable modes own their precise safepoint here; non-GC
+    /// modes retain leaf-runtime semantics and never collect.
+    fn trace_execute_collection_fast(
+        &mut self,
+        mode: u32,
+        next: TraceLocation,
+    ) -> Result<TraceStep, RuntimeError> {
+        let before = self.trace_current_location();
+        let fiber = self.current_fiber;
+        let depth = self.fiber(fiber).frames.len();
+        let function = self.current_frame().function;
+        let op = *self
+            .current_prepared()
+            .original_ops
+            .get(self.hot_pc as usize)
+            .ok_or_else(|| RuntimeError::new("specialized collection PC is out of bounds"))?;
+        let function_index = self.current_frame().function as usize;
+        let opcode = self
+            .program
+            .functions
+            .get(function_index)
+            .and_then(|function| function.chunk.code.get(op.raw_pc as usize))
+            .and_then(|word| word.opcode())
+            .ok_or_else(|| RuntimeError::new("specialized collection opcode is invalid"))?;
+
+        let requires_gc = matches!(
+            mode,
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_SPREAD
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SPREAD
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REST
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REST
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_APPEND
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_INSERT
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
+        );
+        if requires_gc {
+            self.mark_gc_point(&op);
+            self.maybe_collect();
+        }
+
+        let result = match mode {
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_SPREAD
+                if opcode == Opcode::ListSpread =>
+            {
+                let destination = Value::from_word(unsafe { self.reg(op.b) });
+                let source = Value::from_word(unsafe { self.reg(op.c) });
+                list_spread_list(self, destination, source)
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SPREAD
+                if opcode == Opcode::MapSpread =>
+            {
+                let destination = Value::from_word(unsafe { self.reg(op.a) });
+                let source = Value::from_word(unsafe { self.reg(op.b) });
+                map_spread_map(self, destination, source)
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REST
+                if opcode == Opcode::DestructureRest =>
+            {
+                let source = Value::from_word(unsafe { self.reg(op.b) });
+                let key = Value::from_word(unsafe { self.reg(op.c) });
+                destructure_rest_list(self, source, key).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REST
+                if opcode == Opcode::DestructureRest =>
+            {
+                let source = Value::from_word(unsafe { self.reg(op.b) });
+                let key = Value::from_word(unsafe { self.reg(op.c) });
+                destructure_rest_map(self, source, key).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_APPEND
+                if opcode == Opcode::ListAppend =>
+            {
+                let list = Value::from_word(unsafe { self.reg(op.a) });
+                let value = Value::from_word(unsafe { self.reg(op.b) });
+                list_append_value(self, list, value)
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_INSERT
+                if opcode == Opcode::ListInsert =>
+            {
+                let list = Value::from_word(unsafe { self.reg(op.a) });
+                let index = word_i32(unsafe { self.reg(op.b) });
+                let value = Value::from_word(unsafe { self.reg(op.c) });
+                list_insert_value(self, list, index, value)
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REMOVE
+                if opcode == Opcode::ListRemoveAt =>
+            {
+                let list = Value::from_word(unsafe { self.reg(op.b) });
+                let index = word_i32(unsafe { self.reg(op.c) });
+                list_remove_at_value(self, list, index).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REMOVE
+                if opcode == Opcode::MapRemove =>
+            {
+                let map = Value::from_word(unsafe { self.reg(op.b) });
+                let key = Value::from_word(unsafe { self.reg(op.c) });
+                map_remove_value(self, map, key).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_GET
+                if opcode == Opcode::MapGet =>
+            {
+                let map = Value::from_word(unsafe { self.reg(op.b) });
+                let key = Value::from_word(unsafe { self.reg(op.c) });
+                map_get_value(self, map, key, op.x as usize).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
+                if opcode == Opcode::MapSet =>
+            {
+                let map = Value::from_word(unsafe { self.reg(op.a) });
+                let key = Value::from_word(unsafe { self.reg(op.b) });
+                let value = Value::from_word(unsafe { self.reg(op.c) });
+                map_set_value(self, map, key, value, op.x as usize)
+            }
+            _ => return Err(RuntimeError::new("specialized collection mode/opcode mismatch")),
+        };
+
+        match result {
+            Ok(()) => self.trace_set_location(next)?,
+            Err(error) => self.fail_at(&op, error.message),
+        }
+
+        let running = self.run_state == RunState::Running;
+        let after = self.trace_current_location();
+        let frame_changed = self.current_fiber != fiber
+            || self.fiber(self.current_fiber).frames.len() != depth
+            || self.hot_frame.is_null()
+            || self.current_frame().function != function;
+        Ok(TraceStep { before, after, frame_changed, running })
+    }
+}
+
 /// The native caller has committed all dirty registers. A helper may collect,
 /// throw, suspend or replace the frame: only a matching continuation may resume.
 unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, function: u32, pc: u32, next: u32) -> u32 {
     // Rust unwinding must never cross generated code (it has no unwind metadata).
     let activation = unsafe { &mut *activation };
     let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
-    let call_to_return = next & crate::napalm_tracing_jit::TRACE_RUNTIME_CALL_FLAG != 0;
-    let next_pc = next & !crate::napalm_tracing_jit::TRACE_RUNTIME_CALL_FLAG;
+    let mode = next & crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK;
+    let next_pc = next & !crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc)))?;
-        if call_to_return {
-            vm.trace_execute_call_to_return()
-        } else {
-            vm.trace_execute_unfused_step()
+        let continuation = TraceLocation::new(FuncId(function), BytecodePc(next_pc));
+        match mode {
+            0 => vm.trace_execute_unfused_step(),
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_CALL => {
+                vm.trace_execute_call_to_return()
+            }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_SPREAD
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SPREAD
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REST
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REST
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_APPEND
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_INSERT
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REMOVE
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REMOVE
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_GET
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET => {
+                vm.trace_execute_collection_fast(mode, continuation)
+            }
+            _ => Err(RuntimeError::new("unknown JIT runtime helper mode")),
         }
     }));
     match result {

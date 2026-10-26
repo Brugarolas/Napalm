@@ -66,7 +66,7 @@ use crate::napalm_bytecode::{
     SpecialReg,
 };
 use crate::napalm_ir::{
-    CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind, Type,
+    CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind, StringId, Type,
 };
 use crate::napalm_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
@@ -154,6 +154,43 @@ extern "C" fn native_cos(value: f64) -> f64 { value.cos() }
 extern "C" fn native_tan(value: f64) -> f64 { value.tan() }
 extern "C" fn native_log(value: f64) -> f64 { value.ln() }
 extern "C" fn native_exp(value: f64) -> f64 { value.exp() }
+
+/// Pure helper for Napalm's byte-indexed StringCodePointAt semantics. The caller
+/// proves index < len and pins the immutable String buffer for this native epoch.
+unsafe extern "C" fn native_decode_napalm_code_point(
+    data: *const u8,
+    len: usize,
+    index: usize,
+) -> i32 {
+    debug_assert!(!data.is_null());
+    debug_assert!(index < len);
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let first = unsafe { *bytes.get_unchecked(index) };
+    if first < 0x80 {
+        return first as i32;
+    }
+    let (needed, mut code, min) = match first {
+        0xC2..=0xDF => (2usize, (first & 0x1f) as u32, 0x80u32),
+        0xE0..=0xEF => (3usize, (first & 0x0f) as u32, 0x800u32),
+        0xF0..=0xF4 => (4usize, (first & 0x07) as u32, 0x10000u32),
+        _ => return first as i32,
+    };
+    if index + needed > len {
+        return first as i32;
+    }
+    for offset in 1..needed {
+        let byte = unsafe { *bytes.get_unchecked(index + offset) };
+        if (byte & 0xC0) != 0x80 {
+            return first as i32;
+        }
+        code = (code << 6) | (byte & 0x3f) as u32;
+    }
+    if code < min || code > 0x10ffff || (0xd800..=0xdfff).contains(&code) {
+        return first as i32;
+    }
+    code as i32
+}
+
 unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize) {}
 
 // =============================================================================
@@ -165,10 +202,24 @@ pub const TRACE_RESULT_SIDE_EXIT: u32 = 1;
 pub const TRACE_RESULT_RETURNED: u32 = 2;
 pub const TRACE_RESULT_LINK: u32 = 3;
 pub const TRACE_RESULT_RUNTIME: u32 = 4;
-/// High bit in the runtime-helper `next` operand. It requests call-to-return
-/// execution instead of exactly one bytecode step. Bytecode PCs are u32 word
-/// offsets and the verifier never emits code streams approaching this boundary.
-pub const TRACE_RUNTIME_CALL_FLAG: u32 = 1 << 31;
+/// Runtime-helper mode bits encoded in the high portion of the `next` operand.
+/// Bytecode PCs are word offsets and practical Napalm functions are many orders
+/// of magnitude smaller than the reserved 28-bit PC range. Specialized collection
+/// modes bypass baseline opcode dispatch while retaining Runtime synchronization
+/// and memory-epoch semantics.
+pub const TRACE_RUNTIME_MODE_SHIFT: u32 = 28;
+pub const TRACE_RUNTIME_MODE_MASK: u32 = 0xf << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_CALL: u32 = 1 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_LIST_SPREAD: u32 = 2 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_MAP_SPREAD: u32 = 3 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_LIST_REST: u32 = 4 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_MAP_REST: u32 = 5 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_LIST_APPEND: u32 = 6 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_LIST_INSERT: u32 = 7 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_LIST_REMOVE: u32 = 8 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_MAP_REMOVE: u32 = 9 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_MAP_GET: u32 = 10 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_MAP_SET: u32 = 11 << TRACE_RUNTIME_MODE_SHIFT;
 
 /// Maximum number of distinct dynamic values one side-exit snapshot may
 /// describe. Native exits now commit these values directly to architectural
@@ -204,6 +255,12 @@ pub enum TraceHeapKind {
     Cell = 4,
     Instance = 5,
     Promise = 6,
+    Range = 7,
+    Closure = 8,
+    Fiber = 9,
+    Module = 10,
+    Class = 11,
+    Foreign = 12,
 }
 
 /// Stable JIT-visible sidecar for one Napalm heap handle.
@@ -427,6 +484,28 @@ pub trait TraceRuntime {
     /// Module variable arrays are fixed-size for the lifetime of an interpreter.
     fn trace_module_slot_address(&self, _location: TraceLocation) -> Option<usize> { None }
 
+    /// Stable address of a profiling counter. Profile counter arrays are created
+    /// at interpreter initialization and never resized.
+    fn trace_profile_counter_address(
+        &self,
+        _function: FuncId,
+        _counter: u32,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Resolve an ImportVariable against an observed module object. Runtime
+    /// module variable arrays are fixed-size, so the returned slot address stays
+    /// stable for the lifetime of the interpreter. The module word is guarded
+    /// exactly before generated code dereferences the address.
+    fn trace_import_variable_access(
+        &self,
+        _module: RegisterWord,
+        _name: StringId,
+    ) -> Option<(RegisterWord, usize)> {
+        None
+    }
+
     /// Observe one class static-field access. Returns the exact receiver-class
     /// key of the class object plus the lifetime-stable address of the slot.
     fn trace_static_field_access(
@@ -486,6 +565,10 @@ pub trait TraceRuntime {
         None
     }
 
+    /// Recorder hint for the ASCII StringCodePointAt fast path. Generated code
+    /// still rechecks ASCII dynamically using immutable String sidecar lengths.
+    fn trace_string_is_ascii(&self, _value: RegisterWord) -> bool { false }
+
     /// Observe a Map/key pair without mutating VM state. Returning Some allows
     /// the recorder to specialize this site to shape+slot native code.
     fn trace_shaped_map_access(
@@ -525,6 +608,7 @@ pub trait TraceRuntime {
             TraceConstant::NumBits(bits) => Ok(RegisterWord(bits)),
             TraceConstant::Int32(value) => Ok(int_word(value)),
             TraceConstant::F64Bits(bits) => Ok(RegisterWord(bits)),
+            TraceConstant::StableTagged(bits) => Ok(RegisterWord(bits)),
             TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
                 // Runtime-owned heap values need the interpreter's interning
                 // tables. An implementation that allows them in traces should
@@ -1189,6 +1273,93 @@ impl<'a> TraceRecorder<'a> {
         Ok(ExpectedStep::Runtime { terminal: false })
     }
 
+    /// Same synchronization contract as runtime_gc_leaf, but the compiled trace
+    /// asks execute_trace_runtime for a dedicated helper instead of redispatching
+    /// the original bytecode opcode. The recording run still executes baseline
+    /// bytecode so path validation remains unchanged.
+    fn runtime_gc_specialized(
+        &self,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        mode_flag: u32,
+        outputs: &[(Reg, TraceType, TraceRep)],
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if !op.opcode.may_gc()
+            || !matches!(
+                mode_flag,
+                TRACE_RUNTIME_MODE_LIST_SPREAD
+                    | TRACE_RUNTIME_MODE_MAP_SPREAD
+                    | TRACE_RUNTIME_MODE_LIST_REST
+                    | TRACE_RUNTIME_MODE_MAP_REST
+                    | TRACE_RUNTIME_MODE_LIST_APPEND
+                    | TRACE_RUNTIME_MODE_LIST_INSERT
+                    | TRACE_RUNTIME_MODE_MAP_SET
+            )
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+        {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        let used = builder
+            .trace()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+            .count();
+        if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        builder.runtime_gc_leaf(
+            op.location,
+            BytecodePc(op.next_pc.0 | mode_flag),
+        );
+        for &(reg, ty, rep) in outputs {
+            builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
+        }
+        Ok(ExpectedStep::Runtime { terminal: false })
+    }
+
+    /// Non-GC counterpart of runtime_gc_specialized. This is useful for
+    /// container mutations that require Rust Vec/hash-map bookkeeping but never
+    /// allocate through the Napalm collector. The trace skips opcode redispatch
+    /// while preserving unrelated SSA and precise non-GC leaf semantics.
+    fn runtime_leaf_specialized(
+        &self,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        mode_flag: u32,
+        outputs: &[(Reg, TraceType, TraceRep)],
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode.may_gc()
+            || !matches!(
+                mode_flag,
+                TRACE_RUNTIME_MODE_LIST_REMOVE
+                    | TRACE_RUNTIME_MODE_MAP_REMOVE
+                    | TRACE_RUNTIME_MODE_MAP_GET
+            )
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+        {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        let used = builder
+            .trace()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+            .count();
+        if used >= MAX_RUNTIME_LEAF_OPS_PER_TRACE {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        builder.runtime_leaf(op.location, BytecodePc(op.next_pc.0 | mode_flag));
+        for &(reg, ty, rep) in outputs {
+            builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
+        }
+        Ok(ExpectedStep::Runtime { terminal: false })
+    }
+
     fn record_num_invoke<R: TraceRuntime>(
         &self,
         runtime: &R,
@@ -1569,12 +1740,15 @@ impl<'a> TraceRecorder<'a> {
                     Constant::Int32(value) => {
                         builder.constant(TraceConstant::Int32(*value))
                     }
-                    Constant::String(_) => {
-                        return self.runtime_leaf(
-                            op,
-                            builder,
-                            &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-                        );
+                    Constant::String(id) => {
+                        // Program strings are persistent VM roots. Materialize the
+                        // stable tagged handle once while recording and embed it in
+                        // native code instead of round-tripping through Runtime on
+                        // every hot execution of this LoadConst.
+                        let word = runtime
+                            .trace_materialize_constant(TraceConstant::String(*id))
+                            .map_err(|_| RecordingAbort::UnsupportedConstant)?;
+                        builder.constant(TraceConstant::StableTagged(word.0))
                     }
                 };
                 self.write_gpr(builder, op.a, value);
@@ -1970,6 +2144,61 @@ impl<'a> TraceRecorder<'a> {
                 let Some(descriptor) = function.chunk.type_guards.get(op.x as usize) else {
                     return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
                 };
+
+                // Generic Instance accepts both managed Instance and Foreign
+                // objects. Specialize to the concrete kind observed at this site;
+                // the alternate valid kind simply side-exits and can form its own
+                // trace instead of paying a runtime type helper every iteration.
+                if matches!(&descriptor.expected, Type::Instance(classes) if classes.is_unknown()) {
+                    let physical = runtime
+                        .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                        .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                    let observed_kind = runtime.trace_heap_object_kind(physical);
+                    let kind = match observed_kind {
+                        Some(TraceHeapObjectKind::Instance) => TraceHeapObjectKind::Instance,
+                        Some(TraceHeapObjectKind::Foreign) => TraceHeapObjectKind::Foreign,
+                        _ => return Err(RecordingAbort::GuardFailedWhileRecording),
+                    };
+                    let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let resume = deopt_resume(function, op.y).unwrap_or(op.location.pc);
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, resume);
+                    let _ = self.guard_heap_object(builder, source, kind, exit);
+                    self.write_gpr(builder, op.a, source);
+                    return Ok(ExpectedStep::Exact(next));
+                }
+
+                // The most common heap type guards can be replayed entirely in
+                // native code. GuardHeapObject validates the tagged handle, live
+                // sidecar entry and semantic heap kind; the architectural result
+                // remains the original tagged value, exactly like h_guard_type.
+                let heap_kind = match &descriptor.expected {
+                    Type::String => Some(TraceHeapObjectKind::String),
+                    Type::List(_) => Some(TraceHeapObjectKind::List),
+                    Type::Map => Some(TraceHeapObjectKind::Map),
+                    Type::Cell(_) => Some(TraceHeapObjectKind::Cell),
+                    Type::Range => Some(TraceHeapObjectKind::Range),
+                    Type::Closure(None) => Some(TraceHeapObjectKind::Closure),
+                    Type::Fiber => Some(TraceHeapObjectKind::Fiber),
+                    Type::Module => Some(TraceHeapObjectKind::Module),
+                    Type::Class(classes) if classes.is_unknown() => Some(TraceHeapObjectKind::Class),
+                    Type::Foreign(None) => Some(TraceHeapObjectKind::Foreign),
+                    _ => None,
+                };
+                if let Some(kind) = heap_kind {
+                    let physical = runtime
+                        .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                        .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                    if runtime.trace_heap_object_kind(physical) != Some(kind) {
+                        return Err(RecordingAbort::GuardFailedWhileRecording);
+                    }
+                    let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let resume = deopt_resume(function, op.y).unwrap_or(op.location.pc);
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, resume);
+                    let _ = self.guard_heap_object(builder, source, kind, exit);
+                    self.write_gpr(builder, op.a, source);
+                    return Ok(ExpectedStep::Exact(next));
+                }
+
                 let expected = match &descriptor.expected {
                     Type::Top => TraceType::Any,
                     Type::Null => TraceType::Null,
@@ -2472,6 +2701,15 @@ impl<'a> TraceRecorder<'a> {
                     );
                     self.write_gpr(builder, op.a, result);
                     Ok(ExpectedStep::Exact(next))
+                } else if runtime.trace_heap_object_kind(map_word) == Some(TraceHeapObjectKind::Map) {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let _ = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                    self.runtime_leaf_specialized(
+                        op,
+                        builder,
+                        TRACE_RUNTIME_MODE_MAP_GET,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
                 } else {
                     self.runtime_leaf(
                         op,
@@ -2494,7 +2732,18 @@ impl<'a> TraceRecorder<'a> {
                 let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
                     // Inserts, dictionary Maps and non-string keys can allocate or
                     // change representation, but they stay in the current frame.
-                    // Preserve unrelated SSA values across that GC-capable helper.
+                    // Skip baseline redispatch when the receiver is already proven
+                    // to be a Map and call the extracted mutation body directly.
+                    if runtime.trace_heap_object_kind(map_word) == Some(TraceHeapObjectKind::Map) {
+                        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                        let _ = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                        return self.runtime_gc_specialized(
+                            op,
+                            builder,
+                            TRACE_RUNTIME_MODE_MAP_SET,
+                            &[],
+                        );
+                    }
                     return self.runtime_gc_leaf(op, builder, &[]);
                 };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
@@ -2673,8 +2922,8 @@ impl<'a> TraceRecorder<'a> {
                     self.write_gpr(builder, op.a, source);
                     Ok(ExpectedStep::Exact(next))
                 } else {
-                    // Generic iterable/object materialization may allocate.
-                    self.runtime_gc_leaf(
+                    // Invalid/dynamic values keep the exact baseline guard/error path.
+                    self.runtime_leaf(
                         op,
                         builder,
                         &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
@@ -2757,21 +3006,111 @@ impl<'a> TraceRecorder<'a> {
                 }
             }
 
-            // Remaining non-GC runtime leaf operations preserve unrelated native
-            // SSA values instead of forcing the full runtime memory epoch.
-            ListRemoveAt | MapRemove => self.runtime_leaf(
-                op,
-                builder,
-                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
+            ListRemoveAt => {
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if runtime.trace_heap_object_kind(observed) == Some(TraceHeapObjectKind::List) {
+                    let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                    self.runtime_leaf_specialized(
+                        op,
+                        builder,
+                        TRACE_RUNTIME_MODE_LIST_REMOVE,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                } else {
+                    self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
 
-            StringCodePointAt => self.runtime_leaf(
-                op,
-                builder,
-                &[(Reg(op.a), TraceType::Int32, TraceRep::Int32)],
-            ),
+            MapRemove => {
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if runtime.trace_heap_object_kind(observed) == Some(TraceHeapObjectKind::Map) {
+                    let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                    self.runtime_leaf_specialized(
+                        op,
+                        builder,
+                        TRACE_RUNTIME_MODE_MAP_REMOVE,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                } else {
+                    self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
 
-            WriteBarrier | ProfileBlock | ProfileNumeric => self.runtime_leaf(op, builder, &[]),
+            StringCodePointAt => {
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if runtime.trace_heap_object_kind(observed) != Some(TraceHeapObjectKind::String) {
+                    return Err(RecordingAbort::GuardFailedWhileRecording);
+                }
+                if runtime.trace_string_is_ascii(observed) {
+                    let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let index = self.read_gpr(builder, op.c, TraceType::Int32, TraceRep::Int32)?;
+                    let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                    let string = self.guard_heap_object(
+                        builder,
+                        string,
+                        TraceHeapObjectKind::String,
+                        exit,
+                    );
+                    let result = builder.emit1(
+                        TraceInst::HeapStringAsciiCodePointAt { string, index, exit },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    );
+                    self.write_gpr(builder, op.a, result);
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let index = self.read_gpr(builder, op.c, TraceType::Int32, TraceRep::Int32)?;
+                    let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                    let string = self.guard_heap_object(
+                        builder,
+                        string,
+                        TraceHeapObjectKind::String,
+                        exit,
+                    );
+                    let result = builder.emit1(
+                        TraceInst::HeapStringCodePointAt { string, index, exit },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    );
+                    self.write_gpr(builder, op.a, result);
+                    Ok(ExpectedStep::Exact(next))
+                }
+            }
+
+            WriteBarrier => {
+                let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::HeapWriteBarrier { object, value, exit });
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            ProfileBlock | ProfileNumeric => {
+                let address = runtime
+                    .trace_profile_counter_address(op.location.function, op.x)
+                    .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                builder.emit0(TraceInst::IncrementProfileCounter { address: address as u64 });
+                Ok(ExpectedStep::Exact(next))
+            }
 
             Await => {
                 let observed = runtime
@@ -2811,7 +3150,7 @@ impl<'a> TraceRecorder<'a> {
             // contract keeps execution in the same frame. Preserve unrelated SSA
             // values across the memory epoch and reload only architectural outputs.
             AllocCell | MakeClosure | AllocList | AllocListCap | AllocMap
-            | StringConcat | StringSlice | MakeRange | DestructureRest => {
+            | StringConcat | StringSlice | MakeRange => {
                 self.runtime_gc_leaf(
                     op,
                     builder,
@@ -2819,28 +3158,238 @@ impl<'a> TraceRecorder<'a> {
                 )
             }
 
-            // Same-frame GC-capable mutations with no architectural result.
-            ListAppend | ListInsert | MapSpread | Safepoint => {
-                self.runtime_gc_leaf(op, builder, &[])
+            DestructureRest => {
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let source_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let key_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.c)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+
+                match runtime.trace_heap_object_kind(source_word) {
+                    Some(TraceHeapObjectKind::List) => {
+                        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                        let _ = self.guard_heap_object(
+                            builder,
+                            source,
+                            TraceHeapObjectKind::List,
+                            exit,
+                        );
+                        self.runtime_gc_specialized(
+                            op,
+                            builder,
+                            TRACE_RUNTIME_MODE_LIST_REST,
+                            &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                        )
+                    }
+                    Some(TraceHeapObjectKind::Map)
+                        if runtime.trace_heap_object_kind(key_word) == Some(TraceHeapObjectKind::List) =>
+                    {
+                        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                        let _ = self.guard_heap_object(
+                            builder,
+                            source,
+                            TraceHeapObjectKind::Map,
+                            exit,
+                        );
+                        let _ = self.guard_heap_object(
+                            builder,
+                            key,
+                            TraceHeapObjectKind::List,
+                            exit,
+                        );
+                        self.runtime_gc_specialized(
+                            op,
+                            builder,
+                            TRACE_RUNTIME_MODE_MAP_REST,
+                            &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                        )
+                    }
+                    _ => self.runtime_gc_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    ),
+                }
             }
 
-            // These operations are intentionally left on the conservative full
-            // runtime boundary. They change class/module/fiber/exception state that
-            // is broader than the collection-focused same-frame contract above.
-            CreateClass | BindMethod | BindForeignMethod | AllocInstance | AllocForeign
-            | ImportVariable | MakeFiber | Catch => {
+            // List -> List spread is hot enough to deserve a dedicated runtime
+            // helper. The trace guards both operands as Lists, commits roots, then
+            // calls the extracted Vec-extension body directly without redispatching
+            // h_list_spread. The handled result is therefore a native constant.
+            ListSpread => {
+                let destination = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let source = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let destination_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let source_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.c)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+
+                if runtime.trace_heap_object_kind(destination_word) == Some(TraceHeapObjectKind::List)
+                    && runtime.trace_heap_object_kind(source_word) == Some(TraceHeapObjectKind::List)
+                {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let _ = self.guard_heap_object(
+                        builder,
+                        destination,
+                        TraceHeapObjectKind::List,
+                        exit,
+                    );
+                    let _ = self.guard_heap_object(
+                        builder,
+                        source,
+                        TraceHeapObjectKind::List,
+                        exit,
+                    );
+                    let step = self.runtime_gc_specialized(
+                        op,
+                        builder,
+                        TRACE_RUNTIME_MODE_LIST_SPREAD,
+                        &[],
+                    )?;
+                    let handled = builder.constant(TraceConstant::Bool(true));
+                    self.write_gpr(builder, op.a, handled);
+                    Ok(step)
+                } else {
+                    // Non-List sources intentionally return false so the lowerer can
+                    // continue through the ordinary iterator protocol. Preserve that
+                    // uncommon path exactly in the baseline helper.
+                    self.runtime_gc_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
+                    )
+                }
+            }
+
+            // Object spread is similarly specialized for Map -> Map. Null source
+            // is a pure no-op and needs no runtime boundary at all.
+            MapSpread => {
+                let destination = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let destination_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let source_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+
+                if source_word.0 == TAG_NULL {
+                    let null = builder.constant(TraceConstant::Null);
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    builder.emit0(TraceInst::GuardEq { lhs: source, rhs: null, exit });
+                    Ok(ExpectedStep::Exact(next))
+                } else if runtime.trace_heap_object_kind(destination_word) == Some(TraceHeapObjectKind::Map)
+                    && runtime.trace_heap_object_kind(source_word) == Some(TraceHeapObjectKind::Map)
+                {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let _ = self.guard_heap_object(
+                        builder,
+                        destination,
+                        TraceHeapObjectKind::Map,
+                        exit,
+                    );
+                    let _ = self.guard_heap_object(
+                        builder,
+                        source,
+                        TraceHeapObjectKind::Map,
+                        exit,
+                    );
+                    self.runtime_gc_specialized(
+                        op,
+                        builder,
+                        TRACE_RUNTIME_MODE_MAP_SPREAD,
+                        &[],
+                    )
+                } else {
+                    self.runtime_gc_leaf(op, builder, &[])
+                }
+            }
+
+            ListAppend | ListInsert => {
+                let list_reg = Reg(op.a);
+                let list_word = runtime
+                    .trace_read_slot(FrameSlot::General(list_reg))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if runtime.trace_heap_object_kind(list_word) == Some(TraceHeapObjectKind::List) {
+                    let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let _ = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                    let mode = if op.opcode == ListAppend {
+                        TRACE_RUNTIME_MODE_LIST_APPEND
+                    } else {
+                        TRACE_RUNTIME_MODE_LIST_INSERT
+                    };
+                    self.runtime_gc_specialized(op, builder, mode, &[])
+                } else {
+                    self.runtime_gc_leaf(op, builder, &[])
+                }
+            }
+
+            Safepoint => self.runtime_gc_leaf(op, builder, &[]),
+
+            // These allocators mutate runtime-owned heap/scheduler state but never
+            // leave the current frame. A GC leaf preserves unrelated register SSA.
+            AllocInstance | AllocForeign | MakeFiber => self.runtime_gc_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+
+            ImportVariable => {
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if let Some((expected_module, address)) =
+                    runtime.trace_import_variable_access(observed, StringId(op.x))
+                {
+                    let module = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    let expected = builder.constant(TraceConstant::StableTagged(expected_module.0));
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    builder.emit0(TraceInst::GuardEq { lhs: module, rhs: expected, exit });
+                    let value = builder.emit1(
+                        TraceInst::LoadAbsoluteValue { address: address as u64 },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    );
+                    self.write_gpr(builder, op.a, value);
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
+
+            Catch => {
+                // Catch may materialize a native RuntimeError into a new String and
+                // always rewrites Special::Error in addition to A. Keep both slots
+                // coherent while retaining every unrelated SSA value.
+                let step = self.runtime_gc_leaf(
+                    op,
+                    builder,
+                    &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                )?;
+                builder.reload_slot_after_runtime(
+                    FrameSlot::Special(SpecialReg::Error),
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                Ok(step)
+            }
+
+            // Class creation/binding changes global layout or method-table epochs.
+            // Keep those rare structural operations as full runtime boundaries.
+            CreateClass | BindMethod | BindForeignMethod => {
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
-
-            // ListSpread writes a tagged handled flag in A. The common List case
-            // may still resize the destination, so keep exact semantics in the GC
-            // helper while retaining every unrelated SSA value around it.
-            ListSpread => self.runtime_gc_leaf(
-                op,
-                builder,
-                &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
-            ),
 
             Return
             | Return2
@@ -4167,6 +4716,9 @@ impl CraneliftLoweringState<'_, '_> {
                 .builder
                 .ins()
                 .f64const(Ieee64::with_bits(bits)),
+            TraceConstant::StableTagged(bits) => {
+                self.builder.ins().iconst(types::I64, bits as i64)
+            }
             TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
                 return Err(self.error("runtime-owned constant reached native tier"));
             }
@@ -4560,7 +5112,8 @@ impl CraneliftLoweringState<'_, '_> {
                     let source_rep = match constant {
                         TraceConstant::Int32(_) => TraceRep::Int32,
                         TraceConstant::F64Bits(_) => TraceRep::F64,
-                        TraceConstant::Null | TraceConstant::Bool(_) | TraceConstant::NumBits(_) => TraceRep::Tagged,
+                        TraceConstant::Null | TraceConstant::Bool(_) | TraceConstant::NumBits(_)
+                        | TraceConstant::StableTagged(_) => TraceRep::Tagged,
                         TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
                             return Err(self.error("runtime-owned constant reached native trace link"));
                         }
@@ -4705,6 +5258,12 @@ impl CraneliftLoweringState<'_, '_> {
             TraceHeapObjectKind::Cell => TraceHeapKind::Cell,
             TraceHeapObjectKind::Instance => TraceHeapKind::Instance,
             TraceHeapObjectKind::Promise => TraceHeapKind::Promise,
+            TraceHeapObjectKind::Range => TraceHeapKind::Range,
+            TraceHeapObjectKind::Closure => TraceHeapKind::Closure,
+            TraceHeapObjectKind::Fiber => TraceHeapKind::Fiber,
+            TraceHeapObjectKind::Module => TraceHeapKind::Module,
+            TraceHeapObjectKind::Class => TraceHeapKind::Class,
+            TraceHeapObjectKind::Foreign => TraceHeapKind::Foreign,
         }
     }
 
@@ -5154,8 +5713,8 @@ impl CraneliftLoweringState<'_, '_> {
                 // Calls may allocate/collect even when they synchronously return to
                 // the same Napalm frame, so moving addresses die at this boundary.
                 self.invalidate_heap_proofs();
-                if next.0 & TRACE_RUNTIME_CALL_FLAG != 0 {
-                    return Err(self.error("RuntimeCall continuation PC uses reserved high bit"));
+                if next.0 & TRACE_RUNTIME_MODE_MASK != 0 {
+                    return Err(self.error("RuntimeCall continuation PC uses reserved runtime-mode bits"));
                 }
                 let callee = self.builder.ins().load(
                     self.pointer_type,
@@ -5167,7 +5726,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let pc = self.builder.ins().iconst(types::I32, location.pc.0 as i64);
                 let next = self.builder.ins().iconst(
                     types::I32,
-                    (next.0 | TRACE_RUNTIME_CALL_FLAG) as i64,
+                    (next.0 | TRACE_RUNTIME_MODE_CALL) as i64,
                 );
                 let call = self.builder.ins().call_indirect(
                     self.runtime_signature,
@@ -5205,6 +5764,15 @@ impl CraneliftLoweringState<'_, '_> {
                 self.builder
                     .ins()
                     .store(Self::trusted_mem(), value, address, 0);
+            }
+
+            IncrementProfileCounter { address } => {
+                let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                let current = self.builder.ins().load(types::I64, Self::trusted_mem(), pointer, 0);
+                let saturated = self.builder.ins().icmp_imm(IntCC::Equal, current, -1);
+                let incremented = self.builder.ins().iadd_imm(current, 1);
+                let next = self.builder.ins().select(saturated, current, incremented);
+                self.builder.ins().store(Self::trusted_mem(), next, pointer, 0);
             }
 
             IsInstanceObserved {
@@ -5891,6 +6459,43 @@ impl CraneliftLoweringState<'_, '_> {
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, data, 0);
             }
 
+            HeapWriteBarrier { object, value, exit } => {
+                if self.trace_value_may_be_heap(*value)? {
+                    let tagged_value = self.lower_value(*value)?;
+                    let mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
+                    let tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+                    let masked = self.builder.ins().band(tagged_value, mask);
+                    let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, tag);
+
+                    let barrier = self.builder.create_block();
+                    let done = self.builder.create_block();
+                    self.builder.ins().brif(is_heap, barrier, &[], done, &[]);
+
+                    self.builder.switch_to_block(barrier);
+                    let tagged_object = self.lower_value(*object)?;
+                    let (_, owner_address) = self.guard_live_heap_entry(tagged_object, *exit)?;
+                    let callee = self.builder.ins().load(
+                        self.pointer_type,
+                        Self::trusted_mem(),
+                        self.activation,
+                        offset_of!(TraceActivation, heap_write_barrier) as i32,
+                    );
+                    let runtime = self.builder.ins().load(
+                        self.pointer_type,
+                        Self::trusted_mem(),
+                        self.activation,
+                        offset_of!(TraceActivation, runtime) as i32,
+                    );
+                    self.builder.ins().call_indirect(
+                        self.heap_barrier_signature,
+                        callee,
+                        &[runtime, owner_address],
+                    );
+                    self.builder.ins().jump(done, &[]);
+                    self.builder.switch_to_block(done);
+                }
+            }
+
             HeapListLen { list, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let len = self.heap_entry_len(entry);
@@ -5972,6 +6577,90 @@ impl CraneliftLoweringState<'_, '_> {
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
+            }
+
+            HeapStringAsciiCodePointAt { string, index, exit } => {
+                let (entry, _, metadata) = self.heap_entry_with_metadata_for_value(
+                    *string,
+                    TraceHeapKind::String,
+                    *exit,
+                )?;
+                // String sidecars store code-point count in len and UTF-8 byte
+                // length in metadata. Equality proves every code point is one byte.
+                let code_points = self.heap_entry_len(entry);
+                let byte_len32 = self.heap_metadata_payload(metadata);
+                let byte_len = self.builder.ins().uextend(types::I64, byte_len32);
+                let same_length = self.builder.ins().icmp(
+                    IntCC::Equal,
+                    code_points,
+                    byte_len,
+                );
+                // Metadata saturates at 24 bits. A saturated byte length cannot
+                // prove ASCII because a non-ASCII string may have exactly MAX
+                // code points while occupying more than MAX UTF-8 bytes.
+                let metadata_exact = self.builder.ins().icmp_imm_s(
+                    IntCC::NotEqual,
+                    byte_len32,
+                    TRACE_HEAP_METADATA_MAX as i64,
+                );
+                let same_length = self.bool32(same_length);
+                let metadata_exact = self.bool32(metadata_exact);
+                let ascii = self.builder.ins().band(same_length, metadata_exact);
+                let not_ascii = self.bool_not(ascii);
+                self.emit_side_exit(*exit, not_ascii)?;
+
+                let index = self.lower_value(*index)?;
+                let index = self.normalize_list_index(index, byte_len, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let address = self.builder.ins().iadd(data, index);
+                let byte = self.builder.ins().load(
+                    types::I8,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                let code_point = self.builder.ins().uextend(types::I32, byte);
+                self.cache_value(one_result(node)?, code_point);
+            }
+
+            HeapStringCodePointAt { string, index, exit } => {
+                let (entry, _, metadata) = self.heap_entry_with_metadata_for_value(
+                    *string,
+                    TraceHeapKind::String,
+                    *exit,
+                )?;
+                let byte_len32 = self.heap_metadata_payload(metadata);
+                let exact = self.builder.ins().icmp_imm_s(
+                    IntCC::NotEqual,
+                    byte_len32,
+                    TRACE_HEAP_METADATA_MAX as i64,
+                );
+                let exact = self.bool32(exact);
+                let saturated = self.bool_not(exact);
+                self.emit_side_exit(*exit, saturated)?;
+
+                let byte_len = self.builder.ins().uextend(types::I64, byte_len32);
+                let index = self.lower_value(*index)?;
+                let index = self.normalize_list_index(index, byte_len, *exit)?;
+                let data = self.heap_entry_data(entry);
+
+                let mut signature = Signature::new(self.builder.func.signature.call_conv);
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                let signature = self.builder.import_signature(signature);
+                let callee = self.builder.ins().iconst(
+                    self.pointer_type,
+                    native_decode_napalm_code_point as *const () as usize as i64,
+                );
+                let call = self.builder.ins().call_indirect(
+                    signature,
+                    callee,
+                    &[data, byte_len, index],
+                );
+                let result = self.builder.inst_results(call)[0];
+                self.cache_value(one_result(node)?, result);
             }
 
             HeapAwaitFulfilled { promise, exit } => {

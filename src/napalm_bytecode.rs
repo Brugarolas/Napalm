@@ -1141,20 +1141,16 @@ impl Opcode {
         matches!(
             self,
             Safepoint
-                | ListSpread | MapSpread | DestructureCheck | DestructureRest | InvokeSpread
+                | ListSpread | MapSpread | DestructureRest | InvokeSpread
                 | Invoke
                 | InvokeSuper
                 | CallDirect
                 | CallClosure
                 | CallPrimitive
                 | CallForeign
-                | CreateClass
-                | BindMethod
-                | BindForeignMethod
                 | AllocInstance
                 | AllocForeign
                 | ImportModule
-                | ImportVariable
                 | AllocCell
                 | MakeClosure
                 | AllocList
