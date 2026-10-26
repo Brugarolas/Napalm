@@ -30,7 +30,7 @@ use crate::napalm_gc::{
     RootVisitor as GcRootVisitor, Slot as GcSlot, TraceLayout as GcTraceLayout,
     RAW_CODEC as GC_RAW_CODEC,
 };
-use crate::napalm_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
+use crate::napalm_trace_ir::{FrameSlot, TraceConstant, TraceHeapObjectKind, TraceId, TraceLocation};
 #[path = "napalm_event_loop.rs"]
 pub mod napalm_event_loop;
 use self::napalm_event_loop::{CancelOutcome, EventId, FiredEvent, NapalmEventLoop};
@@ -9309,6 +9309,18 @@ impl TraceRuntime for Interpreter<'_> {
             returns: banks.returns.as_mut_ptr(), special: banks.special.as_mut_ptr(), runtime,
             execute: execute_trace_runtime, heap_chunks: handles().jit_chunks(),
             heap_write_barrier: trace_heap_write_barrier })
+    }
+
+    fn trace_heap_object_kind(&self, value: RegisterWord) -> Option<TraceHeapObjectKind> {
+        match self.heap.get(Value::from_word(value))? {
+            HeapObject::String(_) => Some(TraceHeapObjectKind::String),
+            HeapObject::List(_) => Some(TraceHeapObjectKind::List),
+            HeapObject::Map(_) => Some(TraceHeapObjectKind::Map),
+            HeapObject::Cell(_) => Some(TraceHeapObjectKind::Cell),
+            HeapObject::Instance { .. } => Some(TraceHeapObjectKind::Instance),
+            HeapObject::Promise { .. } => Some(TraceHeapObjectKind::Promise),
+            _ => None,
+        }
     }
 
     fn trace_shaped_map_access(

@@ -497,10 +497,24 @@ impl TraceBuilder {
         self.emit0(TraceInst::Runtime { location, next, terminal: false });
     }
 
-    /// Reload a register written by `runtime_leaf`. Runtime-owned results are
-    /// architectural writes, so keep them in the logical dirty set for loop-phi
-    /// construction and side-exit reconstruction even though memory is already
-    /// synchronized at this point.
+    /// Emit a synchronized same-frame runtime step which may allocate or collect,
+    /// while preserving SSA values for architectural registers that the opcode does
+    /// not modify. Heap/memory facts are still killed by the Runtime node itself.
+    ///
+    /// This is safe for opcodes such as collection spread/rest and allocation
+    /// helpers whose bytecode contract guarantees that they return to the same
+    /// frame. Registers first observed after this point are loaded from the
+    /// refreshed activation instead of being treated as trace-entry values.
+    pub fn runtime_gc_leaf(&mut self, location: TraceLocation, next: BytecodePc) {
+        self.commit_preserving_ssa();
+        self.emit0(TraceInst::Runtime { location, next, terminal: false });
+        self.memory_epoch = true;
+    }
+
+    /// Reload a register written by `runtime_leaf` or `runtime_gc_leaf`.
+    /// Runtime-owned results are architectural writes, so keep them in the logical
+    /// dirty set for loop-phi construction and side-exit reconstruction even though
+    /// memory is already synchronized at this point.
     pub fn reload_slot_after_runtime(
         &mut self,
         slot: FrameSlot,
@@ -988,6 +1002,38 @@ mod optimizer_tests {
             builder.trace.value(loaded).map(|value| &value.origin),
             Some(TraceValueOrigin::InstResult { .. })
         ));
+    }
+
+    #[test]
+    fn runtime_gc_leaf_preserves_known_ssa_but_starts_a_memory_epoch() {
+        let location = TraceLocation::new(FuncId(0), BytecodePc(12));
+        let mut builder = TraceBuilder::new(
+            TraceId(100),
+            TraceAnchor { kind: TraceKind::Entry, location },
+        );
+        let preserved = FrameSlot::General(Reg(2));
+        let first_after_gc = FrameSlot::General(Reg(3));
+
+        let value = builder.constant(TraceConstant::Int32(7));
+        builder.write_slot(preserved, value);
+        builder.runtime_gc_leaf(location, BytecodePc(13));
+
+        assert_eq!(builder.slot_value(preserved), Some(value));
+        assert!(builder.has_runtime_calls());
+
+        let loaded = builder.read_slot(
+            first_after_gc,
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        assert!(matches!(
+            builder.trace.value(loaded).map(|value| &value.origin),
+            Some(TraceValueOrigin::InstResult { .. })
+        ));
+        assert!(builder.trace.nodes.iter().any(|node| matches!(
+            node.kind,
+            TraceInst::LoadFrameSlot { slot } if slot == first_after_gc
+        )));
     }
 
 }

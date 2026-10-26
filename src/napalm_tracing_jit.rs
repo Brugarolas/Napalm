@@ -478,6 +478,14 @@ pub trait TraceRuntime {
         &mut self,
     ) -> Result<TraceActivationInputs, Self::RuntimeError>;
 
+    /// Observe the stable internal heap kind of a tagged value without mutating
+    /// VM state. This lets syntax operations such as destructuring specialize the
+    /// overwhelmingly common List/Map cases while side-exiting to baseline for
+    /// generic iterables or other dynamic values.
+    fn trace_heap_object_kind(&self, _value: RegisterWord) -> Option<TraceHeapObjectKind> {
+        None
+    }
+
     /// Observe a Map/key pair without mutating VM state. Returning Some allows
     /// the recorder to specialize this site to shape+slot native code.
     fn trace_shaped_map_access(
@@ -898,6 +906,9 @@ fn deopt_resume(
 /// module operations between larger native regions, not for replacing baseline
 /// dispatch one opcode at a time.
 const MAX_RUNTIME_LEAF_OPS_PER_TRACE: usize = 8;
+/// GC-capable same-frame helpers are slightly more expensive but can still be
+/// profitable inside collection-heavy traces because they preserve register SSA.
+const MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE: usize = 16;
 
 struct TraceRecorder<'a> {
     options: &'a TracingJitOptions,
@@ -1143,6 +1154,38 @@ impl<'a> TraceRecorder<'a> {
         // successful path it must advance to `next_pc`; if the opcode throws,
         // deoptimizes or otherwise changes control flow while recording, the
         // recorder ends the trace cleanly instead of reporting a path mismatch.
+        Ok(ExpectedStep::Runtime { terminal: false })
+    }
+
+    /// Same-frame runtime boundary for an opcode that may allocate/collect but
+    /// cannot switch frames or fibers. Unlike the generic full Runtime fallback,
+    /// unaffected architectural registers stay in SSA/native registers. The
+    /// Runtime node still acts as a complete heap/memory epoch, so no stale list,
+    /// map or object-address proof can cross the call.
+    fn runtime_gc_leaf(
+        &self,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        outputs: &[(Reg, TraceType, TraceRep)],
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if !op.opcode.may_gc() {
+            return self.runtime_leaf(op, builder, outputs);
+        }
+
+        let used = builder
+            .trace()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+            .count();
+        if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        builder.runtime_gc_leaf(op.location, op.next_pc);
+        for &(reg, ty, rep) in outputs {
+            builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
+        }
         Ok(ExpectedStep::Runtime { terminal: false })
     }
 
@@ -2449,9 +2492,10 @@ impl<'a> TraceRecorder<'a> {
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
                 let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
-                    // Inserts, dictionary Maps and non-string keys remain runtime
-                    // operations because they can change representation/storage.
-                    return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                    // Inserts, dictionary Maps and non-string keys can allocate or
+                    // change representation, but they stay in the current frame.
+                    // Preserve unrelated SSA values across that GC-capable helper.
+                    return self.runtime_gc_leaf(op, builder, &[]);
                 };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
@@ -2609,6 +2653,110 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
+            DestructureCheck => {
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let expected = if op.c != 0 {
+                    TraceHeapObjectKind::List
+                } else {
+                    TraceHeapObjectKind::Map
+                };
+
+                if runtime.trace_heap_object_kind(observed) == Some(expected) {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    // The guard proves the common already-materialized case. The
+                    // validated source is the original tagged handle, not the raw
+                    // sidecar pointer produced by GuardHeapObject.
+                    let _ = self.guard_heap_object(builder, source, expected, exit);
+                    self.write_gpr(builder, op.a, source);
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    // Generic iterable/object materialization may allocate.
+                    self.runtime_gc_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
+
+            DestructureGet => {
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let source_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let key_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.c)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+
+                match runtime.trace_heap_object_kind(source_word) {
+                    Some(TraceHeapObjectKind::List) if word_exact_i32(key_word).is_some() => {
+                        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                        let list = self.guard_heap_object(
+                            builder,
+                            source,
+                            TraceHeapObjectKind::List,
+                            exit,
+                        );
+                        // Array destructuring keys are ordinary tagged Numbers in
+                        // bytecode. Guard/unbox them once, then reuse the existing
+                        // native ListGet path. Missing/out-of-range elements side
+                        // exit to the original destructuring opcode, which returns
+                        // Napalm null instead of raising.
+                        let index = self.num_to_i32_guard(builder, key, op.location.pc);
+                        let result = builder.emit1(
+                            TraceInst::HeapListGet { list, index, exit },
+                            TraceType::Any,
+                            TraceRep::Tagged,
+                        );
+                        self.write_gpr(builder, op.a, result);
+                        Ok(ExpectedStep::Exact(next))
+                    }
+                    Some(TraceHeapObjectKind::Map) => {
+                        if let Some(access) = runtime.trace_shaped_map_access(source_word, key_word) {
+                            let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                            let map = self.guard_heap_object(
+                                builder,
+                                source,
+                                TraceHeapObjectKind::Map,
+                                exit,
+                            );
+                            let result = builder.emit1(
+                                TraceInst::HeapMapGetShaped {
+                                    map,
+                                    key,
+                                    expected_key: access.key_bytes,
+                                    shape: access.shape,
+                                    slot: access.slot as u32,
+                                    exit,
+                                },
+                                TraceType::Any,
+                                TraceRep::Tagged,
+                            );
+                            self.write_gpr(builder, op.a, result);
+                            Ok(ExpectedStep::Exact(next))
+                        } else {
+                            // Missing properties, dictionary Maps and non-string
+                            // keys keep exact destructuring-null semantics in the
+                            // non-GC leaf helper without destroying unrelated SSA.
+                            self.runtime_leaf(
+                                op,
+                                builder,
+                                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                            )
+                        }
+                    }
+                    _ => self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    ),
+                }
+            }
+
             // Remaining non-GC runtime leaf operations preserve unrelated native
             // SSA values instead of forcing the full runtime memory epoch.
             ListRemoveAt | MapRemove => self.runtime_leaf(
@@ -2659,19 +2807,40 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::RuntimeCall)
             }
 
-            // GC-capable operations that return to the same frame are explicit
-            // synchronized slow paths rather than unsupported opcodes. They still
-            // form a full heap/register epoch, but the surrounding arithmetic and
-            // control flow remains in the compiled trace even when the default
-            // `no_runtime_calls_in_native_trace` policy is enabled.
+            // Allocation/mutation helpers below may collect, but their bytecode
+            // contract keeps execution in the same frame. Preserve unrelated SSA
+            // values across the memory epoch and reload only architectural outputs.
+            AllocCell | MakeClosure | AllocList | AllocListCap | AllocMap
+            | StringConcat | StringSlice | MakeRange | DestructureRest => {
+                self.runtime_gc_leaf(
+                    op,
+                    builder,
+                    &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                )
+            }
+
+            // Same-frame GC-capable mutations with no architectural result.
+            ListAppend | ListInsert | MapSpread | Safepoint => {
+                self.runtime_gc_leaf(op, builder, &[])
+            }
+
+            // These operations are intentionally left on the conservative full
+            // runtime boundary. They change class/module/fiber/exception state that
+            // is broader than the collection-focused same-frame contract above.
             CreateClass | BindMethod | BindForeignMethod | AllocInstance | AllocForeign
-            | ImportVariable | AllocCell | MakeClosure | AllocList | AllocListCap
-            | ListAppend | ListInsert | AllocMap | StringConcat | StringSlice
-            | MakeRange | MakeFiber | Safepoint | Catch
-            | ListSpread | MapSpread | DestructureCheck | DestructureGet | DestructureRest => {
+            | ImportVariable | MakeFiber | Catch => {
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
+
+            // ListSpread writes a tagged handled flag in A. The common List case
+            // may still resize the destination, so keep exact semantics in the GC
+            // helper while retaining every unrelated SSA value around it.
+            ListSpread => self.runtime_gc_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
+            ),
 
             Return
             | Return2
