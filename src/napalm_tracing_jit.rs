@@ -229,6 +229,9 @@ pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
 /// The source opcode may be CallClosure or an Invoke("call") proven to resolve
 /// to the standard Fn.call builtin.
 pub const TRACE_DIRECT_CALL_FLAG_CLOSURE: u32 = 1 << 0;
+/// Closure capture words were loaded by generated code from TraceHeapEntry::data
+/// and packed immediately after ordinary arguments in direct_call_args.
+pub const TRACE_DIRECT_CALL_FLAG_STAGED_CAPTURES: u32 = 1 << 1;
 
 /// Maximum number of distinct dynamic values one side-exit snapshot may
 /// describe. Native exits now commit these values directly to architectural
@@ -794,6 +797,9 @@ pub struct TracingJitStats {
     /// Ordinary Invoke("call") sites proven to target the standard Fn.call
     /// builtin and lowered to the closure DirectBytecodeCall path.
     pub invoke_closure_direct_calls: u64,
+    /// Closure direct-call sites whose capture payload is staged natively in the
+    /// fixed direct-call scratch instead of reopened through HeapObject in Rust.
+    pub closure_capture_staged_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
@@ -2033,6 +2039,7 @@ impl<'a> TraceRecorder<'a> {
                 exit,
             });
         }
+        let capture_count = callee.capture_count;
         let result = builder.runtime_direct_closure_call(
             op.location,
             op.next_pc,
@@ -2040,11 +2047,15 @@ impl<'a> TraceRecorder<'a> {
             Reg(op.a),
             closure,
             args,
+            capture_count,
             exit,
         );
         self.write_gpr(builder, op.a, result);
         builder.trace_mut().stats.devirtualized_calls += 1;
         builder.trace_mut().stats.closure_direct_calls += 1;
+        if op.args.len() + capture_count as usize <= MAX_WREN_ARITY {
+            builder.trace_mut().stats.closure_capture_staged_calls += 1;
+        }
         if guard_method_epoch {
             builder.trace_mut().stats.invoke_closure_direct_calls += 1;
         }
@@ -6665,12 +6676,19 @@ impl CraneliftLoweringState<'_, '_> {
                     {
                         return Err(self.error("invalid direct bytecode call runtime payload"));
                     }
+                    let mut staged_capture_values = Vec::new();
+                    let stage_captures = direct.closure_guard_exit.is_some()
+                        && direct.args.len() + direct.closure_capture_count as usize <= MAX_WREN_ARITY;
+                    if direct.closure_guard_exit.is_none() && direct.closure_capture_count != 0 {
+                        return Err(self.error("non-closure direct call carries capture metadata"));
+                    }
                     if let Some(exit) = direct.closure_guard_exit {
-                        // Closure function identity is immutable and published in
-                        // TraceHeapEntry::len. Guard it entirely in native code so
-                        // different closure instances of the same function share
-                        // this trace without entering baseline dispatch.
-                        let (entry, _) = self.heap_entry_for_value(
+                        // Closure function identity and capture count are immutable
+                        // and published in the stable sidecar. When the complete
+                        // call payload fits the fixed scratch, load captures here
+                        // before the runtime boundary so the helper never reopens
+                        // HeapObject::Closure.
+                        let (entry, _, metadata) = self.heap_entry_with_metadata_for_value(
                             direct.receiver,
                             TraceHeapKind::Closure,
                             exit,
@@ -6683,6 +6701,28 @@ impl CraneliftLoweringState<'_, '_> {
                         );
                         let mismatch = self.bool32(mismatch);
                         self.emit_side_exit(exit, mismatch)?;
+
+                        if stage_captures {
+                            let actual_count = self.heap_metadata_payload(metadata);
+                            let count_mismatch = self.builder.ins().icmp_imm_u(
+                                IntCC::NotEqual,
+                                actual_count,
+                                direct.closure_capture_count as i64,
+                            );
+                            let count_mismatch = self.bool32(count_mismatch);
+                            self.emit_side_exit(exit, count_mismatch)?;
+
+                            let data = self.heap_entry_data(entry);
+                            for index in 0..direct.closure_capture_count as usize {
+                                let value = self.builder.ins().load(
+                                    types::I64,
+                                    Self::trusted_mem(),
+                                    data,
+                                    (index * std::mem::size_of::<RegisterWord>()) as i32,
+                                );
+                                staged_capture_values.push(value);
+                            }
+                        }
                     }
 
                     let store_i32 = |state: &mut Self, offset: i32, value: u32| {
@@ -6714,6 +6754,7 @@ impl CraneliftLoweringState<'_, '_> {
                         offset_of!(TraceActivation, direct_call_reserved) as i32,
                         if direct.closure_guard_exit.is_some() {
                             TRACE_DIRECT_CALL_FLAG_CLOSURE
+                                | if stage_captures { TRACE_DIRECT_CALL_FLAG_STAGED_CAPTURES } else { 0 }
                         } else {
                             0
                         },
@@ -6733,6 +6774,15 @@ impl CraneliftLoweringState<'_, '_> {
                             argument,
                             self.activation,
                             args_base + (index * std::mem::size_of::<RegisterWord>()) as i32,
+                        );
+                    }
+                    for (capture_index, capture) in staged_capture_values.into_iter().enumerate() {
+                        let scratch_index = direct.args.len() + capture_index;
+                        self.builder.ins().store(
+                            Self::trusted_mem(),
+                            capture,
+                            self.activation,
+                            args_base + (scratch_index * std::mem::size_of::<RegisterWord>()) as i32,
                         );
                     }
                     next.0 | TRACE_RUNTIME_MODE_DIRECT_CALL
@@ -8019,6 +8069,7 @@ impl TracingJit {
                 self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
                 self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
                 self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
+                self.stats.closure_capture_staged_calls += trace.stats.closure_capture_staged_calls as u64;
                 self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
@@ -8160,6 +8211,7 @@ impl TracingJit {
         self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
         self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
         self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
+        self.stats.closure_capture_staged_calls += trace.stats.closure_capture_staged_calls as u64;
         self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
         self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
         self.stats.promoted_u32_loop_phis += trace.stats.promoted_u32_loop_phis as u64;
@@ -8404,6 +8456,7 @@ impl TracingJit {
         self.stats.invoke_super_direct_calls += trace.stats.invoke_super_direct_calls as u64;
         self.stats.closure_direct_calls += trace.stats.closure_direct_calls as u64;
         self.stats.invoke_closure_direct_calls += trace.stats.invoke_closure_direct_calls as u64;
+        self.stats.closure_capture_staged_calls += trace.stats.closure_capture_staged_calls as u64;
         self.stats.recorded_bytecodes = self
             .stats
             .recorded_bytecodes
@@ -9305,10 +9358,12 @@ mod tests {
             assert_eq!(activation.direct_call_arity, 1);
             assert_eq!(
                 activation.direct_call_reserved,
-                TRACE_DIRECT_CALL_FLAG_CLOSURE
+                TRACE_DIRECT_CALL_FLAG_CLOSURE | TRACE_DIRECT_CALL_FLAG_STAGED_CAPTURES
             );
             assert_eq!(activation.direct_call_receiver, RegisterWord(TAG_HEAP));
             assert_eq!(activation.direct_call_args[0], RegisterWord(0x4444));
+            assert_eq!(activation.direct_call_args[1], RegisterWord(0xaaaa));
+            assert_eq!(activation.direct_call_args[2], RegisterWord(0xbbbb));
             unsafe { *activation.general.add(2) = RegisterWord(0xfeed_face) };
             TRACE_RESULT_CONTINUE
         }
@@ -9328,6 +9383,7 @@ mod tests {
             Reg(2),
             closure,
             vec![argument],
+            2,
             slow,
         );
         builder.write_slot(FrameSlot::General(Reg(2)), result);
@@ -9342,8 +9398,14 @@ mod tests {
             .collect::<Vec<_>>();
         let chunks = [chunk.as_mut_ptr()];
         let entry = &chunk[0];
+        let captures = [RegisterWord(0xaaaa), RegisterWord(0xbbbb)];
         entry.address.store(1, Ordering::Relaxed);
-        entry.kind.store(TraceHeapKind::Closure as u32, Ordering::Relaxed);
+        entry.kind.store(
+            TraceHeapKind::Closure as u32
+                | (captures.len() as u32) << TRACE_HEAP_METADATA_SHIFT,
+            Ordering::Relaxed,
+        );
+        entry.data.store(captures.as_ptr() as usize, Ordering::Relaxed);
         entry.len.store(9, Ordering::Relaxed);
 
         let mut general = [RegisterWord(TAG_HEAP), RegisterWord(0), RegisterWord(0)];
@@ -9362,6 +9424,23 @@ mod tests {
         assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2], RegisterWord(0xfeed_face));
+
+        // Capture count is part of the native sidecar contract. A mismatched
+        // payload must replay baseline before any direct-call helper executes.
+        entry.kind.store(
+            TraceHeapKind::Closure as u32 | (1u32 << TRACE_HEAP_METADATA_SHIFT),
+            Ordering::Release,
+        );
+        general[2] = RegisterWord(0);
+        activation.reset_result();
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, slow.0);
+        assert_eq!(general[2], RegisterWord(0));
+        entry.kind.store(
+            TraceHeapKind::Closure as u32
+                | (captures.len() as u32) << TRACE_HEAP_METADATA_SHIFT,
+            Ordering::Release,
+        );
 
         // A different closure function must replay the original CallClosure and
         // must not enter the direct-call runtime helper.

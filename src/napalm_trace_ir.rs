@@ -105,6 +105,9 @@ pub struct TraceDirectCall {
     /// ordinary Invoke("call")).
     pub receiver: TraceValueId,
     pub args: Vec<TraceValueId>,
+    /// Number of closure capture words that generated code may stage directly
+    /// from the stable sidecar payload. Zero for non-closure ABI calls.
+    pub closure_capture_count: u16,
     /// Closure ABI calls specialize an immutable closure function identity. The
     /// side exit replays the original source opcode if heap kind or function index
     /// no longer matches the observation used to build this trace.
@@ -444,6 +447,10 @@ pub struct TraceStats {
     /// inside the trace to guarded closure DirectBytecodeCall without changing
     /// frontend or bytecode semantics.
     pub invoke_closure_direct_calls: usize,
+    /// Closure direct-call sites whose complete capture payload fits in the fixed
+    /// native call scratch and is therefore loaded from TraceHeapEntry::data by
+    /// Cranelift before entering the runtime helper.
+    pub closure_capture_staged_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
 }
@@ -654,6 +661,7 @@ impl TraceBuilder {
                 destination,
                 receiver,
                 args,
+                closure_capture_count: 0,
                 closure_guard_exit: None,
             }),
         });
@@ -690,6 +698,7 @@ impl TraceBuilder {
         destination: Reg,
         closure: TraceValueId,
         args: Vec<TraceValueId>,
+        capture_count: u16,
         guard_exit: SideExitId,
     ) -> TraceValueId {
         self.commit_preserving_ssa();
@@ -702,6 +711,7 @@ impl TraceBuilder {
                 destination,
                 receiver: closure,
                 args,
+                closure_capture_count: capture_count,
                 closure_guard_exit: Some(guard_exit),
             }),
         });
@@ -811,6 +821,9 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             }
             if call.closure_guard_exit.is_some_and(|exit| exit.0 as usize >= t.exits.len()) {
                 errors.push("direct closure call references an unknown guard exit".into());
+            }
+            if call.closure_guard_exit.is_none() && call.closure_capture_count != 0 {
+                errors.push("non-closure direct call carries capture metadata".into());
             }
             if t.value(t.canonical_value(call.receiver))
                 .is_some_and(|value| value.rep != TraceRep::Tagged)
@@ -1298,6 +1311,7 @@ mod optimizer_tests {
             destination,
             closure,
             vec![argument],
+            2,
             guard_exit,
         );
 
@@ -1309,6 +1323,7 @@ mod optimizer_tests {
             TraceInst::Runtime { direct_call: Some(call), .. }
                 if call.function_index == 9
                     && call.receiver == closure
+                    && call.closure_capture_count == 2
                     && call.closure_guard_exit == Some(guard_exit)
         )));
     }

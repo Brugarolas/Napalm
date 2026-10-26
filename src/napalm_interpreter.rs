@@ -5063,6 +5063,24 @@ impl<'p> Interpreter<'p> {
         closure: Option<Value>,
         return_dst: Option<Reg>,
     ) -> Result<(), RuntimeError> {
+        self.push_frame_with_capture_words(
+            function_index, receiver, args, closure, None, return_dst,
+        )
+    }
+
+    /// Push a frame with an optional capture payload that has already been
+    /// validated and materialized by native trace code. This avoids reopening
+    /// HeapObject::Closure on the hot direct-call path while preserving the
+    /// ordinary frame layout and precise root map.
+    fn push_frame_with_capture_words(
+        &mut self,
+        function_index: u32,
+        receiver: Option<RegisterWord>,
+        args: &[RegisterWord],
+        closure: Option<Value>,
+        capture_words: Option<&[RegisterWord]>,
+        return_dst: Option<Reg>,
+    ) -> Result<(), RuntimeError> {
         if args.len() > ARGUMENT_REGISTER_COUNT {
             return Err(RuntimeError::new("too many call arguments"));
         }
@@ -5079,9 +5097,16 @@ impl<'p> Interpreter<'p> {
         let module_value = self.modules[prepared.module_slot as usize].module_value;
         let fiber_value = self.fiber(self.current_fiber).object;
 
-        // Closure captures live in a stable heap slot. The heap is not mutated
-        // while constructing the frame, so retaining this slice is safe here.
-        let captures: &[RegisterWord] = if let Some(closure_value) = closure {
+        // Native direct-closure calls can stage the immutable capture array in
+        // TraceActivation before crossing the runtime boundary. The staged
+        // slice is already guarded by heap kind, function identity and capture
+        // count, so this path avoids a second HeapObject lookup entirely.
+        let captures: &[RegisterWord] = if let Some(words) = capture_words {
+            if closure.is_none() || words.len() != prepared.capture_count as usize {
+                return Err(RuntimeError::new("staged closure capture payload mismatch"));
+            }
+            words
+        } else if let Some(closure_value) = closure {
             match self.heap.get(closure_value) {
                 Some(HeapObject::Closure { function_index: actual, captures, .. })
                     if *actual == function_index => captures.as_ref(),
@@ -5459,6 +5484,35 @@ impl<'p> Interpreter<'p> {
                 }
                 Err(error) => self.fail_at(op, error.message),
             }
+        }
+    }
+
+    /// Synchronous bytecode-call boundary with captures already staged by the
+    /// native trace. No GC-capable operation runs between reading the scratch
+    /// words and publishing them in the new callee frame.
+    fn enter_bytecode_call_with_capture_words(
+        &mut self,
+        op: &PreparedOp,
+        function: u32,
+        args: &[RegisterWord],
+        closure: Value,
+        captures: &[RegisterWord],
+    ) {
+        self.mark_gc_point(op);
+        unsafe { self.advance(op); }
+        self.flush_hot_pc();
+
+        if self.prepared.functions[function as usize].is_async {
+            self.fail_at(op, "staged direct closure call cannot target async bytecode");
+            return;
+        }
+        match self.push_frame_with_capture_words(
+            function, None, args, Some(closure), Some(captures), Some(Reg(op.a)),
+        ) {
+            Ok(()) => {
+                self.current_frame_mut().caller_pc = Some(op.raw_pc);
+            }
+            Err(error) => self.fail_at(op, error.message),
         }
     }
 
@@ -9576,12 +9630,17 @@ impl Interpreter<'_> {
         };
         let closure_call =
             activation.direct_call_reserved & crate::napalm_tracing_jit::TRACE_DIRECT_CALL_FLAG_CLOSURE != 0;
+        let staged_captures = activation.direct_call_reserved
+            & crate::napalm_tracing_jit::TRACE_DIRECT_CALL_FLAG_STAGED_CAPTURES != 0;
         if closure_call {
             if !matches!(opcode, Opcode::CallClosure | Opcode::Invoke) {
                 return Err(RuntimeError::new("closure direct trace call used from incompatible opcode"));
             }
         } else if opcode == Opcode::CallClosure {
             return Err(RuntimeError::new("CallClosure direct trace call is missing closure ABI flag"));
+        }
+        if staged_captures && !closure_call {
+            return Err(RuntimeError::new("staged captures require closure direct-call ABI"));
         }
         if callee_is_async
             || callee_arity != arity
@@ -9592,27 +9651,38 @@ impl Interpreter<'_> {
             return Err(RuntimeError::new("direct trace call target contract changed"));
         }
 
-        // Scratch values are copied before any operation capable of collecting.
-        // enter_bytecode_call only publishes the caller safepoint and pushes the
-        // new frame for synchronous bytecode callees; subsequent GC sees these
-        // values in the callee's precise architectural registers.
+        // Direct-call scratch is stable for the duration of this helper. Known
+        // synchronous bytecode calls do not collect before push_frame publishes
+        // arguments/captures into precise architectural roots, so use the
+        // activation slices directly and avoid another fixed-array copy.
         let subject = activation.direct_call_receiver;
-        let mut args = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
-        args[..arity].copy_from_slice(&activation.direct_call_args[..arity]);
+        let args = &activation.direct_call_args[..arity];
         if closure_call {
             let closure = Value::from_word(subject);
-            let valid = matches!(
-                self.heap.get(closure),
-                Some(HeapObject::Closure { function_index: actual, captures, .. })
-                    if *actual == function_index
-                        && captures.len() == callee_capture_count
-            );
-            if !valid {
-                return Err(RuntimeError::new("direct closure call target contract changed"));
+            if staged_captures {
+                let end = arity.checked_add(callee_capture_count)
+                    .ok_or_else(|| RuntimeError::new("staged closure scratch overflow"))?;
+                if end > ARGUMENT_REGISTER_COUNT {
+                    return Err(RuntimeError::new("staged closure captures exceed direct-call scratch"));
+                }
+                let captures = &activation.direct_call_args[arity..end];
+                self.enter_bytecode_call_with_capture_words(
+                    &op, function_index, args, closure, captures,
+                );
+            } else {
+                let valid = matches!(
+                    self.heap.get(closure),
+                    Some(HeapObject::Closure { function_index: actual, captures, .. })
+                        if *actual == function_index
+                            && captures.len() == callee_capture_count
+                );
+                if !valid {
+                    return Err(RuntimeError::new("direct closure call target contract changed"));
+                }
+                self.enter_bytecode_call(&op, function_index, None, args, Some(closure));
             }
-            self.enter_bytecode_call(&op, function_index, None, &args[..arity], Some(closure));
         } else {
-            self.enter_bytecode_call(&op, function_index, Some(subject), &args[..arity], None);
+            self.enter_bytecode_call(&op, function_index, Some(subject), args, None);
         }
 
         while self.run_state == RunState::Running
@@ -10045,6 +10115,7 @@ return result
             if native {
                 let stats = vm.jit_stats().unwrap();
                 assert!(stats.invoke_closure_direct_calls > 0, "{stats:?}");
+                assert!(stats.closure_capture_staged_calls > 0, "{stats:?}");
                 assert!(stats.closure_direct_calls >= stats.invoke_closure_direct_calls, "{stats:?}");
                 assert!(stats.devirtualized_calls >= stats.invoke_closure_direct_calls, "{stats:?}");
             }
@@ -10083,6 +10154,7 @@ return result
             if native {
                 let stats = vm.jit_stats().unwrap();
                 assert!(stats.invoke_closure_direct_calls > 0, "{stats:?}");
+                assert!(stats.closure_capture_staged_calls > 0, "{stats:?}");
             }
         }
     }
