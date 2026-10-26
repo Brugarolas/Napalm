@@ -1,5 +1,138 @@
 // Production frontend -> HIR -> optimizer -> bytecode -> interpreter/JIT.
+#[test]
+fn napalm_destructuring_assignments_parameters_and_captures() {
+    run_napalm(r#"
+        function swap(pair) { let [a, b] = pair; [a, b] = [b, a]; return [a, b]; }
+        const arrow = ({x: [first, ...rest]}, [other = 3]) => [first, rest, other];
+        class Box {
+            value;
+            constructor({value}) { this.value = value; }
+            add([a, b]) { return this.value + a + b; }
+        }
+        let a = 0; let rest = null; let x = 0;
+        function change() { [a, ...rest] = [7, 8, 9]; ({missing: x = 10} = {}); }
+        change();
+        const object = {};
+        const returned = ([object.value, x] = [11, 12]);
+        let sum = 0;
+        for (const [left, {right = 2}] of [[1, {}], [3, {right: 4}]]) sum += left + right;
+        const result = [swap([1, 2]), arrow({x: [4, 5, 6]}, []), new Box({value: 1}).add([2, 3]), a, rest, object.value, x, returned, sum];
+    "#, "[[2, 1], [4, [5, 6], 3], 6, 7, [8, 9], 11, 12, [11, 12], 10]");
+}
+
+#[test]
+fn napalm_destructuring_rejects_invalid_patterns_and_const_writes() {
+    for source in [
+        "const [...rest, last] = [1, 2];",
+        "const [...rest,] = [];",
+        "let rest; [...rest,] = [];",
+        "let rest; ({...rest,} = {});",
+        "const {...rest, x} = {};",
+        "const [a = ] = [];",
+        "const x = 1; [x] = [2];",
+        "const x = 1; const f = () => { ({x} = {x: 2}); };",
+        "let x; [x] += [1];",
+        "let x; [0] = [1];",
+        "let x; const object = {x = 1};",
+        "function f([x], {x}) {}",
+    ] {
+        let parsed = crate::napalm_front_main::parse("bad.nap", source);
+        assert!(parsed.has_errors(), "accepted invalid pattern: {source}");
+    }
+}
+
+#[test]
+fn napalm_spread_and_destructuring_use_dedicated_bytecode() {
+    use crate::napalm_bytecode::{Decoder, Opcode};
+    let source = "const [a, ...rest] = [1, ...[2, 3]]; const {x, ...other} = {...{x: 4, y: 5}}; const f = (x) => x; const result = f(...[a]);";
+    let parsed = crate::napalm_front_main::parse("ops.nap", source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut hir = Program::new();
+    napalm_builtin::install_hir_builtins(&mut hir);
+    let lowered = lower_module(&mut hir, "ops.nap", source, "ops", &parsed.module);
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    let mut program = compile_program(&mut hir).unwrap();
+    let opcodes: std::collections::HashSet<_> = program.functions.iter()
+        .flat_map(|function| Decoder::new(&function.chunk.code).map(|op| op.unwrap().opcode)).collect();
+    for opcode in [Opcode::ListSpread, Opcode::MapSpread, Opcode::DestructureCheck,
+        Opcode::DestructureGet, Opcode::DestructureRest, Opcode::InvokeSpread] {
+        assert!(opcodes.contains(&opcode), "missing {opcode:?}");
+    }
+    assert!(crate::napalm_bytecode::BytecodeVerifier::verify_program(&program).is_ok());
+    // Corrupt a dynamic dispatch operand: the verifier must reject it before VM preparation.
+    let function = program.functions.iter_mut().find(|f| Decoder::new(&f.chunk.code)
+        .any(|op| op.unwrap().opcode == Opcode::InvokeSpread)).unwrap();
+    let pc = Decoder::new(&function.chunk.code).find_map(|op| {
+        let op = op.unwrap(); (op.opcode == Opcode::InvokeSpread).then_some(op.pc)
+    }).unwrap();
+    function.chunk.code[pc.word_index() + 1].0 = u32::MAX;
+    assert!(crate::napalm_bytecode::BytecodeVerifier::verify_program(&program).is_err());
+}
+
+#[test]
+fn napalm_destructuring_nested_defaults_rest_and_computed_keys() {
+    run_napalm(r#"
+        let calls = 0;
+        function source() { calls++; return [{x: [1, 2, 3]}, 4, 5]; }
+        const [{x: [first, , ...tail]}, second, ...rest] = source();
+        let keys = 0;
+        function key() { keys++; return 'x'; }
+        const {[key()]: renamed, missing = ++calls, ...others} = {x: 7, y: 8};
+        const [absent = 9, falseValue = 10] = [null, false];
+        rest.add(6);
+        const result = [first, tail, second, rest, renamed, missing, others.y, calls, keys, absent, falseValue];
+    "#, "[1, [3], 4, [5, 6], 7, 2, 8, 2, 1, 9, false]");
+}
+
+#[test]
+fn napalm_spread_collections_and_iterators() {
+    run_napalm(r#"
+        const original = [1, 2];
+        const copied = [0, ...original, ...[], ...new Range(3, 5), ...'ab'];
+        const base = {x: 1, y: [2]};
+        const merged = {x: 0, ...base, ...null, x: 3};
+        merged.y.add(4);
+        original[0] = 9;
+        const result = [copied, merged.x, base.x, base.y];
+    "#, "[[0, 1, 2, 3, 4, a, b], 3, 1, [2, 4]]");
+}
+
+#[test]
+fn napalm_spread_calls_methods_constructors_and_super() {
+    run_napalm(r#"
+        const sum = (a, b, c) => a + b + c;
+        class Base { value; constructor(a, b) { this.value = a + b; } add(a, b) { return this.value + a + b; } }
+        class Derived extends Base {
+            constructor(xs) { super(...xs); }
+            add(xs) { return super.add(...xs); }
+        }
+        const item = new Derived(...[[2, 3]]);
+        const object = {sum};
+        let skipped = 0;
+        const missing = null;
+        const ignored = missing?.(...[++skipped]);
+        const result = [sum(1, ...[2, 3]), object.sum(...[4, 5, 6]), item.add([7, 8]), skipped, ignored];
+    "#, "[6, 15, 20, 0, null]");
+}
+
+#[test]
+fn napalm_destructuring_and_spread_report_catchable_errors() {
+    run_napalm(r#"
+        let errors = 0;
+        try { const [] = null; } catch (e) { errors++; }
+        try { const {} = null; } catch (e) { errors++; }
+        try { const value = [...1]; } catch (e) { errors++; }
+        try { const value = {...1}; } catch (e) { errors++; }
+        try { const f = () => 1; f(...[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]); } catch (e) { errors++; }
+        const result = errors;
+    "#, "5");
+}
+
 fn run_napalm(source: &str, expected: &str) {
+    run_napalm_checked(source, expected, false);
+}
+
+fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
     let parsed = crate::napalm_front_main::parse("test.nap", source);
     assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
     let mut hir = Program::new();
@@ -12,6 +145,7 @@ fn run_napalm(source: &str, expected: &str) {
         let mut vm = source_vm(&program, &manifest);
         vm.set_jit_options(enabled.then(|| TracingJitOptions {
             hot_loop_threshold: 2,
+            native_loop_iteration_budget: if require_native { 7 } else { 10_000 },
             ..Default::default()
         }));
         let result = vm.run_module(entry).unwrap_or_else(|e| {
@@ -27,6 +161,10 @@ fn run_napalm(source: &str, expected: &str) {
             )
         });
         let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        if enabled && require_native {
+            assert!(vm.jit_stats().unwrap().native_entries > 0, "new collection opcodes never reached native code: {:?}", vm.jit_stats());
+            assert!(vm.jit_stats().unwrap().native_budget_exits > 0, "collection loops must honor the native watchdog");
+        }
         let context = HostContext { heap: &mut vm.heap };
         assert_eq!(
             context.format_value(value),
@@ -34,6 +172,66 @@ fn run_napalm(source: &str, expected: &str) {
             "jit={enabled}, {result:?}"
         );
     }
+}
+
+#[test]
+fn napalm_spread_and_destructuring_in_native_loops_with_gc() {
+    run_napalm_checked(r#"
+        function add(a, b) { return a + b; }
+        let total = 0;
+        for (let i = 0; i < 100; i++) {
+            const [first, ...tail] = [i, ...[1, 2]];
+            const {x, ...rest} = {...{x: first, y: tail}};
+            total += add(...[x, rest.y[0]]);
+        }
+        let source = {};
+        for (let i = 0; i < 40; i++) source[`key${i}`] = [i];
+        const copied = {...source};
+        const {key0, ...rest} = copied;
+        source = null;
+        System.gc();
+        const [a, ...tail] = [rest.key39, key0, rest.key1];
+        System.gc();
+        const result = [total, a, tail];
+    "#, "[5050, [39], [[0], [1]]]", true);
+}
+
+#[test]
+fn napalm_spread_preserves_custom_iteration_and_evaluation_order() {
+    run_napalm(r#"
+        let log = '';
+        class Sequence {
+            iterate(state) { log += 'i'; return state == null ? 0 : (state < 1 ? state + 1 : false); }
+            iteratorValue(state) { log += 'v'; System.gc(); return state + 1; }
+        }
+        function part(n) { log += n; return n; }
+        const f = (a, b, c, d) => [a, b, c, d];
+        const items = f(part('a'), ...new Sequence(), part('b'));
+        const result = [items, log];
+    "#, "[[a, 1, 2, b], aivivib]");
+}
+
+#[test]
+fn napalm_destructuring_defaults_merge_local_state_and_only_export_bindings() {
+    run_napalm("function f() { let n = 0; const [a = ++n, b = ++n] = []; return [a, b, n]; } const result = f();", "[1, 2, 2]");
+    run_napalm("function f() { let n = 0; let a; let b; [a = ++n, b = ++n] = []; return [a, b, n]; } const result = f();", "[1, 2, 2]");
+    run_napalm(r#"
+        function values() {
+            let n = 0;
+            const [a = ++n, b = ++n] = [];
+            let c; let d;
+            [c = ++n, d = ++n] = [];
+            let sum = 0;
+            for (let i = 0; i < 4; i++) [sum] = [sum + i];
+            return [a, b, c, d, n, sum];
+        }
+        const result = values();
+    "#, "[1, 2, 3, 4, 4, 6]");
+    let parsed = crate::napalm_front_main::parse("exports.nap",
+        "export const {a, nested: [b], ...rest} = {a: 1, nested: [2], c: 3};");
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let names: Vec<_> = parsed.module.exports.unwrap().into_iter().map(|(_, public)| public.value).collect();
+    assert_eq!(names, ["a", "b", "rest"]);
 }
 
 #[test]

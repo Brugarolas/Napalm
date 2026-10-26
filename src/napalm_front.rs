@@ -1265,6 +1265,11 @@ pub enum ExprKind {
     /// Napalm/TypeScript surface-only spread element. The lowerer accepts this
     /// only in collection literals; ordinary expression use is rejected.
     Spread(Box<Expr>),
+    /// Syntax-owned collection accesses, distinct from ordinary subscripting:
+    /// missing elements produce null and rest always creates a fresh collection.
+    DestructureGet { source: Box<Expr>, key: Box<Expr> },
+    DestructureRest { source: Box<Expr>, key: Box<Expr> },
+    DestructureCheck { source: Box<Expr>, is_array: bool },
     /// JavaScript/TypeScript optional-chain semantics. Once an optional segment
     /// short-circuits, the remainder of this chain is skipped and the expression
     /// evaluates to null (Napalm intentionally has no separate `undefined`).
@@ -1378,8 +1383,11 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
             | ExprKind::Await(inner)
+            | ExprKind::DestructureCheck { source: inner, .. }
             | ExprKind::Spread(inner) => visit_expr(inner, out),
-            ExprKind::Binary { left, right, .. }
+            ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. }
             | ExprKind::Logical { left, right, .. } => {
                 visit_expr(left, out);
                 visit_expr(right, out);

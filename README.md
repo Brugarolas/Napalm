@@ -42,11 +42,13 @@ System.print(twice(Answer));
 - Arithmetic, comparisons, `==`/`!=` and `===`/`!==`, bitwise operators, `&&`, `||`, conditional expressions, assignment, `+=`, `-=`, `*=`, `/=`, `%=`, and prefix/postfix `++`/`--`. `instanceof` replaces Wren's `is` operator.
 - Single/double quoted strings and backtick templates with nested `${expression}` interpolation. `%` is ordinary text.
 - Array literals and object/Map literals with named, computed or shorthand keys. Dot access resolves Map keys when a built-in member does not already exist; brackets always access the key. Function-valued Map properties can be called directly.
+- Array/List and object/Map destructuring in declarations, assignments, parameters and `for...of` bindings: nested patterns, holes, aliases, computed keys, lazy defaults and final `...rest` elements/properties. Patterns evaluate each source and computed key once. Missing values are `null`; defaults also apply to explicit `null`, following Napalm's single missing-value representation.
+- Spread in arrays (`[...items]`), objects (`{...object}`), function/method calls (`fn(...args)`), constructors and `super` calls. Array and call spread use Napalm's iterator protocol; object spread copies Map entries and ignores `null`. Copies and rest collections are shallow and independent. Later object entries overwrite earlier keys. Expanded calls retain the 16-argument limit and report a catchable error when it is exceeded.
 - Named/default/side-effect imports; named/default declaration exports, `export { local as public }`, and named re-exports with `from`. Only explicit exports are public.
 - `async function`, async methods/arrows, `await`, `throw`, `try`/`catch`/`finally`, plus Napalm's `defer` and `errdefer` extensions.
 - Semicolons and line-separated statements. Braced function bodies always contain statements; only expression-bodied arrows return implicitly. Napalm does not implement every ECMAScript automatic-semicolon-insertion edge case.
 
-Examples are in [scripts/complete.nap](scripts/complete.nap), [scripts/module_import.nap](scripts/module_import.nap) and [scripts/builtins.nap](scripts/builtins.nap).
+Examples are in [scripts/complete.nap](scripts/complete.nap), [scripts/module_import.nap](scripts/module_import.nap), [scripts/builtins.nap](scripts/builtins.nap) and [scripts/destructuring_spread.nap](scripts/destructuring_spread.nap).
 
 ## Migration from WrenJIT
 
@@ -79,7 +81,9 @@ The register VM, SSA optimizer, tracing JIT, moving GC, Fibers, Promise/timer sc
 
 The standard library retains its existing API (`System.print`, `list.add`, `list.count`, `Timer.delay`, `Fiber`, etc.). Values, truthiness, equality, numbers, strings, collections and iteration keep the engine's dynamic semantics; using familiar syntax does not change them into ECMAScript semantics. Missing values use `null`; there is no separate `undefined`. Both equality spellings use the same non-coercing operation. The VM accepts at most 16 parameters/arguments.
 
-Not implemented: destructuring, spread/rest/default/optional parameters, optional chaining, nullish coalescing, `switch`, `do...while`, JavaScript `for...in`, generators, regular-expression literals, namespace imports/exports, JSX, enums, decorators, TypeScript's advanced type operators, call-site type arguments, constructor parameter properties or user-defined operator/subscript declarations. Use explicit constructors and `super(...)` in derived classes, and normal named methods in place of operator declarations. Methods can still be overloaded by arity as an engine extension.
+Destructuring currently operates on Lists and Maps, including empty patterns; it rejects `null` and other receiver types. Rest parameters (`function f(...args)`), defaults for whole parameters and omitted optional arguments remain unsupported; defaults inside destructured parameters are supported. Parameter arity is still fixed.
+
+Other limits include `switch`, generators, regular-expression literals, namespace imports/exports, JSX, enums, decorators and user-defined operator/subscript declarations. Use explicit constructors and `super(...)` in derived classes, and normal named methods in place of operator declarations. Methods can still be overloaded by arity as an engine extension.
 
 For class fields containing functions, use `(object.callback)(...)` to call the stored function; `object.method(...)` selects method dispatch. `private`, `protected`, `public`, `readonly` and `override` are erased modifiers, not runtime access controls. There is no function hoisting or per-iteration rebinding of a captured C-style `for` variable.
 

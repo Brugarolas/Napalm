@@ -1187,6 +1187,7 @@ impl FunctionOptimization for FastLocalSimplify {
                         list_values.insert(SeqReadKey::ListGet(list, index), value);
                     }
                     Inst::ListAppend { .. }
+                    | Inst::ListSpread { .. }
                     | Inst::ListInsert { .. }
                     | Inst::ListRemoveAt { .. } => {
                         list_values.clear();
@@ -1215,7 +1216,7 @@ impl FunctionOptimization for FastLocalSimplify {
                         map_values.clear();
                         map_values.insert(SeqReadKey::MapGet(map, key), value);
                     }
-                    Inst::MapRemove { .. } => {
+                    Inst::MapRemove { .. } | Inst::MapSpread { .. } => {
                         map_values.clear();
                     }
                     Inst::StringCodePointAt { string, index } => {

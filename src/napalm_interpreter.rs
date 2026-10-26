@@ -40,6 +40,9 @@ use self::napalm_ffi::{
     FfiFunction, FfiLibrary, FfiRuntime, FfiSignature, FfiType, NativeArg as FfiNativeArg,
     NativeResult as FfiNativeResult,
 };
+#[path = "napalm_collection_ops.rs"]
+mod collection_ops;
+use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
     JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
     TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
@@ -7902,7 +7905,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 124;
+const OPCODE_COUNT: usize = 130;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -8029,13 +8032,19 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_breakpoint, // Breakpoint
     h_await, // Await
     h_catch, // Catch
+    h_list_spread,
+    h_map_spread,
+    h_destructure_check,
+    h_destructure_get,
+    h_destructure_rest,
+    h_invoke_spread,
 ];
 
 #[inline(always)]
 fn handler_for(opcode: Opcode) -> Handler {
-    // Opcode values are deliberately dense 0..123. Preparation has already
+    // Opcode values are deliberately dense. Preparation has already
     // validated the byte stream, so dispatch selection is a single indexed
-    // load instead of a generated 124-way match.
+    // load instead of a generated opcode match.
     unsafe { *HANDLER_TABLE.get_unchecked(opcode as usize) }
 }
 
@@ -9223,6 +9232,7 @@ impl TraceRuntime for Interpreter<'_> {
         if !matches!(
             opcode,
             Opcode::Invoke
+                | Opcode::InvokeSpread
                 | Opcode::InvokeSuper
                 | Opcode::CallDirect
                 | Opcode::CallClosure

@@ -72,6 +72,24 @@ Independent WIR functions can also be optimized concurrently, with one optimizer
 
 Napalm lowers WIR to a compact register bytecode designed around interpreter throughput.
 
+Destructuring and spread retain dedicated operations through HIR and bytecode:
+
+| Opcode | Operands and behavior |
+| --- | --- |
+| `ListSpread` (124) | `A = handled`, `B = destination`, `C = source`. Bulk-appends a List and returns true; other iterables return false without mutation and use the normal `iterate` / `iteratorValue` fallback. |
+| `MapSpread` (125) | `A = destination`, `B = source`. Copies Map entries; ignores a null source. |
+| `DestructureCheck` (126) | `A = result`, `B = source`, `C = array flag`. Validates even empty patterns and preserves the source identity. |
+| `DestructureGet` (127) | `A = result`, `B = source`, `C = index/key`. Missing elements/properties return null; object reads use Map keys directly. |
+| `DestructureRest` (128) | `A = result`, `B = source`, `C = starting index or excluded-key List`. Allocates a shallow copy of the remainder. |
+| `InvokeSpread` (129) | `A = result`, `B = receiver`, `C = argument List`; extension words select the method name/kind and optional lexical home class for `super`. Resolves the signature using the expanded arity, after checking the 16-argument limit. |
+
+Existing opcode numbers are unchanged. The verifier checks registers, pattern flags,
+method references and lexical home classes. Mutation effects invalidate cached
+collection reads; allocating operations publish GC stack maps, and bulk stores
+apply write barriers and update the JIT heap view. The tracing JIT executes these
+operations through synchronized runtime boundaries, retaining native execution
+around them and preserving exceptions and the native loop watchdog.
+
 ### Architectural register model
 
 - **256 frame-local GPRs** (`R0..R255`);

@@ -779,6 +779,23 @@ pub enum Inst {
         captures: Vec<ValueId>,
     },
 
+    // ----- Destructuring and spread -----
+    /// Append a List directly; returns false without modifying it for other
+    /// iterables, which the lowerer handles through the ordinary iterator protocol.
+    ListSpread { list: ValueId, source: ValueId },
+    MapSpread { map: ValueId, source: ValueId },
+    DestructureCheck { source: ValueId, is_array: bool },
+    DestructureGet { source: ValueId, key: ValueId },
+    DestructureRest { source: ValueId, key: ValueId },
+    /// Arguments have already been evaluated, in order, into a List. The method
+    /// signature's arity is selected at runtime after checking the ABI limit.
+    InvokeSpread {
+        receiver: ValueId,
+        method: MethodSymbol,
+        arguments: ValueId,
+        home_class: Option<ClassId>,
+    },
+
     // ----- Lists -----
     AllocList {
         capacity: Option<ValueId>,
@@ -956,6 +973,10 @@ impl Inst {
         use Inst::*;
 
         match self {
+            ListSpread { .. } | MapSpread { .. } => B::Chain(E::Write),
+            DestructureRest { .. } | DestructureCheck { .. } => B::Chain(E::Alloc),
+            DestructureGet { .. } => B::Chain(E::Read),
+            InvokeSpread { .. } => B::Chain(E::Call),
             Return(_) | Unreachable => B::Sink(E::Control),
             TailInvoke { .. }
             | TailInvokeSuper { .. }
@@ -1068,6 +1089,8 @@ impl Inst {
 
         matches!(
             self,
+            ListSpread { .. } | MapSpread { .. } | DestructureGet { .. }
+                | DestructureRest { .. } | DestructureCheck { .. } | InvokeSpread { .. } |
             // Arbitrary Napalm/host code may raise, and call setup itself can fail.
             Invoke { .. }
                 | InvokeSuper { .. }
@@ -1137,6 +1160,9 @@ impl Inst {
         use Inst::*;
 
         match self {
+            MapSpread { .. } => 0,
+            ListSpread { .. } | DestructureGet { .. } | DestructureRest { .. }
+            | DestructureCheck { .. } | InvokeSpread { .. } => 1,
             Jump { .. }
             | Branch { .. }
             | Switch { .. }
@@ -1268,6 +1294,15 @@ impl Inst {
 
         let mut out = SmallVec::<[ValueId; 4]>::new();
         match self {
+            DestructureCheck { source, .. } => out.push(*source),
+            ListSpread { list: left, source: right }
+            | MapSpread { map: left, source: right }
+            | DestructureGet { source: left, key: right }
+            | DestructureRest { source: left, key: right }
+            | InvokeSpread { receiver: left, arguments: right, .. } => {
+                out.push(*left);
+                out.push(*right);
+            }
             Jump { edge } => out.extend_from_slice(&edge.args),
             Branch {
                 cond,
@@ -1453,6 +1488,15 @@ impl Inst {
         use Inst::*;
 
         match self {
+            DestructureCheck { source, .. } => f(source),
+            ListSpread { list: left, source: right }
+            | MapSpread { map: left, source: right }
+            | DestructureGet { source: left, key: right }
+            | DestructureRest { source: left, key: right }
+            | InvokeSpread { receiver: left, arguments: right, .. } => {
+                f(left);
+                f(right);
+            }
             Jump { edge } => {
                 for value in &mut edge.args {
                     f(value);

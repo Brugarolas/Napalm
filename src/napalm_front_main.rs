@@ -116,14 +116,16 @@ struct Tok {
 #[derive(Clone, Debug)]
 enum BindingPattern {
     Ident(Ident),
-    Array { items: Vec<Option<BindingPattern>>, span: Span },
-    Object { items: Vec<(String, BindingPattern, Span)>, span: Span },
+    Array { items: Vec<Option<BindingPattern>>, rest: Option<Box<BindingPattern>>, span: Span },
+    Object { items: Vec<(Expr, BindingPattern)>, rest: Option<Box<BindingPattern>>, span: Span },
+    Default { pattern: Box<BindingPattern>, value: Expr },
 }
 
 impl BindingPattern {
     fn span(&self) -> Span {
         match self {
             BindingPattern::Ident(ident) => ident.span,
+            BindingPattern::Default { pattern, value } => pattern.span().join(value.span),
             BindingPattern::Array { span, .. } | BindingPattern::Object { span, .. } => *span,
         }
     }
@@ -143,6 +145,7 @@ struct Parser<'a> {
     diagnostics: Vec<Diagnostic>,
     exports: Vec<(Ident, Ident)>,
     immutable: HashSet<Span>,
+    parameter_patterns: HashMap<Span, BindingPattern>,
 }
 
 pub fn parse(_name: &str, source: &str) -> ParseOutput {
@@ -204,6 +207,7 @@ impl<'a> Parser<'a> {
             diagnostics,
             exports: Vec::new(),
             immutable: HashSet::new(),
+            parameter_patterns: HashMap::new(),
         }
     }
     fn peek(&self) -> Tok {
@@ -584,7 +588,7 @@ impl<'a> Parser<'a> {
                     _ => None,
                 };
                 if let Some(name) = name {
-                    if name.value.starts_with("<destructure:") {
+                    if name.value.starts_with("<destructure:") || name.value.starts_with("<pattern") {
                         continue;
                     }
                     self.exports.push((
@@ -729,132 +733,140 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    fn binding_element(&mut self) -> Result<BindingPattern> {
+        let pattern = self.binding_pattern()?;
+        self.binding_default(pattern)
+    }
+
+    fn binding_default(&mut self, pattern: BindingPattern) -> Result<BindingPattern> {
+        if self.eat("=") {
+            self.lines();
+            Ok(BindingPattern::Default { pattern: Box::new(pattern), value: self.expr(1)? })
+        } else { Ok(pattern) }
+    }
+
     fn binding_pattern(&mut self) -> Result<BindingPattern> {
+        if self.depth >= MAX_PARSE_DEPTH { return self.error("binding pattern is nested too deeply"); }
+        self.depth += 1;
+        let result = self.binding_pattern_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn binding_pattern_inner(&mut self) -> Result<BindingPattern> {
         let start = self.peek().span.start;
         if self.eat("[") {
             self.lines();
             let mut items = Vec::new();
+            let mut rest = None;
             while !self.at("]") {
-                if self.eat(",") {
-                    items.push(None);
-                    self.lines();
-                    continue;
-                }
+                if self.eat(",") { items.push(None); self.lines(); continue; }
                 if self.eat("...") {
-                    return self.error("rest elements in destructuring patterns are not implemented yet");
-                }
-                items.push(Some(self.binding_pattern()?));
-                self.lines();
-                if !self.eat(",") {
+                    self.lines();
+                    rest = Some(Box::new(self.binding_pattern()?));
+                    self.lines();
+                    if !self.at("]") { return self.error("rest element must be last, without a default or trailing comma"); }
                     break;
                 }
+                items.push(Some(self.binding_element()?));
+                self.lines();
+                if !self.eat(",") { break; }
                 self.lines();
             }
             self.expect("]")?;
-            return Ok(BindingPattern::Array {
-                items,
-                span: self.end(start),
-            });
+            return Ok(BindingPattern::Array { items, rest, span: self.end(start) });
         }
-
         if self.eat("{") {
             self.lines();
             let mut items = Vec::new();
+            let mut rest = None;
             while !self.at("}") {
                 if self.eat("...") {
-                    return self.error("rest properties in destructuring patterns are not implemented yet");
-                }
-
-                let key_start = self.peek().span.start;
-                let (key, shorthand_ident) = if self.peek().kind == Kind::Word {
-                    let ident = self.ident()?;
-                    (ident.value.clone(), Some(ident))
-                } else if self.peek().kind == Kind::String {
-                    let expr = self.string_expr()?;
-                    let ExprKind::String(bytes) = expr.kind else {
-                        return self.error("destructuring property names cannot interpolate");
-                    };
-                    (String::from_utf8_lossy(&bytes).into_owned(), None)
-                } else {
-                    return self.error("expected a property name in object destructuring");
-                };
-
-                let pattern = if self.eat(":") {
                     self.lines();
-                    self.binding_pattern()?
-                } else if let Some(ident) = shorthand_ident {
-                    BindingPattern::Ident(ident)
-                } else {
-                    return self.error("a quoted destructuring property requires `:` and a binding");
-                };
-
-                if self.eat("=") {
-                    return self.error("default values in destructuring patterns are not implemented yet");
-                }
-
-                let span = Span::new(key_start, pattern.span().end);
-                items.push((key, pattern, span));
-                self.lines();
-                if !self.eat(",") {
+                    rest = Some(Box::new(BindingPattern::Ident(self.ident()?)));
+                    self.lines();
+                    if !self.at("}") { return self.error("rest property must be last, without a default or trailing comma"); }
                     break;
                 }
+                let (key, shorthand) = if self.eat("[") {
+                    self.lines();
+                    let key = self.expr(0)?;
+                    self.lines();
+                    self.expect("]")?;
+                    (key, None)
+                } else if self.peek().kind == Kind::Word {
+                    let name = self.ident()?;
+                    (Expr::new(ExprKind::String(name.value.as_bytes().to_vec()), name.span), Some(name))
+                } else if self.peek().kind == Kind::String {
+                    let key = self.string_expr()?;
+                    if !matches!(key.kind, ExprKind::String(_)) { return self.error("destructuring keys cannot interpolate"); }
+                    (key, None)
+                } else if self.peek().kind == Kind::Number {
+                    (self.prefix()?, None)
+                } else { return self.error("expected a property name in object destructuring"); };
+                self.lines();
+                let pattern = if self.eat(":") {
+                    self.lines();
+                    self.binding_element()?
+                } else if let Some(name) = shorthand {
+                    self.binding_default(BindingPattern::Ident(name))?
+                } else { return self.error("destructuring property requires `:` and a binding"); };
+                items.push((key, pattern));
+                self.lines();
+                if !self.eat(",") { break; }
                 self.lines();
             }
             self.expect("}")?;
-            return Ok(BindingPattern::Object {
-                items,
-                span: self.end(start),
-            });
+            return Ok(BindingPattern::Object { items, rest, span: self.end(start) });
         }
-
         Ok(BindingPattern::Ident(self.ident()?))
     }
 
-    fn expand_binding_pattern(
-        &mut self,
-        pattern: BindingPattern,
-        source: Expr,
-        immutable: bool,
-        out: &mut Vec<Stmt>,
-    ) -> Result<()> {
+    fn pattern_temporary(&mut self, tag: &str, span: Span, value: Expr, out: &mut Vec<Stmt>) -> Expr {
+        let name = Spanned::new(format!("<{tag}:{}>", span.start), Span::empty(span.start));
+        out.push(Stmt { span, kind: StmtKind::Variable { name: name.clone(), initializer: Some(value) } });
+        Expr::new(ExprKind::Name(name), span)
+    }
+
+    fn expand_binding_pattern(&mut self, pattern: BindingPattern, source: Expr, immutable: bool, out: &mut Vec<Stmt>) -> Result<()> {
         match pattern {
             BindingPattern::Ident(name) => {
-                if immutable {
-                    self.immutable.insert(name.span);
-                }
-                out.push(Stmt {
-                    span: name.span.join(source.span),
-                    kind: StmtKind::Variable {
-                        name,
-                        initializer: Some(source),
-                    },
-                });
+                if immutable { self.immutable.insert(name.span); }
+                out.push(Stmt { span: name.span.join(source.span), kind: StmtKind::Variable { name, initializer: Some(source) } });
             }
-            BindingPattern::Array { items, .. } => {
+            BindingPattern::Default { pattern, value } => {
+                let span = source.span.join(value.span);
+                let default = Expr::new(ExprKind::Logical { left: Box::new(source), operator: LogicalOp::Nullish, right: Box::new(value) }, span);
+                self.expand_binding_pattern(*pattern, default, immutable, out)?;
+            }
+            BindingPattern::Array { items, rest, span } => {
+                let checked = Expr::new(ExprKind::DestructureCheck { source: Box::new(source), is_array: true }, span);
+                let source = self.pattern_temporary("pattern", span, checked, out);
+                let count = items.len();
                 for (index, item) in items.into_iter().enumerate() {
-                    let Some(item) = item else { continue };
-                    let index_expr = Expr::new(ExprKind::Number(index as f64), source.span);
-                    let access = Expr::new(
-                        ExprKind::Subscript {
-                            receiver: Box::new(source.clone()),
-                            args: vec![index_expr],
-                        },
-                        source.span,
-                    );
-                    self.expand_binding_pattern(item, access, immutable, out)?;
+                    if let Some(item) = item {
+                        let access = Expr::new(ExprKind::DestructureGet { source: Box::new(source.clone()), key: Box::new(Expr::new(ExprKind::Number(index as f64), span)) }, span);
+                        self.expand_binding_pattern(item, access, immutable, out)?;
+                    }
+                }
+                if let Some(rest) = rest {
+                    let value = Expr::new(ExprKind::DestructureRest { source: Box::new(source), key: Box::new(Expr::new(ExprKind::Number(count as f64), span)) }, span);
+                    self.expand_binding_pattern(*rest, value, immutable, out)?;
                 }
             }
-            BindingPattern::Object { items, .. } => {
-                for (key, item, key_span) in items {
-                    let key_expr = Expr::new(ExprKind::String(key.into_bytes()), key_span);
-                    let access = Expr::new(
-                        ExprKind::Subscript {
-                            receiver: Box::new(source.clone()),
-                            args: vec![key_expr],
-                        },
-                        source.span.join(key_span),
-                    );
+            BindingPattern::Object { items, rest, span } => {
+                let checked = Expr::new(ExprKind::DestructureCheck { source: Box::new(source), is_array: false }, span);
+                let source = self.pattern_temporary("pattern", span, checked, out);
+                let mut excluded = Vec::new();
+                for (key, item) in items {
+                    let key = self.pattern_temporary("pattern-key", key.span, key, out);
+                    excluded.push(key.clone());
+                    let access = Expr::new(ExprKind::DestructureGet { source: Box::new(source.clone()), key: Box::new(key) }, span);
                     self.expand_binding_pattern(item, access, immutable, out)?;
+                }
+                if let Some(rest) = rest {
+                    let value = Expr::new(ExprKind::DestructureRest { source: Box::new(source), key: Box::new(Expr::new(ExprKind::List(excluded), span)) }, span);
+                    self.expand_binding_pattern(*rest, value, immutable, out)?;
                 }
             }
         }
@@ -1265,7 +1277,16 @@ impl<'a> Parser<'a> {
             if self.eat("...") {
                 return self.error("rest parameters are not implemented yet");
             }
-            let param = self.ident()?;
+            let pattern = self.binding_pattern()?;
+            let param = match pattern {
+                BindingPattern::Ident(name) => name,
+                pattern => {
+                    if property { return self.error("parameter properties require a simple identifier"); }
+                    let span = pattern.span();
+                    self.parameter_patterns.insert(span, pattern);
+                    Spanned::new(format!("<parameter:{}>", span.start), span)
+                }
+            };
             // Optionality is a type-system marker. The current VM still has fixed
             // arity, so callers must supply the argument until default/optional
             // argument lowering is added deliberately.
@@ -1290,12 +1311,25 @@ impl<'a> Parser<'a> {
         }
         Ok((params, properties))
     }
+    fn parameter_bindings(&mut self, params: &[Ident]) -> Result<Vec<Stmt>> {
+        let mut prefix = Vec::new();
+        for param in params {
+            if let Some(pattern) = self.parameter_patterns.remove(&param.span) {
+                let source = Expr::new(ExprKind::Name(param.clone()), param.span);
+                self.expand_binding_pattern(pattern, source, false, &mut prefix)?;
+            }
+        }
+        Ok(prefix)
+    }
+
     fn function_body(&mut self, params: Vec<Ident>, start: usize) -> Result<FunctionBody> {
         self.lines();
         let block = self.block()?;
-        let StmtKind::Block(statements) = block.kind else {
+        let StmtKind::Block(body_statements) = block.kind else {
             unreachable!()
         };
+        let mut statements = self.parameter_bindings(&params)?;
+        statements.extend(body_statements);
         Ok(FunctionBody {
             params,
             kind: FunctionBodyKind::Statements(statements),
@@ -1594,7 +1628,8 @@ impl<'a> Parser<'a> {
             if min <= 1 && matches!(self.text(), "=" | "+=" | "-=" | "*=" | "/=" | "%=") {
                 let op = self.text();
                 self.bump();
-                self.assignment_target(&left)?;
+                if op == "=" { self.destructuring_target(&left)?; }
+                else { self.assignment_target(&left)?; }
                 self.lines();
                 let value = Box::new(self.expr(1)?);
                 let kind = if op == "=" {
@@ -1826,6 +1861,45 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn destructuring_target(&mut self, e: &Expr) -> Result<()> {
+        match &e.kind {
+            ExprKind::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if matches!(item.kind, ExprKind::Null) && item.span.start == item.span.end { continue; }
+                    if let ExprKind::Spread(target) = &item.kind {
+                        if i + 1 != items.len() || matches!(target.kind, ExprKind::Assign { .. })
+                            || self.rest_has_trailing_comma(item.span.end, e.span.end) {
+                            return self.error("rest element must be last and cannot have a default");
+                        }
+                        self.destructuring_target(target)?;
+                    } else { self.destructuring_target(item)?; }
+                }
+                Ok(())
+            }
+            ExprKind::Map(entries) => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if entry.spread {
+                        if i + 1 != entries.len() || self.rest_has_trailing_comma(entry.span.end, e.span.end) {
+                            return self.error("rest property must be last, without a trailing comma");
+                        }
+                        self.assignment_target(&entry.value)?;
+                    } else { self.destructuring_target(&entry.value)?; }
+                }
+                Ok(())
+            }
+            ExprKind::Assign { target, .. } => self.destructuring_target(target),
+            _ => self.assignment_target(e),
+        }
+    }
+
+    fn rest_has_trailing_comma(&self, start: usize, end: usize) -> bool {
+        let mut lexer = Kind::lexer(&self.source[start..end]);
+        while let Some(token) = lexer.next() {
+            if token == Ok(Kind::Symbol) && lexer.slice() == "," { return true; }
+        }
+        false
+    }
+
     fn assignment_target(&mut self, e: &Expr) -> Result<()> {
         if matches!(&e.kind, ExprKind::Name(_) | ExprKind::Subscript { .. })
             || matches!(&e.kind, ExprKind::Invoke(i) if i.syntax == InvokeSyntax::Getter)
@@ -1927,11 +2001,13 @@ impl<'a> Parser<'a> {
                 self.function_body(params, start)?
             } else {
                 let value = self.expr(1)?;
-                FunctionBody {
-                    params,
-                    kind: FunctionBodyKind::Expression(Box::new(value)),
-                    span: self.end(start),
-                }
+                let mut statements = self.parameter_bindings(&params)?;
+                let kind = if statements.is_empty() { FunctionBodyKind::Expression(Box::new(value)) }
+                else {
+                    statements.push(Stmt { span: value.span, kind: StmtKind::Return(Some(value)) });
+                    FunctionBodyKind::Statements(statements)
+                };
+                FunctionBody { params, kind, span: self.end(start) }
             }
         };
         Ok(Expr::new(
@@ -2086,6 +2162,11 @@ impl<'a> Parser<'a> {
             let mut items = Vec::new();
             while !self.at("]") {
                 let item_start = self.peek().span.start;
+                if self.eat(",") {
+                    items.push(Expr::new(ExprKind::Null, Span::empty(item_start)));
+                    self.lines();
+                    continue;
+                }
                 let item = if self.eat("...") {
                     self.lines();
                     let value = self.expr(1)?;
@@ -2135,13 +2216,14 @@ impl<'a> Parser<'a> {
                         self.lines();
                         self.expr(0)?
                     } else if let ExprKind::String(bytes) = &key.kind {
-                        Expr::new(
-                            ExprKind::Name(Spanned::new(
-                                String::from_utf8_lossy(bytes).into_owned(),
-                                key.span,
-                            )),
-                            key.span,
-                        )
+                        let target = Expr::new(ExprKind::Name(Spanned::new(
+                            String::from_utf8_lossy(bytes).into_owned(), key.span)), key.span);
+                        if self.eat("=") {
+                            self.lines();
+                            let value = self.expr(1)?;
+                            let span = target.span.join(value.span);
+                            Expr::new(ExprKind::Assign { target: Box::new(target), value: Box::new(value) }, span)
+                        } else { target }
                     } else {
                         return self.error("expected `:` after object key");
                     };
@@ -2404,6 +2486,7 @@ impl<'a> Parser<'a> {
             self.type_parameters()?;
             if self.at("(") {
                 let (params, parameter_properties) = self.params_with_properties(is_constructor)?;
+                let body_params = params.clone();
                 self.annotation()?;
                 let signature = match access {
                     Some("get") if params.is_empty() => MethodSignatureAst::Getter { name: member },
@@ -2454,7 +2537,7 @@ impl<'a> Parser<'a> {
                     self.boundary()?;
                     None
                 } else {
-                    Some(self.function_body(Vec::new(), member_start)?)
+                    Some(self.function_body(body_params, member_start)?)
                 };
                 if is_constructor {
                     constructor = Some(methods.len());
@@ -2877,28 +2960,27 @@ fn validate_bindings(
                 _ => {}
             }
         }
+        fn assignment(&mut self, target: &Expr) {
+            match &target.kind {
+                ExprKind::Name(n) => {
+                    if self.scopes.iter().rev().find_map(|scope| scope.get(&n.value)).copied() == Some(true) {
+                        self.diagnostics.push(Diagnostic::error("NAPALM-B002",
+                            format!("cannot assign to immutable binding '{}'", n.value), n.span));
+                    }
+                }
+                ExprKind::List(items) => for item in items { self.assignment(item); },
+                ExprKind::Map(entries) => for entry in entries { self.expr(&entry.key); self.assignment(&entry.value); },
+                ExprKind::Spread(inner) => self.assignment(inner),
+                ExprKind::Assign { target, value } => { self.assignment(target); self.expr(value); }
+                _ => self.expr(target),
+            }
+        }
         fn expr(&mut self, e: &Expr) {
             match &e.kind {
                 ExprKind::Assign { target, value }
                 | ExprKind::Update { target, value, .. }
                 | ExprKind::LogicalAssign { target, value, .. } => {
-                    if let ExprKind::Name(n) = &target.kind {
-                        if self
-                            .scopes
-                            .iter()
-                            .rev()
-                            .find_map(|s| s.get(&n.value))
-                            .copied()
-                            == Some(true)
-                        {
-                            self.diagnostics.push(Diagnostic::error(
-                                "NAPALM-B002",
-                                format!("cannot assign to immutable binding '{}'", n.value),
-                                n.span,
-                            ));
-                        }
-                    }
-                    self.expr(target);
+                    self.assignment(target);
                     self.expr(value);
                 }
                 ExprKind::Closure(b) | ExprKind::AsyncClosure(b) => self.body(b, &b.params),
@@ -2928,6 +3010,10 @@ fn validate_bindings(
                 }
                 ExprKind::Map(entries) => {
                     for e in entries {
+                        if matches!(&e.value.kind, ExprKind::Assign { target, .. } if target.span == e.key.span) {
+                            self.diagnostics.push(Diagnostic::error("NAPALM-P001",
+                                "shorthand defaults are only valid in destructuring patterns", e.value.span));
+                        }
                         self.expr(&e.key);
                         self.expr(&e.value);
                     }
@@ -2935,8 +3021,11 @@ fn validate_bindings(
                 ExprKind::Unary { operand, .. }
                 | ExprKind::Grouped(operand)
                 | ExprKind::Await(operand)
+                | ExprKind::DestructureCheck { source: operand, .. }
                 | ExprKind::Spread(operand) => self.expr(operand),
-                ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+                ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
                     self.expr(left);
                     self.expr(right);
                 }

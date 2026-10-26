@@ -1065,6 +1065,14 @@ define_opcodes! {
 
     // Structured exception handler entry. A=destination for the thrown value.
     Catch = 123,
+
+    // Collection syntax operations. Existing opcode numbers remain stable.
+    ListSpread = 124, // A=handled Bool, B=destination List, C=source iterable
+    MapSpread = 125, // A=destination Map, B=source Map (null is ignored)
+    DestructureCheck = 126, // A=validated source, B=source, C=is_array
+    DestructureGet = 127, // A=value (null when absent), B=source, C=key/index
+    DestructureRest = 128, // A=fresh collection, B=source, C=start/excluded keys
+    InvokeSpread = 129, // A=result, B=receiver, C=argument List; X=method, Y=home
 }
 
 impl Opcode {
@@ -1102,6 +1110,7 @@ impl Opcode {
             | ProfileNumeric => Some(2),
 
             GuardType
+            | InvokeSpread
             | GuardClass
             | BindMethod
             | BindForeignMethod
@@ -1132,6 +1141,7 @@ impl Opcode {
         matches!(
             self,
             Safepoint
+                | ListSpread | MapSpread | DestructureCheck | DestructureRest | InvokeSpread
                 | Invoke
                 | InvokeSuper
                 | CallDirect
@@ -2605,6 +2615,16 @@ impl BytecodeVerifier {
                 })?;
 
                 match inst.opcode {
+                    Opcode::InvokeSpread => {
+                        let method = MethodSymbol(inst.extension(0).unwrap());
+                        if program.metadata.method(method).is_none() {
+                            return Err(VerificationError::at(inst.pc, "spread call references unknown method"));
+                        }
+                        let home = inst.extension(1).unwrap();
+                        if home != u32::MAX && !program.metadata.classes.iter().any(|class| class.id == ClassId(home)) {
+                            return Err(VerificationError::at(inst.pc, "spread call references unknown home class"));
+                        }
+                    }
                     Opcode::CallDirect => {
                         let callee_id = FuncId(inst.extension(0).unwrap());
                         let callee = program.function(callee_id).ok_or_else(|| {
@@ -3414,7 +3434,8 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
             }
-            ListGet | ListRemoveAt | MapGet | MapRemove | StringCodePointAt => {
+            ListSpread | DestructureGet | DestructureRest | InvokeSpread
+            | ListGet | ListRemoveAt | MapGet | MapRemove | StringCodePointAt => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
@@ -3424,9 +3445,16 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
             }
-            ListAppend => {
+            MapSpread | ListAppend => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
+            }
+            DestructureCheck => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.first.c() > 1 {
+                    return Err(VerificationError::at(inst.pc, "destructuring kind must be 0 or 1"));
+                }
             }
             StringConcat => {
                 Self::verify_reg(function, inst.pc, a)?;
@@ -3560,6 +3588,9 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
     use OperandRole::*;
     use Opcode::*;
     match opcode {
+        ListSpread | DestructureGet | DestructureRest | InvokeSpread => [General, General, General],
+        MapSpread => [General, General, None],
+        DestructureCheck => [General, General, Flag],
         Move | Swap => [General, General, None],
         LoadNull | LoadFalse | LoadTrue | LoadI8 | LoadI32 | LoadConst => [General, SmallImmediate, None],
         MoveFromArg => [General, Argument, None],
@@ -3618,6 +3649,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
 pub const fn extension_description(opcode: Opcode) -> &'static str {
     use Opcode::*;
     match opcode {
+        InvokeSpread => "x0=MethodSymbol (runtime arity), x1=home ClassId or u32::MAX",
         LoadI32 => "x0=i32 bits",
         LoadConst => "x0=ConstIndex",
         Jump | JumpIfFalse | JumpIfTrue => "x0=i32 relative word displacement",

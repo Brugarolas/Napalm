@@ -1,0 +1,24 @@
+// Patterns work in declarations, assignments and function parameters.
+const [first, , ...remaining] = [10, 20, 30, 40];
+const {name: title, options: {enabled = true}, ...extra} = {
+    name: 'Napalm', options: {}, version: 1
+};
+System.print([first, remaining, title, enabled, extra.version]);
+
+function describe({name, scores: [best, ...others]}) {
+    return `${name}: ${best}, remaining ${others}`;
+}
+System.print(describe({name: title, scores: [42, 21, 7]}));
+
+let left = 1;
+let right = 2;
+[left, right] = [right, left];
+System.print([left, right]);
+
+// Spread keeps evaluation order and makes shallow copies.
+const expanded = [0, ...remaining, ...new Range(1, 3)];
+const original = {name: 'Napalm', version: 1};
+const updated = {...original, version: 2};
+const add = (a: number, b: number, c: number): number => a + b + c;
+System.print(expanded);
+System.print([original.version, updated.version, add(1, ...[2, 3])]);

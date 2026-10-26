@@ -637,7 +637,9 @@ impl Analyzer {
             }
             ExprKind::Grouped(inner) => self.visit_expr(inner),
             ExprKind::Unary { operand, .. } => self.visit_expr(operand),
-            ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
                 self.visit_expr(left);
                 self.visit_expr(right);
             }
@@ -672,7 +674,7 @@ impl Analyzer {
                     self.visit_expr(arg);
                 }
             }
-            ExprKind::Spread(value) => self.visit_expr(value),
+            ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => self.visit_expr(value),
             ExprKind::OptionalChain { base, segments } => {
                 self.visit_expr(base);
                 for segment in segments {
@@ -697,6 +699,17 @@ impl Analyzer {
 
     fn visit_assignment_target(&mut self, target: &Expr) {
         match &target.kind {
+            ExprKind::List(items) => for item in items { self.visit_assignment_target(item); },
+            ExprKind::Map(entries) => for entry in entries {
+                self.visit_expr(&entry.key);
+                self.visit_assignment_target(&entry.value);
+            },
+            ExprKind::Spread(inner) => self.visit_assignment_target(inner),
+            ExprKind::Assign { target, value } => {
+                self.visit_assignment_target(target);
+                self.visit_expr(value);
+            }
+
             ExprKind::Name(name) => self.note_binding_use(name, true),
             ExprKind::Field(_) | ExprKind::StaticField(_) => self.note_this_use(),
             ExprKind::Invoke(invoke) => {
@@ -2809,6 +2822,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             ExprKind::Invoke(invoke) => self.lower_invoke(invoke, expr.span),
             ExprKind::Subscript { receiver, args } => self.lower_subscript(receiver, args),
+            ExprKind::DestructureCheck { source, is_array } => {
+                let source = self.lower_expr(source);
+                self.builder.emit1(Inst::DestructureCheck { source, is_array: *is_array }, Type::Top)
+            }
+            ExprKind::DestructureGet { source, key } | ExprKind::DestructureRest { source, key } => {
+                let source = self.lower_expr(source);
+                let key = self.lower_expr(key);
+                let inst = if matches!(expr.kind, ExprKind::DestructureRest { .. }) {
+                    Inst::DestructureRest { source, key }
+                } else { Inst::DestructureGet { source, key } };
+                self.builder.emit1(inst, Type::Top)
+            }
             ExprKind::Spread(value) => {
                 self.error(
                     "NAPALM-L100",
@@ -2994,9 +3019,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         };
         // A missing superclass implementation is a runtime dispatch error, not
         // a missing-symbol panic in the compiler (including changed arities).
-        let symbol = self.builder.intern_method(&name, kind, arity as u8);
-        let args = self.lower_call_args(&super_expr.args, span);
-        self.builder.invoke_super(method.class, receiver, symbol, args)
+        self.lower_call(receiver, &name, kind, &super_expr.args, Some(method.class), span)
     }
 
     fn context_symbol_signature(&self, symbol: MethodSymbol) -> Option<(String, MethodKind)> {
@@ -3035,9 +3058,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn append_iterable_to_list(&mut self, list: ValueId, sequence: ValueId) {
-        // This is deliberately emitted as ordinary SSA control flow rather than a
-        // runtime helper. The existing optimizer/JIT can therefore specialize the
-        // iterator protocol and keep the destination list hot.
+        // Lists use one bulk bytecode. Other iterables keep the language's
+        // ordinary protocol, so custom iterators, strings and ranges still work.
         let saved_env = self.env.clone();
         let initial = self.builder.const_null();
         let header = self.new_block(&[]);
@@ -3045,6 +3067,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let body = self.new_block(&[]);
         let exit = self.new_block(&[]);
 
+        let fallback = self.new_block(&[]);
+        let handled = self.builder.emit1(Inst::ListSpread { list, source: sequence }, Type::Bool);
+        self.builder.branch(handled, exit, Vec::new(), fallback, Vec::new());
+        self.builder.position_at(fallback);
         self.builder.jump(header, vec![initial]);
         self.builder.seal_block(header);
         self.builder.position_at(header);
@@ -3084,50 +3110,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         map
     }
 
-    fn copy_map_entries(&mut self, destination: ValueId, source: ValueId) {
-        // Napalm object literals are backed by Map. Spreading therefore means
-        // copying the source's enumerable map entries in source iteration order.
-        let saved_env = self.env.clone();
-        let keys_symbol = self.context.symbols.expect("keys", MethodKind::Getter, 0);
-        let keys = self.builder.invoke(source, keys_symbol, Vec::new());
-
-        let initial = self.builder.const_null();
-        let header = self.new_block(&[]);
-        let iter_param = self.builder.add_block_param(header, Type::Top);
-        let body = self.new_block(&[]);
-        let exit = self.new_block(&[]);
-
-        self.builder.jump(header, vec![initial]);
-        self.builder.seal_block(header);
-        self.builder.position_at(header);
-        self.env = saved_env.clone();
-
-        let iterate = self.context.symbols.expect("iterate", MethodKind::Method, 1);
-        let iter = self.builder.invoke(keys, iterate, vec![iter_param]);
-        self.builder.branch(iter, body, Vec::new(), exit, Vec::new());
-
-        self.builder.position_at(body);
-        self.env = saved_env.clone();
-        let value_symbol = self
-            .context
-            .symbols
-            .expect("iteratorValue", MethodKind::Method, 1);
-        let key = self.builder.invoke(keys, value_symbol, vec![iter]);
-        let getter = self
-            .context
-            .symbols
-            .expect("[]", MethodKind::SubscriptGetter, 1);
-        let value = self.builder.invoke(source, getter, vec![key]);
-        self.builder.emit0(Inst::MapSet {
-            map: destination,
-            key,
-            value,
-        });
-        self.builder.jump(header, vec![iter]);
-
-        self.builder.seal_block(exit);
-        self.builder.position_at(exit);
-        self.env = saved_env;
+    fn copy_map_entries(&mut self, map: ValueId, source: ValueId) {
+        self.builder.emit0(Inst::MapSpread { map, source });
     }
 
     fn lower_unary(&mut self, operator: UnaryOp, operand: &Expr) -> ValueId {
@@ -3156,6 +3140,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_logical(&mut self, left: &Expr, operator: LogicalOp, right: &Expr) -> ValueId {
         let left_value = self.lower_expr(left);
+        self.lower_logical_value(left_value, operator, right)
+    }
+
+    fn lower_logical_value(&mut self, left_value: ValueId, operator: LogicalOp, right: &Expr) -> ValueId {
         let rhs_block = self.new_block(&[]);
         let short_block = self.new_block(&[]);
         let join = self.new_block(&[]);
@@ -3298,7 +3286,58 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         result_param
     }
 
+    fn lower_destructure_assignment(&mut self, target: &Expr, source: ValueId) {
+        match &target.kind {
+            ExprKind::List(items) => {
+                let source = self.builder.emit1(Inst::DestructureCheck { source, is_array: true }, Type::Top);
+                for (index, item) in items.iter().enumerate() {
+                    if matches!(item.kind, ExprKind::Null) && item.span.start == item.span.end { continue; }
+                    let key = self.builder.const_num(index as f64);
+                    let (target, inst) = match &item.kind {
+                        ExprKind::Spread(inner) => (inner.as_ref(), Inst::DestructureRest { source, key }),
+                        _ => (item, Inst::DestructureGet { source, key }),
+                    };
+                    let value = self.builder.emit1(inst, Type::Top);
+                    self.lower_destructure_assignment(target, value);
+                }
+            }
+            ExprKind::Map(entries) => {
+                let source = self.builder.emit1(Inst::DestructureCheck { source, is_array: false }, Type::Top);
+                let excluded = self.builder.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+                for entry in entries {
+                    let value = if entry.spread {
+                        self.builder.emit1(Inst::DestructureRest { source, key: excluded }, Type::Map)
+                    } else {
+                        let key = self.lower_expr(&entry.key);
+                        self.builder.emit0(Inst::ListAppend { list: excluded, value: key });
+                        self.builder.emit1(Inst::DestructureGet { source, key }, Type::Top)
+                    };
+                    self.lower_destructure_assignment(&entry.value, value);
+                }
+            }
+            ExprKind::Assign { target, value } => {
+                if matches!(target.kind, ExprKind::List(_) | ExprKind::Map(_)) {
+                    let value = self.lower_logical_value(source, LogicalOp::Nullish, value);
+                    self.lower_destructure_assignment(target, value);
+                } else {
+                    let location = self.prepare_assignment(target);
+                    let value = self.lower_logical_value(source, LogicalOp::Nullish, value);
+                    self.store_assignment(target, value, location);
+                }
+            }
+            _ => {
+                let location = self.prepare_assignment(target);
+                self.store_assignment(target, source, location);
+            }
+        }
+    }
+
     fn lower_assignment(&mut self, target: &Expr, value: &Expr) -> ValueId {
+        if matches!(target.kind, ExprKind::List(_) | ExprKind::Map(_)) {
+            let source = self.lower_expr(value);
+            self.lower_destructure_assignment(target, source);
+            return source;
+        }
         let location = self.prepare_assignment(target);
         let value = self.lower_expr(value);
         self.store_assignment(target, value, location)
@@ -3530,22 +3569,30 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         value
     }
 
+    fn lower_call(&mut self, receiver: ValueId, name: &str, kind: MethodKind,
+        args: &[Expr], home_class: Option<ClassId>, span: Span) -> ValueId {
+        if args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
+            let arguments = self.lower_list(args);
+            // The runtime selects a pre-interned signature by the expanded arity.
+            for arity in 0..=MAX_WREN_ARITY { self.builder.intern_method(name, kind, arity as u8); }
+            let method = self.builder.intern_method(name, kind, 0);
+            self.builder.emit1(Inst::InvokeSpread { receiver, method, arguments, home_class }, Type::Top)
+        } else {
+            let args = self.lower_call_args(args, span);
+            let symbol = self.builder.intern_method(name, kind, args.len() as u8);
+            if let Some(home) = home_class { self.builder.invoke_super(home, receiver, symbol, args) }
+            else { self.builder.invoke(receiver, symbol, args) }
+        }
+    }
+
     fn lower_invoke(&mut self, invoke: &front::InvokeExpr, span: Span) -> ValueId {
-        let receiver = invoke
-            .receiver
-            .as_ref()
-            .map(|receiver| self.lower_expr(receiver))
+        let receiver = invoke.receiver.as_ref().map(|e| self.lower_expr(e))
             .unwrap_or_else(|| self.lower_this(span));
-        let args = self.lower_call_args(&invoke.args, span);
         let kind = match invoke.syntax {
             InvokeSyntax::Getter => MethodKind::Getter,
             InvokeSyntax::Method => MethodKind::Method,
         };
-        let symbol = self
-            .context
-            .symbols
-            .expect(&invoke.name.value, kind, args.len());
-        self.builder.invoke(receiver, symbol, args)
+        self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
     }
 
     fn lower_subscript(&mut self, receiver: &Expr, args: &[Expr]) -> ValueId {
@@ -3559,23 +3606,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn emit_is_null(&mut self, value: ValueId) -> ValueId {
-        let Some(slot) = self.context.module_layout.get("Null") else {
-            self.error(
-                "NAPALM-L101",
-                "internal error: core global `Null` is not available",
-                Span::empty(0),
-            );
-            return self.builder.const_bool(false);
-        };
-        let class = self.builder.emit1(
-            Inst::LoadModuleVar {
-                module: self.context.module,
-                slot,
-            },
-            Type::Class(ClassSet::new()),
-        );
-        self.builder
-            .emit1(Inst::IsInstance { value, class }, Type::Bool)
+        let null = self.builder.const_null();
+        self.builder.emit1(Inst::RefEq { left: value, right: null }, Type::Bool)
     }
 
     fn lower_optional_chain(
@@ -3688,12 +3720,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ..
             } => {
                 if let Some(args) = call_args {
-                    let args = self.lower_call_args(args, span);
-                    let method = self
-                        .context
-                        .symbols
-                        .expect(&name.value, MethodKind::Method, args.len());
-                    self.builder.invoke(current, method, args)
+                    self.lower_call(current, &name.value, MethodKind::Method, args, None, span)
                 } else {
                     let getter = self
                         .context
@@ -3711,12 +3738,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 self.builder.invoke(current, getter, vec![key])
             }
             front::OptionalChainSegment::Call { args, .. } => {
-                let args = self.lower_call_args(args, span);
-                let call = self
-                    .context
-                    .symbols
-                    .expect("call", MethodKind::Method, args.len());
-                self.builder.invoke(current, call, args)
+                self.lower_call(current, "call", MethodKind::Method, args, None, span)
             }
         };
 
@@ -3727,7 +3749,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let mut lowered = Vec::with_capacity(args.len());
         for arg in args {
             match &arg.kind {
-                ExprKind::Spread(value) => {
+                ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => {
                     // Dynamic call-spread needs a variable-arity invoke ABI. Do
                     // not silently turn it into one list argument.
                     self.error(
@@ -4065,7 +4087,9 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
         }
         ExprKind::Grouped(inner) => collect_fields_expr(inner, instance, statics),
         ExprKind::Unary { operand, .. } => collect_fields_expr(operand, instance, statics),
-        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+        ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
             collect_fields_expr(left, instance, statics);
             collect_fields_expr(right, instance, statics);
         }
@@ -4098,7 +4122,7 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 collect_fields_expr(arg, instance, statics)
             }
         }
-        ExprKind::Spread(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => collect_fields_expr(value, instance, statics),
         ExprKind::OptionalChain { base, segments } => {
             collect_fields_expr(base, instance, statics);
             for segment in segments {
@@ -4234,6 +4258,10 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             });
             collect_method_keys_expr(operand, out)
         }
+        ExprKind::DestructureGet { source, key } | ExprKind::DestructureRest { source, key } => {
+            collect_method_keys_expr(source, out);
+            collect_method_keys_expr(key, out);
+        }
         ExprKind::Binary { left, operator, right } => {
             if *operator != BinaryOp::Is {
                 out.insert(MethodKey {
@@ -4287,7 +4315,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 collect_method_keys_expr(arg, out)
             }
         }
-        ExprKind::Spread(value) => collect_method_keys_expr(value, out),
+        ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => collect_method_keys_expr(value, out),
         ExprKind::OptionalChain { base, segments } => {
             collect_method_keys_expr(base, out);
             for segment in segments {
@@ -4504,7 +4532,9 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
         }
         ExprKind::Grouped(inner) => collect_strings_expr(inner, out),
         ExprKind::Unary { operand, .. } => collect_strings_expr(operand, out),
-        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+        ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
             collect_strings_expr(left, out);
             collect_strings_expr(right, out)
         }
@@ -4537,7 +4567,7 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
                 collect_strings_expr(arg, out)
             }
         }
-        ExprKind::Spread(value) => collect_strings_expr(value, out),
+        ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => collect_strings_expr(value, out),
         ExprKind::OptionalChain { base, segments } => {
             collect_strings_expr(base, out);
             for segment in segments {
@@ -4636,6 +4666,16 @@ fn collect_written_bindings_stmt(
     }
 }
 
+fn collect_assignment_bindings(target: &Expr, analysis: &RootAnalysis, out: &mut HashSet<BindingId>) {
+    match &target.kind {
+        ExprKind::Name(name) => if let Some(binding) = analysis.use_map.get(&name.span) { out.insert(*binding); },
+        ExprKind::List(items) => for item in items { collect_assignment_bindings(item, analysis, out); },
+        ExprKind::Map(entries) => for entry in entries { collect_assignment_bindings(&entry.value, analysis, out); },
+        ExprKind::Spread(inner) | ExprKind::Assign { target: inner, .. } => collect_assignment_bindings(inner, analysis, out),
+        _ => {}
+    }
+}
+
 fn collect_written_bindings_expr(
     expr: &Expr,
     analysis: &RootAnalysis,
@@ -4645,6 +4685,7 @@ fn collect_written_bindings_expr(
         ExprKind::Assign { target, value }
         | ExprKind::Update { target, value, .. }
         | ExprKind::LogicalAssign { target, value, .. } => {
+            collect_assignment_bindings(target, analysis, out);
             if let ExprKind::Name(name) = &target.kind {
                 if let Some(binding) = analysis.use_map.get(&name.span).copied() {
                     out.insert(binding);
@@ -4673,7 +4714,9 @@ fn collect_written_bindings_expr(
         }
         ExprKind::Grouped(inner) => collect_written_bindings_expr(inner, analysis, out),
         ExprKind::Unary { operand, .. } => collect_written_bindings_expr(operand, analysis, out),
-        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+        ExprKind::DestructureGet { source: left, key: right }
+            | ExprKind::DestructureRest { source: left, key: right }
+            | ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
             collect_written_bindings_expr(left, analysis, out);
             collect_written_bindings_expr(right, analysis, out)
         }
@@ -4700,7 +4743,7 @@ fn collect_written_bindings_expr(
                 collect_written_bindings_expr(arg, analysis, out)
             }
         }
-        ExprKind::Spread(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::DestructureCheck { source: value, .. } | ExprKind::Spread(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::OptionalChain { base, segments } => {
             collect_written_bindings_expr(base, analysis, out);
             for segment in segments {

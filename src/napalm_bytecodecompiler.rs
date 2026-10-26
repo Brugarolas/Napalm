@@ -1818,7 +1818,7 @@ impl<'a> FunctionEmitter<'a> {
         use Opcode::*;
         match opcode {
             Safepoint => SafepointKind::ExplicitPoll,
-            Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive => SafepointKind::Call,
+            Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | CallPrimitive => SafepointKind::Call,
             CallForeign => SafepointKind::Foreign,
             ImportModule | ImportVariable => SafepointKind::Module,
             Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
@@ -2632,6 +2632,25 @@ impl FunctionEmitter<'_> {
                 self.reg(*list)?.0,
                 self.reg(*index)?.0,
                 self.reg(*value)?.0,
+            ),
+            ListSpread { list, source } => self.assembler.emit_abc(
+                Opcode::ListSpread, self.result_reg(node)?.0, self.reg(*list)?.0, self.reg(*source)?.0,
+            ),
+            MapSpread { map, source } => self.assembler.emit_ab(
+                Opcode::MapSpread, self.reg(*map)?.0, self.reg(*source)?.0,
+            ),
+            DestructureCheck { source, is_array } => self.assembler.emit_abc(
+                Opcode::DestructureCheck, self.result_reg(node)?.0, self.reg(*source)?.0, u8::from(*is_array),
+            ),
+            DestructureGet { source, key } => self.assembler.emit_abc(
+                Opcode::DestructureGet, self.result_reg(node)?.0, self.reg(*source)?.0, self.reg(*key)?.0,
+            ),
+            DestructureRest { source, key } => self.assembler.emit_abc(
+                Opcode::DestructureRest, self.result_reg(node)?.0, self.reg(*source)?.0, self.reg(*key)?.0,
+            ),
+            InvokeSpread { receiver, method, arguments, home_class } => self.assembler.emit_x32_y32(
+                Opcode::InvokeSpread, self.result_reg(node)?.0, self.reg(*receiver)?.0,
+                self.reg(*arguments)?.0, method.0, home_class.map_or(u32::MAX, |id| id.0),
             ),
             ListAppend { list, value } => self.assembler.emit_ab(
                 Opcode::ListAppend,

@@ -2654,7 +2654,7 @@ impl<'a> TraceRecorder<'a> {
             // this frame, or reports a terminal/frame-changing condition. This
             // removes the tier-manager round trip without pretending that host
             // or foreign calls are pure or non-GC.
-            InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign | ImportModule => {
+            InvokeSpread | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign | ImportModule => {
                 builder.runtime_call(op.location, op.next_pc);
                 Ok(ExpectedStep::RuntimeCall)
             }
@@ -2667,7 +2667,8 @@ impl<'a> TraceRecorder<'a> {
             CreateClass | BindMethod | BindForeignMethod | AllocInstance | AllocForeign
             | ImportVariable | AllocCell | MakeClosure | AllocList | AllocListCap
             | ListAppend | ListInsert | AllocMap | StringConcat | StringSlice
-            | MakeRange | MakeFiber | Safepoint | Catch => {
+            | MakeRange | MakeFiber | Safepoint | Catch
+            | ListSpread | MapSpread | DestructureCheck | DestructureGet | DestructureRest => {
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
@@ -2997,9 +2998,12 @@ impl<'a> TraceRecorder<'a> {
             RecordingMode::RootLoop => {
                 if !builder.has_runtime_calls() {
                     self.install_loop_phis(&mut builder).map_err(RecordOutcome::Abort)?;
-                    if self.options.native_loop_iteration_budget != 0 {
-                        builder.add_native_budget_exit(self.anchor.pc);
-                    }
+                }
+                // Synchronized collection/call helpers still produce native
+                // loops. Their registers are committed by prepare_memory_loop,
+                // but they need the same watchdog exit as pure SSA loops.
+                if !runtime_end && self.options.native_loop_iteration_budget != 0 {
+                    builder.add_native_budget_exit(self.anchor.pc);
                 }
                 builder.set_terminator(if runtime_end {
                     TraceTerminator::RuntimeReturn
