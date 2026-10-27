@@ -975,10 +975,48 @@ pub struct Stmt {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TypeAnnotation {
+    pub kind: TypeAnnotationKind,
+    pub span: Span,
+}
+
+impl TypeAnnotation {
+    #[inline]
+    pub const fn new(kind: TypeAnnotationKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    #[inline]
+    pub fn is_any(&self) -> bool {
+        matches!(self.kind, TypeAnnotationKind::Any)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeAnnotationKind {
+    Any,
+    Never,
+    Null,
+    Bool,
+    Num,
+    String,
+    List(Option<Box<TypeAnnotation>>),
+    Map,
+    Closure,
+    Named(String),
+    Union(Vec<TypeAnnotation>),
+    /// Syntactically valid TypeScript type forms that do not yet have a Napalm
+    /// runtime type counterpart. Keeping the spelling lets later type-system
+    /// phases upgrade these without changing the parser or AST shape again.
+    Opaque(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
     Variable {
         name: Ident,
+        annotation: Option<TypeAnnotation>,
         initializer: Option<Expr>,
     },
     Class(ClassDecl),
@@ -1728,7 +1766,7 @@ impl<'a> Parser<'a> {
         };
         let end = initializer.as_ref().map_or(name.span.end, |expr| expr.span.end);
         Ok(Stmt {
-            kind: StmtKind::Variable { name, initializer },
+            kind: StmtKind::Variable { name, annotation: None, initializer },
             span: Span::new(start, end),
         })
     }

@@ -1,16 +1,16 @@
 // Compare with WREN_NO_ENTRY_JIT=1 (loop tier only) and WREN_NO_JIT=1.
 class EntryBench {
-    static kernel(x) {
-        let a = x * 1.0001 + 0.25
-        let b = a * a - a / 3.0
-        let c = b * 0.75 + a * 0.5
-        let d = c * c / (b + 1.0)
+    static kernel(x): Number {
+        let a: Number = x * 1.0001 + 0.25
+        let b: Number = a * a - a / 3.0
+        let c: Number = b * 0.75 + a * 0.5
+        let d: Number = c * c / (b + 1.0)
         return d + b - a + c / 7.0
     }
 
-    static run(count) {
-        let total = 0
-        let i = 0
+    static run(count): Number {
+        let total: Number = 0
+        let i: Number = 0
         while (i < count) {
             total = total + this.kernel(i % 97 + 0.125)
             i = i + 1

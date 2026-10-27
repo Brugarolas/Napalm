@@ -1,4 +1,4 @@
-//! Napalm's TypeScript-inspired surface syntax. Types are parsed and erased.
+//! Napalm's TypeScript-inspired surface syntax. Runtime-relevant variable types are retained.
 //!
 //! The frontend produces the existing engine AST directly, retaining source byte
 //! spans. The legacy Napalm parser is used only by historical backend regressions.
@@ -146,6 +146,181 @@ struct Parser<'a> {
     exports: Vec<(Ident, Ident)>,
     immutable: HashSet<Span>,
     parameter_patterns: HashMap<Span, BindingPattern>,
+}
+
+fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
+    let mut source = source.trim();
+    if let Some(rest) = source.strip_prefix("readonly") {
+        let boundary = rest
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()));
+        if boundary {
+            source = rest.trim_start();
+        }
+    }
+    let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+    classify_compact_type(&compact, span)
+}
+
+fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
+    use TypeAnnotationKind as K;
+
+    let source = source.trim();
+
+    if source.len() >= 2 && source.starts_with('(') && source.ends_with(')')
+        && encloses_complete_type(source, '(', ')')
+    {
+        return classify_compact_type(&source[1..source.len() - 1], span);
+    }
+
+    let union = split_type_top_level(source, '|');
+    if union.len() > 1 {
+        return TypeAnnotation::new(
+            K::Union(
+                union
+                    .into_iter()
+                    .map(|part| classify_compact_type(part, span))
+                    .collect(),
+            ),
+            span,
+        );
+    }
+
+    if source.ends_with("[]") {
+        let element = classify_compact_type(&source[..source.len() - 2], span);
+        return TypeAnnotation::new(K::List(Some(Box::new(element))), span);
+    }
+
+    if source.starts_with('[') && source.ends_with(']') {
+        let inner = &source[1..source.len() - 1];
+        let elements = split_type_top_level(inner, ',');
+        let element = match elements.as_slice() {
+            [] => None,
+            [one] => Some(Box::new(classify_compact_type(one, span))),
+            many => Some(Box::new(TypeAnnotation::new(
+                K::Union(
+                    many.iter()
+                        .map(|part| classify_compact_type(part, span))
+                        .collect(),
+                ),
+                span,
+            ))),
+        };
+        return TypeAnnotation::new(K::List(element), span);
+    }
+
+    if source.starts_with('{') && source.ends_with('}') {
+        return TypeAnnotation::new(K::Opaque(source.to_owned()), span);
+    }
+
+    if source.contains("=>") {
+        return TypeAnnotation::new(K::Closure, span);
+    }
+
+    if let Some((base, args)) = split_generic_type(source) {
+        let arguments = split_type_top_level(args, ',');
+        return match base {
+            "Array" | "ReadonlyArray" | "List" => {
+                let element = arguments
+                    .first()
+                    .map(|part| Box::new(classify_compact_type(part, span)));
+                TypeAnnotation::new(K::List(element), span)
+            }
+            "Map" | "ReadonlyMap" | "Record" => TypeAnnotation::new(K::Map, span),
+            "Function" | "Fn" => TypeAnnotation::new(K::Closure, span),
+            _ => TypeAnnotation::new(K::Named(base.to_owned()), span),
+        };
+    }
+
+    let lower = source.to_ascii_lowercase();
+    let kind = match lower.as_str() {
+        "any" => K::Any,
+        "never" => K::Never,
+        "null" => K::Null,
+        "boolean" | "bool" => K::Bool,
+        "number" | "num" => K::Num,
+        "string" => K::String,
+        "object" => K::Opaque(source.to_owned()),
+        "function" | "fn" => K::Closure,
+        "true" | "false" => K::Bool,
+        _ if source.starts_with('"') || source.starts_with('\'') || source.starts_with('`') => K::String,
+        _ if source.parse::<f64>().is_ok() => K::Num,
+        _ if source
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())) =>
+        {
+            K::Named(source.to_owned())
+        }
+        _ => K::Opaque(source.to_owned()),
+    };
+    TypeAnnotation::new(kind, span)
+}
+
+fn split_generic_type(source: &str) -> Option<(&str, &str)> {
+    let open = source.find('<')?;
+    if !source.ends_with('>') {
+        return None;
+    }
+    let base = &source[..open];
+    let args = &source[open + 1..source.len() - 1];
+    let mut depth = 0isize;
+    for byte in args.bytes() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then_some((base, args))
+}
+
+fn split_type_top_level(source: &str, separator: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut angle = 0isize;
+    let mut paren = 0isize;
+    let mut bracket = 0isize;
+    let mut brace = 0isize;
+    for (index, ch) in source.char_indices() {
+        match ch {
+            '<' => angle += 1,
+            '>' => angle -= 1,
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            _ => {}
+        }
+        if ch == separator && angle == 0 && paren == 0 && bracket == 0 && brace == 0 {
+            out.push(&source[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    out.push(&source[start..]);
+    out
+}
+
+fn encloses_complete_type(source: &str, open: char, close: char) -> bool {
+    let mut depth = 0isize;
+    for (index, ch) in source.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 && index + ch.len_utf8() != source.len() {
+                return false;
+            }
+        }
+    }
+    depth == 0
 }
 
 pub fn parse(_name: &str, source: &str) -> ParseOutput {
@@ -410,6 +585,7 @@ impl<'a> Parser<'a> {
             return Ok(vec![Stmt {
                 kind: StmtKind::Variable {
                     name,
+                    annotation: None,
                     initializer: Some(initializer),
                 },
                 span: self.end(start),
@@ -560,6 +736,7 @@ impl<'a> Parser<'a> {
             vec![Stmt {
                 kind: StmtKind::Variable {
                     name,
+                    annotation: None,
                     initializer: Some(initializer),
                 },
                 span: self.end(start),
@@ -685,7 +862,7 @@ impl<'a> Parser<'a> {
         loop {
             self.lines();
             let pattern = self.binding_pattern()?;
-            self.annotation()?;
+            let annotation = self.variable_annotation()?;
             let initializer = if self.eat("=") {
                 self.lines();
                 Some(self.expr(0)?)
@@ -703,7 +880,7 @@ impl<'a> Parser<'a> {
                 }
                 out.push(Stmt {
                     span: self.end(name.span.start),
-                    kind: StmtKind::Variable { name, initializer },
+                    kind: StmtKind::Variable { name, annotation, initializer },
                 });
             } else {
                 let Some(initializer) = initializer else {
@@ -719,6 +896,7 @@ impl<'a> Parser<'a> {
                     span: span.join(initializer.span),
                     kind: StmtKind::Variable {
                         name: temporary,
+                        annotation,
                         initializer: Some(initializer),
                     },
                 });
@@ -824,7 +1002,7 @@ impl<'a> Parser<'a> {
 
     fn pattern_temporary(&mut self, tag: &str, span: Span, value: Expr, out: &mut Vec<Stmt>) -> Expr {
         let name = Spanned::new(format!("<{tag}:{}>", span.start), Span::empty(span.start));
-        out.push(Stmt { span, kind: StmtKind::Variable { name: name.clone(), initializer: Some(value) } });
+        out.push(Stmt { span, kind: StmtKind::Variable { name: name.clone(), annotation: None, initializer: Some(value) } });
         Expr::new(ExprKind::Name(name), span)
     }
 
@@ -832,7 +1010,7 @@ impl<'a> Parser<'a> {
         match pattern {
             BindingPattern::Ident(name) => {
                 if immutable { self.immutable.insert(name.span); }
-                out.push(Stmt { span: name.span.join(source.span), kind: StmtKind::Variable { name, initializer: Some(source) } });
+                out.push(Stmt { span: name.span.join(source.span), kind: StmtKind::Variable { name, annotation: None, initializer: Some(source) } });
             }
             BindingPattern::Default { pattern, value } => {
                 let span = source.span.join(value.span);
@@ -1344,6 +1522,22 @@ impl<'a> Parser<'a> {
             self.ty()?;
         }
         Ok(())
+    }
+
+    fn variable_annotation(&mut self) -> Result<Option<TypeAnnotation>> {
+        if !self.eat(":") {
+            return Ok(None);
+        }
+
+        self.lines();
+        let start = self.peek().span.start;
+        self.ty()?;
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map_or(start, |token| token.span.end);
+        let span = Span::new(start, end);
+        Ok(Some(classify_variable_type(&self.source[span.as_range()], span)))
     }
     fn type_parameters(&mut self) -> Result<()> {
         if self.eat("<") {
@@ -3205,6 +3399,46 @@ mod napalm_syntax_tests {
         "#);
 
         assert!(!module.statements.is_empty());
+    }
+
+    #[test]
+    fn retains_variable_type_annotations_in_the_engine_ast() {
+        let module = assert_parses(r#"
+            let count: number = 1;
+            let label: string = "napalm";
+            let enabled: boolean = true;
+            let values: number[] = [1, 2, 3];
+            let escapeHatch: any = count;
+            let inferred = 42;
+        "#);
+
+        let expected = [
+            TypeAnnotationKind::Num,
+            TypeAnnotationKind::String,
+            TypeAnnotationKind::Bool,
+            TypeAnnotationKind::List(Some(Box::new(TypeAnnotation::new(
+                TypeAnnotationKind::Num,
+                Span::default(),
+            )))),
+            TypeAnnotationKind::Any,
+        ];
+
+        for (statement, expected_kind) in module.statements.iter().take(5).zip(expected) {
+            let StmtKind::Variable { annotation: Some(annotation), .. } = &statement.kind else {
+                panic!("expected retained variable type annotation");
+            };
+            match (&annotation.kind, expected_kind) {
+                (TypeAnnotationKind::List(Some(actual)), TypeAnnotationKind::List(Some(expected))) => {
+                    assert_eq!(actual.kind, expected.kind);
+                }
+                (actual, expected) => assert_eq!(actual, &expected),
+            }
+        }
+
+        let StmtKind::Variable { annotation, .. } = &module.statements[5].kind else {
+            panic!("expected inferred variable declaration");
+        };
+        assert!(annotation.is_none(), "inferred types are intentionally computed by lowering");
     }
 
     #[test]

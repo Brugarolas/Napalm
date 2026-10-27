@@ -24,7 +24,7 @@ use crate::napalm_front::{
     self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticLabel, DiagnosticSeverity, Expr,
     ExprKind, FunctionBody, FunctionBodyKind, Ident, ImportDecl, InvokeSyntax, LogicalOp,
     MethodDecl, MethodSignatureAst, ModuleAst, OperatorName, Span, Stmt, StmtKind, StringPart,
-    UnaryOp,
+    TypeAnnotation, TypeAnnotationKind, UnaryOp,
 };
 use crate::napalm_ir::{
     self as ir, BlockId, Builder, BuiltinBinding, BuiltinId, CaptureMode, ClassId, ClassSet, FieldSlot,
@@ -230,6 +230,283 @@ fn byte_span_to_char_range(source: &str, span: Span) -> std::ops::Range<usize> {
 }
 
 // =============================================================================
+// Source type retention and static assignment checking
+// =============================================================================
+
+fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
+    use TypeAnnotationKind as K;
+
+    let direct = |kind| Some(TypeAnnotation::new(kind, expr.span));
+    match &expr.kind {
+        ExprKind::Null => direct(K::Null),
+        ExprKind::Bool(_) => direct(K::Bool),
+        ExprKind::Number(_) => direct(K::Num),
+        ExprKind::String(_) | ExprKind::InterpolatedString(_) => direct(K::String),
+        ExprKind::List(items) => {
+            let mut elements = Vec::<TypeAnnotation>::new();
+            for item in items {
+                let item = match &item.kind {
+                    ExprKind::Spread(_) => return direct(K::List(None)),
+                    _ => infer_surface_type_annotation(item),
+                }?;
+                if !elements.iter().any(|existing| existing.kind == item.kind) {
+                    elements.push(item);
+                }
+            }
+            let element = match elements.len() {
+                0 => None,
+                1 => Some(Box::new(elements.remove(0))),
+                _ => Some(Box::new(TypeAnnotation::new(K::Union(elements), expr.span))),
+            };
+            direct(K::List(element))
+        }
+        ExprKind::Map(_) => direct(K::Map),
+        ExprKind::Closure(_) | ExprKind::AsyncClosure(_) => direct(K::Closure),
+        ExprKind::Grouped(inner) => infer_surface_type_annotation(inner),
+        ExprKind::Unary { operator, operand } => match operator {
+            UnaryOp::Not => direct(K::Bool),
+            UnaryOp::Negate | UnaryOp::Complement => {
+                let operand = infer_surface_type_annotation(operand)?;
+                matches!(operand.kind, K::Num).then(|| TypeAnnotation::new(K::Num, expr.span))
+            }
+        },
+        ExprKind::Binary {
+            left,
+            operator,
+            right,
+        } => match operator {
+            BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual
+            | BinaryOp::Is
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual => direct(K::Bool),
+            BinaryOp::InclusiveRange | BinaryOp::ExclusiveRange => {
+                direct(K::Named("Range".to_owned()))
+            }
+            BinaryOp::Add => {
+                let left = infer_surface_type_annotation(left);
+                let right = infer_surface_type_annotation(right);
+                if matches!(left.as_ref().map(|t| &t.kind), Some(K::String))
+                    || matches!(right.as_ref().map(|t| &t.kind), Some(K::String))
+                {
+                    direct(K::String)
+                } else if matches!(left.as_ref().map(|t| &t.kind), Some(K::Num))
+                    && matches!(right.as_ref().map(|t| &t.kind), Some(K::Num))
+                {
+                    direct(K::Num)
+                } else {
+                    None
+                }
+            }
+            BinaryOp::Power
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulo
+            | BinaryOp::Subtract
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::BitAnd
+            | BinaryOp::BitXor
+            | BinaryOp::BitOr => {
+                let left = infer_surface_type_annotation(left)?;
+                let right = infer_surface_type_annotation(right)?;
+                (matches!(left.kind, K::Num) && matches!(right.kind, K::Num))
+                    .then(|| TypeAnnotation::new(K::Num, expr.span))
+            }
+        },
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let left = infer_surface_type_annotation(then_expr)?;
+            let right = infer_surface_type_annotation(else_expr)?;
+            if left.kind == right.kind {
+                Some(TypeAnnotation::new(left.kind, expr.span))
+            } else {
+                direct(K::Union(vec![left, right]))
+            }
+        }
+        ExprKind::Assign { value, .. }
+        | ExprKind::Update { value, .. }
+        | ExprKind::LogicalAssign { value, .. }
+        | ExprKind::Spread(value) => infer_surface_type_annotation(value),
+        ExprKind::Logical { left, right, .. } => {
+            let left = infer_surface_type_annotation(left)?;
+            let right = infer_surface_type_annotation(right)?;
+            if left.kind == right.kind {
+                Some(TypeAnnotation::new(left.kind, expr.span))
+            } else {
+                direct(K::Union(vec![left, right]))
+            }
+        }
+        ExprKind::DestructureCheck { source, .. }
+        | ExprKind::Await(source) => infer_surface_type_annotation(source),
+        ExprKind::Name(_)
+        | ExprKind::Field(_)
+        | ExprKind::StaticField(_)
+        | ExprKind::This
+        | ExprKind::Super(_)
+        | ExprKind::Invoke(_)
+        | ExprKind::Subscript { .. }
+        | ExprKind::DestructureGet { .. }
+        | ExprKind::DestructureRest { .. }
+        | ExprKind::OptionalChain { .. } => None,
+    }
+}
+
+fn resolve_type_annotation(
+    annotation: &TypeAnnotation,
+    classes: &HashMap<String, ClassId>,
+) -> Type {
+    use TypeAnnotationKind as K;
+
+    match &annotation.kind {
+        K::Any | K::Opaque(_) => Type::Top,
+        K::Never => Type::Bottom,
+        K::Null => Type::Null,
+        K::Bool => Type::Bool,
+        K::Num => Type::Num,
+        K::String => Type::String,
+        K::List(None) => Type::List(None),
+        K::List(Some(element)) => {
+            Type::List(Some(Box::new(resolve_type_annotation(element, classes))))
+        }
+        K::Map => Type::Map,
+        K::Closure => Type::Closure(None),
+        K::Named(name) => match name.rsplit('.').next().unwrap_or(name) {
+            "Range" => Type::Range,
+            "Fiber" => Type::Fiber,
+            "Function" | "Fn" => Type::Closure(None),
+            "Map" => Type::Map,
+            "Object" => Type::Top,
+            "Array" | "List" => Type::List(None),
+            class_name => classes
+                .get(class_name)
+                .copied()
+                .map(|class| Type::Instance(ClassSet::singleton(class)))
+                .unwrap_or(Type::Top),
+        },
+        K::Union(types) => {
+            let mut resolved = Vec::new();
+            for annotation in types {
+                let ty = resolve_type_annotation(annotation, classes);
+                if matches!(ty, Type::Top) {
+                    return Type::Top;
+                }
+                if !resolved.contains(&ty) {
+                    resolved.push(ty);
+                }
+            }
+            match resolved.len() {
+                0 => Type::Bottom,
+                1 => resolved.remove(0),
+                _ => Type::Union(resolved),
+            }
+        }
+    }
+}
+
+fn semantic_source_type(ty: &Type) -> Type {
+    match ty {
+        Type::Int32 | Type::F64 => Type::Num,
+        Type::RawPtr => Type::Top,
+        Type::Cell(inner) => semantic_source_type(inner),
+        Type::Closure(_) => Type::Closure(None),
+        Type::List(Some(inner)) => Type::List(Some(Box::new(semantic_source_type(inner)))),
+        Type::Union(types) => {
+            let mut normalized = Vec::new();
+            for ty in types {
+                let ty = semantic_source_type(ty);
+                if matches!(ty, Type::Top) {
+                    return Type::Top;
+                }
+                if !normalized.contains(&ty) {
+                    normalized.push(ty);
+                }
+            }
+            match normalized.len() {
+                0 => Type::Bottom,
+                1 => normalized.remove(0),
+                _ => Type::Union(normalized),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn type_is_unknown(ty: &Type) -> bool {
+    match ty {
+        Type::Top | Type::RawPtr => true,
+        Type::List(None) => true,
+        Type::Class(classes) | Type::Instance(classes) => classes.is_unknown(),
+        Type::Foreign(None) => true,
+        Type::Union(types) => types.iter().any(type_is_unknown),
+        _ => false,
+    }
+}
+
+fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
+    if matches!(expected, Type::Top) {
+        return false;
+    }
+    let actual = semantic_source_type(actual);
+    !type_is_unknown(&actual) && !expected.accepts(&actual)
+}
+
+fn display_source_type(ty: &Type) -> String {
+    match ty {
+        Type::Bottom => "never".to_owned(),
+        Type::Top | Type::RawPtr => "any".to_owned(),
+        Type::Null => "null".to_owned(),
+        Type::Bool => "boolean".to_owned(),
+        Type::Num | Type::Int32 | Type::F64 => "number".to_owned(),
+        Type::String => "string".to_owned(),
+        Type::List(None) => "any[]".to_owned(),
+        Type::List(Some(element)) => format!("{}[]", display_source_type(element)),
+        Type::Map => "Map".to_owned(),
+        Type::Range => "Range".to_owned(),
+        Type::Class(_) => "class".to_owned(),
+        Type::Instance(_) => "instance".to_owned(),
+        Type::Closure(_) => "Function".to_owned(),
+        Type::Fiber => "Fiber".to_owned(),
+        Type::Foreign(_) => "foreign".to_owned(),
+        Type::Module => "module".to_owned(),
+        Type::Cell(inner) => display_source_type(inner),
+        Type::Union(types) => types
+            .iter()
+            .map(display_source_type)
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
+}
+
+fn display_type_annotation(annotation: &TypeAnnotation) -> String {
+    use TypeAnnotationKind as K;
+
+    match &annotation.kind {
+        K::Any => "any".to_owned(),
+        K::Never => "never".to_owned(),
+        K::Null => "null".to_owned(),
+        K::Bool => "boolean".to_owned(),
+        K::Num => "number".to_owned(),
+        K::String => "string".to_owned(),
+        K::List(None) => "any[]".to_owned(),
+        K::List(Some(element)) => format!("{}[]", display_type_annotation(element)),
+        K::Map => "Map".to_owned(),
+        K::Closure => "Function".to_owned(),
+        K::Named(name) | K::Opaque(name) => name.clone(),
+        K::Union(types) => types
+            .iter()
+            .map(display_type_annotation)
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
+}
+
+// =============================================================================
 // Internal identities and semantic analysis
 // =============================================================================
 
@@ -247,6 +524,9 @@ struct BindingInfo {
     captured: bool,
     mutated: bool,
     synthetic_this: bool,
+    /// Explicit annotation or a conservative source-level inference hint. The
+    /// lowering stage remains authoritative because WIR can infer more precisely.
+    source_type: Option<TypeAnnotation>,
 }
 
 #[derive(Clone, Debug)]
@@ -387,11 +667,16 @@ impl Analyzer {
             captured: false,
             mutated: false,
             synthetic_this: true,
+            source_type: None,
         });
         id
     }
 
     fn declare(&mut self, ident: &Ident) -> BindingId {
+        self.declare_typed(ident, None)
+    }
+
+    fn declare_typed(&mut self, ident: &Ident, source_type: Option<TypeAnnotation>) -> BindingId {
         if self.warn_shadowing
             && self
                 .scopes
@@ -418,6 +703,7 @@ impl Analyzer {
             captured: false,
             mutated: false,
             synthetic_this: false,
+            source_type,
         });
         self.analysis.declaration_map.insert(ident.span, id);
         self.scopes
@@ -489,13 +775,16 @@ impl Analyzer {
 
     fn visit_stmt(&mut self, stmt: &Stmt, module_level: bool) {
         match &stmt.kind {
-            StmtKind::Variable { name, initializer } => {
+            StmtKind::Variable { name, annotation, initializer } => {
                 if module_level && self.module_root {
                     if let Some(initializer) = initializer {
                         self.visit_expr(initializer);
                     }
                 } else {
-                    let binding = self.declare(name);
+                    let source_type = annotation
+                        .clone()
+                        .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+                    let binding = self.declare_typed(name, source_type);
                     if let Some(initializer) = initializer {
                         self.visit_expr(initializer);
                     }
@@ -832,6 +1121,13 @@ struct ClassPlan {
 }
 
 #[derive(Clone, Debug)]
+struct StaticBindingType {
+    expected: Type,
+    origin: Span,
+    display: String,
+}
+
+#[derive(Clone, Debug)]
 struct ModuleLayout {
     slots: HashMap<String, ModuleSlot>,
 }
@@ -853,6 +1149,7 @@ struct ModuleLowerer<'p, 's, 'a> {
     source_file: ir::StringId,
     module_id: Option<ModuleId>,
     module_layout: ModuleLayout,
+    module_binding_types: HashMap<String, StaticBindingType>,
     symbols: SymbolTable,
     class_plans: HashMap<Span, ClassPlan>,
     top_level_classes: HashMap<String, ClassId>,
@@ -888,6 +1185,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             module_layout: ModuleLayout {
                 slots: HashMap::new(),
             },
+            module_binding_types: HashMap::new(),
             symbols: SymbolTable::default(),
             class_plans: HashMap::new(),
             top_level_classes: HashMap::new(),
@@ -917,6 +1215,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .set_module_builtin_bindings(module_id, builtin_bindings);
 
         self.plan_classes(module_id);
+        self.plan_module_binding_types();
         self.collect_and_intern_symbols();
         self.preintern_strings();
         self.compile_methods(module_id);
@@ -1008,6 +1307,39 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         for (name, span) in declarations {
             self.insert_module_slot(&name, span, &mut next);
+        }
+    }
+
+    fn plan_module_binding_types(&mut self) {
+        for statement in &self.ast.statements {
+            let StmtKind::Variable {
+                name,
+                annotation,
+                initializer,
+            } = &statement.kind
+            else {
+                continue;
+            };
+
+            let source_type = annotation
+                .clone()
+                .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+            let (expected, origin, display) = match source_type.as_ref() {
+                Some(annotation) => (
+                    resolve_type_annotation(annotation, &self.top_level_classes),
+                    annotation.span,
+                    display_type_annotation(annotation),
+                ),
+                None => (Type::Top, name.span, "any".to_owned()),
+            };
+            self.module_binding_types.insert(
+                name.value.clone(),
+                StaticBindingType {
+                    expected,
+                    origin,
+                    display,
+                },
+            );
         }
     }
 
@@ -1612,6 +1944,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             source_file: self.source_file,
             module,
             module_layout: &self.module_layout,
+            module_binding_types: &self.module_binding_types,
+            top_level_classes: &self.top_level_classes,
             implicit_this: self.ast.exports.is_none(),
             symbols: &self.symbols,
             class_plans: &self.class_plans,
@@ -1743,6 +2077,8 @@ struct FunctionCompilerContext<'a> {
     source_file: ir::StringId,
     module: ModuleId,
     module_layout: &'a ModuleLayout,
+    module_binding_types: &'a HashMap<String, StaticBindingType>,
+    top_level_classes: &'a HashMap<String, ClassId>,
     implicit_this: bool,
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
@@ -1761,6 +2097,7 @@ struct FunctionCompiler<'p, 'a, 'd> {
     context: FunctionCompilerContext<'a>,
     diagnostics: &'d mut Vec<Diagnostic>,
     env: HashMap<BindingId, Storage>,
+    binding_types: HashMap<BindingId, StaticBindingType>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
     cleanup_scopes: Vec<CleanupScope>,
@@ -1778,11 +2115,31 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         diagnostics: &'d mut Vec<Diagnostic>,
         env: HashMap<BindingId, Storage>,
     ) -> Self {
+        let binding_types = context
+            .analysis
+            .bindings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, binding)| {
+                binding.source_type.as_ref().map(|annotation| {
+                    (
+                        BindingId(index as u32),
+                        StaticBindingType {
+                            expected: resolve_type_annotation(annotation, context.top_level_classes),
+                            origin: annotation.span,
+                            display: display_type_annotation(annotation),
+                        },
+                    )
+                })
+            })
+            .collect();
+
         Self {
             builder,
             context,
             diagnostics,
             env,
+            binding_types,
             loops: Vec::new(),
             constructor_this: None,
             cleanup_scopes: Vec::new(),
@@ -1818,6 +2175,112 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             let value = self.builder.param(param_offset + index);
             self.bind_initial(binding, value);
         }
+    }
+
+    fn common_value_type(&self, values: &[ValueId]) -> Type {
+        let Some((&first, rest)) = values.split_first() else {
+            return Type::Top;
+        };
+        let first_type = self.builder.value_type(first);
+        if rest
+            .iter()
+            .all(|value| self.builder.value_type(*value) == first_type)
+        {
+            first_type.clone()
+        } else {
+            Type::Top
+        }
+    }
+
+    fn register_binding_type(
+        &mut self,
+        binding: BindingId,
+        annotation: Option<&TypeAnnotation>,
+        initializer: Option<&Expr>,
+        value: ValueId,
+    ) {
+        let expected = if let Some(annotation) = annotation {
+            resolve_type_annotation(annotation, self.context.top_level_classes)
+        } else if initializer.is_some() {
+            let actual = semantic_source_type(self.builder.value_type(value));
+            if matches!(actual, Type::Top) {
+                self.context
+                    .analysis
+                    .binding(binding)
+                    .source_type
+                    .as_ref()
+                    .map(|annotation| {
+                        resolve_type_annotation(annotation, self.context.top_level_classes)
+                    })
+                    .unwrap_or(Type::Top)
+            } else {
+                actual
+            }
+        } else {
+            Type::Top
+        };
+        let origin = annotation
+            .map(|annotation| annotation.span)
+            .or_else(|| initializer.map(|initializer| initializer.span))
+            .unwrap_or_else(|| self.context.analysis.binding(binding).declaration);
+        let display = annotation
+            .map(display_type_annotation)
+            .unwrap_or_else(|| display_source_type(&expected));
+        self.binding_types.insert(
+            binding,
+            StaticBindingType {
+                expected,
+                origin,
+                display,
+            },
+        );
+    }
+
+    fn check_binding_assignment(&mut self, binding: BindingId, value: ValueId, span: Span) {
+        let Some(binding_type) = self.binding_types.get(&binding).cloned() else {
+            return;
+        };
+        let actual = self.builder.value_type(value).clone();
+        if assignment_is_known_incompatible(&binding_type.expected, &actual) {
+            let name = self.context.analysis.binding(binding).name.clone();
+            self.report_type_mismatch(&name, &binding_type, &actual, span);
+        }
+    }
+
+    fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) {
+        let Some(binding_type) = self.context.module_binding_types.get(name).cloned() else {
+            return;
+        };
+        let actual = self.builder.value_type(value).clone();
+        if assignment_is_known_incompatible(&binding_type.expected, &actual) {
+            self.report_type_mismatch(name, &binding_type, &actual, span);
+        }
+    }
+
+    fn report_type_mismatch(
+        &mut self,
+        name: &str,
+        binding_type: &StaticBindingType,
+        actual: &Type,
+        span: Span,
+    ) {
+        let expected = binding_type.display.clone();
+        let actual = display_source_type(&semantic_source_type(actual));
+        self.diagnostics.push(
+            Diagnostic::error(
+                "NAPALM-T001",
+                format!("cannot assign `{actual}` to variable '{name}' of type `{expected}`"),
+                span,
+            )
+            .with_primary_label(span, format!("this value has type `{actual}`"))
+            .with_secondary_label(
+                binding_type.origin,
+                format!("'{name}' is constrained to `{expected}` here"),
+            )
+            .with_note(
+                "Use `any` explicitly when this binding is intentionally allowed to hold values of unrelated types.",
+            ),
+        );
     }
 
     fn bind_initial(&mut self, binding: BindingId, value: ValueId) {
@@ -2184,22 +2647,35 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_stmt(&mut self, stmt: &Stmt, module_level: bool) {
         self.set_source(stmt.span);
         match &stmt.kind {
-            StmtKind::Variable { name, initializer } => {
-                let early_binding = if module_level { None } else {
-                    self.context.analysis.declaration_map.get(&name.span).copied().filter(|binding| {
-                        let info = self.context.analysis.binding(*binding);
-                        info.captured && info.mutated
-                    })
+            StmtKind::Variable {
+                name,
+                annotation,
+                initializer,
+            } => {
+                let binding = if module_level {
+                    None
+                } else {
+                    self.context.analysis.declaration_map.get(&name.span).copied()
                 };
+                let early_binding = binding.filter(|binding| {
+                    let info = self.context.analysis.binding(*binding);
+                    info.captured && info.mutated
+                });
                 if let Some(binding) = early_binding {
                     let empty = self.builder.const_null();
                     self.bind_initial(binding, empty);
                 }
+
                 let value = initializer
                     .as_ref()
                     .map(|expr| self.lower_expr(expr))
                     .unwrap_or_else(|| self.builder.const_null());
+                let value_span = initializer.as_ref().map_or(name.span, |expr| expr.span);
+
                 if module_level {
+                    if initializer.is_some() {
+                        self.check_module_assignment(&name.value, value, value_span);
+                    }
                     if let Some(slot) = self.context.module_layout.get(&name.value) {
                         self.builder.emit0(Inst::StoreModuleVar {
                             module: self.context.module,
@@ -2209,16 +2685,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     } else {
                         self.error("NAPALM-L010", "missing module slot for variable", name.span);
                     }
-                } else if let Some(binding) = early_binding {
-                    self.write_binding(binding, value);
-                } else if let Some(binding) = self
-                    .context
-                    .analysis
-                    .declaration_map
-                    .get(&name.span)
-                    .copied()
-                {
-                    self.bind_initial(binding, value);
+                } else if let Some(binding) = binding {
+                    self.register_binding_type(binding, annotation.as_ref(), initializer.as_ref(), value);
+                    if initializer.is_some() {
+                        self.check_binding_assignment(binding, value, value_span);
+                    }
+                    if early_binding.is_some() {
+                        self.write_binding_unchecked(binding, value);
+                    } else {
+                        self.bind_initial(binding, value);
+                    }
                 }
             }
             StmtKind::Class(class) => self.lower_class_stmt(class, module_level),
@@ -2439,7 +2915,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         continue;
                     }
                     if values.iter().all(|value| matches!(value, Storage::Value(_))) {
-                        let param = self.builder.add_block_param(join, Type::Top);
+                        let ids = values
+                            .iter()
+                            .map(|value| match value {
+                                Storage::Value(value) => *value,
+                                Storage::Cell(_) => unreachable!(),
+                            })
+                            .collect::<Vec<_>>();
+                        let param_type = self.common_value_type(&ids);
+                        let param = self.builder.add_block_param(join, param_type);
                         merged.insert(binding, Storage::Value(param));
                         params.push(binding);
                     }
@@ -3042,17 +3526,44 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             },
             Type::List(None),
         );
+
+        let mut element_types = Vec::<Type>::new();
+        let mut element_type_known = true;
         for item in items {
             match &item.kind {
                 ExprKind::Spread(iterable) => {
                     let sequence = self.lower_expr(iterable);
+                    match semantic_source_type(self.builder.value_type(sequence)) {
+                        Type::List(Some(element)) if !type_is_unknown(&element) => {
+                            if !element_types.contains(&element) {
+                                element_types.push(*element);
+                            }
+                        }
+                        _ => element_type_known = false,
+                    }
                     self.append_iterable_to_list(list, sequence);
                 }
                 _ => {
                     let value = self.lower_expr(item);
+                    let ty = semantic_source_type(self.builder.value_type(value));
+                    if type_is_unknown(&ty) {
+                        element_type_known = false;
+                    } else if !element_types.contains(&ty) {
+                        element_types.push(ty);
+                    }
                     self.builder.emit0(Inst::ListAppend { list, value });
                 }
             }
+        }
+
+        if element_type_known && !element_types.is_empty() {
+            let element = if element_types.len() == 1 {
+                element_types.remove(0)
+            } else {
+                Type::Union(element_types)
+            };
+            self.builder
+                .refine_value_type(list, Type::List(Some(Box::new(element))));
         }
         list
     }
@@ -3116,13 +3627,28 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_unary(&mut self, operator: UnaryOp, operand: &Expr) -> ValueId {
         let receiver = self.lower_expr(operand);
+        let receiver_type = semantic_source_type(self.builder.value_type(receiver));
         let name = match operator {
             UnaryOp::Negate => "-",
             UnaryOp::Not => "!",
             UnaryOp::Complement => "~",
         };
+        let result_type = match (operator, receiver_type) {
+            (UnaryOp::Negate | UnaryOp::Complement, Type::Num) => Type::Num,
+            (UnaryOp::Not, Type::Num | Type::Bool | Type::Null | Type::String) => Type::Bool,
+            _ => Type::Top,
+        };
         let method = self.context.symbols.expect(name, MethodKind::Method, 0);
-        self.builder.invoke(receiver, method, Vec::new())
+        let site = self.builder.fresh_site();
+        self.builder.emit1(
+            Inst::Invoke {
+                site,
+                receiver,
+                method,
+                args: Vec::new(),
+            },
+            result_type,
+        )
     }
 
     fn lower_binary(&mut self, left: &Expr, operator: BinaryOp, right: &Expr) -> ValueId {
@@ -3133,9 +3659,56 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 .builder
                 .emit1(Inst::IsInstance { value: left, class: right }, Type::Bool);
         }
+
+        let left_type = semantic_source_type(self.builder.value_type(left));
+        let right_type = semantic_source_type(self.builder.value_type(right));
+        let result_type = match operator {
+            BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual
+                if matches!(left_type, Type::Num | Type::String | Type::Bool | Type::Null) =>
+            {
+                Type::Bool
+            }
+            BinaryOp::InclusiveRange | BinaryOp::ExclusiveRange
+                if left_type == Type::Num && right_type == Type::Num =>
+            {
+                Type::Range
+            }
+            BinaryOp::Add if left_type == Type::String && right_type == Type::String => Type::String,
+            BinaryOp::Power
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulo
+            | BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::BitAnd
+            | BinaryOp::BitXor
+            | BinaryOp::BitOr
+                if left_type == Type::Num && right_type == Type::Num =>
+            {
+                Type::Num
+            }
+            _ => Type::Top,
+        };
+
         let name = binary_operator_name(operator);
         let method = self.context.symbols.expect(name, MethodKind::Method, 1);
-        self.builder.invoke(left, method, vec![right])
+        let site = self.builder.fresh_site();
+        self.builder.emit1(
+            Inst::Invoke {
+                site,
+                receiver: left,
+                method,
+                args: vec![right],
+            },
+            result_type,
+        )
     }
 
     fn lower_logical(&mut self, left: &Expr, operator: LogicalOp, right: &Expr) -> ValueId {
@@ -3187,13 +3760,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let rhs_value = self.lower_expr(right);
         let rhs_end = self.builder.current_block();
         let rhs_env = self.env.clone();
+        let result_type = self.common_value_type(&[left_value, rhs_value]);
+        self.builder.refine_value_type(result_param, result_type);
 
         let mut merged_env = incoming.clone();
         let mut env_params = Vec::new();
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (short_env.get(&binding).copied(), rhs_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param = self.builder.add_block_param(join, Type::Top);
+                    let param_type = self.common_value_type(&[a, b]);
+                    let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
                 }
@@ -3247,13 +3823,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let else_value = self.lower_expr(else_expr);
         let else_end = self.builder.current_block();
         let else_env = self.env.clone();
+        let result_type = self.common_value_type(&[then_value, else_value]);
+        self.builder.refine_value_type(result_param, result_type);
 
         let mut merged_env = incoming.clone();
         let mut env_params = Vec::new();
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (then_env.get(&binding).copied(), else_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param = self.builder.add_block_param(join, Type::Top);
+                    let param_type = self.common_value_type(&[a, b]);
+                    let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
                 }
@@ -3432,7 +4011,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (short_env.get(&binding).copied(), rhs_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param = self.builder.add_block_param(join, Type::Top);
+                    let param_type = self.common_value_type(&[a, b]);
+                    let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
                 }
@@ -3489,7 +4069,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         match &target.kind {
             ExprKind::Name(name) => {
                 if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
-                    self.write_binding(binding, value);
+                    self.write_binding(binding, value, name.span);
                 } else if self.context.implicit_this && self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
                     let receiver = self.lower_this(name.span);
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
@@ -3502,6 +4082,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             name.span,
                         );
                     } else {
+                        self.check_module_assignment(&name.value, value, name.span);
                         self.builder.emit0(Inst::StoreModuleVar {
                             module: self.context.module,
                             slot,
@@ -3808,7 +4389,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
     }
 
-    fn write_binding(&mut self, binding: BindingId, value: ValueId) {
+    fn write_binding(&mut self, binding: BindingId, value: ValueId, span: Span) {
+        self.check_binding_assignment(binding, value, span);
+        self.write_binding_unchecked(binding, value);
+    }
+
+    fn write_binding_unchecked(&mut self, binding: BindingId, value: ValueId) {
         match self.env.get(&binding).copied() {
             Some(Storage::Cell(cell)) => self.builder.store_cell(cell, value),
             Some(Storage::Value(_)) => {
@@ -4926,6 +5512,73 @@ class Child is Parent {
             }
         }
         assert!(saw_child_field);
+    }
+
+    fn parse_typescript(source: &str) -> ModuleAst {
+        let parsed = crate::napalm_front_main::parse("types.nap", source);
+        assert!(
+            !parsed.has_errors(),
+            "TypeScript frontend diagnostics: {:#?}",
+            parsed.diagnostics
+        );
+        parsed.module
+    }
+
+    #[test]
+    fn explicit_variable_type_rejects_incompatible_assignment() {
+        let source = r#"
+            let count: number = 1;
+            count = "wrong";
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "NAPALM-T001"
+                && diagnostic.message.contains("count")
+                && diagnostic.message.contains("number")
+                && diagnostic.message.contains("string")
+        }));
+    }
+
+    #[test]
+    fn inferred_variable_type_is_sticky_after_initialization() {
+        let source = r#"
+            {
+                let count = 1;
+                count = false;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "NAPALM-T001"));
+    }
+
+    #[test]
+    fn any_and_uninitialized_untyped_bindings_remain_dynamic() {
+        let source = r#"
+            {
+                let explicit: any = 1;
+                explicit = "text";
+                explicit = true;
+
+                let implicit;
+                implicit = 1;
+                implicit = "text";
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "NAPALM-T001"),
+            "unexpected type diagnostics: {:#?}",
+            output.diagnostics
+        );
     }
 
     #[test]

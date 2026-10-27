@@ -186,7 +186,9 @@ impl Type {
                             .iter()
                             .all(|class| expected.contains(*class)))
             }
+            (Num, Int32 | F64) => true,
             (Foreign(None), Foreign(_)) => true,
+            (Closure(None), Closure(_)) => true,
             (List(None), List(_)) => true,
             (List(Some(expected)), List(Some(actual))) => expected.accepts(actual),
             _ => false,
@@ -2223,6 +2225,28 @@ impl<'p> Builder<'p> {
 
     pub fn capture(&self, index: usize) -> ValueId {
         self.function.captures[index].value
+    }
+
+    #[inline]
+    pub fn value_type(&self, value: ValueId) -> &Type {
+        &self
+            .function
+            .value(value)
+            .expect("unknown value in Builder::value_type")
+            .ty
+    }
+
+    /// Refine the semantic type of an already emitted SSA value without changing
+    /// its runtime representation. This is used when collection construction
+    /// learns a more precise element type after emitting the allocation node.
+    pub fn refine_value_type(&mut self, value: ValueId, ty: Type) {
+        let slot = self
+            .function
+            .values
+            .get_mut(value.0 as usize)
+            .filter(|slot| slot.id == value)
+            .expect("unknown value in Builder::refine_value_type");
+        slot.ty = ty;
     }
 
     pub fn add_capture(&mut self, ty: Type, mode: CaptureMode) -> ValueId {
