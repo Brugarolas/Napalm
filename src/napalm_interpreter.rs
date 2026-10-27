@@ -241,7 +241,7 @@ mod runtime_hash {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static THREAD_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-        const STEP: u64 = 0xA076_1D64_78BD_642F;
+        pub(super) const STEP: u64 = 0xA076_1D64_78BD_642F;
 
         #[inline]
         fn splitmix64_stateless(mut z: u64) -> u64 {
@@ -298,7 +298,7 @@ mod runtime_hash {
         }
 
         #[inline]
-        fn output(s: u64) -> u64 {
+        pub(super) fn output(s: u64) -> u64 {
             let product = (s as u128) * ((s ^ 0xE703_7ED1_A0B4_28DB) as u128);
             (product as u64) ^ ((product >> 64) as u64)
         }
@@ -342,6 +342,23 @@ mod runtime_hash {
 
     }
     use tls_prng::fast_two_u64;
+
+    /// Seed a stateful Random instance from the same syscall-free TLS generator
+    /// used to key runtime hash tables. Both outputs are folded so each Random
+    /// construction consumes the full pair produced by `fast_two_u64()`.
+    #[inline]
+    pub(super) fn fast_random_seed() -> u64 {
+        let (first, second) = fast_two_u64();
+        first ^ second.rotate_left(32)
+    }
+
+    /// Advance a per-instance Random state with the same transition/output core
+    /// as the TLS generator. This path performs only wrapping integer arithmetic.
+    #[inline]
+    pub(super) fn next_random_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(tls_prng::STEP);
+        tls_prng::output(*state)
+    }
 
     /// ------------------------
     /// Non-cryptographic AES-backed hashers.
@@ -787,6 +804,15 @@ mod runtime_hash {
         use super::*;
 
         #[test]
+        fn per_instance_random_matches_tls_prng_core() {
+            let mut state = 0x0123_4567_89ab_cdefu64;
+            let expected_state = state.wrapping_add(super::tls_prng::STEP);
+            let expected = super::tls_prng::output(expected_state);
+            assert_eq!(next_random_u64(&mut state), expected);
+            assert_eq!(state, expected_state);
+        }
+
+        #[test]
         fn equal_values_use_equal_hashes() {
             let builder = AesBuildHasher::from_seed(123, 456);
             let mut a = builder.build_hasher();
@@ -881,6 +907,14 @@ mod runtime_hash {
             }
         }
     }
+}
+
+/// Fast seed for the standard-library Random object. The first TLS initialization
+/// uses only process/thread-local state, cycle-counter/address noise and an atomic
+/// sequence; generation itself performs no OS entropy or time syscall.
+#[inline]
+pub(crate) fn fast_random_seed() -> u64 {
+    runtime_hash::fast_random_seed()
 }
 
 use self::runtime_hash::AesBuildHasher;
@@ -2821,12 +2855,9 @@ impl HostContext<'_> {
             Some(HeapObject::Random { state }) => state,
             _ => return Err(RuntimeError::new("receiver is not Random")),
         };
-        // SplitMix64: per-instance state; wrapping arithmetic is intentional.
-        *state = state.wrapping_add(0x9e3779b97f4a7c15);
-        let mut value = *state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-        Ok(value ^ (value >> 31))
+        // Keep Random instances independent while using the same fast transition
+        // and multiply-fold output function as the syscall-free TLS PRNG.
+        Ok(runtime_hash::next_random_u64(state))
     }
 
     #[inline]

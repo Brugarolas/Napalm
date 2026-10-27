@@ -5,12 +5,11 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
 use std::io::{self, Write};
-use std::hash::BuildHasher;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug)]
@@ -735,8 +734,7 @@ fn execute_primitive(
     let this = receiver(args)?;
     match op {
         RandomNew => {
-            let seed = std::collections::hash_map::RandomState::new().hash_one(());
-            Ok(context.allocate_random(seed))
+            Ok(context.allocate_random(fast_random_seed()))
         }
         RandomInt => {
             let (from, to) = if args.len() == 2 {
