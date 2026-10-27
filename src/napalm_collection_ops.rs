@@ -9,6 +9,7 @@ pub(super) fn list_append_value(
     list: Value,
     value: Value,
 ) -> Result<(), RuntimeError> {
+    vm.heap.check_list_write(list, value)?;
     vm.heap.remember_if_reference(list, value);
     let resized = match vm.heap.get_mut(list) {
         Some(HeapObject::List(values)) => {
@@ -32,6 +33,7 @@ pub(super) fn list_insert_value(
     index: i32,
     value: Value,
 ) -> Result<(), RuntimeError> {
+    vm.heap.check_list_write(list, value)?;
     vm.heap.remember_if_reference(list, value);
     let resized = match vm.heap.get_mut(list) {
         Some(HeapObject::List(values)) => {
@@ -64,6 +66,13 @@ pub(super) fn list_spread_list(
     list: Value,
     source: Value,
 ) -> Result<(), RuntimeError> {
+    if vm.heap.has_contract(list) {
+        let items = match vm.heap.get(source) {
+            Some(HeapObject::List(items)) => items.clone(),
+            _ => return Err(RuntimeError::new("spread source is not a List")),
+        };
+        for item in items { vm.heap.check_list_write(list, item)?; }
+    }
     // Self-spread must snapshot the source before growing the destination. For
     // distinct lists, borrow the immutable source buffer by raw pointer so the
     // hot path avoids allocating and copying a temporary Vec. No GC or reentrant

@@ -454,3 +454,205 @@ fn napalm_object_property_stores_survive_gc_and_shape_changes() {
         "[[29, 30], retained, [79]]",
     );
 }
+
+
+#[test]
+fn napalm_interfaces_valid_aliases_nested_lists_and_gc() {
+    run_napalm(r#"
+        interface Child { value: number; }
+        interface Base { name: string; }
+        interface Item extends Base { child: Child; values: number[]; label?: string; readonly id: number; }
+        const child = {value: 1};
+        const values = [2, 3];
+        const raw: any = {name: 'item', child, values, id: 7, extra: true};
+        let item: Item = raw;
+        child.value = 4;
+        values.add(5);
+        item.label = 'ok';
+        raw.name = 'changed';
+        System.gc();
+        function local() {
+            const p: Child = {value: 9};
+            p.value++;
+            return p.value + p['value'];
+        }
+        const copy = {...item};
+        copy.name = 123;
+        const result = [item.name, item.child.value, item.values, item.label, copy.name, local()];
+    "#, "[changed, 4, [2, 3, 5], ok, 123, 20]");
+}
+
+fn interface_error(source: &str, require_native: bool) {
+    let parsed = crate::napalm_front_main::parse("interface.nap", source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let mut hir = Program::new();
+    let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+    let lowered = lower_module(&mut hir, "interface.nap", source, "interface", &parsed.module);
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    let entry = lowered.lowered.unwrap().entry;
+    let program = compile_program(&mut hir).unwrap();
+    for enabled in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(enabled.then(|| TracingJitOptions {
+            hot_loop_threshold: 2, ..Default::default()
+        }));
+        let error = vm.run_module(entry).expect_err("interface violation did not terminate execution");
+        assert!(error.message.starts_with(interfaces::TYPE_ERROR), "jit={enabled}: {error:?}");
+        if require_native && enabled {
+            assert!(vm.jit_stats().unwrap().native_entries > 0, "test did not reach native code");
+        }
+    }
+}
+
+#[test]
+fn napalm_interfaces_reject_all_mutation_routes_and_cannot_be_caught() {
+    let prefix = r#"
+        interface Child { value: number; }
+        interface Item { name: string; child: Child; values: number[]; optional?: boolean; readonly id: number; }
+        const nested: any = {value: 1};
+        const list: any = [1, 2];
+        const raw: any = {name: 'ok', child: nested, values: list, id: 3};
+        let item: Item = raw;
+    "#;
+    for mutation in [
+        "item.name = 1;", "raw['name'] = false;", "raw[42] = true; raw.name = false;",
+        "nested.value = 'bad';", "item.child = {value: 'bad'};",
+        "list[0] = 'bad';", "list.add('bad');", "list.insert(0, 'bad');",
+        "item.values = [1, 'bad'];", "raw.remove('name');", "raw.clear();",
+        "item.optional = 'bad';", "item.id = 4;",
+        "function bad(x) { x.name = 1; } bad(raw);",
+        "item = {name: 'ok'};",
+        "const replacement = {value: 5}; item.child = replacement; replacement.value = 'bad';",
+        "const replacement = [5]; item.values = replacement; replacement.add('bad');",
+        "const fiber = new Fiber(() => { raw.name = 1; }); fiber.try();",
+        "async function bad() { raw.name = 1; } await bad();",
+    ] {
+        interface_error(&format!("{prefix} try {{ {mutation} }} catch (e) {{ }} const result = 1;"), false);
+    }
+}
+
+#[test]
+fn napalm_interfaces_reject_initial_shape_and_dynamic_rebinding() {
+    for source in [
+        "interface P { x: number; } const p: P = {};",
+        "interface P { x: number; } const p: P = {x: 'bad'};",
+        "interface P { x: number; } function f() { return 'bad'; } const p: P = f();",
+        "interface P { x: number; } function f() { let p: P = {x: 1}; const g = () => { p = {x: 'bad'}; }; g(); } f();",
+    ] { interface_error(source, false); }
+}
+
+#[test]
+fn napalm_interfaces_jit_preexisting_alias_and_late_failure() {
+    // Compile writes while untyped, then attach a contract through another alias.
+    interface_error(r#"
+        interface P { x: number; }
+        function write(p, value) { for (let i = 0; i < 100; i++) p.x = value; }
+        const raw: any = {x: 1};
+        write(raw, 'warmup');
+        raw.x = 1;
+        const typed: P = raw;
+        write(raw, 'bad');
+    "#, true);
+    interface_error(r#"
+        interface P { xs: number[]; }
+        function write(xs, value) { for (let i = 0; i < 100; i++) xs[0] = value; }
+        const xs: any = [1];
+        write(xs, 'warmup');
+        xs[0] = 1;
+        const typed: P = {xs};
+        write(xs, 'bad');
+    "#, true);
+}
+
+#[test]
+fn napalm_interfaces_ir_retains_contract_and_typed_reads() {
+    let source = "interface P { x: number; } function f() { const p: P = {x: 1}; return p.x; } const result = f();";
+    let parsed = crate::napalm_front_main::parse("typed.nap", source);
+    let mut hir = Program::new();
+    napalm_builtin::install_hir_builtins(&mut hir);
+    let lowered = lower_module(&mut hir, "typed.nap", source, "typed", &parsed.module);
+    assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
+    let mut program = compile_program(&mut hir).unwrap();
+    use crate::napalm_bytecode::{Decoder, Opcode};
+    assert!(program.functions.iter().any(|f| Decoder::new(&f.chunk.code)
+        .any(|op| op.unwrap().opcode == Opcode::BindInterface)));
+    assert!(hir.functions.iter().any(|f| f.nodes.iter().any(|node| {
+        matches!(node.kind, crate::napalm_ir::Inst::MapGet { .. })
+            && f.value(node.results[0]).unwrap().ty == Type::Num
+    })));
+    // A corrupted descriptor must fail verification before VM preparation.
+    let function = program.functions.iter_mut().find(|f| Decoder::new(&f.chunk.code)
+        .any(|op| op.unwrap().opcode == Opcode::BindInterface)).unwrap();
+    let pc = Decoder::new(&function.chunk.code).find_map(|op| {
+        let op = op.unwrap(); (op.opcode == Opcode::BindInterface).then_some(op.pc)
+    }).unwrap();
+    function.chunk.code[pc.word_index() + 1].0 = u32::MAX;
+    assert!(crate::napalm_bytecode::BytecodeVerifier::verify_program(&program).is_err());
+}
+
+
+#[test]
+fn napalm_interfaces_unions_optional_removal_and_multiple_contracts() {
+    run_napalm(r#"
+        interface P { x: number | string; optional?: boolean; }
+        let p: P | null = {x: 1};
+        p.x = 'ok'; p.optional = true; p.remove('optional');
+        const rows: P[] = [{x: 2}, {x: 'three'}];
+        rows.add({x: 4});
+        interface Q { child: { value: number; }; rows: { name: string; }[]; }
+        const q: Q = {child: {value: 7}, rows: [{name: 'row'}]};
+        const result = [p.x, p.optional, rows[2].x, q.child.value, q.rows[0].name];
+    "#, "[ok, null, 4, 7, row]");
+    interface_error("interface A { x: number; } interface B { x: number | string; } const raw = {x: 1}; const a: A = raw; const b: B = raw; b.x = 'bad';", false);
+    interface_error("interface P { x: number; } const rows: P[] = [{x: 1}]; rows.add({x: 'bad'});", false);
+    interface_error("interface Q { child: { value: number; }; } const q: Q = {child: {value: 1}}; q.child.value = 'bad';", false);
+}
+
+#[test]
+fn napalm_interfaces_typed_mutations_remain_jittable() {
+    run_napalm_checked(r#"
+        interface P { x: number; values: number[]; }
+        const p: P = {x: 0, values: [0]};
+        for (let i = 0; i < 200; i++) { p.x++; p.values[0] = i; }
+        System.gc();
+        const result = [p.x, p.values[0]];
+    "#, "[200, 199]", true);
+}
+
+#[test]
+fn napalm_interfaces_jit_does_not_erase_a_failing_overwritten_store() {
+    interface_error(r#"
+        interface P { x: number; }
+        function write(p) { for (let i = 0; i < 100; i++) { p.x = 'bad'; p.x = 1; } }
+        const raw: any = {x: 1}; write(raw);
+        const typed: P = raw; write(raw);
+    "#, true);
+}
+
+#[test]
+fn napalm_interfaces_preserve_map_builtin_precedence() {
+    run_napalm(r#"
+        interface P { count: string; }
+        function f() { const p: P = {count: 'field'}; return [p.count, p['count']]; }
+        const p: P = {count: 'global'};
+        const result = [f(), p.count, p['count']];
+    "#, "[[1, field], 1, global]");
+}
+
+#[test]
+fn napalm_interfaces_reject_unresolved_and_conflicting_schemas() {
+    for source in [
+        "interface P { x: Unknown; }",
+        "interface P { next: P; }",
+        "interface P extends Missing { x: number; }",
+        "interface A { x: number; } interface B extends A { x: string; }",
+        "interface P { x: {nested: Unknown;}; }",
+    ] {
+        let parsed = crate::napalm_front_main::parse("invalid.nap", source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let mut hir = Program::new();
+        napalm_builtin::install_hir_builtins(&mut hir);
+        let lowered = lower_module(&mut hir, "invalid.nap", source, "invalid", &parsed.module);
+        assert!(lowered.has_errors(), "accepted {source}");
+    }
+}

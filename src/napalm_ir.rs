@@ -126,6 +126,7 @@ pub enum Type {
     // Napalm-visible heap/runtime types.
     List(Option<Box<Type>>),
     Map,
+    Interface(Vec<InterfaceFieldType>),
     Range,
     Class(ClassSet),
     Instance(ClassSet),
@@ -146,6 +147,14 @@ pub enum Type {
     Union(Vec<Type>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InterfaceFieldType {
+    pub name: String,
+    pub ty: Type,
+    pub optional: bool,
+    pub readonly: bool,
+}
+
 impl Type {
     pub fn is_internal_representation(&self) -> bool {
         matches!(self, Type::Int32 | Type::F64 | Type::RawPtr)
@@ -157,6 +166,7 @@ impl Type {
             Type::String
                 | Type::List(_)
                 | Type::Map
+                | Type::Interface(_)
                 | Type::Range
                 | Type::Class(_)
                 | Type::Instance(_)
@@ -187,6 +197,7 @@ impl Type {
                             .all(|class| expected.contains(*class)))
             }
             (Num, Int32 | F64) => true,
+            (Map, Interface(_)) => true,
             (Foreign(None), Foreign(_)) => true,
             (Closure(None), Closure(_)) => true,
             (List(None), List(_)) => true,
@@ -209,6 +220,7 @@ impl fmt::Debug for Type {
             List(None) => write!(f, "List<?>"),
             List(Some(ty)) => write!(f, "List<{ty:?}>") ,
             Map => write!(f, "Map"),
+            Interface(fields) => write!(f, "Interface{fields:?}"),
             Range => write!(f, "Range"),
             Class(classes) => write!(f, "Class<{classes:?}>") ,
             Instance(classes) => write!(f, "Instance<{classes:?}>") ,
@@ -588,6 +600,10 @@ pub enum Inst {
     // ----- Constants / value movement -----
     Const(Constant),
     Move(ValueId),
+
+    /// Validate and permanently attach a heap contract. This is a write, never
+    /// a speculative guard: optimizers must preserve it even if the value is dead.
+    BindInterface { value: ValueId, expected: Type },
 
     // ----- Speculation / deoptimization -----
     GuardType {
@@ -975,6 +991,7 @@ impl Inst {
         use Inst::*;
 
         match self {
+            BindInterface { .. } => B::Chain(E::Write),
             ListSpread { .. } | MapSpread { .. } => B::Chain(E::Write),
             DestructureRest { .. } => B::Chain(E::Alloc),
             DestructureCheck { .. } => B::Chain(E::Guard),
@@ -1194,6 +1211,7 @@ impl Inst {
 
             Const(_)
             | Move(_)
+            | BindInterface { .. }
             | GuardType { .. }
             | GuardClass { .. }
             | GuardNotNull { .. }
@@ -1330,7 +1348,7 @@ impl Inst {
             Return(value) => out.push(*value),
             Unreachable | Safepoint | OSRPoint | Const(_) | FiberSuspend | AllocMap => {}
             Move(value) => out.push(*value),
-            GuardType { value, .. }
+            BindInterface { value, .. } | GuardType { value, .. }
             | GuardClass { value, .. }
             | GuardNotNull { value, .. }
             | GuardInt32 { value, .. }
@@ -1536,7 +1554,7 @@ impl Inst {
             Return(value) => f(value),
             Unreachable | Safepoint | OSRPoint | Const(_) | FiberSuspend | AllocMap => {}
             Move(value) => f(value),
-            GuardType { value, .. }
+            BindInterface { value, .. } | GuardType { value, .. }
             | GuardClass { value, .. }
             | GuardNotNull { value, .. }
             | GuardInt32 { value, .. }

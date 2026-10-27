@@ -201,6 +201,8 @@ pub enum TraceInst {
     HeapWriteBarrier { object: TraceValueId, value: TraceValueId, exit: SideExitId },
     HeapListLen { list: TraceValueId, exit: SideExitId },
     HeapListGet { list: TraceValueId, index: TraceValueId, exit: SideExitId },
+    /// Keep the contract check explicit so dead-store elimination cannot erase a failing write.
+    GuardNoContract { value: TraceValueId, kind: TraceHeapObjectKind, exit: SideExitId },
     HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId },
     HeapMapLen { map: TraceValueId, exit: SideExitId },
     /// Direct access to the dense value array of a shape-backed Map. Dynamic
@@ -250,7 +252,7 @@ impl TraceInst {
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | GuardClass { value, .. } | IntUnary { value, .. }
             | F64Unary { value, .. } | F64Math { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
-            | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. } | GuardHeapObject { value, .. }
+            | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. } | GuardHeapObject { value, .. } | GuardNoContract { value, .. }
             | ReadBarrier { value }
             | StoreAbsoluteValue { value, .. }
             | HeapLoadField { object: value, .. }
@@ -303,7 +305,7 @@ impl TraceInst {
             GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. } | GuardClass { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
-            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. }
+            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
             | HeapWriteBarrier { exit, .. }
@@ -345,7 +347,7 @@ impl TraceInst {
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. }
             | GuardType { exit, .. } | GuardClass { exit, .. } | GuardBounds { exit, .. }
             | GuardEq { exit, .. } | GuardSwitch { exit, .. }
-            | GuardHeapObject { exit, .. } | IsInstanceObserved { exit, .. }
+            | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. } | IsInstanceObserved { exit, .. }
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }

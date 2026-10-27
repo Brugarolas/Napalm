@@ -4,7 +4,7 @@
 
 Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dynamic runtime. WrenJIT remains the frozen Wren-syntax project. This repository builds the `napalm` executable.
 
-Type annotations are optional and erased. Napalm does **not** type-check programs or promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
+Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
 
 ## Run
 
@@ -39,7 +39,7 @@ System.print(twice(Answer));
 - `let`, `const` and `var`, including multiple declarations. Bindings are block-scoped; `const` requires an initializer and rejects reassignment, including from a closure. Objects held by a constant remain mutable.
 - `function name(...) { ... }`, anonymous `function (...) { ... }`, arrow functions, direct calls `fn(...)`, and lexical closures. Functions are initialized when their declaration executes; there is no JavaScript hoisting.
 - `class`, `constructor(...)`, `new Class(...)`, `extends`, `super(...)`, `super.method(...)`, declared instance/static fields, methods, `get` and `set`. Field initializers run for each construction; static initializers run once when the declaration executes. Use `this.member` explicitly.
-- Optional parameter, return and variable annotations; named/generic/array/tuple/object/function/union/intersection types; erased `type`, `interface`, generic declaration parameters, `implements`, `as Type` and class visibility/readonly modifiers. These provide syntax and documentation, with no type checking or runtime visibility enforcement.
+- Optional variable annotations and object interfaces with required/optional fields, `readonly`, `extends`, unions, nested interfaces and typed lists. Interface violations terminate execution, including inside `try/catch`. Parameter/return annotations, `type` aliases, generic parameters, `implements`, `as Type` and class visibility/readonly modifiers remain erased; see [interface scope and limits](docs/INTERFACES.md).
 - `if`/`else`, `while`, `for (let i = 0; i < n; i++)`, `for (const item of collection)`, `break`, `continue` and `return`.
 - Arithmetic, comparisons, `==`/`!=` and `===`/`!==`, bitwise operators, `&&`, `||`, conditional expressions, assignment, `+=`, `-=`, `*=`, `/=`, `%=`, and prefix/postfix `++`/`--`. `instanceof` replaces Wren's `is` operator.
 - Single/double quoted strings and backtick templates with nested `${expression}` interpolation. `%` is ordinary text.

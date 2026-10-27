@@ -118,7 +118,7 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
             regs[2] = if opcode == StringConcat { regs[1] } else { i32_word(0) };
         },
         CallClosure | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError => {
-            let closure = vm.heap.alloc(HeapObject::Closure { function_index: 1, captures: Box::new([]), reference_indices: Box::new([]) });
+            let closure = vm.heap.alloc(HeapObject::Closure { function_index: 1, captures: Box::new([]), reference_indices: std::sync::Arc::from([]) });
             regs[1] = if matches!(opcode, CallClosure | MakeFiber) { closure.word() }
                 else { vm.allocate_fiber(closure).unwrap().word() };
             regs[2] = Value::NULL.word();

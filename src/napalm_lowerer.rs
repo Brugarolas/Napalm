@@ -357,9 +357,30 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
     }
 }
 
+fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
+    match &a.kind {
+        TypeAnnotationKind::Named(n) => known.contains_key(n),
+        TypeAnnotationKind::Opaque(_) => false,
+        TypeAnnotationKind::Object(fields) => fields.iter().all(|f| supported_interface_annotation(&f.annotation, known)),
+        TypeAnnotationKind::List(Some(t)) => supported_interface_annotation(t, known),
+        TypeAnnotationKind::Union(ts) => ts.iter().all(|t| supported_interface_annotation(t, known)),
+        _ => true,
+    }
+}
+
+fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
+    match &annotation.kind {
+        TypeAnnotationKind::Object(_) => !supported_interface_annotation(annotation, known),
+        TypeAnnotationKind::List(Some(t)) => invalid_structural_annotation(t, known),
+        TypeAnnotationKind::Union(ts) => ts.iter().any(|t| invalid_structural_annotation(t, known)),
+        _ => false,
+    }
+}
+
 fn resolve_type_annotation(
     annotation: &TypeAnnotation,
     classes: &HashMap<String, ClassId>,
+    interfaces: &HashMap<String, Type>,
 ) -> Type {
     use TypeAnnotationKind as K;
 
@@ -372,10 +393,17 @@ fn resolve_type_annotation(
         K::String => Type::String,
         K::List(None) => Type::List(None),
         K::List(Some(element)) => {
-            Type::List(Some(Box::new(resolve_type_annotation(element, classes))))
+            Type::List(Some(Box::new(resolve_type_annotation(element, classes, interfaces))))
         }
         K::Map => Type::Map,
+        K::Object(fields) => Type::Interface(fields.iter().map(|field| ir::InterfaceFieldType {
+            name: field.name.value.clone(),
+            ty: resolve_type_annotation(&field.annotation, classes, interfaces),
+            optional: field.optional,
+            readonly: field.readonly,
+        }).collect()),
         K::Closure => Type::Closure(None),
+        K::Named(name) if interfaces.contains_key(name) => interfaces[name].clone(),
         K::Named(name) => match name.rsplit('.').next().unwrap_or(name) {
             "Range" => Type::Range,
             "Fiber" => Type::Fiber,
@@ -392,7 +420,7 @@ fn resolve_type_annotation(
         K::Union(types) => {
             let mut resolved = Vec::new();
             for annotation in types {
-                let ty = resolve_type_annotation(annotation, classes);
+                let ty = resolve_type_annotation(annotation, classes, interfaces);
                 if matches!(ty, Type::Top) {
                     return Type::Top;
                 }
@@ -452,8 +480,17 @@ fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
     if matches!(expected, Type::Top) {
         return false;
     }
+    fn may_satisfy(expected: &Type, actual: &Type) -> bool {
+        match (expected, actual) {
+            (Type::Interface(_), Type::Map | Type::Interface(_)) => true,
+            (Type::List(Some(e)), Type::List(Some(a))) => may_satisfy(e, a),
+            (e, Type::Union(ts)) => ts.iter().all(|a| may_satisfy(e, a)),
+            (Type::Union(ts), a) => ts.iter().any(|e| may_satisfy(e, a)),
+            _ => expected.accepts(actual),
+        }
+    }
     let actual = semantic_source_type(actual);
-    !type_is_unknown(&actual) && !expected.accepts(&actual)
+    !type_is_unknown(&actual) && !may_satisfy(expected, &actual)
 }
 
 fn display_source_type(ty: &Type) -> String {
@@ -467,6 +504,7 @@ fn display_source_type(ty: &Type) -> String {
         Type::List(None) => "any[]".to_owned(),
         Type::List(Some(element)) => format!("{}[]", display_source_type(element)),
         Type::Map => "Map".to_owned(),
+        Type::Interface(_) => "interface".to_owned(),
         Type::Range => "Range".to_owned(),
         Type::Class(_) => "class".to_owned(),
         Type::Instance(_) => "instance".to_owned(),
@@ -496,6 +534,7 @@ fn display_type_annotation(annotation: &TypeAnnotation) -> String {
         K::List(None) => "any[]".to_owned(),
         K::List(Some(element)) => format!("{}[]", display_type_annotation(element)),
         K::Map => "Map".to_owned(),
+        K::Object(_) => "object interface".to_owned(),
         K::Closure => "Function".to_owned(),
         K::Named(name) | K::Opaque(name) => name.clone(),
         K::Union(types) => types
@@ -1153,6 +1192,7 @@ struct ModuleLowerer<'p, 's, 'a> {
     symbols: SymbolTable,
     class_plans: HashMap<Span, ClassPlan>,
     top_level_classes: HashMap<String, ClassId>,
+    interface_types: HashMap<String, Type>,
     string_ids: HashMap<String, ir::StringId>,
     /// Source import spelling -> canonical resolved module StringId. Kept
     /// separate from string_ids so an ordinary literal like "./dep" retains
@@ -1189,6 +1229,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             symbols: SymbolTable::default(),
             class_plans: HashMap::new(),
             top_level_classes: HashMap::new(),
+            interface_types: HashMap::new(),
             string_ids: HashMap::new(),
             import_ids: HashMap::new(),
             closure_functions: HashMap::new(),
@@ -1215,6 +1256,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .set_module_builtin_bindings(module_id, builtin_bindings);
 
         self.plan_classes(module_id);
+        self.plan_interfaces();
         self.plan_module_binding_types();
         self.collect_and_intern_symbols();
         self.preintern_strings();
@@ -1310,6 +1352,53 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
     }
 
+    fn plan_interfaces(&mut self) {
+        let mut pending: Vec<_> = self.ast.interfaces.iter().collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            pending.retain(|decl| {
+                if !decl.parents.iter().all(|p| self.interface_types.contains_key(&p.value))
+                    || !decl.fields.iter().all(|f| supported_interface_annotation(&f.annotation, &self.interface_types)) {
+                    return true;
+                }
+                let mut fields: Vec<ir::InterfaceFieldType> = Vec::new();
+                for parent in &decl.parents {
+                    if let Type::Interface(inherited) = &self.interface_types[&parent.value] {
+                        for field in inherited {
+                            if let Some(old) = fields.iter().find(|f| f.name == field.name) {
+                                if old != field {
+                                    self.diagnostics.push(Diagnostic::error("NAPALM-T002", "conflicting inherited interface fields", parent.span));
+                                }
+                            } else { fields.push(field.clone()); }
+                        }
+                    }
+                }
+                for field in &decl.fields {
+                    let field_ty = ir::InterfaceFieldType {
+                        name: field.name.value.clone(),
+                        ty: resolve_type_annotation(&field.annotation, &self.top_level_classes, &self.interface_types),
+                        optional: field.optional,
+                        readonly: field.readonly,
+                    };
+                    if let Some(old) = fields.iter().find(|f| f.name == field_ty.name) {
+                        if old != &field_ty {
+                            self.diagnostics.push(Diagnostic::error("NAPALM-T002", "incompatible interface field override", field.name.span));
+                        }
+                    } else { fields.push(field_ty); }
+                }
+                self.interface_types.insert(decl.name.value.clone(), Type::Interface(fields));
+                false
+            });
+            if pending.len() == before {
+                for decl in pending {
+                    self.diagnostics.push(Diagnostic::error("NAPALM-T002",
+                        "unresolved, recursive or unsupported interface field type or parent", decl.name.span));
+                }
+                break;
+            }
+        }
+    }
+
     fn plan_module_binding_types(&mut self) {
         for statement in &self.ast.statements {
             let StmtKind::Variable {
@@ -1324,9 +1413,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             let source_type = annotation
                 .clone()
                 .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+            if source_type.as_ref().is_some_and(|a| invalid_structural_annotation(a, &self.interface_types)) {
+                self.diagnostics.push(Diagnostic::error("NAPALM-T002", "unsupported field type in object interface", name.span));
+            }
             let (expected, origin, display) = match source_type.as_ref() {
                 Some(annotation) => (
-                    resolve_type_annotation(annotation, &self.top_level_classes),
+                    resolve_type_annotation(annotation, &self.top_level_classes, &self.interface_types),
                     annotation.span,
                     display_type_annotation(annotation),
                 ),
@@ -1945,6 +2037,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             module,
             module_layout: &self.module_layout,
             module_binding_types: &self.module_binding_types,
+            interface_types: &self.interface_types,
             top_level_classes: &self.top_level_classes,
             implicit_this: self.ast.exports.is_none(),
             symbols: &self.symbols,
@@ -2079,6 +2172,7 @@ struct FunctionCompilerContext<'a> {
     module_layout: &'a ModuleLayout,
     module_binding_types: &'a HashMap<String, StaticBindingType>,
     top_level_classes: &'a HashMap<String, ClassId>,
+    interface_types: &'a HashMap<String, Type>,
     implicit_this: bool,
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
@@ -2125,7 +2219,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     (
                         BindingId(index as u32),
                         StaticBindingType {
-                            expected: resolve_type_annotation(annotation, context.top_level_classes),
+                            expected: resolve_type_annotation(annotation, context.top_level_classes, context.interface_types),
                             origin: annotation.span,
                             display: display_type_annotation(annotation),
                         },
@@ -2199,8 +2293,13 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         initializer: Option<&Expr>,
         value: ValueId,
     ) {
+        if let Some(annotation) = annotation {
+            if invalid_structural_annotation(annotation, self.context.interface_types) {
+                self.error("NAPALM-T002", "unsupported field type in object interface", annotation.span);
+            }
+        }
         let expected = if let Some(annotation) = annotation {
-            resolve_type_annotation(annotation, self.context.top_level_classes)
+            resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
         } else if initializer.is_some() {
             let actual = semantic_source_type(self.builder.value_type(value));
             if matches!(actual, Type::Top) {
@@ -2210,7 +2309,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     .source_type
                     .as_ref()
                     .map(|annotation| {
-                        resolve_type_annotation(annotation, self.context.top_level_classes)
+                        resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
                     })
                     .unwrap_or(Type::Top)
             } else {
@@ -2236,25 +2335,41 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         );
     }
 
-    fn check_binding_assignment(&mut self, binding: BindingId, value: ValueId, span: Span) {
+    fn bind_interface(&mut self, value: ValueId, expected: &Type) -> ValueId {
+        fn contains_interface(ty: &Type) -> bool {
+            match ty {
+                Type::Interface(_) => true,
+                Type::List(Some(t)) => contains_interface(t),
+                Type::Union(ts) => ts.iter().any(contains_interface),
+                _ => false,
+            }
+        }
+        if contains_interface(expected) {
+            self.builder.emit1(Inst::BindInterface { value, expected: expected.clone() }, expected.clone())
+        } else { value }
+    }
+
+    fn check_binding_assignment(&mut self, binding: BindingId, value: ValueId, span: Span) -> ValueId {
         let Some(binding_type) = self.binding_types.get(&binding).cloned() else {
-            return;
+            return value;
         };
         let actual = self.builder.value_type(value).clone();
         if assignment_is_known_incompatible(&binding_type.expected, &actual) {
             let name = self.context.analysis.binding(binding).name.clone();
             self.report_type_mismatch(&name, &binding_type, &actual, span);
         }
+        self.bind_interface(value, &binding_type.expected)
     }
 
-    fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) {
+    fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) -> ValueId {
         let Some(binding_type) = self.context.module_binding_types.get(name).cloned() else {
-            return;
+            return value;
         };
         let actual = self.builder.value_type(value).clone();
         if assignment_is_known_incompatible(&binding_type.expected, &actual) {
             self.report_type_mismatch(name, &binding_type, &actual, span);
         }
+        self.bind_interface(value, &binding_type.expected)
     }
 
     fn report_type_mismatch(
@@ -2673,9 +2788,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 let value_span = initializer.as_ref().map_or(name.span, |expr| expr.span);
 
                 if module_level {
-                    if initializer.is_some() {
-                        self.check_module_assignment(&name.value, value, value_span);
-                    }
+                    let value = if initializer.is_some() {
+                        self.check_module_assignment(&name.value, value, value_span)
+                    } else { value };
                     if let Some(slot) = self.context.module_layout.get(&name.value) {
                         self.builder.emit0(Inst::StoreModuleVar {
                             module: self.context.module,
@@ -2687,9 +2802,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     }
                 } else if let Some(binding) = binding {
                     self.register_binding_type(binding, annotation.as_ref(), initializer.as_ref(), value);
-                    if initializer.is_some() {
-                        self.check_binding_assignment(binding, value, value_span);
-                    }
+                    let value = if initializer.is_some() {
+                        self.check_binding_assignment(binding, value, value_span)
+                    } else { value };
                     if early_binding.is_some() {
                         self.write_binding_unchecked(binding, value);
                     } else {
@@ -4082,7 +4197,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             name.span,
                         );
                     } else {
-                        self.check_module_assignment(&name.value, value, name.span);
+                        let value = self.check_module_assignment(&name.value, value, name.span);
                         self.builder.emit0(Inst::StoreModuleVar {
                             module: self.context.module,
                             slot,
@@ -4173,11 +4288,34 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             InvokeSyntax::Getter => MethodKind::Getter,
             InvokeSyntax::Method => MethodKind::Method,
         };
+        // Dot syntax preserves builtin Map getter precedence. Brackets always
+        // address the property, even for these reserved member names.
+        if kind == MethodKind::Getter && !matches!(invoke.name.value.as_str(), "count" | "isEmpty" | "keys" | "toString") {
+            if let Some(ty) = self.interface_field_type(receiver, &invoke.name.value) {
+                let key = self.builder.const_string(&invoke.name.value);
+                return self.builder.emit1(Inst::MapGet { map: receiver, key }, ty);
+            }
+        }
         self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
+    }
+
+    fn interface_field_type(&self, receiver: ValueId, name: &str) -> Option<Type> {
+        let Type::Interface(fields) = self.builder.value_type(receiver) else { return None; };
+        let field = fields.iter().find(|f| f.name == name)?;
+        Some(if field.optional && !field.ty.accepts(&Type::Null) {
+            Type::Union(vec![field.ty.clone(), Type::Null])
+        } else { field.ty.clone() })
     }
 
     fn lower_subscript(&mut self, receiver: &Expr, args: &[Expr]) -> ValueId {
         let receiver = self.lower_expr(receiver);
+        if let [Expr { kind: ExprKind::String(name), .. }] = args {
+            let name = String::from_utf8_lossy(name);
+            if let Some(ty) = self.interface_field_type(receiver, &name) {
+                let key = self.builder.const_string(&name);
+                return self.builder.emit1(Inst::MapGet { map: receiver, key }, ty);
+            }
+        }
         let args: Vec<_> = args.iter().map(|arg| self.lower_expr(arg)).collect();
         let symbol = self
             .context
@@ -4390,7 +4528,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn write_binding(&mut self, binding: BindingId, value: ValueId, span: Span) {
-        self.check_binding_assignment(binding, value, span);
+        let value = self.check_binding_assignment(binding, value, span);
         self.write_binding_unchecked(binding, value);
     }
 

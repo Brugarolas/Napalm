@@ -1072,6 +1072,7 @@ define_opcodes! {
     DestructureCheck = 126, // A=validated source, B=source, C=is_array
     DestructureGet = 127, // A=value (null when absent), B=source, C=key/index
     DestructureRest = 128, // A=fresh collection, B=source, C=start/excluded keys
+    BindInterface = 130, // A=checked value, B=input; X=type descriptor
     InvokeSpread = 129, // A=result, B=receiver, C=argument List; X=method, Y=home
 }
 
@@ -1084,7 +1085,8 @@ impl Opcode {
             Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign
             | MakeClosure => None,
 
-            LoadI32
+            BindInterface
+            | LoadI32
             | LoadConst
             | Jump
             | JumpIfFalse
@@ -3245,6 +3247,13 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, b)?;
             }
 
+            BindInterface => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.extension(0).unwrap() as usize >= chunk.type_guards.len() {
+                    return Err(VerificationError::at(inst.pc, "interface descriptor index out of bounds"));
+                }
+            }
             GuardType => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
@@ -3599,6 +3608,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         JumpIfFalse | JumpIfTrue | Switch => [General, None, None],
         Opcode::Return => [General, None, None],
         Return2 => [General, General, None],
+        BindInterface => [General, General, None],
         GuardType | GuardClass | GuardNotNull | GuardInt32 | GuardF64 => [General, General, None],
         GuardBounds => [General, General, None],
         Bailout => [SmallImmediate, None, None],
@@ -3650,6 +3660,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         LoadConst => "x0=ConstIndex",
         Jump | JumpIfFalse | JumpIfTrue => "x0=i32 relative word displacement",
         Switch => "x0=SwitchTableId",
+        BindInterface => "x0=TypeGuardId (persistent contract)",
         GuardType => "x0=TypeGuardId, x1=DeoptId",
         GuardClass => "x0=ClassGuardId, x1=DeoptId",
         GuardBounds | GuardNotNull | GuardInt32 | GuardF64 => "x0=DeoptId",

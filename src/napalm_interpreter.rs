@@ -42,6 +42,9 @@ use self::napalm_ffi::{
 };
 #[path = "napalm_collection_ops.rs"]
 mod collection_ops;
+#[path = "napalm_interfaces.rs"]
+mod interfaces;
+use self::interfaces::h_bind_interface;
 use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
     JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
@@ -1719,6 +1722,7 @@ fn handles() -> &'static HandleTable {
 
 #[repr(C)]
 struct ManagedObject {
+    contracts: Option<Box<Vec<Type>>>,
     handle: u32,
     receiver_class: Option<ReceiverClass>,
     object: HeapObject,
@@ -2284,6 +2288,7 @@ impl Heap {
             std::ptr::write(
                 gc_object.payload().cast::<ManagedObject>(),
                 ManagedObject {
+                    contracts: None,
                     handle,
                     receiver_class,
                     object,
@@ -2405,6 +2410,7 @@ impl Heap {
         item: Value,
         mut cache: Option<&mut MapInlineCacheState>,
     ) -> Result<bool, RuntimeError> {
+        self.check_map_write(map_value, Some(&key), Some(item))?;
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -2461,6 +2467,10 @@ impl Heap {
         item: Value,
         cache: &mut MapInlineCacheState,
     ) -> Result<bool, RuntimeError> {
+        if self.has_contract(map_value) {
+            let contract_key = self.map_key(key_value)?;
+            self.check_map_write(map_value, Some(&contract_key), Some(item))?;
+        }
         // Classify the key before taking a mutable view of the map. For shaped
         // string properties keep only a raw pointer to the immutable string so a
         // PIC hit does not clone Arc<[u8]> or build/hash a temporary MapKey.
@@ -2555,6 +2565,7 @@ impl Heap {
         map_value: Value,
         key: &MapKey,
     ) -> Result<(Value, bool), RuntimeError> {
+        self.check_map_write(map_value, Some(key), None)?;
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -2587,6 +2598,7 @@ impl Heap {
     }
 
     fn map_clear_storage(&mut self, map_value: Value) -> Result<bool, RuntimeError> {
+        self.check_map_write(map_value, None, None)?;
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -2871,6 +2883,7 @@ impl HostContext<'_> {
     }
 
     pub fn list_set(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
+        self.heap.check_list_write(value, item)?;
         self.heap.remember_if_reference(value, item);
         match self.heap.get_mut(value) {
             Some(HeapObject::List(list)) => {
@@ -2883,6 +2896,7 @@ impl HostContext<'_> {
     }
 
     pub fn list_push(&mut self, value: Value, item: Value) -> Result<Value, RuntimeError> {
+        self.heap.check_list_write(value, item)?;
         self.heap.remember_if_reference(value, item);
         let resized = match self.heap.get_mut(value) {
             Some(HeapObject::List(list)) => {
@@ -2900,6 +2914,7 @@ impl HostContext<'_> {
     }
 
     pub fn list_insert(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
+        self.heap.check_list_write(value, item)?;
         self.heap.remember_if_reference(value, item);
         let resized = match self.heap.get_mut(value) {
             Some(HeapObject::List(list)) if index <= list.len() => {
@@ -5815,6 +5830,7 @@ impl<'p> Interpreter<'p> {
     #[cold]
     #[inline(never)]
     fn raise_runtime_exception(&mut self, op: &PreparedOp, error: RuntimeError) -> bool {
+        if error.message.starts_with(interfaces::TYPE_ERROR) { return false; }
         self.unwind_to_structured_handler(op, None, Some(error))
     }
 
@@ -5911,6 +5927,7 @@ impl<'p> Interpreter<'p> {
     #[cold]
     #[inline(never)]
     fn fail(&mut self, error: RuntimeError) {
+        if error.message.starts_with(interfaces::TYPE_ERROR) { self.fail_terminal(error); return; }
         if self.catch_runtime_error_in_fiber(&error) {
             return;
         }
@@ -8550,6 +8567,7 @@ impl Interpreter<'_> {
             Type::Num => Value::from_word(word).is_num(),
             Type::String => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::String(_))),
             Type::List(_) => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::List(_))),
+            Type::Interface(_) => self.heap.interface_matches(Value::from_word(word), expected),
             Type::Map => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Map(_))),
             Type::Range => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Range { .. })),
             Type::Closure(function) => match self.heap.get(Value::from_word(word)) {
@@ -8976,7 +8994,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 130;
+const OPCODE_COUNT: usize = 131;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -9109,6 +9127,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_destructure_get,
     h_destructure_rest,
     h_invoke_spread,
+    h_bind_interface,
 ];
 
 #[inline(always)]
@@ -9880,7 +9899,7 @@ unsafe fn h_alloc_list(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;
 unsafe fn h_alloc_list_cap(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cap=word_i32(vm.reg(op.b));if cap<0{vm.fail_at(op,"negative list capacity");return;}vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::List(Vec::with_capacity(cap as usize)));vm.set_reg(op.a,v.word());vm.advance(op)}
 unsafe fn h_list_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));match vm.heap.get(list){Some(HeapObject::List(values))=>{vm.set_reg(op.a,i32_word(values.len() as i32));vm.advance(op)},_=>vm.fail_at(op,"ListLen operand is not list")}}
 unsafe fn h_list_get(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let value=match vm.heap.get(list){Some(HeapObject::List(values))=>normalize_index(index,values.len()).map(|i|*values.get_unchecked(i)),_=>None};match value{Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"list index out of bounds")}}
-unsafe fn h_list_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));vm.heap.remember_if_reference(list,value);match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){*values.get_unchecked_mut(i)=value;vm.advance(op)}else{vm.fail_at(op,"list index out of bounds")},_=>vm.fail_at(op,"ListSet operand is not list")}}
+unsafe fn h_list_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));if let Err(error)=vm.heap.check_list_write(list,value){vm.fail_at(op,error.message);return;}vm.heap.remember_if_reference(list,value);match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){*values.get_unchecked_mut(i)=value;vm.advance(op)}else{vm.fail_at(op,"list index out of bounds")},_=>vm.fail_at(op,"ListSet operand is not list")}}
 unsafe fn h_list_append(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let list=Value::from_word(vm.reg(op.a));
@@ -10739,6 +10758,10 @@ impl TraceRuntime for Interpreter<'_> {
             self.heap.get(Value::from_word(value)),
             Some(HeapObject::String(bytes)) if bytes.as_ref().is_ascii()
         )
+    }
+
+    fn trace_has_contract(&self, value: RegisterWord) -> bool {
+        self.heap.has_contract(Value::from_word(value))
     }
 
     fn trace_shaped_map_access(

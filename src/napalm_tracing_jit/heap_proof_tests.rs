@@ -61,7 +61,7 @@ fn runtime_invalidates_list_length_and_negative_index_proofs() {
             execute: mutate, heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
         });
         activation.current_links = compiled.native_links.as_ptr();
-        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { (compiled.entry)(&mut activation, compiled.native_links.as_ptr()) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, succeeds as u32);
         assert_eq!(general[2], num_word(30.0));
         if succeeds { assert_eq!(general[3], num_word(20.0)); }
@@ -105,7 +105,7 @@ fn preheader_list_proofs_do_not_survive_runtime_on_the_backedge() {
         execute: empty_list, heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
     });
     activation.current_links = compiled.native_links.as_ptr();
-    assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+    assert_eq!(unsafe { (compiled.entry)(&mut activation, compiled.native_links.as_ptr()) }, TRACE_RESULT_SIDE_EXIT);
     assert_eq!(activation.exit_id, failure.0, "the second iteration must recheck bounds");
     assert_eq!(general[1], num_word(42.0));
 }

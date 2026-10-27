@@ -1,0 +1,22 @@
+interface Position { x: number; y: number; }
+interface Player {
+    readonly id: number;
+    name: string;
+    position: Position;
+    scores: number[];
+    nickname?: string;
+}
+
+const player: Player = {
+    id: 1, name: 'Ada', position: {x: 0, y: 0}, scores: []
+};
+const alias: any = player;
+for (let i = 0; i < 100; i++) {
+    player.position.x += 1;
+    player.scores.add(i);
+}
+System.print(player.position.x);
+System.print(player.scores.count);
+
+// Uncomment to see a fatal contract violation through an alias:
+// alias.name = 42;

@@ -138,6 +138,7 @@ impl BindingPattern {
 type Result<T> = std::result::Result<T, ()>;
 
 struct Parser<'a> {
+    interfaces: Vec<InterfaceDecl>,
     source: &'a str,
     tokens: Vec<Tok>,
     pos: usize,
@@ -149,6 +150,29 @@ struct Parser<'a> {
 }
 
 fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
+    let parts = split_type_top_level(source, '|');
+    if parts.len() > 1 {
+        return TypeAnnotation::new(TypeAnnotationKind::Union(parts.into_iter()
+            .map(|part| classify_variable_type(part, span)).collect()), span);
+    }
+    if source.trim_start().starts_with('{') {
+        let mut parser = Parser::new(source, 0, source.len());
+        parser.lines();
+        if let Ok(fields) = parser.interface_fields() {
+            let mut annotation = TypeAnnotation::new(TypeAnnotationKind::Object(fields), span);
+            while parser.eat("[") {
+                if !parser.eat("]") { return TypeAnnotation::new(TypeAnnotationKind::Opaque(source.into()), span); }
+                annotation = TypeAnnotation::new(TypeAnnotationKind::List(Some(Box::new(annotation))), span);
+            }
+            parser.lines();
+            if parser.peek().kind == Kind::Eof { return annotation; }
+            if parser.eat("|") {
+                let other = classify_variable_type(&source[parser.peek().span.start..], span);
+                return TypeAnnotation::new(TypeAnnotationKind::Union(vec![annotation, other]), span);
+            }
+        }
+        return TypeAnnotation::new(TypeAnnotationKind::Never, span);
+    }
     let mut source = source.trim();
     if let Some(rest) = source.strip_prefix("readonly") {
         let boundary = rest
@@ -327,6 +351,7 @@ pub fn parse(_name: &str, source: &str) -> ParseOutput {
     let mut p = Parser::new(source, 0, source.len());
     let statements = p.statements(None);
     let module = ModuleAst {
+        interfaces: p.interfaces,
         statements,
         span: Span::new(0, source.len()),
         exports: Some(p.exports),
@@ -375,6 +400,7 @@ impl<'a> Parser<'a> {
             span: Span::empty(end),
         });
         Self {
+            interfaces: Vec::new(),
             source,
             tokens,
             pos: 0,
@@ -601,17 +627,23 @@ impl<'a> Parser<'a> {
             return Ok(Vec::new());
         }
         if self.eat("interface") {
-            self.ident()?;
+            if !module { return self.error("interfaces must be declared at module scope"); }
+            let name = self.ident()?;
             self.type_parameters()?;
+            let mut parents = Vec::new();
             if self.eat("extends") {
                 loop {
-                    self.ty()?;
+                    parents.push(self.ident()?);
                     if !self.eat(",") {
                         break;
                     }
                 }
             }
-            self.type_object()?;
+            let fields = self.interface_fields()?;
+            if self.interfaces.iter().any(|i| i.name.value == name.value) {
+                return self.error("duplicate interface declaration");
+            }
+            self.interfaces.push(InterfaceDecl { name, parents, fields });
             return Ok(Vec::new());
         }
 
@@ -1659,6 +1691,32 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+    fn interface_fields(&mut self) -> Result<Vec<InterfaceField>> {
+        self.lines();
+        self.expect("{")?;
+        self.separators();
+        let mut fields = Vec::new();
+        while !self.at("}") {
+            let readonly = self.eat("readonly");
+            let field_name = self.ident()?;
+            let optional = self.eat("?");
+            let method = self.at("(");
+            if method { self.params()?; }
+            let Some(mut annotation) = self.variable_annotation()? else {
+                return self.error("interface fields require a type");
+            };
+            if method { annotation.kind = TypeAnnotationKind::Closure; }
+            if fields.iter().any(|f: &InterfaceField| f.name.value == field_name.value) {
+                return self.error("duplicate interface field");
+            }
+            fields.push(InterfaceField { name: field_name, annotation, optional, readonly });
+            if !self.eat(",") { self.boundary()?; }
+            self.separators();
+        }
+        self.expect("}")?;
+        Ok(fields)
+    }
+
     fn type_object(&mut self) -> Result<()> {
         self.lines();
         self.expect("{")?;

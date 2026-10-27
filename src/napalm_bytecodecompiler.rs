@@ -1185,6 +1185,7 @@ impl AffinityGraph {
 fn result_affinity_source(node: &crate::napalm_ir::Node) -> Option<ValueId> {
     match &node.kind {
         Inst::Move(value)
+        | Inst::BindInterface { value, .. }
         | Inst::GuardType { value, .. }
         | Inst::GuardClass { value, .. }
         | Inst::GuardNotNull { value, .. }
@@ -1268,6 +1269,7 @@ fn type_may_reference(ty: &Type) -> bool {
         Type::String
         | Type::List(_)
         | Type::Map
+        | Type::Interface(_)
         | Type::Range
         | Type::Class(_)
         | Type::Instance(_)
@@ -2162,6 +2164,10 @@ impl FunctionEmitter<'_> {
                 self.assembler.emit_move(dst, src)
             }
 
+            BindInterface { value, expected } => {
+                let guard = self.type_guard(expected);
+                self.assembler.emit_x32(Opcode::BindInterface, self.result_reg(node)?.0, self.reg(*value)?.0, 0, guard.0)
+            }
             GuardType {
                 value,
                 expected,

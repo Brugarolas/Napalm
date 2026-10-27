@@ -290,6 +290,7 @@ pub enum TraceHeapKind {
 /// retain its existing shared handle-table representation.
 #[repr(C)]
 pub struct TraceHeapEntry {
+    pub(crate) has_contract: AtomicU32,
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
     /// Packed metadata: low 8 bits are TraceHeapKind. The upper 24 bits are a
@@ -309,6 +310,7 @@ impl TraceHeapEntry {
         Self {
             address: AtomicUsize::new(0),
             next_free: AtomicU32::new(free_none),
+            has_contract: AtomicU32::new(0),
             kind: AtomicU32::new(TraceHeapKind::Invalid as u32),
             receiver_class: AtomicU64::new(0),
             data: AtomicUsize::new(0),
@@ -319,6 +321,7 @@ impl TraceHeapEntry {
 
     #[inline]
     pub(crate) fn clear_jit_view(&self) {
+        self.has_contract.store(0, Ordering::Relaxed);
         self.kind.store(TraceHeapKind::Invalid as u32, Ordering::Relaxed);
         self.receiver_class.store(0, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
@@ -654,6 +657,8 @@ pub trait TraceRuntime {
 
     /// Observe a Map/key pair without mutating VM state. Returning Some allows
     /// the recorder to specialize this site to shape+slot native code.
+    fn trace_has_contract(&self, _value: RegisterWord) -> bool { false }
+
     fn trace_shaped_map_access(
         &self,
         _map: RegisterWord,
@@ -3663,11 +3668,17 @@ impl<'a> TraceRecorder<'a> {
             }
 
             ListSet => {
+                let owner = runtime.trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                if runtime.trace_has_contract(owner) {
+                    return self.runtime_gc_leaf(op, builder, &[]);
+                }
                 let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
                 let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
                 let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                builder.emit0(TraceInst::GuardNoContract { value: list, kind: TraceHeapObjectKind::List, exit });
                 builder.emit0(TraceInst::HeapListSet { list, index, value, exit });
                 Ok(ExpectedStep::Exact(next))
             }
@@ -3739,7 +3750,7 @@ impl<'a> TraceRecorder<'a> {
                 let key_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
-                let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
+                let Some(access) = (!runtime.trace_has_contract(map_word)).then(|| runtime.trace_shaped_map_access(map_word, key_word)).flatten() else {
                     // Inserts, dictionary Maps and non-string keys can allocate or
                     // change representation, but they stay in the current frame.
                     // Skip baseline redispatch when the receiver is already proven
@@ -3758,6 +3769,7 @@ impl<'a> TraceRecorder<'a> {
                 };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                builder.emit0(TraceInst::GuardNoContract { value: map, kind: TraceHeapObjectKind::Map, exit });
                 builder.emit0(TraceInst::HeapMapSetShaped {
                     map,
                     key,
@@ -4401,7 +4413,7 @@ impl<'a> TraceRecorder<'a> {
 
             // Class creation/binding changes global layout or method-table epochs.
             // Keep those rare structural operations as full runtime boundaries.
-            CreateClass | BindMethod | BindForeignMethod => {
+            CreateClass | BindMethod | BindForeignMethod | BindInterface => {
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
@@ -6825,6 +6837,13 @@ impl CraneliftLoweringState<'_, '_> {
             .ushr_imm_u(metadata, TRACE_HEAP_METADATA_SHIFT as i64)
     }
 
+    fn guard_uncontracted_store(&mut self, entry: Value, exit: SideExitId) -> Result<(), TracingJitError> {
+        let contract = self.builder.ins().load(types::I32, Self::trusted_mem(), entry,
+            offset_of!(TraceHeapEntry, has_contract) as i32);
+        let invalid = self.builder.ins().icmp_imm(IntCC::NotEqual, contract, 0);
+        self.emit_side_exit(exit, invalid)
+    }
+
     fn guard_map_shape_metadata(
         &mut self,
         metadata: Value,
@@ -8218,10 +8237,21 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, result);
             }
 
+            GuardNoContract { value, kind, exit } => {
+                let heap_kind = match kind {
+                    TraceHeapObjectKind::List => TraceHeapKind::List,
+                    TraceHeapObjectKind::Map => TraceHeapKind::Map,
+                    _ => return Err(self.error("invalid contract guard kind".to_owned())),
+                };
+                let (entry, _) = self.heap_entry_for_value(*value, heap_kind, *exit)?;
+                self.guard_uncontracted_store(entry, *exit)?;
+            }
+
             HeapListSet { list, index, value, exit } => {
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
                     self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
+                self.guard_uncontracted_store(entry, *exit)?;
                 let index = self.validated_list_index(*list, *index, entry, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let address = self.heap_element_address(data, index);
@@ -8272,6 +8302,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address, metadata) =
                     self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
+                self.guard_uncontracted_store(entry, *exit)?;
                 self.guard_map_shape_metadata(metadata, *shape, *exit)?;
                 self.guard_string_bytes(tagged_key, expected_key, *exit)?;
                 let len = self.heap_entry_len(entry);

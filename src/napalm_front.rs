@@ -73,7 +73,7 @@ impl Span {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Spanned<T> {
     pub value: T,
     pub span: Span,
@@ -963,10 +963,26 @@ fn scan_interpolation_tail(bytes: &[u8], depth: usize) -> Result<usize, LexError
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleAst {
+    pub interfaces: Vec<InterfaceDecl>,
     /// None for legacy fixtures; Napalm exports are explicit (local, public).
     pub exports: Option<Vec<(Ident, Ident)>>,
     pub statements: Vec<Stmt>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterfaceDecl {
+    pub name: Ident,
+    pub parents: Vec<Ident>,
+    pub fields: Vec<InterfaceField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InterfaceField {
+    pub name: Ident,
+    pub annotation: TypeAnnotation,
+    pub optional: bool,
+    pub readonly: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1003,6 +1019,7 @@ pub enum TypeAnnotationKind {
     String,
     List(Option<Box<TypeAnnotation>>),
     Map,
+    Object(Vec<InterfaceField>),
     Closure,
     Named(String),
     Union(Vec<TypeAnnotation>),
@@ -1706,6 +1723,7 @@ impl<'a> Parser<'a> {
         }
 
         ModuleAst {
+            interfaces: Vec::new(),
             exports: None,
             statements,
             span: Span::new(start, self.peek().span.end),
