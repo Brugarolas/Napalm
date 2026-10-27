@@ -2235,11 +2235,11 @@ fn napalm_gc_config() -> GcConfig {
             .unwrap_or_else(|| panic!("{name} overflows the address space"))
     }
     let mut config = GcConfig::default();
-    config.heap_bytes = megabytes("WREN_GC_HEAP_MB", config.heap_bytes);
-    config.workers = setting("WREN_GC_WORKERS", config.workers);
-    config.external_gc_threshold = megabytes("WREN_GC_EXTERNAL_MB", config.external_gc_threshold);
-    assert!(config.heap_bytes >= 8 << 20, "WREN_GC_HEAP_MB must be at least 8");
-    assert!(config.workers > 0, "WREN_GC_WORKERS must be at least 1");
+    config.heap_bytes = megabytes("NAPALM_GC_HEAP_MB", config.heap_bytes);
+    config.workers = setting("NAPALM_GC_WORKERS", config.workers);
+    config.external_gc_threshold = megabytes("NAPALM_GC_EXTERNAL_MB", config.external_gc_threshold);
+    assert!(config.heap_bytes >= 8 << 20, "NAPALM_GC_HEAP_MB must be at least 8");
+    assert!(config.workers > 0, "NAPALM_GC_WORKERS must be at least 1");
     config
 }
 
@@ -6055,8 +6055,8 @@ impl<'p> Interpreter<'p> {
         };
         let fiber_value = self.fiber(self.current_fiber).object;
 
-        // Native direct-closure calls can stage the immutable capture array in
-        // TraceActivation before crossing the runtime boundary. The staged
+        // Native direct-closure calls can resolve the immutable capture array via
+        // the stable sidecar before crossing the runtime boundary. The resulting
         // slice is already guarded by heap kind, function identity and capture
         // count, so this path avoids a second HeapObject lookup entirely.
         let captures: &[RegisterWord] = if let Some(words) = capture_words {
@@ -6461,9 +6461,9 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    /// Synchronous bytecode-call boundary with captures already staged by the
-    /// native trace. No GC-capable operation runs between reading the scratch
-    /// words and publishing them in the new callee frame.
+    /// Synchronous bytecode-call boundary with captures already resolved by the
+    /// native trace. No GC-capable operation runs between reading the stable
+    /// capture payload and publishing it in the new callee frame.
     fn enter_bytecode_call_with_capture_words(
         &mut self,
         op: &PreparedOp,
@@ -10870,13 +10870,26 @@ impl Interpreter<'_> {
         let args = &activation.direct_call_args[..arity];
         if closure_call {
             let closure = Value::from_word(subject);
-            if staged_captures {
-                let end = arity.checked_add(callee_capture_count)
-                    .ok_or_else(|| RuntimeError::new("staged closure scratch overflow"))?;
-                if end > ARGUMENT_REGISTER_COUNT {
-                    return Err(RuntimeError::new("staged closure captures exceed direct-call scratch"));
+            if callee_capture_count == 0 {
+                // Function identity already proves an empty capture layout. Avoid
+                // reopening HeapObject::Closure for the common capture-free case.
+                self.enter_bytecode_call_with_capture_words(
+                    &op, function_index, args, closure, &[],
+                );
+            } else if staged_captures {
+                if arity >= ARGUMENT_REGISTER_COUNT {
+                    return Err(RuntimeError::new("staged closure capture pointer has no scratch slot"));
                 }
-                let captures = &activation.direct_call_args[arity..end];
+                let captures_ptr = activation.direct_call_args[arity].0 as *const RegisterWord;
+                if captures_ptr.is_null() {
+                    return Err(RuntimeError::new("staged closure capture pointer is null"));
+                }
+                // TraceHeapEntry::data points to the Closure's external Box payload,
+                // which is stable while the closure is live. No GC-capable operation
+                // runs before push_frame_with_capture_words copies it into roots.
+                let captures = unsafe {
+                    std::slice::from_raw_parts(captures_ptr, callee_capture_count)
+                };
                 self.enter_bytecode_call_with_capture_words(
                     &op, function_index, args, closure, captures,
                 );

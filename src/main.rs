@@ -145,16 +145,16 @@ fn run() -> u8 {
     // Diagnostics useful for comparing the threaded baseline against the tracing
     // tier without recompiling the VM. They are intentionally opt-in so normal
     // execution has no environment lookup in the hot path.
-    if env::var_os("NAPALM_NO_JIT").is_some() || env::var_os("WREN_NO_JIT").is_some() {
+    if env::var_os("NAPALM_NO_JIT").is_some() || env::var_os("NAPALM_NO_JIT").is_some() {
         interpreter.set_jit_options(None);
     }
 
     let execution = interpreter.run_module(lowered_module.entry);
 
-    if env::var_os("NAPALM_JIT_STATS").is_some() || env::var_os("WREN_JIT_STATS").is_some() {
+    if env::var_os("NAPALM_JIT_STATS").is_some() || env::var_os("NAPALM_JIT_STATS").is_some() {
         eprintln!("Napalm JIT stats: {:#?}", interpreter.jit_stats());
     }
-    if env::var_os("NAPALM_GC_STATS").is_some() || env::var_os("WREN_GC_STATS").is_some() {
+    if env::var_os("NAPALM_GC_STATS").is_some() || env::var_os("NAPALM_GC_STATS").is_some() {
         eprintln!("Napalm GC stats: {:#?}", interpreter.gc_statistics());
     }
 

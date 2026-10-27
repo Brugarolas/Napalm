@@ -62,7 +62,7 @@ use cranelift::prelude::*;
 
 use crate::napalm_bytecode::{
     instruction_word_len, ArgReg, BytecodeFunction, BytecodePc, BytecodeProgram, Opcode, Reg,
-    RegisterKind, RegisterWord, ReturnReg, SpecialReg, MAX_WREN_ARITY,
+    RegisterKind, RegisterWord, ReturnReg, SpecialReg, MAX_NAPALM_ARITY,
 };
 use crate::napalm_ir::{
     ClassId, CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp,
@@ -229,8 +229,11 @@ pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
 /// The source opcode may be CallClosure or an Invoke("call") proven to resolve
 /// to the standard Fn.call builtin.
 pub const TRACE_DIRECT_CALL_FLAG_CLOSURE: u32 = 1 << 0;
-/// Closure capture words were loaded by generated code from TraceHeapEntry::data
-/// and packed immediately after ordinary arguments in direct_call_args.
+/// Generated code staged the stable Closure capture-array pointer from
+/// TraceHeapEntry::data in direct_call_args[arity]. The runtime helper consumes
+/// that pointer immediately, avoiding both HeapObject reopening and a second
+/// capture copy through TraceActivation. The public bit name is retained for ABI
+/// compatibility with existing integrations.
 pub const TRACE_DIRECT_CALL_FLAG_STAGED_CAPTURES: u32 = 1 << 1;
 
 /// Maximum number of distinct dynamic values one side-exit snapshot may
@@ -354,7 +357,7 @@ pub struct TraceActivation {
     /// without changing the public TraceActivation layout.
     pub direct_call_reserved: u32,
     pub direct_call_receiver: RegisterWord,
-    pub direct_call_args: [RegisterWord; MAX_WREN_ARITY],
+    pub direct_call_args: [RegisterWord; MAX_NAPALM_ARITY],
 
     /// Dense native entry table and per-trace link-table pointers. The Cranelift
     /// dispatcher uses these to follow stitched trace-tree edges without returning
@@ -394,7 +397,7 @@ impl TraceActivation {
             direct_call_arity: 0,
             direct_call_reserved: 0,
             direct_call_receiver: RegisterWord(0),
-            direct_call_args: [RegisterWord(0); MAX_WREN_ARITY],
+            direct_call_args: [RegisterWord(0); MAX_NAPALM_ARITY],
             trace_entries: std::ptr::null(),
             trace_link_tables: std::ptr::null(),
             current_links: std::ptr::null(),
@@ -804,8 +807,8 @@ pub struct TracingJitStats {
     /// Ordinary Invoke("call") sites proven to target the standard Fn.call
     /// builtin and lowered to the closure DirectBytecodeCall path.
     pub invoke_closure_direct_calls: u64,
-    /// Closure direct-call sites whose capture payload is staged natively in the
-    /// fixed direct-call scratch instead of reopened through HeapObject in Rust.
+    /// Closure direct-call sites whose stable capture-array pointer is staged
+    /// natively instead of reopening HeapObject::Closure in Rust.
     pub closure_capture_staged_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
@@ -1082,7 +1085,7 @@ fn spread_method_for_arity(
     base: MethodSymbol,
     arity: usize,
 ) -> Option<MethodSymbol> {
-    if arity > MAX_WREN_ARITY {
+    if arity > MAX_NAPALM_ARITY {
         return None;
     }
     let signature = program.metadata.method(base)?;
@@ -1853,7 +1856,7 @@ impl<'a> TraceRecorder<'a> {
     ) -> Result<ExpectedStep, RecordingAbort> {
         if !matches!(op.opcode, Opcode::Invoke | Opcode::InvokeSuper)
             || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
-            || op.args.len() > MAX_WREN_ARITY
+            || op.args.len() > MAX_NAPALM_ARITY
             || op.c as usize != op.args.len()
         {
             return Err(RecordingAbort::UnsupportedCall);
@@ -1966,7 +1969,7 @@ impl<'a> TraceRecorder<'a> {
     ) -> Result<ExpectedStep, RecordingAbort> {
         if op.opcode != Opcode::CallClosure
             || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
-            || op.args.len() > MAX_WREN_ARITY
+            || op.args.len() > MAX_NAPALM_ARITY
             || op.c as usize != op.args.len()
         {
             return Err(RecordingAbort::UnsupportedCall);
@@ -1994,7 +1997,7 @@ impl<'a> TraceRecorder<'a> {
     ) -> Result<ExpectedStep, RecordingAbort> {
         if op.opcode != Opcode::Invoke
             || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
-            || op.args.len() > MAX_WREN_ARITY
+            || op.args.len() > MAX_NAPALM_ARITY
             || op.c as usize != op.args.len()
         {
             return Err(RecordingAbort::UnsupportedCall);
@@ -2060,7 +2063,9 @@ impl<'a> TraceRecorder<'a> {
         self.write_gpr(builder, op.a, result);
         builder.trace_mut().stats.devirtualized_calls += 1;
         builder.trace_mut().stats.closure_direct_calls += 1;
-        if op.args.len() + capture_count as usize <= MAX_WREN_ARITY {
+        // A non-empty capture array needs one scratch slot for its stable pointer.
+        // Zero-capture closures bypass HeapObject reopening without using scratch.
+        if capture_count != 0 && op.args.len() < MAX_NAPALM_ARITY {
             builder.trace_mut().stats.closure_capture_staged_calls += 1;
         }
         if guard_method_epoch {
@@ -2132,7 +2137,7 @@ impl<'a> TraceRecorder<'a> {
         let arity = runtime
             .trace_list_len(argument_word)
             .ok_or(RecordingAbort::UnsupportedCall)?;
-        if arity > MAX_WREN_ARITY {
+        if arity > MAX_NAPALM_ARITY {
             return Err(RecordingAbort::UnsupportedCall);
         }
 
@@ -2233,7 +2238,7 @@ impl<'a> TraceRecorder<'a> {
         let arity = runtime
             .trace_list_len(argument_word)
             .ok_or(RecordingAbort::UnsupportedCall)?;
-        if arity > MAX_WREN_ARITY {
+        if arity > MAX_NAPALM_ARITY {
             return Err(RecordingAbort::UnsupportedCall);
         }
 
@@ -7182,26 +7187,25 @@ impl CraneliftLoweringState<'_, '_> {
 
                 let encoded_next = if let Some(direct) = direct_call {
                     if *terminal || next.0 & TRACE_RUNTIME_MODE_MASK != 0
-                        || direct.args.len() > MAX_WREN_ARITY
+                        || direct.args.len() > MAX_NAPALM_ARITY
                     {
                         return Err(self.error("invalid direct bytecode call runtime payload"));
                     }
+                    // The optimized closure path stages only the stable capture-array
+                    // pointer, never the capture words themselves. This removes the old
+                    // capture -> TraceActivation -> frame double copy. A non-empty
+                    // capture array needs one free scratch slot after the arguments.
                     let stage_captures = direct.closure_guard_exit.is_some()
-                        && direct.args.len() + direct.closure_capture_count as usize <= MAX_WREN_ARITY;
-                    let mut staged_capture_values = Vec::with_capacity(if stage_captures {
-                        direct.closure_capture_count as usize
-                    } else {
-                        0
-                    });
+                        && direct.closure_capture_count != 0
+                        && direct.args.len() < MAX_NAPALM_ARITY;
+                    let mut staged_capture_ptr = None;
                     if direct.closure_guard_exit.is_none() && direct.closure_capture_count != 0 {
                         return Err(self.error("non-closure direct call carries capture metadata"));
                     }
                     if let Some(exit) = direct.closure_guard_exit {
-                        // Closure function identity and capture count are immutable
-                        // and published in the stable sidecar. When the complete
-                        // call payload fits the fixed scratch, load captures here
-                        // before the runtime boundary so the helper never reopens
-                        // HeapObject::Closure.
+                        // Closure function identity and capture count are immutable and
+                        // published in the stable sidecar. Guard both before exposing
+                        // the external capture-array pointer to the runtime helper.
                         let (entry, _, metadata) = self.heap_entry_with_metadata_for_value(
                             direct.receiver,
                             TraceHeapKind::Closure,
@@ -7225,17 +7229,7 @@ impl CraneliftLoweringState<'_, '_> {
                             );
                             let count_mismatch = self.bool32(count_mismatch);
                             self.emit_side_exit(exit, count_mismatch)?;
-
-                            let data = self.heap_entry_data(entry);
-                            for index in 0..direct.closure_capture_count as usize {
-                                let value = self.builder.ins().load(
-                                    types::I64,
-                                    Self::trusted_mem(),
-                                    data,
-                                    (index * std::mem::size_of::<RegisterWord>()) as i32,
-                                );
-                                staged_capture_values.push(value);
-                            }
+                            staged_capture_ptr = Some(self.heap_entry_data(entry));
                         }
                     }
 
@@ -7290,11 +7284,14 @@ impl CraneliftLoweringState<'_, '_> {
                             args_base + (index * std::mem::size_of::<RegisterWord>()) as i32,
                         );
                     }
-                    for (capture_index, capture) in staged_capture_values.into_iter().enumerate() {
-                        let scratch_index = direct.args.len() + capture_index;
+                    if let Some(captures_ptr) = staged_capture_ptr {
+                        // Scratch is not scanned as GC roots. The helper consumes this
+                        // pointer immediately and performs no collection before copying
+                        // the capture words into the precise callee frame.
+                        let scratch_index = direct.args.len();
                         self.builder.ins().store(
                             Self::trusted_mem(),
-                            capture,
+                            captures_ptr,
                             self.activation,
                             args_base + (scratch_index * std::mem::size_of::<RegisterWord>()) as i32,
                         );
@@ -8487,7 +8484,7 @@ impl Default for TracingJit {
 
 #[inline]
 fn jit_events_enabled() -> bool {
-    std::env::var_os("WREN_JIT_EVENTS").is_some()
+    std::env::var_os("NAPALM_JIT_EVENTS").is_some()
 }
 
 impl TracingJit {
@@ -9953,8 +9950,10 @@ mod tests {
             );
             assert_eq!(activation.direct_call_receiver, RegisterWord(TAG_HEAP));
             assert_eq!(activation.direct_call_args[0], RegisterWord(0x4444));
-            assert_eq!(activation.direct_call_args[1], RegisterWord(0xaaaa));
-            assert_eq!(activation.direct_call_args[2], RegisterWord(0xbbbb));
+            let captures_ptr = activation.direct_call_args[1].0 as *const RegisterWord;
+            assert!(!captures_ptr.is_null());
+            let captures = unsafe { std::slice::from_raw_parts(captures_ptr, 2) };
+            assert_eq!(captures, &[RegisterWord(0xaaaa), RegisterWord(0xbbbb)]);
             unsafe { *activation.general.add(2) = RegisterWord(0xfeed_face) };
             TRACE_RESULT_CONTINUE
         }

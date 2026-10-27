@@ -41,7 +41,7 @@ use crate::napalm_bytecode::{
     DeoptLocation, ExceptionHandlerEntry, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
     LiveRegisterEntry, LiveRegisterMap, Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
-    TypeGuardId, GENERAL_REGISTER_COUNT, MAX_WREN_ARITY,
+    TypeGuardId, GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
@@ -1422,12 +1422,12 @@ fn build_frame_layout(
         .params
         .len()
         .saturating_sub(if uses_this { 1 } else { 0 });
-    if explicit_arity > MAX_WREN_ARITY {
+    if explicit_arity > MAX_NAPALM_ARITY {
         return Err(CompileError::InvalidFunctionSignature {
             function: function.id,
             message: format!(
                 "{} explicit parameters exceed the VM maximum of {}",
-                explicit_arity, MAX_WREN_ARITY
+                explicit_arity, MAX_NAPALM_ARITY
             ),
         });
     }

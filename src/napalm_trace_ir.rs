@@ -6,7 +6,7 @@
 //! slots are explicitly reloaded afterwards.
 
 use hashbrown::{HashMap, HashSet};
-use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_WREN_ARITY};
+use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_NAPALM_ARITY};
 use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId};
 
 macro_rules! id {
@@ -105,8 +105,9 @@ pub struct TraceDirectCall {
     /// ordinary Invoke("call")).
     pub receiver: TraceValueId,
     pub args: Vec<TraceValueId>,
-    /// Number of closure capture words that generated code may stage directly
-    /// from the stable sidecar payload. Zero for non-closure ABI calls.
+    /// Number of closure captures associated with this known target. Generated
+    /// code may stage the stable sidecar capture-array pointer when a scratch slot
+    /// is available. Zero for non-closure ABI calls.
     pub closure_capture_count: u16,
     /// Closure ABI calls specialize an immutable closure function identity. The
     /// side exit replays the original source opcode if heap kind or function index
@@ -447,9 +448,8 @@ pub struct TraceStats {
     /// inside the trace to guarded closure DirectBytecodeCall without changing
     /// frontend or bytecode semantics.
     pub invoke_closure_direct_calls: usize,
-    /// Closure direct-call sites whose complete capture payload fits in the fixed
-    /// native call scratch and is therefore loaded from TraceHeapEntry::data by
-    /// Cranelift before entering the runtime helper.
+    /// Closure direct-call sites whose stable capture-array pointer is staged in
+    /// the native call scratch, avoiding HeapObject reopening and a second copy.
     pub closure_capture_staged_calls: usize,
     pub peephole_simplified: usize,
     pub redundant_guards: usize,
@@ -862,7 +862,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             if *terminal {
                 errors.push("direct bytecode call cannot be terminal".into());
             }
-            if call.args.len() > MAX_WREN_ARITY {
+            if call.args.len() > MAX_NAPALM_ARITY {
                 errors.push("direct bytecode call exceeds argument ABI".into());
             }
             if call.closure_guard_exit.is_some_and(|exit| exit.0 as usize >= t.exits.len()) {

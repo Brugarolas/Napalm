@@ -51,8 +51,8 @@ use crate::napalm_ir::{
 pub const GENERAL_REGISTER_COUNT: usize = 256;
 pub const ARGUMENT_REGISTER_COUNT: usize = 16;
 pub const RETURN_REGISTER_COUNT: usize = 2;
-pub const MAX_WREN_ARITY: usize = 16;
-pub const MAX_DIRECT_FRAME_VALUES: usize = MAX_WREN_ARITY + 1; // THIS + 16 args.
+pub const MAX_NAPALM_ARITY: usize = 16;
+pub const MAX_DIRECT_FRAME_VALUES: usize = MAX_NAPALM_ARITY + 1; // THIS + 16 args.
 pub const MAX_CLOSURE_CAPTURES: usize = u16::MAX as usize;
 
 /// Frame-local general-purpose register.
@@ -610,7 +610,7 @@ pub fn prepare_invoke_frame(
     receiver: Reg,
     args: &[Reg],
 ) -> Result<(), CallAbiError> {
-    if args.len() > MAX_WREN_ARITY {
+    if args.len() > MAX_NAPALM_ARITY {
         return Err(CallAbiError::TooManyArguments(args.len()));
     }
 
@@ -640,7 +640,7 @@ pub fn prepare_direct_frame(
         sources
     };
 
-    if args.len() > MAX_WREN_ARITY {
+    if args.len() > MAX_NAPALM_ARITY {
         return Err(CallAbiError::TooManyArguments(args.len()));
     }
 
@@ -658,7 +658,7 @@ pub fn prepare_closure_frame(
     closure: Reg,
     args: &[Reg],
 ) -> Result<(), CallAbiError> {
-    if args.len() > MAX_WREN_ARITY {
+    if args.len() > MAX_NAPALM_ARITY {
         return Err(CallAbiError::TooManyArguments(args.len()));
     }
 
@@ -2021,7 +2021,7 @@ impl Assembler {
 
     fn validate_call_count(opcode: Opcode, count: usize) -> Result<(), AssembleError> {
         let valid = match opcode {
-            Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure => count <= MAX_WREN_ARITY,
+            Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure => count <= MAX_NAPALM_ARITY,
             Opcode::CallDirect | Opcode::CallPrimitive | Opcode::CallForeign => {
                 count <= MAX_DIRECT_FRAME_VALUES
             }
@@ -2407,10 +2407,10 @@ impl BytecodeVerifier {
                     index, method.name
                 )));
             }
-            if method.arity as usize > MAX_WREN_ARITY {
+            if method.arity as usize > MAX_NAPALM_ARITY {
                 return Err(VerificationError::function(format!(
                     "method symbol {} has arity {}, maximum is {}",
-                    index, method.arity, MAX_WREN_ARITY
+                    index, method.arity, MAX_NAPALM_ARITY
                 )));
             }
         }
@@ -2803,10 +2803,10 @@ impl BytecodeVerifier {
             .validate()
             .map_err(VerificationError::function)?;
 
-        if function.arity as usize > MAX_WREN_ARITY {
+        if function.arity as usize > MAX_NAPALM_ARITY {
             return Err(VerificationError::function(format!(
                 "function arity {} exceeds Napalm limit {}",
-                function.arity, MAX_WREN_ARITY
+                function.arity, MAX_NAPALM_ARITY
             )));
         }
 
@@ -3284,7 +3284,7 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 let argc = inst.first.c() as usize;
-                if argc > MAX_WREN_ARITY {
+                if argc > MAX_NAPALM_ARITY {
                     return Err(VerificationError::at(inst.pc, "invoke arity exceeds 16"));
                 }
                 for reg in inst.call_arguments().map_err(|error| VerificationError {
@@ -3333,7 +3333,7 @@ impl BytecodeVerifier {
                     return Err(VerificationError::at(inst.pc, "invalid closure-call convention"));
                 }
                 let argc = inst.first.c() as usize;
-                if argc > MAX_WREN_ARITY {
+                if argc > MAX_NAPALM_ARITY {
                     return Err(VerificationError::at(inst.pc, "closure-call arity exceeds 16"));
                 }
                 for reg in inst.call_arguments().map_err(|error| VerificationError {

@@ -37,8 +37,8 @@ use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 use std::io;
 
-const MAX_WREN_ARITY: usize = 16;
-const MAX_WREN_FIELDS: usize = u16::MAX as usize;
+const MAX_NAPALM_ARITY: usize = 16;
+const MAX_NAPALM_FIELDS: usize = u16::MAX as usize;
 
 // =============================================================================
 // Public API
@@ -402,7 +402,7 @@ impl Analyzer {
         {
             self.diagnostics.push(
                 Diagnostic::warning(
-                    "WREN-L001",
+                    "NAPALM-L001",
                     format!("local '{}' shadows an outer local", ident.value),
                     ident.span,
                 )
@@ -1065,7 +1065,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     fn insert_module_slot(&mut self, name: &str, span: Span, next: &mut u32) {
         if self.module_layout.slots.contains_key(name) {
             self.error(
-                "WREN-L002",
+                "NAPALM-L002",
                 format!("module variable '{name}' is already declared"),
                 span,
             );
@@ -1171,7 +1171,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
         if !resolving.insert(key) {
             self.error(
-                "WREN-L003",
+                "NAPALM-L003",
                 "cyclic statically-known superclass relationship",
                 class.name.span,
             );
@@ -1202,18 +1202,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
 
         let locals = local_instance_fields.get(&key).cloned().unwrap_or_default();
-        if locals.len() > MAX_WREN_FIELDS {
+        if locals.len() > MAX_NAPALM_FIELDS {
             self.error(
-                "WREN-L005",
+                "NAPALM-L005",
                 "class contains too many instance fields",
                 class.name.span,
             );
         }
 
         let statics = local_static_fields.get(&key).cloned().unwrap_or_default();
-        if statics.len() > MAX_WREN_FIELDS {
+        if statics.len() > MAX_NAPALM_FIELDS {
             self.error(
-                "WREN-L006",
+                "NAPALM-L006",
                 "class contains too many static fields",
                 class.name.span,
             );
@@ -1339,10 +1339,10 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 let Some((name, kind, arity)) = method_signature_key(&method.signature) else {
                     continue;
                 };
-                if arity > MAX_WREN_ARITY {
+                if arity > MAX_NAPALM_ARITY {
                     self.error(
-                        "WREN-L007",
-                        format!("Napalm methods may have at most {MAX_WREN_ARITY} parameters"),
+                        "NAPALM-L007",
+                        format!("Napalm methods may have at most {MAX_NAPALM_ARITY} parameters"),
                         method.span,
                     );
                     continue;
@@ -1636,7 +1636,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 for error in errors {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-L900",
+                            "NAPALM-L900",
                             format!("generated invalid WIR: {error}"),
                             span,
                         )
@@ -2207,7 +2207,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             value,
                         });
                     } else {
-                        self.error("WREN-L010", "missing module slot for variable", name.span);
+                        self.error("NAPALM-L010", "missing module slot for variable", name.span);
                     }
                 } else if let Some(binding) = early_binding {
                     self.write_binding(binding, value);
@@ -2259,7 +2259,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_class_stmt(&mut self, class: &ClassDecl, module_level: bool) {
         let Some(plan) = self.context.class_plans.get(&class.name.span).cloned() else {
-            self.error("WREN-L011", "class was not planned", class.name.span);
+            self.error("NAPALM-L011", "class was not planned", class.name.span);
             return;
         };
         let superclass = class.superclass.as_ref().map(|expr| self.lower_expr(expr));
@@ -2319,7 +2319,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Ok(name) => name,
             Err(_) => {
                 self.error(
-                    "WREN-L012",
+                    "NAPALM-L012",
                     "module import names must be valid UTF-8 for the current WIR string table",
                     Span::empty(0),
                 );
@@ -2343,7 +2343,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         for binding in &import.bindings {
             let Some(name_id) = self.context.string_ids.get(&binding.imported.value).copied() else {
-                self.error("WREN-L013", "imported name was not preinterned", binding.imported.span);
+                self.error("NAPALM-L013", "imported name was not preinterned", binding.imported.span);
                 continue;
             };
             let value = self.builder.emit1(
@@ -2693,12 +2693,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_break(&mut self, span: Span) {
         if self.in_cleanup != 0 {
-            self.error("WREN-L041", "`break` is not allowed inside defer/finally cleanup", span);
+            self.error("NAPALM-L041", "`break` is not allowed inside defer/finally cleanup", span);
             self.builder.emit0(Inst::Unreachable);
             return;
         }
         let Some(loop_context) = self.loops.last().cloned() else {
-            self.error("WREN-L014", "'break' used outside a loop", span);
+            self.error("NAPALM-L014", "'break' used outside a loop", span);
             return;
         };
         self.emit_exit_actions_from(loop_context.exit_action_depth);
@@ -2711,12 +2711,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_continue(&mut self, span: Span) {
         if self.in_cleanup != 0 {
-            self.error("WREN-L042", "`continue` is not allowed inside defer/finally cleanup", span);
+            self.error("NAPALM-L042", "`continue` is not allowed inside defer/finally cleanup", span);
             self.builder.emit0(Inst::Unreachable);
             return;
         }
         let Some(loop_context) = self.loops.last().cloned() else {
-            self.error("WREN-L015", "'continue' used outside a loop", span);
+            self.error("NAPALM-L015", "'continue' used outside a loop", span);
             return;
         };
         self.emit_exit_actions_from(loop_context.exit_action_depth);
@@ -2730,14 +2730,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_return(&mut self, value: Option<&Expr>, span: Span) {
         if self.in_cleanup != 0 {
-            self.error("WREN-L043", "`return` is not allowed inside defer/finally cleanup", span);
+            self.error("NAPALM-L043", "`return` is not allowed inside defer/finally cleanup", span);
             self.builder.emit0(Inst::Unreachable);
             return;
         }
         if let Some(instance) = self.constructor_this {
             if value.is_some() {
                 self.error(
-                    "WREN-L016",
+                    "NAPALM-L016",
                     "constructors cannot return an explicit value",
                     span,
                 );
@@ -2849,7 +2849,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 let promise = self.lower_expr(promise);
                 if !self.context.allows_await {
                     self.error(
-                        "WREN-L040",
+                        "NAPALM-L040",
                         "`await` is only valid inside an async function or at module scope",
                         expr.span,
                     );
@@ -2865,7 +2865,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Ok(text) => self.builder.const_string(text),
             Err(_) => {
                 self.error(
-                    "WREN-L017",
+                    "NAPALM-L017",
                     "non-UTF-8 Napalm string literals are not representable by the current WIR StringId table",
                     span,
                 );
@@ -2924,7 +2924,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
         }
         self.error(
-            "WREN-L018",
+            "NAPALM-L018",
             format!("undefined variable '{}'", name.value),
             name.span,
         );
@@ -2941,22 +2941,22 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if let Some(binding) = binding {
             return self.read_binding(binding);
         }
-        self.error("WREN-L019", "'this' used outside a method", span);
+        self.error("NAPALM-L019", "'this' used outside a method", span);
         self.builder.const_null()
     }
 
     fn lower_field(&mut self, name: &Ident) -> ValueId {
         let Some(method) = self.context.method_context.clone() else {
-            self.error("WREN-L020", "instance field used outside a class method", name.span);
+            self.error("NAPALM-L020", "instance field used outside a class method", name.span);
             return self.builder.const_null();
         };
         if method.static_method {
-            self.error("WREN-L039", "instance fields cannot be used in static methods", name.span);
+            self.error("NAPALM-L039", "instance fields cannot be used in static methods", name.span);
             return self.builder.const_null();
         }
         let Some(slot) = method.fields.get(&name.value).copied() else {
             self.error(
-                "WREN-L021",
+                "NAPALM-L021",
                 format!("unknown instance field '{}'", name.value),
                 name.span,
             );
@@ -2968,12 +2968,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_static_field(&mut self, name: &Ident) -> ValueId {
         let Some(method) = self.context.method_context.clone() else {
-            self.error("WREN-L022", "static field used outside a class method", name.span);
+            self.error("NAPALM-L022", "static field used outside a class method", name.span);
             return self.builder.const_null();
         };
         let Some(slot) = method.static_fields.get(&name.value).copied() else {
             self.error(
-                "WREN-L023",
+                "NAPALM-L023",
                 format!("unknown static field '{}'", name.value),
                 name.span,
             );
@@ -2994,7 +2994,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_super(&mut self, super_expr: &front::SuperExpr, span: Span) -> ValueId {
         let Some(method) = self.context.method_context.clone() else {
-            self.error("WREN-L025", "'super' used outside a method", span);
+            self.error("NAPALM-L025", "'super' used outside a method", span);
             return self.builder.const_null();
         };
         let receiver = self.lower_this(span);
@@ -3009,12 +3009,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             )
         } else if let Some(symbol) = method.method_symbol {
             let Some(signature) = self.context_symbol_signature(symbol) else {
-                self.error("WREN-L026", "cannot resolve enclosing method signature", span);
+                self.error("NAPALM-L026", "cannot resolve enclosing method signature", span);
                 return self.builder.const_null();
             };
             (signature.0, signature.1, super_expr.args.len())
         } else {
-            self.error("WREN-L027", "unnamed super call has no enclosing method", span);
+            self.error("NAPALM-L027", "unnamed super call has no enclosing method", span);
             return self.builder.const_null();
         };
         // A missing superclass implementation is a runtime dispatch error, not
@@ -3497,7 +3497,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 } else if let Some(slot) = self.context.module_layout.get(&name.value) {
                     if BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value) {
                         self.error(
-                            "WREN-L038",
+                            "NAPALM-L038",
                             format!("cannot assign to core global '{}'", name.value),
                             name.span,
                         );
@@ -3510,7 +3510,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     }
                 } else {
                     self.error(
-                        "WREN-L028",
+                        "NAPALM-L028",
                         format!("assignment to undefined variable '{}'", name.value),
                         name.span,
                     );
@@ -3518,30 +3518,30 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             ExprKind::Field(name) => {
                 let Some(method) = self.context.method_context.clone() else {
-                    self.error("WREN-L029", "field assignment outside a method", name.span);
+                    self.error("NAPALM-L029", "field assignment outside a method", name.span);
                     return value;
                 };
                 if method.static_method {
-                    self.error("WREN-L039", "instance fields cannot be used in static methods", name.span);
+                    self.error("NAPALM-L039", "instance fields cannot be used in static methods", name.span);
                     return value;
                 }
                 if let Some(slot) = method.fields.get(&name.value).copied() {
                     let this = self.lower_this(name.span);
                     self.builder.store_field(this, slot, value);
                 } else {
-                    self.error("WREN-L030", "unknown instance field", name.span);
+                    self.error("NAPALM-L030", "unknown instance field", name.span);
                 }
             }
             ExprKind::StaticField(name) => {
                 let Some(method) = self.context.method_context.clone() else {
-                    self.error("WREN-L031", "static field assignment outside a method", name.span);
+                    self.error("NAPALM-L031", "static field assignment outside a method", name.span);
                     return value;
                 };
                 if let Some(slot) = method.static_fields.get(&name.value).copied() {
                     let class = self.lower_lexical_class(method.class);
                     self.builder.emit0(Inst::StoreStaticField { class, slot, value });
                 } else {
-                    self.error("WREN-L033", "unknown static field", name.span);
+                    self.error("NAPALM-L033", "unknown static field", name.span);
                 }
             }
             ExprKind::Invoke(invoke) => {
@@ -3563,7 +3563,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 let _ = self.builder.invoke(receiver, method, lowered);
             }
             _ => {
-                self.error("WREN-L034", "invalid assignment target", target.span);
+                self.error("NAPALM-L034", "invalid assignment target", target.span);
             }
         }
         value
@@ -3574,7 +3574,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
             let arguments = self.lower_list(args);
             // The runtime selects a pre-interned signature by the expanded arity.
-            for arity in 0..=MAX_WREN_ARITY { self.builder.intern_method(name, kind, arity as u8); }
+            for arity in 0..=MAX_NAPALM_ARITY { self.builder.intern_method(name, kind, arity as u8); }
             let method = self.builder.intern_method(name, kind, 0);
             self.builder.emit1(Inst::InvokeSpread { receiver, method, arguments, home_class }, Type::Top)
         } else {
@@ -3765,10 +3765,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 _ => lowered.push(self.lower_expr(arg)),
             }
         }
-        if lowered.len() > MAX_WREN_ARITY {
+        if lowered.len() > MAX_NAPALM_ARITY {
             self.error(
                 "NAPALM-L104",
-                format!("calls currently support at most {MAX_WREN_ARITY} arguments"),
+                format!("calls currently support at most {MAX_NAPALM_ARITY} arguments"),
                 span,
             );
         }
@@ -3777,11 +3777,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_closure(&mut self, body: &FunctionBody) -> ValueId {
         let Some(node_id) = self.context.analysis.closure_map.get(&body.span).copied() else {
-            self.error("WREN-L035", "closure was not discovered during capture analysis", body.span);
+            self.error("NAPALM-L035", "closure was not discovered during capture analysis", body.span);
             return self.builder.const_null();
         };
         let Some(function) = self.context.closure_ids.get(&node_id).copied() else {
-            self.error("WREN-L036", "closure function was not compiled", body.span);
+            self.error("NAPALM-L036", "closure function was not compiled", body.span);
             return self.builder.const_null();
         };
         let captures = self.context.analysis.nodes[node_id.0]
@@ -3799,7 +3799,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             None => {
                 let info = self.context.analysis.binding(binding);
                 self.error(
-                    "WREN-L037",
+                    "NAPALM-L037",
                     format!("internal lowering error: binding '{}' is unavailable", info.name),
                     info.declaration,
                 );
@@ -3817,7 +3817,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             None => {
                 let info = self.context.analysis.binding(binding);
                 self.error(
-                    "WREN-L038",
+                    "NAPALM-L038",
                     format!("internal lowering error: binding '{}' is unavailable", info.name),
                     info.declaration,
                 );
@@ -4303,7 +4303,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             });
             // A maximum-arity getter is valid even though a corresponding
             // setter would exceed the argument limit once its value is added.
-            if args.len() < MAX_WREN_ARITY {
+            if args.len() < MAX_NAPALM_ARITY {
                 out.insert(MethodKey {
                     name: "[]=".to_owned(),
                     kind: MethodKind::SubscriptSetter,

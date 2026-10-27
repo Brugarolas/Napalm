@@ -637,7 +637,7 @@ fn lex_with_offset(source: &str, base_offset: usize) -> LexOutput {
             Ok(kind) => {
                 if kind == RawTokenKind::Hash && source[raw_span.start..].starts_with("#!/") {
                     diagnostics.push(Diagnostic::error(
-                        "WREN-L008",
+                        "NAPALM-L008",
                         "a shebang is only allowed at the start of the source",
                         span,
                     ));
@@ -649,23 +649,23 @@ fn lex_with_offset(source: &str, base_offset: usize) -> LexOutput {
             Err(error) => {
                 let (code, message) = match error {
                     LexErrorKind::UnterminatedBlockComment => {
-                        ("WREN-L001", "unterminated block comment")
+                        ("NAPALM-L001", "unterminated block comment")
                     }
-                    LexErrorKind::UnterminatedString => ("WREN-L002", "unterminated string literal"),
+                    LexErrorKind::UnterminatedString => ("NAPALM-L002", "unterminated string literal"),
                     LexErrorKind::UnterminatedRawString => {
-                        ("WREN-L003", "unterminated raw string literal")
+                        ("NAPALM-L003", "unterminated raw string literal")
                     }
                     LexErrorKind::InterpolationTooDeep => {
-                        ("WREN-L004", "string interpolation is nested too deeply")
+                        ("NAPALM-L004", "string interpolation is nested too deeply")
                     }
                     LexErrorKind::UnexpectedCharacter => {
-                        ("WREN-L005", "unexpected character in source")
+                        ("NAPALM-L005", "unexpected character in source")
                     }
                     LexErrorKind::InvalidInterpolation => {
-                        ("WREN-L006", "expected `(` after `%` in string interpolation")
+                        ("NAPALM-L006", "expected `(` after `%` in string interpolation")
                     }
                     LexErrorKind::UnterminatedScientificNotation => {
-                        ("WREN-L007", "unterminated scientific notation")
+                        ("NAPALM-L007", "unterminated scientific notation")
                     }
                 };
                 diagnostics.push(
@@ -1684,7 +1684,7 @@ impl<'a> Parser<'a> {
             let is_foreign = self.match_kind(TokenKind::Foreign);
             if !self.match_kind(TokenKind::Class) {
                 return self.error_at_current(
-                    "WREN-P001",
+                    "NAPALM-P001",
                     "attributes at statement scope must annotate a class",
                     "expected `class` after attribute list",
                 );
@@ -1696,7 +1696,7 @@ impl<'a> Parser<'a> {
             let start = self.previous().span.start;
             self.expect(
                 TokenKind::Class,
-                "WREN-P002",
+                "NAPALM-P002",
                 "expected `class` after `foreign`",
             )?;
             return self.parse_class_after_keyword(start, true, Vec::new());
@@ -1719,7 +1719,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_variable(&mut self, start: usize) -> PResult<Stmt> {
-        let name = self.parse_identifier("WREN-P003", "expected variable name after `var`")?;
+        let name = self.parse_identifier("NAPALM-P003", "expected variable name after `var`")?;
         let initializer = if self.match_kind(TokenKind::Equal) {
             self.skip_newlines();
             Some(self.parse_expression()?)
@@ -1738,7 +1738,7 @@ impl<'a> Parser<'a> {
         let module_token = self.peek();
         if !matches!(module_token.kind, TokenKind::String | TokenKind::RawString) {
             return self.error_at_current(
-                "WREN-P004",
+                "NAPALM-P004",
                 "expected a module string after `import`",
                 "module names must be string literals",
             );
@@ -1749,7 +1749,7 @@ impl<'a> Parser<'a> {
         if interpolated {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P005",
+                    "NAPALM-P005",
                     "module names cannot use string interpolation",
                     module_token.span,
                 )
@@ -1763,11 +1763,11 @@ impl<'a> Parser<'a> {
             loop {
                 self.skip_newlines();
                 let imported = self.parse_identifier(
-                    "WREN-P006",
+                    "NAPALM-P006",
                     "expected imported variable name after `for`",
                 )?;
                 let local = if self.match_kind(TokenKind::As) {
-                    self.parse_identifier("WREN-P007", "expected local name after `as`")?
+                    self.parse_identifier("NAPALM-P007", "expected local name after `as`")?
                 } else {
                     imported.clone()
                 };
@@ -1797,12 +1797,12 @@ impl<'a> Parser<'a> {
         is_foreign: bool,
         attributes: Vec<Attribute>,
     ) -> PResult<Stmt> {
-        let name = self.parse_identifier("WREN-P008", "expected class name")?;
+        let name = self.parse_identifier("NAPALM-P008", "expected class name")?;
 
         let superclass = if self.match_kind(TokenKind::Is) {
             if self.at(TokenKind::Newline) {
                 return self.error_at_current(
-                    "WREN-P071",
+                    "NAPALM-P071",
                     "expected superclass expression after `is`",
                     "a class header cannot break the line immediately after `is`",
                 );
@@ -1816,7 +1816,7 @@ impl<'a> Parser<'a> {
 
         self.expect(
             TokenKind::LeftBrace,
-            "WREN-P010",
+            "NAPALM-P010",
             "expected `{` before class body",
         )?;
         self.skip_newlines();
@@ -1842,7 +1842,7 @@ impl<'a> Parser<'a> {
 
         let close = self.expect(
             TokenKind::RightBrace,
-            "WREN-P011",
+            "NAPALM-P011",
             "expected `}` after class body",
         )?;
 
@@ -1883,7 +1883,7 @@ impl<'a> Parser<'a> {
         if is_constructor && is_static {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P012",
+                    "NAPALM-P012",
                     "constructors cannot be static",
                     self.previous().span,
                 )
@@ -1893,7 +1893,7 @@ impl<'a> Parser<'a> {
         if is_constructor && is_async {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P074",
+                    "NAPALM-P074",
                     "constructors cannot be async",
                     Span::new(start, self.previous().span.end),
                 )
@@ -1903,7 +1903,7 @@ impl<'a> Parser<'a> {
         if is_foreign && is_async {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P075",
+                    "NAPALM-P075",
                     "foreign methods cannot be declared async",
                     Span::new(start, self.previous().span.end),
                 )
@@ -1920,7 +1920,7 @@ impl<'a> Parser<'a> {
         if signature.explicit_arity() > MAX_PARAMETERS {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P013",
+                    "NAPALM-P013",
                     format!(
                         "method has {} parameters, but the VM supports at most {}",
                         signature.explicit_arity(),
@@ -1955,10 +1955,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_constructor_signature(&mut self) -> PResult<MethodSignatureAst> {
-        let name = self.parse_identifier("WREN-P014", "expected constructor name")?;
+        let name = self.parse_identifier("NAPALM-P014", "expected constructor name")?;
         self.expect(
             TokenKind::LeftParen,
-            "WREN-P015",
+            "NAPALM-P015",
             "constructors require a parenthesized parameter list",
         )?;
 
@@ -1979,7 +1979,7 @@ impl<'a> Parser<'a> {
                 let span = self.peek().span;
                 self.diagnostics.push(
                     Diagnostic::error(
-                        "WREN-P016",
+                        "NAPALM-P016",
                         "a subscript method needs at least one parameter",
                         span,
                     )
@@ -1992,16 +1992,16 @@ impl<'a> Parser<'a> {
                 if self.match_kind(TokenKind::Equal) {
                     self.expect(
                         TokenKind::LeftParen,
-                        "WREN-P017",
+                        "NAPALM-P017",
                         "expected `(value)` after subscript setter `=`",
                     )?;
                     let value = self.parse_identifier(
-                        "WREN-P018",
+                        "NAPALM-P018",
                         "expected value parameter in subscript setter",
                     )?;
                     self.expect(
                         TokenKind::RightParen,
-                        "WREN-P019",
+                        "NAPALM-P019",
                         "expected `)` after subscript setter value",
                     )?;
                     return Ok(MethodSignatureAst::SubscriptSetter {
@@ -2016,16 +2016,16 @@ impl<'a> Parser<'a> {
             if self.match_kind(TokenKind::Equal) {
                 self.expect(
                     TokenKind::LeftParen,
-                    "WREN-P017",
+                    "NAPALM-P017",
                     "expected `(value)` after subscript setter `=`",
                 )?;
                 let value = self.parse_identifier(
-                    "WREN-P018",
+                    "NAPALM-P018",
                     "expected value parameter in subscript setter",
                 )?;
                 self.expect(
                     TokenKind::RightParen,
-                    "WREN-P019",
+                    "NAPALM-P019",
                     "expected `)` after subscript setter value",
                 )?;
                 return Ok(MethodSignatureAst::SubscriptSetter { params, value });
@@ -2040,7 +2040,7 @@ impl<'a> Parser<'a> {
                 if self.at(TokenKind::LeftParen) {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P020",
+                            "NAPALM-P020",
                             format!("operator `{}` is unary in Napalm", operator.as_str()),
                             operator_span,
                         )
@@ -2056,32 +2056,32 @@ impl<'a> Parser<'a> {
 
             self.expect(
                 TokenKind::LeftParen,
-                "WREN-P020",
+                "NAPALM-P020",
                 format!("operator `{}` requires one parameter", operator.as_str()),
             )?;
             let param = self.parse_identifier(
-                "WREN-P021",
+                "NAPALM-P021",
                 "expected right operand parameter",
             )?;
             self.expect(
                 TokenKind::RightParen,
-                "WREN-P022",
+                "NAPALM-P022",
                 "expected `)` after operator parameter",
             )?;
             return Ok(MethodSignatureAst::InfixOperator { operator, param });
         }
 
-        let name = self.parse_identifier("WREN-P023", "expected method name")?;
+        let name = self.parse_identifier("NAPALM-P023", "expected method name")?;
         if self.match_kind(TokenKind::Equal) {
             self.expect(
                 TokenKind::LeftParen,
-                "WREN-P024",
+                "NAPALM-P024",
                 "expected `(value)` after setter `=`",
             )?;
-            let param = self.parse_identifier("WREN-P025", "expected setter value parameter")?;
+            let param = self.parse_identifier("NAPALM-P025", "expected setter value parameter")?;
             self.expect(
                 TokenKind::RightParen,
-                "WREN-P026",
+                "NAPALM-P026",
                 "expected `)` after setter parameter",
             )?;
             return Ok(MethodSignatureAst::Setter { name, param });
@@ -2109,13 +2109,13 @@ impl<'a> Parser<'a> {
             // before each parameter, but the comma/closing delimiter must
             // immediately follow the parameter itself.
             self.skip_newlines();
-            params.push(self.parse_identifier("WREN-P027", "expected parameter name")?);
+            params.push(self.parse_identifier("NAPALM-P027", "expected parameter name")?);
             if self.match_kind(close) {
                 break;
             }
             self.expect(
                 TokenKind::Comma,
-                "WREN-P028",
+                "NAPALM-P028",
                 format!("expected `,` or {} in parameter list", close.description()),
             )?;
         }
@@ -2175,13 +2175,13 @@ impl<'a> Parser<'a> {
     fn parse_if(&mut self, start: usize) -> PResult<Stmt> {
         self.expect(
             TokenKind::LeftParen,
-            "WREN-P029",
+            "NAPALM-P029",
             "expected `(` after `if`",
         )?;
         let condition = self.parse_expression()?;
         self.expect(
             TokenKind::RightParen,
-            "WREN-P030",
+            "NAPALM-P030",
             "expected `)` after if condition",
         )?;
         let then_branch = Box::new(self.parse_statement()?);
@@ -2208,13 +2208,13 @@ impl<'a> Parser<'a> {
     fn parse_while(&mut self, start: usize) -> PResult<Stmt> {
         self.expect(
             TokenKind::LeftParen,
-            "WREN-P031",
+            "NAPALM-P031",
             "expected `(` after `while`",
         )?;
         let condition = self.parse_expression()?;
         self.expect(
             TokenKind::RightParen,
-            "WREN-P032",
+            "NAPALM-P032",
             "expected `)` after while condition",
         )?;
         let body = Box::new(self.parse_statement()?);
@@ -2228,16 +2228,16 @@ impl<'a> Parser<'a> {
     fn parse_for(&mut self, start: usize) -> PResult<Stmt> {
         self.expect(
             TokenKind::LeftParen,
-            "WREN-P033",
+            "NAPALM-P033",
             "expected `(` after `for`",
         )?;
-        let name = self.parse_identifier("WREN-P034", "expected loop variable name")?;
-        self.expect(TokenKind::In, "WREN-P035", "expected `in` in for loop")?;
+        let name = self.parse_identifier("NAPALM-P034", "expected loop variable name")?;
+        self.expect(TokenKind::In, "NAPALM-P035", "expected `in` in for loop")?;
         self.skip_newlines();
         let iterable = self.parse_expression()?;
         self.expect(
             TokenKind::RightParen,
-            "WREN-P036",
+            "NAPALM-P036",
             "expected `)` after for sequence",
         )?;
         let body = Box::new(self.parse_statement()?);
@@ -2255,12 +2255,12 @@ impl<'a> Parser<'a> {
     fn parse_defer(&mut self, start: usize, error_only: bool) -> PResult<Stmt> {
         let error_binding = if error_only && self.match_kind(TokenKind::LeftParen) {
             let binding = self.parse_identifier(
-                "WREN-P080",
+                "NAPALM-P080",
                 "expected errdefer binding name after `(`",
             )?;
             self.expect(
                 TokenKind::RightParen,
-                "WREN-P081",
+                "NAPALM-P081",
                 "expected `)` after errdefer binding",
             )?;
             Some(binding)
@@ -2287,12 +2287,12 @@ impl<'a> Parser<'a> {
             let catch_start = self.previous().span.start;
             let binding = if self.match_kind(TokenKind::LeftParen) {
                 let binding = self.parse_identifier(
-                    "WREN-P076",
+                    "NAPALM-P076",
                     "expected catch binding name after `(`",
                 )?;
                 self.expect(
                     TokenKind::RightParen,
-                    "WREN-P077",
+                    "NAPALM-P077",
                     "expected `)` after catch binding",
                 )?;
                 Some(binding)
@@ -2322,7 +2322,7 @@ impl<'a> Parser<'a> {
             let span = Span::new(start, body.span.end);
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P078",
+                    "NAPALM-P078",
                     "`try` requires a `catch`, a `finally`, or both",
                     span,
                 )
@@ -2350,7 +2350,7 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::Newline) || self.at(TokenKind::RightBrace) || self.at(TokenKind::Eof) {
             let span = Span::new(start, self.peek().span.start);
             self.diagnostics.push(
-                Diagnostic::error("WREN-P079", "`throw` requires a value", span)
+                Diagnostic::error("NAPALM-P079", "`throw` requires a value", span)
                     .with_primary_label(span, "provide the value to throw"),
             );
             return Err(());
@@ -2395,7 +2395,7 @@ impl<'a> Parser<'a> {
             let expression_span = expression.span;
             let close = self.expect(
                 TokenKind::RightBrace,
-                "WREN-P037",
+                "NAPALM-P037",
                 "single-line blocks may contain only one expression",
             )?;
             return Ok(Stmt {
@@ -2421,7 +2421,7 @@ impl<'a> Parser<'a> {
                 Ok(statement) => {
                     statements.push(statement);
                     self.consume_required_line(
-                        "WREN-P037",
+                        "NAPALM-P037",
                         "expected newline after statement in block",
                     );
                 }
@@ -2430,7 +2430,7 @@ impl<'a> Parser<'a> {
         }
         let close = self.expect(
             TokenKind::RightBrace,
-            "WREN-P037",
+            "NAPALM-P037",
             "expected `}` after block",
         )?;
         Ok(Stmt {
@@ -2442,7 +2442,7 @@ impl<'a> Parser<'a> {
     fn parse_function_body(&mut self, allow_params: bool) -> PResult<FunctionBody> {
         let open = self.expect(
             TokenKind::LeftBrace,
-            "WREN-P038",
+            "NAPALM-P038",
             "expected `{` to start function body",
         )?;
         self.parse_function_body_after_open(open.span.start, allow_params)
@@ -2458,7 +2458,7 @@ impl<'a> Parser<'a> {
             loop {
                 self.skip_newlines();
                 params.push(self.parse_identifier(
-                    "WREN-P039",
+                    "NAPALM-P039",
                     "expected closure parameter name",
                 )?);
                 if self.match_kind(TokenKind::Pipe) {
@@ -2466,7 +2466,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(
                     TokenKind::Comma,
-                    "WREN-P040",
+                    "NAPALM-P040",
                     "expected `,` or `|` in closure parameter list",
                 )?;
                 self.skip_newlines();
@@ -2474,7 +2474,7 @@ impl<'a> Parser<'a> {
             if params.len() > MAX_PARAMETERS {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        "WREN-P041",
+                        "NAPALM-P041",
                         format!(
                             "closure has {} parameters, maximum is {}",
                             params.len(),
@@ -2504,7 +2504,7 @@ impl<'a> Parser<'a> {
                     Ok(statement) => {
                         statements.push(statement);
                         self.consume_required_line(
-                            "WREN-P042",
+                            "NAPALM-P042",
                             "expected newline after statement in function body",
                         );
                     }
@@ -2513,7 +2513,7 @@ impl<'a> Parser<'a> {
             }
             let close = self.expect(
                 TokenKind::RightBrace,
-                "WREN-P042",
+                "NAPALM-P042",
                 "expected `}` after function body",
             )?;
             return Ok(FunctionBody {
@@ -2526,7 +2526,7 @@ impl<'a> Parser<'a> {
         let expression = self.parse_expression()?;
         let close = self.expect(
             TokenKind::RightBrace,
-            "WREN-P043",
+            "NAPALM-P043",
             "single-line function bodies may contain only one expression",
         )?;
         Ok(FunctionBody {
@@ -2542,7 +2542,7 @@ impl<'a> Parser<'a> {
             let start = self.previous().span.start;
             let runtime = self.match_kind(TokenKind::Bang);
             let key_or_group = self.parse_identifier(
-                "WREN-P044",
+                "NAPALM-P044",
                 "expected attribute name after `#`",
             )?;
 
@@ -2553,7 +2553,7 @@ impl<'a> Parser<'a> {
                 if self.match_kind(TokenKind::RightParen) {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P045",
+                            "NAPALM-P045",
                             "attribute groups cannot be empty",
                             Span::new(group.span.start, self.previous().span.end),
                         )
@@ -2566,7 +2566,7 @@ impl<'a> Parser<'a> {
                     loop {
                         self.skip_newlines();
                         let key = self.parse_identifier(
-                            "WREN-P045",
+                            "NAPALM-P045",
                             "expected attribute key",
                         )?;
                         let value = if self.match_kind(TokenKind::Equal) {
@@ -2586,7 +2586,7 @@ impl<'a> Parser<'a> {
                         }
                         self.expect(
                             TokenKind::Comma,
-                            "WREN-P046",
+                            "NAPALM-P046",
                             "expected `,` or `)` in attribute group",
                         )?;
                         self.skip_newlines();
@@ -2624,7 +2624,7 @@ impl<'a> Parser<'a> {
 
             self.expect(
                 TokenKind::Newline,
-                "WREN-P072",
+                "NAPALM-P072",
                 "expected newline after attribute",
             )?;
             self.skip_newlines();
@@ -2657,7 +2657,7 @@ impl<'a> Parser<'a> {
                 if interpolated {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P047",
+                            "NAPALM-P047",
                             "attribute strings cannot use interpolation",
                             token.span,
                         )
@@ -2667,7 +2667,7 @@ impl<'a> Parser<'a> {
                 Ok(AttributeValue::String(bytes))
             }
             _ => self.error_at_current(
-                "WREN-P048",
+                "NAPALM-P048",
                 "invalid attribute value",
                 "expected a name, string, boolean, or number literal",
             ),
@@ -2677,7 +2677,7 @@ impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> PResult<Expr> {
         if self.recursion_depth >= MAX_PARSE_DEPTH {
             return self.error_at_current(
-                "WREN-P049",
+                "NAPALM-P049",
                 "expression nesting is too deep",
                 "simplify this expression",
             );
@@ -2742,7 +2742,7 @@ impl<'a> Parser<'a> {
                 if !is_assignment_target(&left) {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P050",
+                            "NAPALM-P050",
                             "invalid assignment target",
                             left.span,
                         )
@@ -2754,7 +2754,7 @@ impl<'a> Parser<'a> {
                     if args.len() >= MAX_PARAMETERS {
                         self.diagnostics.push(
                             Diagnostic::error(
-                                "WREN-P073",
+                                "NAPALM-P073",
                                 "subscript setter has too many arguments",
                                 left.span,
                             )
@@ -2791,7 +2791,7 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 self.expect(
                     TokenKind::Colon,
-                    "WREN-P051",
+                    "NAPALM-P051",
                     "expected `:` in conditional expression",
                 )?;
                 self.skip_newlines();
@@ -2881,7 +2881,7 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 self.expect(
                     TokenKind::LeftBrace,
-                    "WREN-P076",
+                    "NAPALM-P076",
                     "expected `{` after `async`",
                 )?;
                 let body = self.parse_function_body_after_open(token.span.start, true)?;
@@ -2910,7 +2910,7 @@ impl<'a> Parser<'a> {
                 let expression = self.parse_expression()?;
                 let close = self.expect(
                     TokenKind::RightParen,
-                    "WREN-P052",
+                    "NAPALM-P052",
                     "expected `)` after expression",
                 )?;
                 Ok(Expr::new(
@@ -2923,7 +2923,7 @@ impl<'a> Parser<'a> {
             _ => {
                 self.current = self.current.saturating_sub(1);
                 self.error_at_current(
-                    "WREN-P053",
+                    "NAPALM-P053",
                     "expected expression",
                     format!("found {}", token.kind.description()),
                 )
@@ -2932,7 +2932,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dot_call(&mut self, receiver: Expr) -> PResult<Expr> {
-        let name = self.parse_identifier("WREN-P054", "expected method name after `.`")?;
+        let name = self.parse_identifier("NAPALM-P054", "expected method name after `.`")?;
         let (syntax, mut args, end) = if self.match_kind(TokenKind::LeftParen) {
             let args = self.parse_argument_list(TokenKind::RightParen)?;
             (InvokeSyntax::Method, args, self.previous().span.end)
@@ -2975,7 +2975,7 @@ impl<'a> Parser<'a> {
         if args.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P055",
+                    "NAPALM-P055",
                     "a subscript expression needs at least one argument",
                     self.previous().span,
                 )
@@ -3013,7 +3013,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             self.expect(
                 close,
-                "WREN-P056",
+                "NAPALM-P056",
                 format!("expected `,` or {} after argument", close.description()),
             )?;
             break;
@@ -3022,7 +3022,7 @@ impl<'a> Parser<'a> {
         if args.len() > MAX_PARAMETERS {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P057",
+                    "NAPALM-P057",
                     format!("call has {} arguments, maximum is {}", args.len(), MAX_PARAMETERS),
                     Span::new(
                         args.first().map_or(self.previous().span.start, |arg| arg.span.start),
@@ -3063,7 +3063,7 @@ impl<'a> Parser<'a> {
                 if invoke.args.len() > MAX_PARAMETERS {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P058",
+                            "NAPALM-P058",
                             "block argument exceeds the maximum method arity",
                             body.span,
                         )
@@ -3077,7 +3077,7 @@ impl<'a> Parser<'a> {
                 if super_expr.args.len() > MAX_PARAMETERS {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "WREN-P058",
+                            "NAPALM-P058",
                             "block argument exceeds the maximum method arity",
                             body.span,
                         )
@@ -3094,7 +3094,7 @@ impl<'a> Parser<'a> {
     fn parse_super(&mut self, start: usize) -> PResult<Expr> {
         if self.match_kind(TokenKind::Dot) {
             let method = self.parse_identifier(
-                "WREN-P059",
+                "NAPALM-P059",
                 "expected superclass method name after `super.`",
             )?;
             let (syntax, args, end) = if self.match_kind(TokenKind::LeftParen) {
@@ -3157,7 +3157,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             self.expect(
                 TokenKind::RightBracket,
-                "WREN-P061",
+                "NAPALM-P061",
                 "expected `,` or `]` in list literal",
             )?;
             break;
@@ -3183,7 +3183,7 @@ impl<'a> Parser<'a> {
             let key = self.parse_precedence(15)?;
             self.expect(
                 TokenKind::Colon,
-                "WREN-P062",
+                "NAPALM-P062",
                 "expected `:` between map key and value",
             )?;
             self.skip_newlines();
@@ -3199,7 +3199,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             self.expect(
                 TokenKind::RightBrace,
-                "WREN-P063",
+                "NAPALM-P063",
                 "expected `,` or `}` in map literal",
             )?;
             break;
@@ -3300,7 +3300,7 @@ impl<'a> Parser<'a> {
                     Err(_) => {
                         self.diagnostics.push(
                             Diagnostic::error(
-                                "WREN-P064",
+                                "NAPALM-P064",
                                 "unterminated string interpolation",
                                 token.span,
                             )
@@ -3350,7 +3350,7 @@ impl<'a> Parser<'a> {
     ) -> PResult<Expr> {
         if absolute_start > absolute_end || absolute_end > self.source.len() {
             return self.error_at(
-                "WREN-P065",
+                "NAPALM-P065",
                 "invalid interpolation source range",
                 Span::new(absolute_start, absolute_end.min(self.source.len())),
                 "internal interpolation boundary error",
@@ -3374,7 +3374,7 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         if self.at(TokenKind::Eof) {
             return self.error_at_current(
-                "WREN-P066",
+                "NAPALM-P066",
                 "empty string interpolation",
                 "expected an expression inside `%(` and `)`",
             );
@@ -3384,7 +3384,7 @@ impl<'a> Parser<'a> {
         if !self.at(TokenKind::Eof) {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "WREN-P067",
+                    "NAPALM-P067",
                     "unexpected tokens after interpolation expression",
                     self.peek().span,
                 )
@@ -3587,7 +3587,7 @@ impl<'a> Parser<'a> {
 
     fn invalid_escape(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(
-            Diagnostic::error("WREN-P068", "invalid string escape", span)
+            Diagnostic::error("NAPALM-P068", "invalid string escape", span)
                 .with_primary_label(span, message),
         );
     }
@@ -3603,7 +3603,7 @@ impl<'a> Parser<'a> {
         match value {
             Some(value) if value.is_finite() => Ok(value),
             _ => self.error_at(
-                "WREN-P069",
+                "NAPALM-P069",
                 "invalid number literal",
                 token.span,
                 "this number cannot be represented as a Napalm Num",
@@ -3765,7 +3765,7 @@ impl<'a> Parser<'a> {
         let span = self.peek().span;
         self.diagnostics.push(
             Diagnostic::error(
-                "WREN-P070",
+                "NAPALM-P070",
                 "expected a newline between statements",
                 span,
             )
@@ -4003,7 +4003,7 @@ mod tests {
         assert!(rejected
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "WREN-L004"));
+            .any(|diagnostic| diagnostic.code == "NAPALM-L004"));
     }
 
     #[test]
@@ -4012,7 +4012,7 @@ mod tests {
         assert!(output
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "WREN-L007"));
+            .any(|diagnostic| diagnostic.code == "NAPALM-L007"));
     }
 
     #[test]
