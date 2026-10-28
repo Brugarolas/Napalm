@@ -25,6 +25,7 @@ parking_lot = "0.13.0" # Concurrency primitives
 #archery = "1.2.1" # Faster Arc
 triomphe = "0.1.14" # Faster Arc
 #rclite = "0.4.2" # Optimized Rc for memory usage
+simd-json = "0.19.0" # High-performance JSON parsing and serialization
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
 
 #bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator

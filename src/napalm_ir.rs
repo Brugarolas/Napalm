@@ -227,8 +227,10 @@ impl Type {
         }
 
         match (self, actual) {
-            (Union(expected), actual) => expected.iter().any(|ty| ty.accepts(actual)),
+            // Every actual alternative must fit the expected type, even when
+            // different alternatives are accepted by different union members.
             (expected, Union(actuals)) => actuals.iter().all(|ty| expected.accepts(ty)),
+            (Union(expected), actual) => expected.iter().any(|ty| ty.accepts(actual)),
             (Instance(expected), Instance(actual)) | (Class(expected), Class(actual)) => {
                 expected.is_unknown()
                     || (!actual.is_unknown()
@@ -3371,6 +3373,16 @@ impl fmt::Display for Function {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn union_accepts_each_alternative_of_a_narrower_union() {
+        let expected = Type::flow_join_many([Type::Num, Type::String, Type::Bool]);
+        let actual = Type::flow_join_many([Type::String, Type::Bool]);
+        assert!(expected.accepts(&actual));
+        assert!(!actual.accepts(&expected));
+        assert!(!expected.accepts(&Type::flow_join_many([Type::String, Type::Null])));
+        assert_eq!(expected.flow_join(&actual), expected);
+    }
 
     #[test]
     fn effects_are_threaded_across_cfg_edges() {

@@ -11829,7 +11829,7 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
 // =============================================================================
 
 #[cfg(test)]
-#[path = "napalm_jit_tests.rs"]
+#[path = "tests/napalm_jit_tests.rs"]
 mod jit_tests;
 
 #[cfg(test)]
@@ -12474,8 +12474,8 @@ var result = Runner.run()
         vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
     }
 
-    include!("napalm_class_tests.rs");
-    include!("napalm_tests.rs");
+    include!("tests/napalm_class_tests.rs");
+    include!("tests/napalm_tests.rs");
 
     #[test]
     fn shaped_maps_share_shapes_use_pic_and_promote_for_general_keys() {

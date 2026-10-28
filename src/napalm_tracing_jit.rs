@@ -53,6 +53,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod inlining;
 #[cfg(test)]
+#[path = "tests/heap_proof_tests.rs"]
 mod heap_proof_tests;
 
 use cranelift::codegen::ir::{Type as ClifType, UserFuncName};

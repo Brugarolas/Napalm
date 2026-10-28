@@ -36,7 +36,7 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     let mut chunk = asm.finish().unwrap();
     chunk.constants.push(Constant::String(StringId(1)));
     chunk.inline_caches.push(InlineCacheDescriptor { site: SiteId(0), method: MethodSymbol(0), home_class: (opcode == InvokeSuper).then_some(ClassId(1)) });
-    chunk.type_guards.push(TypeGuardDescriptor { expected: Type::Num });
+    chunk.type_guards.push(TypeGuardDescriptor { expected: Type::Num, layout: None });
     chunk.class_guards.push(ClassGuardDescriptor { expected: ClassSet::singleton(ClassId(0)) });
     chunk.deopts.push(BytecodeDeoptPoint { id: DeoptId(0), resume_pc: next, slots: vec![], inlined_frames: vec![] });
     chunk.switch_tables.push(SwitchTable { default_target: next, cases: vec![SwitchTarget { value: 42, target: next }] });

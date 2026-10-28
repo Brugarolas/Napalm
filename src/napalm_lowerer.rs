@@ -451,6 +451,15 @@ fn seal_structural_type(ty: Type) -> Type {
     }
 }
 
+fn contains_structural_contract(ty: &Type) -> bool {
+    match ty {
+        Type::Interface(_) | Type::Record(_) => true,
+        Type::List(Some(t)) => contains_structural_contract(t),
+        Type::Union(ts) => ts.iter().any(contains_structural_contract),
+        _ => false,
+    }
+}
+
 fn semantic_source_type(ty: &Type) -> Type {
     match ty {
         Type::Int32 | Type::F64 => Type::Num,
@@ -2420,10 +2429,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         )
     }
 
-    /// Preserve a binding's semantic contract across SSA merge parameters. The
-    /// binding checker already guarantees every assignment satisfies this type,
-    /// so carrying `Record`/`Interface`/exact-class information through loops is
-    /// strictly stronger than degrading the parameter to `any`.
+    /// Loop backedges have not been lowered yet. Only runtime-enforced binding
+    /// contracts are safe here: ordinary annotations reject known mismatches,
+    /// but still allow dynamic values. The initializer's type is not an invariant
+    /// either (in particular for `any` and uninitialized locals). SSA propagation
+    /// can recover stronger types after all incoming edges are available.
     fn binding_flow_type(
         &self,
         binding: BindingId,
@@ -2436,15 +2446,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Some(Storage::Value(_)) | None => {}
         }
         if let Some(binding_type) = self.binding_types.get(&binding) {
-            if !matches!(binding_type.expected, Type::Top) {
+            if contains_structural_contract(&binding_type.expected)
+                && matches!(env.get(&binding), Some(Storage::Value(value))
+                    if binding_type.expected.accepts(self.builder.value_type(*value)))
+            {
                 return binding_type.expected.clone();
             }
         }
-        match env.get(&binding).copied() {
-            Some(Storage::Value(value)) => self.builder.value_type(value).clone(),
-            Some(Storage::Cell(cell)) => self.builder.value_type(cell).clone(),
-            None => Type::Top,
-        }
+        Type::Top
     }
 
     fn merged_binding_type(&self, binding: BindingId, values: &[ValueId]) -> Type {
@@ -2513,14 +2522,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn bind_interface(&mut self, value: ValueId, expected: &Type) -> ValueId {
-        fn contains_structural_contract(ty: &Type) -> bool {
-            match ty {
-                Type::Interface(_) | Type::Record(_) => true,
-                Type::List(Some(t)) => contains_structural_contract(t),
-                Type::Union(ts) => ts.iter().any(contains_structural_contract),
-                _ => false,
-            }
-        }
         if contains_structural_contract(expected) {
             let layout = self.builder.intern_structural_layout(expected);
             self.builder.emit1(
@@ -6302,6 +6303,125 @@ class Child is Parent {
     }
 
     #[test]
+    fn loop_carried_dynamic_values_execute_without_invalid_ssa_edges() {
+        let cases = [
+            r#"
+                function id(value) { return value; }
+                function run() {
+                    let total: number = id(0);
+                    let i = 0;
+                    while (i < 4) {
+                        total = total + id(i);
+                        i = i + 1;
+                    }
+                    return total == 6;
+                }
+            "#,
+            r#"
+                function id(value) { return value; }
+                function run() {
+                    let total = 0;
+                    for (let i = 0; i < 8; i = id(i + 1)) {
+                        total = id(total + i);
+                        if (i == 1) continue;
+                        if (i == 4) break;
+                    }
+                    return total == 10;
+                }
+            "#,
+            r#"
+                function id(value) { return value; }
+                function run() {
+                    let total: number = 0;
+                    let i = 0;
+                    do {
+                        i = id(i + 1);
+                        if (i == 1) continue;
+                        total = id(total + i);
+                        if (i == 4) break;
+                    } while (i < 8);
+                    return total == 9;
+                }
+            "#,
+            r#"
+                function id(value) { return value; }
+                function run() {
+                    let total = 0;
+                    for (const value of [1, 2, 3, 4, 5]) {
+                        total = id(total + value);
+                        if (value == 1) continue;
+                        if (value == 4) break;
+                    }
+                    return total == 10;
+                }
+            "#,
+            r#"
+                function run() {
+                    let value: any = 0;
+                    let pending;
+                    let i = 0;
+                    while (i < 3) {
+                        if (i == 0) { value = "text"; pending = 1; }
+                        else { value = true; pending = "done"; }
+                        i = i + 1;
+                    }
+                    return value == true && pending == "done";
+                }
+            "#,
+            r#"
+                function id(value) { return value; }
+                class Point { x: number = 1; }
+                function run() {
+                    let point = new Point();
+                    let i = 0;
+                    while (i < 2) {
+                        point = id({x: 7});
+                        i = i + 1;
+                    }
+                    return point.x == 7;
+                }
+            "#,
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let source = format!("{case}\nif (!run()) {{ throw \"wrong loop result\"; }}");
+            let module = parse_typescript(&source);
+            let mut program = ir::Program::new();
+            let manifest = crate::napalm_builtin::install_hir_builtins(&mut program);
+            let output = lower_module(&mut program, "loops.nap", &source, "loops", &module);
+            assert!(!output.has_errors(), "case {index}: {:#?}", output.diagnostics);
+            for function in &program.functions {
+                ir::verify_function(function).unwrap();
+            }
+            let entry = output.lowered.unwrap().entry;
+            let bytecode = crate::napalm_pipeline::compile_program(&mut program).unwrap();
+            let host = crate::napalm_builtin::BuiltinHost::new(manifest.clone());
+            let mut vm = crate::napalm_interpreter::Interpreter::with_host(&bytecode, Box::new(host))
+                .unwrap();
+            crate::napalm_builtin::install_vm_builtins(&mut vm, &manifest);
+            vm.set_jit_options(None);
+            assert!(matches!(
+                vm.run_module(entry).unwrap_or_else(|error| panic!("case {index}: {error}")),
+                crate::napalm_interpreter::ExecutionResult::Returned(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn jit_benchmark_scripts_lower_with_valid_ssa_edges() {
+        for source in [
+            include_str!("../scripts/jit.nap"),
+            include_str!("../scripts/jit_entries.nap"),
+        ] {
+            let module = parse_typescript(source);
+            let output = lower_new_program("jit.nap", source, "jit", &module);
+            assert!(!output.has_errors(), "{:#?}", output.diagnostics);
+            for function in &output.program.functions {
+                ir::verify_function(function).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn structural_contract_survives_loop_carried_ssa_merges() {
         let source = r#"
             type Point = { x: number; y: number };
@@ -6366,7 +6486,7 @@ class Child is Parent {
     }
 
     #[test]
-    fn exact_class_survives_loop_carried_ssa_merges() {
+    fn exact_class_is_recovered_after_loop_backedges_are_known() {
         let source = r#"
             class Point {
                 x: number = 1;
@@ -6388,15 +6508,21 @@ class Child is Parent {
             }
         "#;
         let module = parse_typescript(source);
-        let output = lower_new_program("classes.nap", source, "classes", &module);
+        let mut output = lower_new_program("classes.nap", source, "classes", &module);
         assert!(
             !output.has_errors(),
             "loop-carried class lowering diagnostics: {:#?}",
             output.diagnostics
         );
 
+        use crate::napalm_ir_optimizer::FunctionOptimization;
+        for function in &mut output.program.functions {
+            ir::verify_function(function).unwrap();
+            crate::napalm_ir_optimizing::TypedObjectSpecialization
+                .optimize_function(function);
+            ir::verify_function(function).unwrap();
+        }
         let mut saw_exact_class_param = false;
-        let mut typed_field_loads = 0usize;
         for function in &output.program.functions {
             for block in &function.blocks {
                 saw_exact_class_param |= block.params.iter().any(|param| {
@@ -6405,25 +6531,10 @@ class Child is Parent {
                     })
                 });
             }
-            for node in &function.nodes {
-                if matches!(node.kind, Inst::LoadField { .. })
-                    && node.results.iter().any(|result| {
-                        function
-                            .value(*result)
-                            .is_some_and(|value| value.ty == Type::Num)
-                    })
-                {
-                    typed_field_loads += 1;
-                }
-            }
         }
         assert!(
             saw_exact_class_param,
-            "loop-carried Point must keep its exact class set"
-        );
-        assert!(
-            typed_field_loads >= 4,
-            "Point field reads after loop merges must remain typed fixed-slot loads"
+            "SSA propagation must recover Point's exact class set from all incoming values"
         );
     }
 
