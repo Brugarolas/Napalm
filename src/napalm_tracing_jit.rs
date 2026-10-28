@@ -4150,6 +4150,14 @@ impl<'a> TraceRecorder<'a> {
                 }
             }
 
+            StorePropertyIfPresent => {
+                // Generated only by PEA rematerialization of optional structural
+                // fields. Escaping paths are cold by construction, so keep this
+                // uncommon conditional insertion on the exact GC-capable runtime
+                // path instead of bloating traces with presence branches.
+                self.runtime_gc_leaf(op, builder, &[])
+            }
+
             StoreProperty => {
                 let map = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let key = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;

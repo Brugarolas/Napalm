@@ -32,6 +32,17 @@ impl Heap {
         path: &str,
         plan: &mut Vec<(Value, Type)>,
     ) -> Result<(), RuntimeError> {
+        // Installed contracts are permanent invariants: all subsequent writes are
+        // checked by the owning container. Rebinding the exact same structural or
+        // typed-list contract therefore needs neither another deep traversal nor a
+        // duplicate installation plan. This is especially valuable for nested
+        // typed object graphs passed repeatedly through typed APIs.
+        if matches!(expected, Type::Interface(_) | Type::Record(_) | Type::List(Some(_)))
+            && self.interface_matches(value, expected)
+        {
+            return Ok(());
+        }
+
         // The finite schema bounds recursion, even when values contain cycles.
         let valid = match expected {
             Type::Top => true,

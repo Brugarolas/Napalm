@@ -451,11 +451,12 @@ fn seal_structural_type(ty: Type) -> Type {
     }
 }
 
-fn contains_structural_contract(ty: &Type) -> bool {
+fn requires_runtime_contract(ty: &Type) -> bool {
     match ty {
-        Type::Interface(_) | Type::Record(_) => true,
-        Type::List(Some(t)) => contains_structural_contract(t),
-        Type::Union(ts) => ts.iter().any(contains_structural_contract),
+        // Structural objects and typed Lists carry persistent runtime contracts so
+        // aliases through `any` cannot bypass later writes.
+        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => true,
+        Type::Union(ts) => ts.iter().any(requires_runtime_contract),
         _ => false,
     }
 }
@@ -2446,7 +2447,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Some(Storage::Value(_)) | None => {}
         }
         if let Some(binding_type) = self.binding_types.get(&binding) {
-            if contains_structural_contract(&binding_type.expected)
+            if requires_runtime_contract(&binding_type.expected)
                 && matches!(env.get(&binding), Some(Storage::Value(value))
                     if binding_type.expected.accepts(self.builder.value_type(*value)))
             {
@@ -2522,7 +2523,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn bind_interface(&mut self, value: ValueId, expected: &Type) -> ValueId {
-        if contains_structural_contract(expected) {
+        if requires_runtime_contract(expected) {
             let layout = self.builder.intern_structural_layout(expected);
             self.builder.emit1(
                 Inst::BindInterface { value, expected: expected.clone(), layout },
@@ -6419,6 +6420,38 @@ class Child is Parent {
                 ir::verify_function(function).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn typed_lists_emit_persistent_runtime_contracts() {
+        let source = r#"
+            let numbers: number[] = [1, 2, 3];
+            let alias: any = numbers;
+            alias[0] = 4;
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("typed_list.nap", source, "typed_list", &module);
+        assert!(
+            !output.has_errors(),
+            "typed-list lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let saw_typed_list_contract = output.program.functions.iter().any(|function| {
+            function.nodes.iter().any(|node| {
+                matches!(
+                    &node.kind,
+                    Inst::BindInterface {
+                        expected: Type::List(Some(element)),
+                        ..
+                    } if element.as_ref() == &Type::Num
+                )
+            })
+        });
+        assert!(
+            saw_typed_list_contract,
+            "number[] must install a persistent list-element contract before aliases can escape"
+        );
     }
 
     #[test]

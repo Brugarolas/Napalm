@@ -3790,7 +3790,7 @@ struct PreparedFunction {
     /// touching the function/IC metadata hierarchy.
     quick_invokes: Vec<QuickInvokeSite>,
     quickened_invoke_ops: Vec<u32>,
-    /// MapGet/MapSet and typed LoadProperty/StoreProperty prepared ops allocate
+    /// MapGet/MapSet and typed property prepared ops allocate
     /// entries here. PreparedOp::cache stores the dense cache index so x/y remain
     /// available for structural layout and logical-slot metadata.
     map_inline_caches: Vec<MapInlineCacheState>,
@@ -4090,7 +4090,7 @@ impl PreparedProgram {
                         RuntimeError::new(format!("unknown module {:?}", module))
                     })?;
                 }
-                Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty => {
+                Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent => {
                     op.cache = map_inline_cache_count as u32;
                     map_inline_cache_count += 1;
                 }
@@ -9018,7 +9018,12 @@ impl Interpreter<'_> {
             Type::Bool => Value::from_word(word).is_bool(),
             Type::Num => Value::from_word(word).is_num(),
             Type::String => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::String(_))),
-            Type::List(_) => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::List(_))),
+            Type::List(None) => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::List(_))),
+            Type::List(Some(_)) => {
+                let value = Value::from_word(word);
+                matches!(self.heap.get(value), Some(HeapObject::List(_)))
+                    && self.heap.interface_matches(value, expected)
+            }
             Type::Interface(_) | Type::Record(_) => self.heap.interface_matches(Value::from_word(word), expected),
             Type::Map => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Map(_))),
             Type::Range => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Range { .. })),
@@ -9478,7 +9483,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 133;
+const OPCODE_COUNT: usize = 134;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -9614,6 +9619,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_bind_interface,
     h_load_property,
     h_store_property,
+    h_store_property_if_present,
 ];
 
 #[inline(always)]
@@ -10561,6 +10567,50 @@ unsafe fn h_store_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
     }
 }
 
+unsafe fn h_store_property_if_present(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let presence_reg = Reg(((op.y >> 16) & 0xff) as u8);
+    let present = Value::from_word(unsafe { vm.reg(presence_reg.0) });
+    match present.as_bool() {
+        Some(false) => unsafe { vm.advance(op) },
+        Some(true) => {
+            let map = Value::from_word(unsafe { vm.reg(op.a) });
+            let key = Value::from_word(unsafe { vm.reg(op.b) });
+            let value = Value::from_word(unsafe { vm.reg(op.c) });
+            let layout_id = StructuralLayoutId(op.x);
+            let logical = PropertySlotId((op.y & 0xffff) as u16);
+            vm.mark_gc_point(op);
+            vm.maybe_collect();
+            vm.heap.remember_if_reference(map, key);
+            vm.heap.remember_if_reference(map, value);
+            let function = vm.current_function_index();
+            let cache = unsafe {
+                vm.prepared
+                    .functions
+                    .get_unchecked_mut(function)
+                    .map_inline_caches
+                    .as_mut_ptr()
+                    .add(op.cache as usize)
+            };
+            match vm.heap.map_set_property_with_pic(
+                map, key, value, layout_id, logical, unsafe { &mut *cache },
+            ) {
+                Ok(structural) => {
+                    if structural {
+                        if let Some(bytes) = vm.heap.map_external_bytes(map) {
+                            vm.heap.set_external_bytes(map, bytes);
+                        }
+                        vm.heap.refresh_jit_view(map);
+                    }
+                    unsafe { vm.advance(op) }
+                }
+                Err(error) => vm.fail_at(op, error.message),
+            }
+        }
+        None => vm.fail_at(op, "PEA presence value is not boolean"),
+    }
+}
+
 unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let map=Value::from_word(vm.reg(op.b));
@@ -11189,7 +11239,7 @@ impl TraceRuntime for Interpreter<'_> {
             op.x = prepared_op.x;
             op.y = prepared_op.y;
         }
-        if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty) {
+        if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent) {
             op.cache = self.current_prepared().ops[self.hot_pc as usize].cache;
         }
         // Runtime boundaries inside a trace still execute exactly one logical

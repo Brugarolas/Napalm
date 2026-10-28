@@ -1364,6 +1364,25 @@ impl FunctionOptimization for FastLocalSimplify {
                         });
                         map_values.insert(SeqReadKey::MapGet(map, key), value);
                     }
+                    Inst::StorePropertyIfPresent { object: map, key, .. } => {
+                        let map = object_alias_root(function, map);
+                        let key = object_alias_root(function, key);
+                        // Presence is dynamic: invalidate aliases that the store may
+                        // touch, but do not forward the stored value unconditionally.
+                        map_values.retain(|cached, _| match cached {
+                            SeqReadKey::MapGet(known_map, known_key) => {
+                                if *known_map == map {
+                                    map_keys_definitely_distinct(function, *known_key, key)
+                                } else {
+                                    objects_definitely_distinct(function, *known_map, map)
+                                }
+                            }
+                            SeqReadKey::MapLen(known_map) => {
+                                objects_definitely_distinct(function, *known_map, map)
+                            }
+                            _ => true,
+                        });
+                    }
                     Inst::MapRemove { .. } | Inst::MapSpread { .. } => {
                         map_values.clear();
                     }

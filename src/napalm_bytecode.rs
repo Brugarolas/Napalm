@@ -1076,6 +1076,9 @@ define_opcodes! {
     BindInterface = 130, // A=checked value, B=input; X=type descriptor
     LoadProperty = 131, // A=value, B=object, C=key; X=layout, Y=logical property slot
     StoreProperty = 132, // A=object, B=key, C=value; X=layout, Y=logical property slot
+    // PEA-only rematerialization helper. A/B/C match StoreProperty; X=layout;
+    // Y[15:0]=logical slot, Y[23:16]=presence GPR.
+    StorePropertyIfPresent = 133,
 }
 
 impl Opcode {
@@ -1087,7 +1090,7 @@ impl Opcode {
             Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign
             | MakeClosure => None,
 
-            LoadProperty | StoreProperty => Some(3),
+            LoadProperty | StoreProperty | StorePropertyIfPresent => Some(3),
 
             BindInterface
             | LoadI32
@@ -1166,6 +1169,7 @@ impl Opcode {
                 | AllocMap
                 | MapSet
                 | StoreProperty
+                | StorePropertyIfPresent
                 | StringConcat
                 | StringSlice
                 | MakeRange
@@ -2729,23 +2733,39 @@ impl BytecodeVerifier {
                 })?;
 
                 match inst.opcode {
-                    Opcode::LoadProperty | Opcode::StoreProperty => {
+                    Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent => {
                         let layout_id = StructuralLayoutId(inst.extension(0).unwrap());
-                        let logical = PropertySlotId(inst.extension(1).unwrap() as u16);
+                        let packed = inst.extension(1).unwrap();
+                        let logical_raw = if inst.opcode == Opcode::StorePropertyIfPresent {
+                            if packed & 0xff00_0000 != 0 {
+                                return Err(VerificationError::at(
+                                    inst.pc,
+                                    "conditional property store has reserved Y bits set",
+                                ));
+                            }
+                            (packed & 0xffff) as u16
+                        } else {
+                            if packed > u16::MAX as u32 {
+                                return Err(VerificationError::at(
+                                    inst.pc,
+                                    "property access logical slot does not fit u16",
+                                ));
+                            }
+                            packed as u16
+                        };
+                        let logical = PropertySlotId(logical_raw);
                         let layout = program.metadata.structural_layout(layout_id).ok_or_else(|| {
                             VerificationError::at(
                                 inst.pc,
                                 format!("property access references unknown structural layout {:?}", layout_id),
                             )
                         })?;
-                        if inst.extension(1).unwrap() > u16::MAX as u32
-                            || layout.property(logical).is_none()
-                        {
+                        if layout.property(logical).is_none() {
                             return Err(VerificationError::at(
                                 inst.pc,
                                 format!(
                                     "property access references invalid logical slot {} in {:?}",
-                                    inst.extension(1).unwrap(), layout_id
+                                    logical_raw, layout_id
                                 ),
                             ));
                         }
@@ -3587,6 +3607,13 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
             }
+            StorePropertyIfPresent => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                Self::verify_reg(function, inst.pc, c)?;
+                let packed = inst.extension(1).unwrap();
+                Self::verify_reg(function, inst.pc, Reg(((packed >> 16) & 0xff) as u8))?;
+            }
             MapSpread | ListAppend => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
@@ -3769,7 +3796,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         AllocList | AllocMap => [General, None, None],
         AllocListCap | ListLen | MapLen | StringLen => [General, General, None],
         ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => [General, General, General],
-        ListSet | ListInsert | MapSet | StoreProperty => [General, General, General],
+        ListSet | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => [General, General, General],
         ListAppend => [General, General, None],
         StringConcat | StringSlice | MakeRange => [General, General, General],
         INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => [General, General, None],
@@ -3798,6 +3825,8 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         Jump | JumpIfFalse | JumpIfTrue => "x0=i32 relative word displacement",
         Switch => "x0=SwitchTableId",
         BindInterface => "x0=TypeGuardId (persistent contract)",
+        LoadProperty | StoreProperty => "x0=StructuralLayoutId, x1=PropertySlotId",
+        StorePropertyIfPresent => "x0=StructuralLayoutId, x1[15:0]=PropertySlotId, x1[23:16]=presence GPR",
         GuardType => "x0=TypeGuardId, x1=DeoptId",
         GuardClass => "x0=ClassGuardId, x1=DeoptId",
         GuardBounds | GuardNotNull | GuardInt32 | GuardF64 => "x0=DeoptId",

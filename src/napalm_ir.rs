@@ -1032,6 +1032,18 @@ pub enum Inst {
         layout: StructuralLayoutId,
         slot: PropertySlotId,
     },
+    /// PEA rematerialization helper for optional structural properties. The
+    /// property is inserted only when `present` is true. This preserves the
+    /// semantic difference between an absent optional field and a present field
+    /// containing null without forcing PEA to synthesize control-flow blocks.
+    StorePropertyIfPresent {
+        object: ValueId,
+        key: ValueId,
+        value: ValueId,
+        present: ValueId,
+        layout: StructuralLayoutId,
+        slot: PropertySlotId,
+    },
     MapRemove {
         map: ValueId,
         key: ValueId,
@@ -1228,6 +1240,7 @@ impl Inst {
             | ListRemoveAt { .. }
             | MapSet { .. }
             | StoreProperty { .. }
+            | StorePropertyIfPresent { .. }
             | MapRemove { .. } => B::Chain(E::Write),
 
             Await { .. } => B::Chain(E::Fiber),
@@ -1333,6 +1346,7 @@ impl Inst {
                 | LoadProperty { .. }
                 | MapSet { .. }
                 | StoreProperty { .. }
+                | StorePropertyIfPresent { .. }
                 | MapRemove { .. }
 
                 // String operations validate dynamic operands and bounds.
@@ -1386,6 +1400,7 @@ impl Inst {
             | ListInsert { .. }
             | MapSet { .. }
             | StoreProperty { .. }
+            | StorePropertyIfPresent { .. }
             | FiberAbort { .. }
             | WriteBarrier { .. } => 0,
 
@@ -1643,6 +1658,12 @@ impl Inst {
                 out.push(*key);
                 out.push(*value);
             }
+            StorePropertyIfPresent { object, key, value, present, .. } => {
+                out.push(*object);
+                out.push(*key);
+                out.push(*value);
+                out.push(*present);
+            }
             StringLen { string } => out.push(*string),
             StringConcat { left, right }
             | IntBin { left, right, .. }
@@ -1869,6 +1890,12 @@ impl Inst {
                 f(object);
                 f(key);
                 f(value);
+            }
+            StorePropertyIfPresent { object, key, value, present, .. } => {
+                f(object);
+                f(key);
+                f(value);
+                f(present);
             }
             StringLen { string } => f(string),
             StringConcat { left, right }
@@ -2953,6 +2980,7 @@ pub enum VerifyError {
     InstructionAfterTerminator { block: BlockId, inst: InstId },
     MissingTerminator(BlockId),
     InvalidValueReference { inst: InstId, value: ValueId },
+    OperandType { inst: InstId, value: ValueId, expected: Type, actual: Type },
     InvalidEffectReference { inst: InstId, effect: EffectId },
     InvalidEdgeTarget { inst: InstId, target: BlockId },
     EdgeArgumentCount {
@@ -3109,6 +3137,19 @@ pub fn verify_function(function: &Function) -> Result<(), Vec<VerifyError>> {
                         inst: inst_id,
                         value: operand,
                     });
+                }
+            }
+
+            if let Inst::StorePropertyIfPresent { present, .. } = &node.kind {
+                if let Some(present_value) = function.value(*present) {
+                    if present_value.ty != Type::Bool {
+                        errors.push(VerifyError::OperandType {
+                            inst: inst_id,
+                            value: *present,
+                            expected: Type::Bool,
+                            actual: present_value.ty.clone(),
+                        });
+                    }
                 }
             }
 

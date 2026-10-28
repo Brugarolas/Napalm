@@ -41,7 +41,7 @@ use smallvec::SmallVec;
 
 use crate::napalm_ir::{
     BlockId, ClassId, Constant, Edge, FieldSlot, FuncId, Function, Inst, InstId, PropertySlotId,
-    SourceSpan, StructuralLayoutId, Type, Value, ValueDef, ValueId,
+    SourceSpan, StringId, StructuralLayoutId, Type, Value, ValueDef, ValueId,
 };
 use crate::napalm_ir_optimizer::{repair_effect_chain, FunctionOptimization, InstFactory};
 use crate::napalm_ir_optimizing::CopyPropagation;
@@ -333,6 +333,14 @@ struct StructuralBind {
     pos: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListBind {
+    expected: Type,
+    inst: InstId,
+    block: usize,
+    pos: usize,
+}
+
 #[derive(Clone, Debug)]
 struct Candidate {
     value: ValueId,
@@ -347,16 +355,24 @@ struct Candidate {
     /// Logical structural properties accessed through a Map candidate. The
     /// physical hidden-shape slot is deliberately not part of PEA state.
     properties: Vec<(StructuralLayoutId, PropertySlotId)>,
-    /// Typed aliases produced by successful structural binds.
+    /// Typed aliases produced by successful persistent contract binds.
     aliases: SmallVec<[ValueId; 2]>,
     /// A single structural contract may be virtualized when its validation is
     /// statically proven.
     structural_bind: Option<StructuralBind>,
-    /// Initial insertion order used to rematerialize all-required structural
-    /// Maps without changing observable Map iteration/shape order.
-    structural_materialization_order: Vec<(StructuralLayoutId, PropertySlotId, ValueId)>,
-    /// Optional fields require presence SSA before a partially escaping object can
-    /// be reconstructed. All-required layouts can already use full PEA.
+    /// Persistent typed-list contract installed by BindInterface. Kept separate
+    /// from structural Map layouts because lists have no StructuralLayoutId.
+    list_bind: Option<ListBind>,
+    /// Whether a typed List can be reconstructed on an escaping path with its
+    /// contract installed after all current virtual elements are appended.
+    list_partial_escape: bool,
+    /// Stable first-insertion order used when rematerializing structural Maps.
+    /// Keys are interned string IDs rather than SSA values because a key created
+    /// inside one branch does not necessarily dominate a later escape merge.
+    structural_materialization_order: Vec<(StructuralLayoutId, PropertySlotId, StringId)>,
+    /// Whether PEA can reconstruct this structural Map on an escaping path.
+    /// Optional properties are supported through separate presence SSA variables
+    /// when their observable first-insertion order is path invariant.
     structural_partial_escape: bool,
 }
 
@@ -367,6 +383,7 @@ enum UseOp {
     LoadProperty(StructuralLayoutId, PropertySlotId),
     StoreProperty(StructuralLayoutId, PropertySlotId),
     BindStructural(StructuralLayoutId),
+    BindListContract,
     LoadCell,
     StoreCell,
     ListLen,
@@ -513,6 +530,10 @@ fn classify_use(
         ) if *source == value && matches!(expected, Type::Interface(_) | Type::Record(_)) => {
             UseOp::BindStructural(*layout)
         }
+        (
+            Inst::BindInterface { value: source, expected: Type::List(Some(_)), layout: None },
+            Shape::List { .. },
+        ) if *source == value => UseOp::BindListContract,
         (Inst::LoadCell { cell }, Shape::Cell) if *cell == value && readable_result() => {
             UseOp::LoadCell
         }
@@ -580,25 +601,121 @@ fn structural_fields(ty: &Type) -> Option<&[crate::napalm_ir::InterfaceFieldType
     }
 }
 
-/// Whether validating `ty` can install a persistent contract on a value that is
-/// not the virtual Map itself. Such side effects survive even when the outer
-/// object never escapes, so scalar replacement must preserve the bind until
-/// nested virtual-object rematerialization metadata exists.
-fn structural_field_check_is_pure(ty: &Type) -> bool {
-    match ty {
-        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => false,
-        Type::Union(types) => types.iter().all(structural_field_check_is_pure),
-        Type::Cell(inner) => structural_field_check_is_pure(inner),
+#[derive(Clone, Copy, Debug)]
+struct StructuralStoreSite {
+    block: usize,
+    pos: usize,
+    key: StringId,
+}
+
+fn resolve_string(function: &Function, value: ValueId) -> Option<StringId> {
+    match resolve_constant(function, value)? {
+        Constant::String(string) => Some(*string),
+        _ => None,
+    }
+}
+
+/// Prove that `value` already owns the exact persistent runtime contract. A
+/// semantic SSA type alone is not enough: interface/record guards intentionally
+/// distinguish "has this installed contract" from "happens to match this shape".
+fn value_has_exact_contract(
+    function: &Function,
+    mut value: ValueId,
+    expected: &Type,
+) -> bool {
+    for _ in 0..16 {
+        let Some(Value { def, .. }) = function.value(value) else {
+            return false;
+        };
+        let ValueDef::InstResult(inst, _) = def else {
+            return false;
+        };
+        let Some(node) = function.node(*inst) else {
+            return false;
+        };
+        match &node.kind {
+            Inst::BindInterface { expected: installed, .. }
+                if installed == expected =>
+            {
+                return true;
+            }
+            Inst::GuardType { expected: guarded, .. }
+                if guarded == expected
+                    && matches!(expected, Type::Interface(_) | Type::Record(_) | Type::List(Some(_))) =>
+            {
+                // Runtime GuardType for contract-bearing types succeeds only when
+                // the corresponding persistent contract is already installed.
+                return true;
+            }
+            Inst::Move(source) => value = *source,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True when validating `expected` against `value` has no persistent side effect
+/// left to perform. Scalar checks are already proven by the SSA type. Contract-
+/// bearing nested values must instead prove the exact contract was installed by
+/// an earlier BindInterface/GuardType. This lets an outer virtual bind disappear
+/// without silently dropping write constraints from nested aliases.
+fn structural_validation_is_redundant(
+    function: &Function,
+    value: ValueId,
+    expected: &Type,
+) -> bool {
+    let Some(actual) = value_type(function, value) else {
+        return false;
+    };
+    if !expected.accepts(actual) {
+        return false;
+    }
+    match expected {
+        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => {
+            value_has_exact_contract(function, value, expected)
+        }
+        Type::Union(types) => {
+            // Runtime union validation commits the first successful alternative.
+            // Eliminate it only when every alternative compatible with the SSA
+            // type is itself side-effect free/proven. This is intentionally more
+            // conservative than selecting a guessed union arm.
+            let mut matched = false;
+            for ty in types {
+                if ty.accepts(actual) {
+                    matched = true;
+                    if !structural_validation_is_redundant(function, value, ty) {
+                        return false;
+                    }
+                }
+            }
+            matched
+        }
         _ => true,
     }
 }
 
+#[inline]
+fn program_point_dominates(
+    cfg: &Cfg,
+    left_block: usize,
+    left_pos: usize,
+    right_block: usize,
+    right_pos: usize,
+) -> bool {
+    if left_block == right_block {
+        left_pos <= right_pos
+    } else {
+        cfg.dominates(left_block, right_block)
+    }
+}
+
 /// A virtual structural bind may be removed only when it cannot throw and every
-/// typed write that would have been checked by the persistent contract is already
-/// proven by SSA types. This is intentionally stricter than source type checking:
-/// `any` values keep the runtime bind alive.
+/// persistent contract that validation would install is already represented by
+/// the scalar web. Optional fields additionally record one SSA presence bit so a
+/// partially escaping object can be rebuilt without conflating absent and null.
 fn prepare_structural_map(
     function: &Function,
+    cfg: &Cfg,
     candidate: &mut Candidate,
     uses: &HashMap<usize, Vec<Use>>,
 ) -> bool {
@@ -606,23 +723,21 @@ fn prepare_structural_map(
         return true;
     }
     let Some(binding) = candidate.structural_bind.clone() else {
-        // Ordinary dynamic Maps still use the historical escape behavior.
         return candidate.properties.is_empty();
     };
     let Some(fields) = structural_fields(&binding.expected) else {
         return false;
     };
-    if fields.iter().any(|field| !structural_field_check_is_pure(&field.ty)) {
-        return false;
-    }
     if binding.block != candidate.block
         || function.blocks[binding.block].insts.get(binding.pos).copied() != Some(binding.inst)
     {
         return false;
     }
 
-    let mut present = vec![false; fields.len()];
-    let mut materialization_order = Vec::with_capacity(fields.len());
+    let mut present_at_bind = vec![false; fields.len()];
+    let mut value_at_bind = vec![None; fields.len()];
+    let mut first_before_bind = vec![None::<StructuralStoreSite>; fields.len()];
+    let mut stores = vec![Vec::<StructuralStoreSite>::new(); fields.len()];
     let mut escape_before_bind = false;
 
     for (&block, block_uses) in uses {
@@ -642,20 +757,34 @@ fn prepare_structural_map(
                     };
                     let Some(node) = function.node(inst) else { return false };
                     let Inst::StoreProperty { value, key, .. } = &node.kind else { return false };
-                    let field = &fields[slot.0 as usize];
+                    let Some(key) = resolve_string(function, *key) else { return false };
+                    let field_index = slot.0 as usize;
+                    let field = &fields[field_index];
                     let Some(actual) = value_type(function, *value) else { return false };
                     if !field.ty.accepts(actual) {
                         return false;
                     }
+                    let site = StructuralStoreSite { block, pos: use_.pos, key };
+                    stores[field_index].push(site);
+
                     let before_bind = block == binding.block && use_.pos < binding.pos;
                     if before_bind {
-                        if !present[slot.0 as usize] {
-                            materialization_order.push((found_layout, slot, *key));
+                        if !present_at_bind[field_index] {
+                            first_before_bind[field_index] = Some(site);
                         }
-                        present[slot.0 as usize] = true;
-                    } else if field.readonly {
-                        // A persistent contract would reject this write.
-                        return false;
+                        present_at_bind[field_index] = true;
+                        value_at_bind[field_index] = Some(*value);
+                    } else {
+                        if field.readonly {
+                            // An installed contract would reject this write.
+                            return false;
+                        }
+                        if !structural_validation_is_redundant(function, *value, &field.ty) {
+                            // A real contracted write could install a persistent
+                            // nested contract on the assigned value. Keep the map
+                            // materialized unless that side effect already happened.
+                            return false;
+                        }
                     }
                 }
                 UseOp::BindStructural(found_layout) if found_layout != binding.layout => return false,
@@ -667,22 +796,153 @@ fn prepare_structural_map(
         }
     }
 
-    if !fields
-        .iter()
-        .enumerate()
-        .all(|(index, field)| field.optional || present[index])
+    for (index, field) in fields.iter().enumerate() {
+        if !field.optional && !present_at_bind[index] {
+            return false;
+        }
+        if let Some(value) = value_at_bind[index] {
+            if !structural_validation_is_redundant(function, value, &field.ty) {
+                return false;
+            }
+        }
+    }
+
+    // Determine the one observable first-insertion point for every property that
+    // can ever be present. Properties already present at bind time have a trivial
+    // first insertion in the allocation block. An initially-absent optional may
+    // participate in partial escape only when one store site dominates all of its
+    // other stores; otherwise the first insertion itself is path dependent.
+    let mut first_insertions = Vec::<(StructuralLayoutId, PropertySlotId, StructuralStoreSite)>::new();
+    let mut ordering_safe = true;
+    for index in 0..fields.len() {
+        let slot = PropertySlotId(index as u16);
+        if let Some(site) = first_before_bind[index] {
+            first_insertions.push((binding.layout, slot, site));
+            continue;
+        }
+        if stores[index].is_empty() {
+            continue;
+        }
+        debug_assert!(fields[index].optional, "required structural fields must exist at bind time");
+        let first = stores[index].iter().copied().find(|candidate_site| {
+            stores[index].iter().all(|site| {
+                program_point_dominates(
+                    cfg,
+                    candidate_site.block,
+                    candidate_site.pos,
+                    site.block,
+                    site.pos,
+                )
+            })
+        });
+        if let Some(site) = first {
+            first_insertions.push((binding.layout, slot, site));
+        } else {
+            ordering_safe = false;
+        }
+    }
+
+    // Fixed materialization order is legal only when all first insertions that
+    // may co-exist are dominance comparable. This preserves Map enumeration order
+    // without introducing a second SSA lattice for insertion ranks.
+    if ordering_safe {
+        for i in 0..first_insertions.len() {
+            for j in i + 1..first_insertions.len() {
+                let a = first_insertions[i].2;
+                let b = first_insertions[j].2;
+                if !program_point_dominates(cfg, a.block, a.pos, b.block, b.pos)
+                    && !program_point_dominates(cfg, b.block, b.pos, a.block, a.pos)
+                {
+                    ordering_safe = false;
+                    break;
+                }
+            }
+            if !ordering_safe { break; }
+        }
+    }
+
+    if ordering_safe {
+        first_insertions.sort_by(|a, b| {
+            let a = a.2;
+            let b = b.2;
+            if a.block == b.block {
+                a.pos.cmp(&b.pos)
+            } else if program_point_dominates(cfg, a.block, a.pos, b.block, b.pos) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+        candidate.structural_materialization_order = first_insertions
+            .into_iter()
+            .map(|(layout, slot, site)| (layout, slot, site.key))
+            .collect();
+    } else {
+        candidate.structural_materialization_order.clear();
+    }
+
+    candidate.structural_partial_escape = !escape_before_bind && ordering_safe;
+    true
+}
+
+/// Validate that a typed List contract can be kept virtual. Before the bind,
+/// every value that may reach the List is conservatively required to satisfy the
+/// element contract already; after the bind, each virtualized write must also be
+/// side-effect free with respect to nested persistent contracts. This is stricter
+/// than necessary for overwritten pre-bind values, but never changes semantics.
+fn prepare_typed_list(
+    function: &Function,
+    candidate: &mut Candidate,
+    uses: &HashMap<usize, Vec<Use>>,
+) -> bool {
+    if !matches!(candidate.shape, Shape::List { .. }) {
+        return true;
+    }
+    let Some(binding) = candidate.list_bind.clone() else {
+        return true;
+    };
+    let Type::List(Some(element)) = &binding.expected else {
+        return false;
+    };
+    if binding.block != candidate.block
+        || function.blocks[binding.block].insts.get(binding.pos).copied() != Some(binding.inst)
     {
         return false;
     }
 
-    candidate.structural_materialization_order = materialization_order;
-    // Full partial-escape reconstruction is already safe for layouts whose
-    // property set is complete at bind time. Optional properties need explicit
-    // presence SSA to reconstruct branch-dependent insertion state, so those
-    // layouts remain NoEscape-only for now.
-    candidate.structural_partial_escape = !escape_before_bind
-        && fields.iter().all(|field| !field.optional)
-        && candidate.structural_materialization_order.len() == fields.len();
+    let mut escape_before_bind = false;
+    for (&block, block_uses) in uses {
+        for use_ in block_uses {
+            match use_.op {
+                UseOp::ListAppend | UseOp::ListSet(_) => {
+                    let Some(&inst) = function.blocks[block].insts.get(use_.pos) else {
+                        return false;
+                    };
+                    let Some(node) = function.node(inst) else { return false };
+                    let stored = match &node.kind {
+                        Inst::ListAppend { value, .. } | Inst::ListSet { value, .. } => *value,
+                        _ => return false,
+                    };
+                    let Some(actual) = value_type(function, stored) else { return false };
+                    if !element.accepts(actual) {
+                        return false;
+                    }
+                    if !structural_validation_is_redundant(function, stored, element) {
+                        // The original bind/write could still validate dynamically
+                        // or install a nested persistent contract. Keep it concrete
+                        // unless that effect is already proven redundant.
+                        return false;
+                    }
+                }
+                UseOp::Escape if block == binding.block && use_.pos < binding.pos => {
+                    escape_before_bind = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    candidate.list_partial_escape = !escape_before_bind;
     true
 }
 
@@ -705,6 +965,7 @@ fn virtual_step(len: u32, op: UseOp) -> Option<u32> {
         | UseOp::LoadProperty(_, _)
         | UseOp::StoreProperty(_, _)
         | UseOp::BindStructural(_)
+        | UseOp::BindListContract
         | UseOp::LoadCell
         | UseOp::StoreCell
         | UseOp::ListLen
@@ -802,6 +1063,8 @@ impl Analysis {
                     properties: Vec::new(),
                     aliases: SmallVec::new(),
                     structural_bind: None,
+                    list_bind: None,
+                    list_partial_escape: false,
                     structural_materialization_order: Vec::new(),
                     structural_partial_escape: false,
                 });
@@ -832,7 +1095,7 @@ impl Analysis {
                 };
                 let kind = node.kind.clone();
                 let result = node.results.first().copied();
-                let mut structural_alias = None;
+                let mut contract_alias = None;
                 seen.clear();
                 for operand in kind.operands() {
                     if seen.contains(&operand) {
@@ -875,7 +1138,24 @@ impl Analysis {
                                     if !candidate.aliases.contains(&alias) {
                                         candidate.aliases.push(alias);
                                     }
-                                    structural_alias = Some((alias, index));
+                                    contract_alias = Some((alias, index));
+                                }
+                            }
+                        }
+                        UseOp::BindListContract => {
+                            let Inst::BindInterface { expected, .. } = &kind else { unreachable!() };
+                            let binding = ListBind {
+                                expected: expected.clone(), inst, block, pos,
+                            };
+                            if candidate.list_bind.as_ref().is_some_and(|old| old != &binding) {
+                                valid[index] = false;
+                            } else {
+                                candidate.list_bind = Some(binding);
+                                if let Some(alias) = result {
+                                    if !candidate.aliases.contains(&alias) {
+                                        candidate.aliases.push(alias);
+                                    }
+                                    contract_alias = Some((alias, index));
                                 }
                             }
                         }
@@ -887,16 +1167,16 @@ impl Analysis {
                         .push(Use { block, pos, op });
                 }
                 // BindInterface returns the same object with a stronger semantic type.
-                // Teach PEA that the result aliases the allocation so typed property
+                // Teach PEA that the result aliases the allocation so typed Map/List
                 // accesses after the bind remain virtualizable.
-                if let Some((alias, index)) = structural_alias {
+                if let Some((alias, index)) = contract_alias {
                     index_of.insert(alias, index);
                 }
             }
         }
 
-        // Structural binds introduce typed aliases after the allocation scan. A
-        // deopt snapshot may reference such an alias rather than the raw AllocMap
+        // Contract binds introduce typed aliases after the allocation scan. A
+        // deopt snapshot may reference such an alias rather than the raw allocation
         // result, so repeat the snapshot check after alias discovery.
         for deopt in &function.deopts {
             let frames = std::iter::once(&deopt.snapshot.slots)
@@ -911,8 +1191,10 @@ impl Analysis {
         }
 
         let mut structural_safe = vec![true; candidates.len()];
+        let mut list_safe = vec![true; candidates.len()];
         for index in 0..candidates.len() {
-            structural_safe[index] = prepare_structural_map(function, &mut candidates[index], &uses[index]);
+            structural_safe[index] = prepare_structural_map(function, &cfg, &mut candidates[index], &uses[index]);
+            list_safe[index] = prepare_typed_list(function, &mut candidates[index], &uses[index]);
         }
 
         let plans = candidates
@@ -922,14 +1204,18 @@ impl Analysis {
                 if !valid[index]
                     || candidate.slots.len().max(candidate.properties.len()) > MAX_FIELDS
                     || !structural_safe[index]
+                    || !list_safe[index]
                     || crosses_exception(function, &cfg, candidate, &uses[index])
                 {
                     return Plan::default();
                 }
                 let plan = analyze_candidate(&cfg, candidate, &uses[index]);
-                if candidate.structural_bind.is_some()
+                if (candidate.structural_bind.is_some()
                     && plan.materializations != 0
-                    && !candidate.structural_partial_escape
+                    && !candidate.structural_partial_escape)
+                    || (candidate.list_bind.is_some()
+                        && plan.materializations != 0
+                        && !candidate.list_partial_escape)
                 {
                     Plan::default()
                 } else {
@@ -994,7 +1280,9 @@ fn crosses_exception(
             // Accesses proved valid on the virtual candidate cannot throw. A
             // failing/dynamic collection access is an Escape and is retained.
             let virtual_access = own_use.is_some_and(|u| matches!(u.op,
-                UseOp::LoadField(_) | UseOp::StoreField(_) | UseOp::LoadCell
+                UseOp::LoadField(_) | UseOp::StoreField(_)
+                | UseOp::LoadProperty(_, _) | UseOp::StoreProperty(_, _)
+                | UseOp::BindStructural(_) | UseOp::BindListContract | UseOp::LoadCell
                 | UseOp::StoreCell | UseOp::ListLen | UseOp::WriteBarrier
                 | UseOp::RefEq | UseOp::BranchCond));
             if live && !virtual_access && function.nodes[inst.0 as usize].kind.may_throw() {
@@ -1154,7 +1442,8 @@ fn analyze_candidate(cfg: &Cfg, candidate: &Candidate, uses: &HashMap<usize, Vec
 // ---------------------------------------------------------------------------
 
 /// SSA variable identifiers: `base + 0` is the object reference after
-/// materialization, `base + 1 + k` is scalarized field/element `k`.
+/// materialization. Ordinary aggregates use `base + 1 + k` for scalar fields;
+/// structural Maps interleave `(value, presence)` for each logical property.
 struct VarLayout {
     base: Vec<usize>,
     total: usize,
@@ -1170,7 +1459,11 @@ impl VarLayout {
                 Shape::Instance { .. } => candidates[index].slots.len(),
                 Shape::Cell => 1,
                 Shape::List { .. } => MAX_FIELDS,
-                Shape::Map => candidates[index].properties.len(),
+                // Structural Maps carry one value SSA variable and one presence
+                // SSA variable per logical property. Presence is independent from
+                // the value because an absent optional field and a present null
+                // field are observably different in Map length/iteration.
+                Shape::Map => candidates[index].properties.len() * 2,
                 Shape::Range { .. } | Shape::Closure { .. } => 0,
             };
             total += 1 + fields;
@@ -1184,6 +1477,14 @@ impl VarLayout {
 
     fn field(&self, candidate: usize, field: usize) -> usize {
         self.base[candidate] + 1 + field
+    }
+
+    fn property_value(&self, candidate: usize, property: usize) -> usize {
+        self.base[candidate] + 1 + property * 2
+    }
+
+    fn property_presence(&self, candidate: usize, property: usize) -> usize {
+        self.base[candidate] + 2 + property * 2
     }
 }
 
@@ -1301,6 +1602,11 @@ fn run_round(function: &mut Function, stats: &mut ScalarReplacementStats) -> boo
     for &index in &selected {
         selected_mask[index] = true;
         var_types[layout.reference(index)] = Some(analysis.candidates[index].ty.clone());
+        if matches!(analysis.candidates[index].shape, Shape::Map) {
+            for property in 0..analysis.candidates[index].properties.len() {
+                var_types[layout.property_presence(index, property)] = Some(Type::Bool);
+            }
+        }
         alloc_of.insert(analysis.candidates[index].inst, index);
         for uses in analysis.uses[index].values() {
             for use_ in uses {
@@ -1477,14 +1783,34 @@ impl<'a> Rewriter<'a> {
             }
             (Shape::Map, Inst::AllocMap) => {
                 if !candidate.properties.is_empty() {
-                    let (null_inst, results) = InstFactory::new(function).create(
+                    let (null_inst, null_results) = InstFactory::new(function).create(
                         Inst::Const(Constant::Null),
                         &[Type::Null],
                         candidate.source,
                     );
-                    new_insts.push(null_inst);
-                    for field in 0..candidate.properties.len() {
-                        self.ssa.write(block, self.layout.field(index, field), results[0]);
+                    let (false_inst, false_results) = InstFactory::new(function).create(
+                        Inst::Const(Constant::Bool(false)),
+                        &[Type::Bool],
+                        candidate.source,
+                    );
+                    let (true_inst, true_results) = InstFactory::new(function).create(
+                        Inst::Const(Constant::Bool(true)),
+                        &[Type::Bool],
+                        candidate.source,
+                    );
+                    new_insts.extend([null_inst, false_inst, true_inst]);
+                    self.fixed[index] = SmallVec::from_slice(&[false_results[0], true_results[0]]);
+                    for property in 0..candidate.properties.len() {
+                        self.ssa.write(
+                            block,
+                            self.layout.property_value(index, property),
+                            null_results[0],
+                        );
+                        self.ssa.write(
+                            block,
+                            self.layout.property_presence(index, property),
+                            false_results[0],
+                        );
                     }
                 }
             }
@@ -1513,12 +1839,11 @@ impl<'a> Rewriter<'a> {
                 .expect("accessed slot was collected by the analysis");
             this.layout.field(index, field)
         };
-        let property_var = |this: &Self, layout: StructuralLayoutId, slot: PropertySlotId| {
-            let property = this.candidates[index]
+        let property_index = |this: &Self, layout: StructuralLayoutId, slot: PropertySlotId| {
+            this.candidates[index]
                 .properties
                 .binary_search(&(layout, slot))
-                .expect("accessed structural property was collected by the analysis");
-            this.layout.field(index, property)
+                .expect("accessed structural property was collected by the analysis")
         };
         match (op, &kind) {
             (UseOp::LoadField(slot), _) => {
@@ -1534,8 +1859,15 @@ impl<'a> Rewriter<'a> {
                 false
             }
             (UseOp::LoadProperty(layout, slot), _) => {
-                let var = property_var(self, layout, slot);
-                let value = self.ssa.read(function, self.cfg, block, var);
+                let property = property_index(self, layout, slot);
+                let value = self.ssa.read(
+                    function,
+                    self.cfg,
+                    block,
+                    self.layout.property_value(index, property),
+                );
+                // Values start as null while presence starts as false, matching a
+                // Map lookup of an absent optional property exactly.
                 self.replace_kind(function, inst, Inst::Move(value));
                 self.stats.scalarized_reads += 1;
                 true
@@ -1544,14 +1876,31 @@ impl<'a> Rewriter<'a> {
                 UseOp::StoreProperty(layout, slot),
                 Inst::StoreProperty { value, .. },
             ) => {
-                let var = property_var(self, layout, slot);
-                self.ssa.write(block, var, *value);
+                let property = property_index(self, layout, slot);
+                self.ssa.write(
+                    block,
+                    self.layout.property_value(index, property),
+                    *value,
+                );
+                let present = *self.fixed[index]
+                    .get(1)
+                    .expect("virtual structural Map has true presence constant");
+                self.ssa.write(
+                    block,
+                    self.layout.property_presence(index, property),
+                    present,
+                );
                 false
             }
             (UseOp::BindStructural(_), Inst::BindInterface { .. }) => {
                 // Validation and persistent write constraints were proven above.
                 // The virtual object has no aliases outside this scalar web, so
                 // installing a runtime contract would have no observable effect.
+                false
+            }
+            (UseOp::BindListContract, Inst::BindInterface { .. }) => {
+                // Element validation and persistent contract side effects were
+                // proven redundant while the list is virtual.
                 false
             }
             (UseOp::LoadCell, _) => {
@@ -1711,20 +2060,58 @@ impl<'a> Rewriter<'a> {
                 }
             }
             Shape::Map => {
-                for &(layout, slot, key) in &candidate.structural_materialization_order {
+                for &(layout, slot, key_string) in &candidate.structural_materialization_order {
                     let property = candidate
                         .properties
                         .binary_search(&(layout, slot))
                         .expect("materialized structural property was collected by PEA");
                     let value = self.ssa.read(
-                        function, self.cfg, block, self.layout.field(index, property),
+                        function,
+                        self.cfg,
+                        block,
+                        self.layout.property_value(index, property),
                     );
-                    let (store, _) = InstFactory::new(function).create(
-                        Inst::StoreProperty { object, key, value, layout, slot },
-                        &[],
+                    let present = self.ssa.read(
+                        function,
+                        self.cfg,
+                        block,
+                        self.layout.property_presence(index, property),
+                    );
+
+                    let (key_inst, key_results) = InstFactory::new(function).create(
+                        Inst::Const(Constant::String(key_string)),
+                        &[Type::String],
                         source,
                     );
-                    new_insts.push(store);
+                    new_insts.push(key_inst);
+                    let key = key_results[0];
+
+                    match resolve_constant(function, present) {
+                        Some(Constant::Bool(false)) => {}
+                        Some(Constant::Bool(true)) => {
+                            let (store, _) = InstFactory::new(function).create(
+                                Inst::StoreProperty { object, key, value, layout, slot },
+                                &[],
+                                source,
+                            );
+                            new_insts.push(store);
+                        }
+                        _ => {
+                            let (store, _) = InstFactory::new(function).create(
+                                Inst::StorePropertyIfPresent {
+                                    object,
+                                    key,
+                                    value,
+                                    present,
+                                    layout,
+                                    slot,
+                                },
+                                &[],
+                                source,
+                            );
+                            new_insts.push(store);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1743,6 +2130,27 @@ impl<'a> Rewriter<'a> {
                         value: object,
                         expected: binding.expected.clone(),
                         layout: Some(binding.layout),
+                    },
+                    &[binding.expected.clone()],
+                    source,
+                );
+                new_insts.push(bind);
+                materialized_reference = results[0];
+            } else {
+                debug_assert!(block == binding.block && pos < binding.pos);
+            }
+        } else if let Some(binding) = &candidate.list_bind {
+            let contract_active = if block == binding.block {
+                pos > binding.pos
+            } else {
+                self.cfg.strictly_dominates(binding.block, block)
+            };
+            if contract_active {
+                let (bind, results) = InstFactory::new(function).create(
+                    Inst::BindInterface {
+                        value: object,
+                        expected: binding.expected.clone(),
+                        layout: None,
                     },
                     &[binding.expected.clone()],
                     source,
@@ -2133,6 +2541,502 @@ mod tests {
         assert_eq!(stats.removed_allocations, 0, "{function}");
         assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
         assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 1, "{function}");
+    }
+
+    #[test]
+    fn optional_presence_is_ssa_and_rematerialized_only_when_present() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![
+            InterfaceFieldType {
+                name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+            InterfaceFieldType {
+                name: "flag".to_owned(), ty: Type::Bool, optional: true, readonly: false,
+            },
+        ]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program,
+            module,
+            "optional_presence_partial",
+            FunctionKind::ModuleBody,
+            vec![Type::Bool, Type::Bool],
+            Type::Top,
+        );
+        let add_optional = b.param(0);
+        let escape = b.param(1);
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_x = b.const_string("x");
+        let key_flag = b.const_string("flag");
+        let one = b.const_num(1.0);
+        b.emit0(Inst::StoreProperty {
+            object: map,
+            key: key_x,
+            value: one,
+            layout,
+            slot: PropertySlotId(0),
+        });
+        let bound = b.emit1(
+            Inst::BindInterface {
+                value: map,
+                expected: record.clone(),
+                layout: Some(layout),
+            },
+            record,
+        );
+
+        let present_block = b.new_block(&[]);
+        let absent_block = b.new_block(&[]);
+        let merge = b.new_block(&[]);
+        b.branch(add_optional, present_block, vec![], absent_block, vec![]);
+
+        b.position_at(present_block);
+        let yes = b.const_bool(true);
+        b.emit0(Inst::StoreProperty {
+            object: bound,
+            key: key_flag,
+            value: yes,
+            layout,
+            slot: PropertySlotId(1),
+        });
+        b.jump(merge, vec![]);
+
+        b.position_at(absent_block);
+        b.jump(merge, vec![]);
+
+        b.position_at(merge);
+        let escape_block = b.new_block(&[]);
+        let scalar_block = b.new_block(&[]);
+        b.branch(escape, escape_block, vec![], scalar_block, vec![]);
+
+        b.position_at(escape_block);
+        let observed = b.emit1(Inst::MapGet { map: bound, key: key_flag }, Type::Top);
+        b.ret(observed);
+
+        b.position_at(scalar_block);
+        let x = b.emit1(
+            Inst::LoadProperty {
+                object: bound,
+                key: key_x,
+                layout,
+                slot: PropertySlotId(0),
+            },
+            Type::Num,
+        );
+        b.ret(x);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.sunk_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
+        assert_eq!(
+            count(function, |i| matches!(i, Inst::StorePropertyIfPresent { .. })),
+            1,
+            "{function}"
+        );
+        assert_eq!(count(function, |i| matches!(i, Inst::LoadProperty { .. })), 0, "{function}");
+
+        let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
+        for (add_optional, escape, expected) in [
+            (true, true, Some(true)),
+            (false, true, None),
+        ] {
+            let mut vm = Interpreter::new(&bytecode).unwrap();
+            vm.set_jit_options(None);
+            let args = [
+                crate::napalm_interpreter::Value::from_bool(add_optional),
+                crate::napalm_interpreter::Value::from_bool(escape),
+            ];
+            let ExecutionResult::Returned(value) = vm.run_function(entry, &args).unwrap() else {
+                panic!("expected return");
+            };
+            match expected {
+                Some(value_expected) => assert_eq!(value.as_bool(), Some(value_expected)),
+                None => assert_eq!(value, crate::napalm_interpreter::Value::NULL),
+            }
+        }
+        for add_optional in [false, true] {
+            let mut vm = Interpreter::new(&bytecode).unwrap();
+            vm.set_jit_options(None);
+            let args = [
+                crate::napalm_interpreter::Value::from_bool(add_optional),
+                crate::napalm_interpreter::Value::from_bool(false),
+            ];
+            let ExecutionResult::Returned(value) = vm.run_function(entry, &args).unwrap() else {
+                panic!("expected return");
+            };
+            assert_eq!(value.as_num(), Some(1.0));
+        }
+    }
+
+    #[test]
+    fn optional_present_null_is_distinct_from_absence_after_rematerialization() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![
+            InterfaceFieldType {
+                name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+            InterfaceFieldType {
+                name: "tag".to_owned(), ty: Type::Top, optional: true, readonly: false,
+            },
+        ]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program,
+            module,
+            "optional_null_presence",
+            FunctionKind::ModuleBody,
+            vec![Type::Bool],
+            Type::Num,
+        );
+        let add_tag = b.param(0);
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_x = b.const_string("x");
+        let key_tag = b.const_string("tag");
+        let one = b.const_num(1.0);
+        b.emit0(Inst::StoreProperty {
+            object: map,
+            key: key_x,
+            value: one,
+            layout,
+            slot: PropertySlotId(0),
+        });
+        let bound = b.emit1(
+            Inst::BindInterface {
+                value: map,
+                expected: record.clone(),
+                layout: Some(layout),
+            },
+            record,
+        );
+        let present_block = b.new_block(&[]);
+        let absent_block = b.new_block(&[]);
+        let merge = b.new_block(&[]);
+        b.branch(add_tag, present_block, vec![], absent_block, vec![]);
+        b.position_at(present_block);
+        let null = b.const_null();
+        b.emit0(Inst::StoreProperty {
+            object: bound,
+            key: key_tag,
+            value: null,
+            layout,
+            slot: PropertySlotId(1),
+        });
+        b.jump(merge, vec![]);
+        b.position_at(absent_block);
+        b.jump(merge, vec![]);
+        b.position_at(merge);
+        // Keep one profitable virtual read before the generic MapLen forces the
+        // partially virtual object to materialize.
+        let _x = b.emit1(
+            Inst::LoadProperty {
+                object: bound,
+                key: key_x,
+                layout,
+                slot: PropertySlotId(0),
+            },
+            Type::Num,
+        );
+        let len = b.emit1(Inst::MapLen { map: bound }, Type::Int32);
+        let result = b.emit1(Inst::Int32ToNum { value: len }, Type::Num);
+        b.ret(result);
+        let entry = b.finish();
+
+        sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(
+            count(function, |i| matches!(i, Inst::StorePropertyIfPresent { .. })),
+            1,
+            "{function}"
+        );
+
+        let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
+        for (present, expected_len) in [(false, 1.0), (true, 2.0)] {
+            let mut vm = Interpreter::new(&bytecode).unwrap();
+            vm.set_jit_options(None);
+            let arg = crate::napalm_interpreter::Value::from_bool(present);
+            let ExecutionResult::Returned(value) = vm.run_function(entry, &[arg]).unwrap() else {
+                panic!("expected return");
+            };
+            assert_eq!(value.as_num(), Some(expected_len));
+        }
+    }
+
+    #[test]
+    fn nested_record_bind_is_elided_only_when_nested_contract_is_already_installed() {
+        let (mut program, module) = new_program();
+        let inner = Type::Record(vec![InterfaceFieldType {
+            name: "n".to_owned(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let outer = Type::Record(vec![InterfaceFieldType {
+            name: "inner".to_owned(), ty: inner.clone(), optional: false, readonly: false,
+        }]);
+        let inner_layout = program.intern_structural_layout(&inner).unwrap();
+        let outer_layout = program.intern_structural_layout(&outer).unwrap();
+        let mut b = Builder::new(
+            &mut program, module, "nested_contract", FunctionKind::ModuleBody, vec![], Type::Bool,
+        );
+
+        let inner_map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_n = b.const_string("n");
+        let one = b.const_num(1.0);
+        b.emit0(Inst::StoreProperty {
+            object: inner_map,
+            key: key_n,
+            value: one,
+            layout: inner_layout,
+            slot: PropertySlotId(0),
+        });
+        let inner_bound = b.emit1(
+            Inst::BindInterface {
+                value: inner_map,
+                expected: inner.clone(),
+                layout: Some(inner_layout),
+            },
+            inner.clone(),
+        );
+
+        let outer_map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_inner = b.const_string("inner");
+        b.emit0(Inst::StoreProperty {
+            object: outer_map,
+            key: key_inner,
+            value: inner_bound,
+            layout: outer_layout,
+            slot: PropertySlotId(0),
+        });
+        let outer_bound = b.emit1(
+            Inst::BindInterface {
+                value: outer_map,
+                expected: outer.clone(),
+                layout: Some(outer_layout),
+            },
+            outer.clone(),
+        );
+        let loaded = b.emit1(
+            Inst::LoadProperty {
+                object: outer_bound,
+                key: key_inner,
+                layout: outer_layout,
+                slot: PropertySlotId(0),
+            },
+            inner,
+        );
+        let same = b.emit1(Inst::RefEq { left: loaded, right: inner_bound }, Type::Bool);
+        b.ret(same);
+        let entry = b.finish();
+
+        sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(
+            count(function, |i| matches!(i, Inst::BindInterface { expected, .. } if expected == &outer)),
+            0,
+            "outer bind should be redundant once the nested contract is persistent\n{function}"
+        );
+        assert_eq!(run(&program, entry).as_bool(), Some(true));
+    }
+
+    #[test]
+    fn nested_record_bind_is_kept_when_nested_contract_is_only_a_semantic_type() {
+        let (mut program, module) = new_program();
+        let inner = Type::Record(vec![InterfaceFieldType {
+            name: "n".to_owned(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let outer = Type::Record(vec![InterfaceFieldType {
+            name: "inner".to_owned(), ty: inner.clone(), optional: false, readonly: false,
+        }]);
+        let outer_layout = program.intern_structural_layout(&outer).unwrap();
+        let mut b = Builder::new(
+            &mut program,
+            module,
+            "nested_contract_unproven",
+            FunctionKind::ModuleBody,
+            vec![inner],
+            Type::Top,
+        );
+        let nested = b.param(0);
+        let outer_map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_inner = b.const_string("inner");
+        b.emit0(Inst::StoreProperty {
+            object: outer_map,
+            key: key_inner,
+            value: nested,
+            layout: outer_layout,
+            slot: PropertySlotId(0),
+        });
+        let outer_bound = b.emit1(
+            Inst::BindInterface {
+                value: outer_map,
+                expected: outer.clone(),
+                layout: Some(outer_layout),
+            },
+            outer.clone(),
+        );
+        b.ret(outer_bound);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.removed_allocations, 0, "{function}");
+        assert_eq!(
+            count(function, |i| matches!(i, Inst::BindInterface { expected, .. } if expected == &outer)),
+            1,
+            "semantic type alone must not erase nested contract installation\n{function}"
+        );
+    }
+
+    #[test]
+    fn post_bind_nested_store_is_not_scalarized_without_nested_contract() {
+        let (mut program, module) = new_program();
+        let inner = Type::Record(vec![InterfaceFieldType {
+            name: "n".to_owned(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let outer = Type::Record(vec![InterfaceFieldType {
+            name: "inner".to_owned(), ty: inner.clone(), optional: true, readonly: false,
+        }]);
+        let outer_layout = program.intern_structural_layout(&outer).unwrap();
+        let mut b = Builder::new(
+            &mut program,
+            module,
+            "post_bind_nested_contract_unproven",
+            FunctionKind::ModuleBody,
+            vec![inner.clone()],
+            Type::Bool,
+        );
+        let nested = b.param(0);
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_inner = b.const_string("inner");
+        let bound = b.emit1(
+            Inst::BindInterface {
+                value: map,
+                expected: outer.clone(),
+                layout: Some(outer_layout),
+            },
+            outer,
+        );
+        b.emit0(Inst::StoreProperty {
+            object: bound,
+            key: key_inner,
+            value: nested,
+            layout: outer_layout,
+            slot: PropertySlotId(0),
+        });
+        let loaded = b.emit1(
+            Inst::LoadProperty {
+                object: bound,
+                key: key_inner,
+                layout: outer_layout,
+                slot: PropertySlotId(0),
+            },
+            inner,
+        );
+        let same = b.emit1(Inst::RefEq { left: loaded, right: nested }, Type::Bool);
+        b.ret(same);
+        let entry = b.finish();
+
+        sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 1, "{function}");
+    }
+
+    #[test]
+    fn non_escaping_typed_list_contract_stays_virtual() {
+        let (mut program, module) = new_program();
+        let typed_list = Type::List(Some(Box::new(Type::Num)));
+        let mut b = Builder::new(
+            &mut program, module, "typed_list_sroa", FunctionKind::ModuleBody, vec![], Type::Num,
+        );
+        let list = b.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let one = b.const_num(1.0);
+        let two = b.const_num(2.0);
+        b.emit0(Inst::ListAppend { list, value: one });
+        b.emit0(Inst::ListAppend { list, value: two });
+        let bound = b.emit1(
+            Inst::BindInterface { value: list, expected: typed_list.clone(), layout: None },
+            typed_list,
+        );
+        let index = b.const_i32(1);
+        let value = b.emit1(Inst::ListGet { list: bound, index }, Type::Num);
+        b.ret(value);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.removed_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocList { .. })), 0, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 0, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::ListGet { .. })), 0, "{function}");
+        assert_eq!(run(&program, entry).as_num(), Some(2.0));
+    }
+
+    #[test]
+    fn partially_escaping_typed_list_reinstalls_contract_on_materialization() {
+        let (mut program, module) = new_program();
+        let typed_list = Type::List(Some(Box::new(Type::Num)));
+        let mut b = Builder::new(
+            &mut program,
+            module,
+            "typed_list_partial",
+            FunctionKind::ModuleBody,
+            vec![Type::Bool],
+            Type::Top,
+        );
+        let escape = b.param(0);
+        let list = b.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let one = b.const_num(1.0);
+        b.emit0(Inst::ListAppend { list, value: one });
+        let bound = b.emit1(
+            Inst::BindInterface { value: list, expected: typed_list.clone(), layout: None },
+            typed_list.clone(),
+        );
+        let escape_block = b.new_block(&[]);
+        let scalar_block = b.new_block(&[]);
+        b.branch(escape, escape_block, vec![], scalar_block, vec![]);
+        b.position_at(escape_block);
+        b.ret(bound);
+        b.position_at(scalar_block);
+        let zero = b.const_i32(0);
+        let value = b.emit1(Inst::ListGet { list: bound, index: zero }, Type::Num);
+        b.ret(value);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.sunk_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocList { .. })), 1, "{function}");
+        assert_eq!(
+            count(function, |i| matches!(i, Inst::BindInterface { expected, .. } if expected == &typed_list)),
+            1,
+            "materialized typed List must regain its persistent contract\n{function}"
+        );
+    }
+
+    #[test]
+    fn typed_list_contract_rejects_alias_write() {
+        let (mut program, module) = new_program();
+        let typed_list = Type::List(Some(Box::new(Type::Num)));
+        let mut b = Builder::new(
+            &mut program, module, "typed_list_contract", FunctionKind::ModuleBody, vec![], Type::Top,
+        );
+        let list = b.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let one = b.const_num(1.0);
+        b.emit0(Inst::ListAppend { list, value: one });
+        let bound = b.emit1(
+            Inst::BindInterface { value: list, expected: typed_list.clone(), layout: None },
+            typed_list,
+        );
+        let zero = b.const_i32(0);
+        let wrong = b.const_string("wrong");
+        b.emit0(Inst::ListSet { list: bound, index: zero, value: wrong });
+        b.ret(bound);
+        let entry = b.finish();
+
+        let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
+        let mut vm = Interpreter::new(&bytecode).unwrap();
+        vm.set_jit_options(None);
+        assert!(vm.run_module(entry).is_err(), "typed-list contract must reject alias writes");
     }
 
     #[test]
