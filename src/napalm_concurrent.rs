@@ -7,9 +7,10 @@
 
 use super::*;
 use crate::napalm_builtin::{install_vm_builtins, BuiltinHost, BuiltinManifest};
+use crate::napalm_tracing_jit::SharedJitProfile;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -61,11 +62,15 @@ struct ConcurrentJob {
 struct WorkerSignal {
     lock: Mutex<()>,
     cv: Condvar,
+    busy: AtomicBool,
 }
 
 pub(crate) struct ConcurrentRuntime {
-    injector: Arc<Injector<ConcurrentJob>>,
-    signal: Arc<WorkerSignal>,
+    /// One ingress lane per worker. `submit()` hashes FuncId to a preferred lane;
+    /// idle workers can still steal from every other lane.
+    affinity_queues: Arc<Vec<Arc<Injector<ConcurrentJob>>>>,
+    signals: Arc<Vec<Arc<WorkerSignal>>>,
+    wake_cursor: AtomicUsize,
     shutdown: Arc<AtomicBool>,
     completion_rx: Receiver<ConcurrentCompletion>,
     cancellations: FastMap<ConcurrentJobId, Arc<AtomicBool>>,
@@ -85,11 +90,23 @@ impl ConcurrentRuntime {
             .max(1);
         let program = Arc::new(program);
         let manifest = Arc::new(manifest);
-        let injector: Arc<Injector<ConcurrentJob>> = Arc::new(Injector::new());
-        let signal = Arc::new(WorkerSignal {
-            lock: Mutex::new(()),
-            cv: Condvar::new(),
-        });
+        let shared_jit_profile = Arc::new(SharedJitProfile::new(program.as_ref()));
+        let affinity_queues = Arc::new(
+            (0..worker_count)
+                .map(|_| Arc::new(Injector::new()))
+                .collect::<Vec<_>>(),
+        );
+        let signals = Arc::new(
+            (0..worker_count)
+                .map(|_| {
+                    Arc::new(WorkerSignal {
+                        lock: Mutex::new(()),
+                        cv: Condvar::new(),
+                        busy: AtomicBool::new(false),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let (completion_tx, completion_rx) = mpsc::channel();
 
@@ -104,28 +121,30 @@ impl ConcurrentRuntime {
         let mut workers = Vec::with_capacity(worker_count);
 
         for (index, local) in locals.into_iter().enumerate() {
-            let worker_injector = injector.clone();
+            let worker_affinity_queues = affinity_queues.clone();
             let worker_stealers = stealers.clone();
-            let worker_signal = signal.clone();
+            let worker_signals = signals.clone();
             let worker_shutdown = shutdown.clone();
             let worker_completion_tx = completion_tx.clone();
             let worker_wake_tx = wake_tx.clone();
             let worker_program = program.clone();
             let worker_manifest = manifest.clone();
+            let worker_shared_jit_profile = shared_jit_profile.clone();
             let spawn = thread::Builder::new()
                 .name(format!("napalm-worker-{index}"))
                 .spawn(move || {
                     worker_main(
                         index,
                         local,
-                        worker_injector,
+                        worker_affinity_queues,
                         worker_stealers,
-                        worker_signal,
+                        worker_signals,
                         worker_shutdown,
                         worker_completion_tx,
                         worker_wake_tx,
                         worker_program,
                         worker_manifest,
+                        worker_shared_jit_profile,
                     );
                 });
             match spawn {
@@ -134,7 +153,10 @@ impl ConcurrentRuntime {
                     // Do not detach already-started workers on partial pool
                     // construction failure.
                     shutdown.store(true, AtomicOrdering::Release);
-                    signal.cv.notify_all();
+                    for signal in signals.iter() {
+                        let _guard = signal.lock.lock();
+                        signal.cv.notify_all();
+                    }
                     for handle in workers.drain(..) {
                         let _ = handle.join();
                     }
@@ -146,8 +168,9 @@ impl ConcurrentRuntime {
         }
 
         Ok(Self {
-            injector,
-            signal,
+            affinity_queues,
+            signals,
+            wake_cursor: AtomicUsize::new(0),
             shutdown,
             completion_rx,
             cancellations: FastMap::default(),
@@ -166,17 +189,50 @@ impl ConcurrentRuntime {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.cancellations.insert(id, cancelled.clone());
 
-        // Pair the queue push with the sleeper lock so a worker cannot observe an
-        // empty queue and go to sleep after the notification has already passed.
-        let _guard = self.signal.lock.lock();
-        self.injector.push(ConcurrentJob {
-            id,
-            function,
-            args,
-            cancelled,
-        });
-        self.signal.cv.notify_one();
+        let preferred_worker = preferred_worker(function, self.affinity_queues.len());
+        let preferred_queue = &self.affinity_queues[preferred_worker];
+        let preferred_signal = &self.signals[preferred_worker];
+
+        // Queue placement provides soft function affinity. If the preferred worker
+        // is already busy or has queued work, wake one additional worker so the
+        // backlog can be stolen instead of serializing a burst of identical calls.
+        let had_backlog = !preferred_queue.is_empty();
+        let preferred_busy = preferred_signal.busy.load(AtomicOrdering::Acquire);
+        {
+            // Pair push and notification with this worker's sleeper lock so it
+            // cannot decide to sleep after the notification has already passed.
+            let _guard = preferred_signal.lock.lock();
+            preferred_queue.push(ConcurrentJob {
+                id,
+                function,
+                args,
+                cancelled,
+            });
+            preferred_signal.cv.notify_one();
+        }
+
+        if self.signals.len() > 1 && (had_backlog || preferred_busy) {
+            self.wake_one_stealer(preferred_worker);
+        }
         id
+    }
+
+    fn wake_one_stealer(&self, preferred_worker: usize) {
+        let count = self.signals.len();
+        if count <= 1 {
+            return;
+        }
+        let start = self.wake_cursor.fetch_add(1, AtomicOrdering::Relaxed) % count;
+        for offset in 0..count {
+            let candidate = (start + offset) % count;
+            if candidate == preferred_worker {
+                continue;
+            }
+            let signal = &self.signals[candidate];
+            let _guard = signal.lock.lock();
+            signal.cv.notify_one();
+            return;
+        }
     }
 
     #[inline]
@@ -206,7 +262,10 @@ impl ConcurrentRuntime {
 impl Drop for ConcurrentRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, AtomicOrdering::Release);
-        self.signal.cv.notify_all();
+        for signal in self.signals.iter() {
+            let _guard = signal.lock.lock();
+            signal.cv.notify_all();
+        }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -217,30 +276,39 @@ impl Drop for ConcurrentRuntime {
 fn worker_main(
     index: usize,
     local: Worker<ConcurrentJob>,
-    injector: Arc<Injector<ConcurrentJob>>,
+    affinity_queues: Arc<Vec<Arc<Injector<ConcurrentJob>>>>,
     stealers: Arc<Vec<Stealer<ConcurrentJob>>>,
-    signal: Arc<WorkerSignal>,
+    signals: Arc<Vec<Arc<WorkerSignal>>>,
     shutdown: Arc<AtomicBool>,
     completion_tx: Sender<ConcurrentCompletion>,
     wake_tx: Sender<()>,
     program: Arc<BytecodeProgram>,
     manifest: Arc<BuiltinManifest>,
+    shared_jit_profile: Arc<SharedJitProfile>,
 ) {
-    let mut vm = build_worker_vm(program.as_ref(), manifest.as_ref());
+    let signal = &signals[index];
+    let mut vm = build_worker_vm(
+        program.as_ref(),
+        manifest.as_ref(),
+        shared_jit_profile.clone(),
+    );
 
     while !shutdown.load(AtomicOrdering::Acquire) {
-        let Some(job) = take_job(index, &local, &injector, &stealers) else {
+        let Some(job) = take_job(index, &local, &affinity_queues, &stealers) else {
+            signal.busy.store(false, AtomicOrdering::Release);
             let mut guard = signal.lock.lock();
             if shutdown.load(AtomicOrdering::Acquire) {
                 break;
             }
-            if injector.is_empty() && local.is_empty() {
+            if local.is_empty() && affinity_queues.iter().all(|queue| queue.is_empty()) {
                 signal.cv.wait(&mut guard);
             }
             continue;
         };
 
+        signal.busy.store(true, AtomicOrdering::Release);
         if job.cancelled.load(AtomicOrdering::Acquire) {
+            signal.busy.store(false, AtomicOrdering::Release);
             continue;
         }
 
@@ -249,8 +317,13 @@ fn worker_main(
             Err(message) => (Err(message.clone()), true),
         };
         if reset_vm {
-            vm = build_worker_vm(program.as_ref(), manifest.as_ref());
+            vm = build_worker_vm(
+                program.as_ref(),
+                manifest.as_ref(),
+                shared_jit_profile.clone(),
+            );
         }
+        signal.busy.store(false, AtomicOrdering::Release);
         if job.cancelled.load(AtomicOrdering::Acquire) {
             continue;
         }
@@ -262,23 +335,38 @@ fn worker_main(
 fn take_job(
     index: usize,
     local: &Worker<ConcurrentJob>,
-    injector: &Injector<ConcurrentJob>,
+    affinity_queues: &[Arc<Injector<ConcurrentJob>>],
     stealers: &[Stealer<ConcurrentJob>],
 ) -> Option<ConcurrentJob> {
     if let Some(job) = local.pop() {
         return Some(job);
     }
 
+    // Prefer jobs whose FuncId hashes to this worker. Batch stealing keeps a hot
+    // function on one worker long enough to benefit its private IC/JIT state.
     loop {
-        match injector.steal_batch_and_pop(local) {
+        match affinity_queues[index].steal_batch_and_pop(local) {
             Steal::Success(job) => return Some(job),
             Steal::Retry => continue,
             Steal::Empty => break,
         }
     }
 
-    // Rotate the victim order by worker index. This avoids every idle worker
-    // hammering stealer zero first under bursty launch workloads.
+    // No affinity work is available locally, so preserve load balancing by
+    // stealing from other workers' ingress lanes. Rotate victims by worker index.
+    for offset in 1..affinity_queues.len() {
+        let victim = (index + offset) % affinity_queues.len();
+        loop {
+            match affinity_queues[victim].steal_batch_and_pop(local) {
+                Steal::Success(job) => return Some(job),
+                Steal::Retry => continue,
+                Steal::Empty => break,
+            }
+        }
+    }
+
+    // Finally steal already-batched local work. This is the least affinity-friendly
+    // path and therefore intentionally comes after all ingress lanes.
     for offset in 1..stealers.len() {
         let victim = (index + offset) % stealers.len();
         loop {
@@ -292,15 +380,29 @@ fn take_job(
     None
 }
 
+#[inline]
+fn preferred_worker(function: FuncId, worker_count: usize) -> usize {
+    debug_assert!(worker_count > 0);
+    // Multiplicative hashing spreads sequential FuncIds across power-of-two and
+    // non-power-of-two worker counts while remaining deterministic.
+    let mixed = function
+        .0
+        .wrapping_mul(0x9e37_79b1)
+        ^ function.0.rotate_right(16);
+    (mixed as usize) % worker_count
+}
+
 fn build_worker_vm<'a>(
     program: &'a BytecodeProgram,
     manifest: &BuiltinManifest,
+    shared_jit_profile: Arc<SharedJitProfile>,
 ) -> Result<Interpreter<'a>, String> {
     let host = Box::new(BuiltinHost::new(manifest.clone()));
     let mut vm = Interpreter::with_host(program, host)
         .map_err(|error| format!("failed to initialize concurrent VM: {}", error.message))?;
     install_vm_builtins(&mut vm, manifest);
     vm.set_concurrent_worker(true);
+    vm.set_shared_jit_profile(shared_jit_profile);
     Ok(vm)
 }
 
@@ -336,5 +438,33 @@ fn execute_job(
     match vm.snapshot_concurrent_value(value) {
         Ok(value) => (Ok(value), false),
         Err(error) => (Err(error.message), false),
+    }
+}
+
+#[cfg(test)]
+mod phase1_tests {
+    use super::*;
+
+    #[test]
+    fn function_affinity_is_stable() {
+        for workers in 1..=32 {
+            for function in 0..256u32 {
+                let id = FuncId(function);
+                let a = preferred_worker(id, workers);
+                let b = preferred_worker(id, workers);
+                assert_eq!(a, b);
+                assert!(a < workers);
+            }
+        }
+    }
+
+    #[test]
+    fn function_affinity_uses_multiple_workers() {
+        let workers = 8;
+        let mut seen = [false; 8];
+        for function in 0..256u32 {
+            seen[preferred_worker(FuncId(function), workers)] = true;
+        }
+        assert!(seen.into_iter().all(|used| used));
     }
 }

@@ -50,6 +50,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 mod inlining;
 #[cfg(test)]
@@ -350,6 +351,13 @@ pub struct TraceActivation {
     /// Non-allocating StickyImmix post-barrier slow path.
     pub heap_write_barrier: HeapWriteBarrierFn,
 
+    /// VM-local relocation words for the currently executing trace. Generated
+    /// code addresses this table only by compact slot index; it never embeds a
+    /// heap handle, runtime class key, shape id, relocated slot or VM-owned
+    /// address directly in machine code. The native dispatcher rewrites this
+    /// pointer before entering each root/side trace.
+    pub vm_bindings: *const u64,
+
     /// Scratch call frame used only by TRACE_RUNTIME_MODE_DIRECT_CALL. The values
     /// are not GC roots by themselves: the helper performs no collection between
     /// reading this scratch area and copying it into the freshly pushed callee
@@ -368,6 +376,8 @@ pub struct TraceActivation {
     /// to the Rust tiering manager. They remain stable for one dispatcher call.
     pub trace_entries: *const usize,
     pub trace_link_tables: *const usize,
+    /// Dense TraceId -> VM binding-table pointer map parallel to trace_entries.
+    pub trace_vm_bindings: *const usize,
     pub current_links: *const u32,
     pub trace_entries_len: u32,
     pub next_trace: u32,
@@ -396,6 +406,7 @@ impl TraceActivation {
             execute: inputs.execute,
             heap_chunks: inputs.heap_chunks,
             heap_write_barrier: inputs.heap_write_barrier,
+            vm_bindings: std::ptr::null(),
             direct_call_function: u32::MAX,
             direct_call_destination: u32::MAX,
             direct_call_arity: 0,
@@ -404,6 +415,7 @@ impl TraceActivation {
             direct_call_args: [RegisterWord(0); MAX_NAPALM_ARITY],
             trace_entries: std::ptr::null(),
             trace_link_tables: std::ptr::null(),
+            trace_vm_bindings: std::ptr::null(),
             current_links: std::ptr::null(),
             trace_entries_len: 0,
             next_trace: u32::MAX,
@@ -439,9 +451,10 @@ pub type NativeDispatcherFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
 pub type RuntimeTraceFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32) -> u32;
 
 #[inline]
-unsafe fn invoke_native_trace(entry: NativeTraceFn, activation: &mut TraceActivation) -> u32 {
+unsafe fn invoke_native_trace(compiled: &CompiledTrace, activation: &mut TraceActivation) -> u32 {
+    activation.vm_bindings = compiled.vm_bindings.as_ptr();
     let current_links = activation.current_links;
-    unsafe { entry(activation, current_links) }
+    unsafe { (compiled.entry)(activation, current_links) }
 }
 
 // =============================================================================
@@ -5495,11 +5508,45 @@ impl CompiledExitPlan {
 // Cranelift lowering
 // =============================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum VmBindingKind {
+    StableTagged,
+    ValueAddress,
+    ProfileCounterAddress,
+    ClassKey,
+    MethodEpoch,
+    ShapeId,
+    DenseSlot,
+    FieldSlot,
+    PreparedFunctionIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VmBindingKey {
+    kind: VmBindingKind,
+    raw: u64,
+}
+
+impl VmBindingKey {
+    #[inline]
+    const fn new(kind: VmBindingKind, raw: u64) -> Self {
+        Self { kind, raw }
+    }
+}
+
 struct CompiledTrace {
     trace: Trace,
     function: ClifFuncId,
     code_ptr: *const u8,
     entry: NativeTraceFn,
+    /// Relocation words consumed through TraceActivation::vm_bindings. This is
+    /// intentionally private to one worker/JIT in phase 2; phase 3 will replace
+    /// the raw words with repository-level binding descriptors.
+    vm_bindings: Box<[u64]>,
+    /// Binding categories are retained even while phase 2 stores raw private
+    /// values. Two equal u64 words with different meanings must remain distinct
+    /// slots so phase 3 can replace them with semantic rebinding descriptors.
+    vm_binding_keys: Box<[VmBindingKey]>,
     exits: Vec<CompiledExitPlan>,
     exit_hits: Vec<u32>,
     side_trace_attempted: Vec<bool>,
@@ -5721,6 +5768,30 @@ impl CraneliftBackend {
                 link_addr,
                 0,
             );
+
+            // VM-local constants/addresses are selected by TraceId just like the
+            // native entry/link tables. A linked child therefore receives its own
+            // relocation table before any of its machine code executes.
+            let binding_tables = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, trace_vm_bindings) as i32,
+            );
+            let binding_addr = builder.ins().iadd(binding_tables, byte_offset);
+            let current_bindings = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                binding_addr,
+                0,
+            );
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                current_bindings,
+                activation,
+                offset_of!(TraceActivation, vm_bindings) as i32,
+            );
+
             // Pass the per-trace link table in SSA instead of storing it into
             // TraceActivation only for the callee to reload it on a side exit.
             let call = builder.ins().call_indirect(
@@ -5872,6 +5943,11 @@ struct CraneliftLoweringState<'a, 'p> {
     /// Absolute VM slots have stable, exact addresses and can therefore be
     /// forwarded precisely until a full runtime boundary.
     forwarded_absolute_loads: HashMap<u64, Value>,
+    /// Dense compile-time map from a VM-local raw word to the slot that the
+    /// dispatcher will expose through TraceActivation::vm_bindings.
+    vm_binding_slots: HashMap<VmBindingKey, u32>,
+    vm_binding_values: HashMap<u32, Value>,
+    vm_bindings_base: Option<Value>,
     /// TraceActivation fields that are invariant for one native entry. Caching
     /// them explicitly keeps indirect-call and sidecar plumbing out of hot loops
     /// even when backend alias analysis must conservatively forget loads across
@@ -5942,6 +6018,103 @@ fn trace_exit_available_in_preheader(
     })
 }
 
+fn push_vm_binding(
+    words: &mut Vec<u64>,
+    keys: &mut Vec<VmBindingKey>,
+    slots: &mut HashMap<VmBindingKey, u32>,
+    key: VmBindingKey,
+) {
+    if slots.contains_key(&key) {
+        return;
+    }
+    let slot = words.len() as u32;
+    words.push(key.raw);
+    keys.push(key);
+    slots.insert(key, slot);
+}
+
+/// Collect every recording-time value whose physical representation belongs to
+/// one Interpreter. Native code receives only the resulting slot numbers. The
+/// category is part of the key even when two bindings currently contain the same
+/// raw word; future per-VM rebinding is allowed to resolve them differently.
+fn collect_vm_bindings(
+    trace: &Trace,
+) -> (Box<[u64]>, Box<[VmBindingKey]>, HashMap<VmBindingKey, u32>) {
+    let mut words = Vec::new();
+    let mut keys = Vec::new();
+    let mut slots = HashMap::default();
+    let mut add = |kind: VmBindingKind, raw: u64| {
+        push_vm_binding(
+            &mut words,
+            &mut keys,
+            &mut slots,
+            VmBindingKey::new(kind, raw),
+        )
+    };
+
+    for value in &trace.values {
+        if let TraceValueOrigin::Constant(TraceConstant::StableTagged(word)) = &value.origin {
+            add(VmBindingKind::StableTagged, *word);
+        }
+    }
+    for exit in &trace.exits {
+        for frame in &exit.frames {
+            for write in &frame.writes {
+                if let SnapshotValue::Constant(TraceConstant::StableTagged(word)) = write.value {
+                    add(VmBindingKind::StableTagged, word);
+                }
+            }
+        }
+    }
+
+    for node in &trace.nodes {
+        use TraceInst::*;
+        match &node.kind {
+            Runtime { direct_call: Some(call), .. } => {
+                add(VmBindingKind::PreparedFunctionIndex, call.function_index as u64)
+            }
+            LoadAbsoluteValue { address } | StoreAbsoluteValue { address, .. } => {
+                add(VmBindingKind::ValueAddress, *address)
+            }
+            IncrementProfileCounter { address } => {
+                add(VmBindingKind::ProfileCounterAddress, *address)
+            }
+            IsInstanceObserved {
+                expected_class,
+                instance_classes,
+                known_classes,
+                ..
+            } => {
+                add(VmBindingKind::ClassKey, *expected_class);
+                for &class in instance_classes { add(VmBindingKind::ClassKey, class); }
+                for &class in known_classes { add(VmBindingKind::ClassKey, class); }
+            }
+            GuardClass { classes, .. } => {
+                for &class in classes { add(VmBindingKind::ClassKey, class); }
+            }
+            GuardMethodEpoch { expected, .. } => add(VmBindingKind::MethodEpoch, *expected),
+            HeapLoadField { slot, .. } | HeapStoreField { slot, .. } => {
+                add(VmBindingKind::FieldSlot, *slot as u64)
+            }
+            HeapMapGetShaped { shape, slot, .. }
+            | HeapMapSetShaped { shape, slot, .. } => {
+                add(VmBindingKind::ShapeId, *shape as u64);
+                add(VmBindingKind::DenseSlot, *slot as u64);
+            }
+            HeapMapGetPic { entries, .. } => {
+                for entry in entries {
+                    add(VmBindingKind::ShapeId, entry.shape as u64);
+                    add(VmBindingKind::DenseSlot, entry.slot as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    drop(add);
+    (words.into_boxed_slice(), keys.into_boxed_slice(), slots)
+}
+
 impl<'a> CraneliftTraceCompiler<'a> {
     fn new(trace: &'a Trace, options: &'a TracingJitOptions) -> Result<Self, TracingJitError> {
         verify_trace(trace).map_err(|errors| {
@@ -5983,6 +6156,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
     fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
+        let (vm_bindings, vm_binding_keys, vm_binding_slots) = collect_vm_bindings(self.trace);
         let CraneliftBackend { module, context, function_context, scalar_helpers, .. } = backend;
         let arena = bumpalo::Bump::new();
         context.clear();
@@ -6064,6 +6238,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 shared_constant_exit_blocks: HashMap::default(),
                 forwarded_heap_loads: HashMap::default(),
                 forwarded_absolute_loads: HashMap::default(),
+                vm_binding_slots,
+                vm_binding_values: HashMap::default(),
+                vm_bindings_base: None,
                 runtime_context: None,
                 execute_callee: None,
                 heap_barrier_callee: None,
@@ -6327,6 +6504,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
             function,
             code_ptr,
             entry,
+            vm_bindings,
+            vm_binding_keys,
             exit_hits: vec![0; self.exit_plans.len()],
             side_trace_attempted: vec![false; self.exit_plans.len()],
             native_links: vec![u32::MAX; self.exit_plans.len()].into_boxed_slice(),
@@ -6359,6 +6538,62 @@ impl CraneliftLoweringState<'_, '_> {
     #[inline]
     fn plain_mem() -> MemFlagsData {
         MemFlagsData::new()
+    }
+
+    #[inline(always)]
+    fn vm_bindings_base(&mut self) -> Value {
+        if let Some(value) = self.vm_bindings_base {
+            return value;
+        }
+        let value = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, vm_bindings) as i32,
+        );
+        self.vm_bindings_base = Some(value);
+        value
+    }
+
+    /// Load one VM-owned relocation word. The raw word is used only as a
+    /// compile-time lookup key and never reaches Cranelift as an immediate.
+    fn vm_binding_word(
+        &mut self,
+        kind: VmBindingKind,
+        raw: u64,
+    ) -> Result<Value, TracingJitError> {
+        let key = VmBindingKey::new(kind, raw);
+        let slot = *self
+            .vm_binding_slots
+            .get(&key)
+            .ok_or_else(|| self.error(format!("missing VM binding {kind:?} for {raw:#x}")))?;
+        if let Some(&value) = self.vm_binding_values.get(&slot) {
+            return Ok(value);
+        }
+        let byte_offset = (slot as usize)
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| self.error("VM binding offset overflow"))?;
+        let offset = i32::try_from(byte_offset)
+            .map_err(|_| self.error("VM binding table exceeds Cranelift offset range"))?;
+        let base = self.vm_bindings_base();
+        let value = self.builder.ins().load(
+            types::I64,
+            Self::trusted_mem(),
+            base,
+            offset,
+        );
+        self.vm_binding_values.insert(slot, value);
+        Ok(value)
+    }
+
+    #[inline]
+    fn vm_binding_i32(
+        &mut self,
+        kind: VmBindingKind,
+        raw: u32,
+    ) -> Result<Value, TracingJitError> {
+        let word = self.vm_binding_word(kind, raw as u64)?;
+        Ok(self.builder.ins().ireduce(types::I32, word))
     }
 
     #[inline(always)]
@@ -6591,9 +6826,7 @@ impl CraneliftLoweringState<'_, '_> {
                 .builder
                 .ins()
                 .f64const(Ieee64::with_bits(bits)),
-            TraceConstant::StableTagged(bits) => {
-                self.builder.ins().iconst(types::I64, bits as i64)
-            }
+            TraceConstant::StableTagged(bits) => self.vm_binding_word(VmBindingKind::StableTagged, bits)?,
             TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
                 return Err(self.error("runtime-owned constant reached native tier"));
             }
@@ -7363,10 +7596,11 @@ impl CraneliftLoweringState<'_, '_> {
         exit: SideExitId,
     ) -> Result<(), TracingJitError> {
         let shape = self.heap_metadata_payload(metadata);
+        let expected = self.vm_binding_i32(VmBindingKind::ShapeId, expected)?;
         let fail = self
             .builder
             .ins()
-            .icmp_imm_u(IntCC::NotEqual, shape, expected as i64);
+            .icmp(IntCC::NotEqual, shape, expected);
         self.emit_side_exit(exit, fail)
     }
 
@@ -7791,10 +8025,11 @@ impl CraneliftLoweringState<'_, '_> {
                             exit,
                         )?;
                         let actual_function = self.heap_entry_len(entry);
-                        let mismatch = self.builder.ins().icmp_imm_u(
+                        let expected_function = self.vm_binding_word(VmBindingKind::PreparedFunctionIndex, direct.function_index as u64)?;
+                        let mismatch = self.builder.ins().icmp(
                             IntCC::NotEqual,
                             actual_function,
-                            direct.function_index as i64,
+                            expected_function,
                         );
                         let mismatch = self.bool32(mismatch);
                         self.emit_side_exit(exit, mismatch)?;
@@ -7821,10 +8056,12 @@ impl CraneliftLoweringState<'_, '_> {
                             offset,
                         );
                     };
-                    store_i32(
-                        self,
+                    let direct_function = self.vm_binding_i32(VmBindingKind::PreparedFunctionIndex, direct.function_index)?;
+                    self.builder.ins().store(
+                        Self::trusted_mem(),
+                        direct_function,
+                        self.activation,
                         offset_of!(TraceActivation, direct_call_function) as i32,
-                        direct.function_index,
                     );
                     store_i32(
                         self,
@@ -7964,7 +8201,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let value = if let Some(&value) = self.forwarded_absolute_loads.get(address) {
                     value
                 } else {
-                    let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                    let pointer = self.vm_binding_word(VmBindingKind::ValueAddress, *address)?;
                     let value = self.builder.ins().load(
                         types::I64,
                         Self::trusted_mem(),
@@ -7979,7 +8216,7 @@ impl CraneliftLoweringState<'_, '_> {
 
             StoreAbsoluteValue { address, value } => {
                 let value = self.lower_value(*value)?;
-                let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                let pointer = self.vm_binding_word(VmBindingKind::ValueAddress, *address)?;
                 self.builder
                     .ins()
                     .store(Self::trusted_mem(), value, pointer, 0);
@@ -7987,7 +8224,7 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             IncrementProfileCounter { address } => {
-                let pointer = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                let pointer = self.vm_binding_word(VmBindingKind::ProfileCounterAddress, *address)?;
                 let current = self.builder.ins().load(types::I64, Self::trusted_mem(), pointer, 0);
                 let saturated = self.builder.ins().icmp_imm(IntCC::Equal, current, -1);
                 let incremented = self.builder.ins().iadd_imm(current, 1);
@@ -8008,10 +8245,11 @@ impl CraneliftLoweringState<'_, '_> {
                 // full dynamic semantics.
                 let (class_entry, _) = self.live_heap_entry_for_value(*class, *exit)?;
                 let class_key = self.heap_entry_receiver_class(class_entry);
-                let wrong_class = self.builder.ins().icmp_imm_u(
+                let expected_class = self.vm_binding_word(VmBindingKind::ClassKey, *expected_class)?;
+                let wrong_class = self.builder.ins().icmp(
                     IntCC::NotEqual,
                     class_key,
-                    *expected_class as i64,
+                    expected_class,
                 );
                 self.emit_side_exit(*exit, wrong_class)?;
 
@@ -8044,20 +8282,22 @@ impl CraneliftLoweringState<'_, '_> {
                 let actual = self.heap_entry_receiver_class(entry);
                 let mut candidates = instance_classes.iter().copied();
                 let mut matches = if let Some(candidate) = candidates.next() {
-                    let equal = self.builder.ins().icmp_imm_u(
+                    let candidate = self.vm_binding_word(VmBindingKind::ClassKey, candidate)?;
+                    let equal = self.builder.ins().icmp(
                         IntCC::Equal,
                         actual,
-                        candidate as i64,
+                        candidate,
                     );
                     self.bool32(equal)
                 } else {
                     self.builder.ins().iconst(types::I32, 0)
                 };
                 for candidate in candidates {
-                    let equal = self.builder.ins().icmp_imm_u(
+                    let candidate = self.vm_binding_word(VmBindingKind::ClassKey, candidate)?;
+                    let equal = self.builder.ins().icmp(
                         IntCC::Equal,
                         actual,
-                        candidate as i64,
+                        candidate,
                     );
                     let equal = self.bool32(equal);
                     matches = self.bool_or(matches, equal);
@@ -8068,20 +8308,22 @@ impl CraneliftLoweringState<'_, '_> {
                 // in `known_classes`; side-exit rather than returning a stale false.
                 let mut known_candidates = known_classes.iter().copied();
                 let mut known = if let Some(candidate) = known_candidates.next() {
-                    let equal = self.builder.ins().icmp_imm_u(
+                    let candidate = self.vm_binding_word(VmBindingKind::ClassKey, candidate)?;
+                    let equal = self.builder.ins().icmp(
                         IntCC::Equal,
                         actual,
-                        candidate as i64,
+                        candidate,
                     );
                     self.bool32(equal)
                 } else {
                     self.builder.ins().iconst(types::I32, 0)
                 };
                 for candidate in known_candidates {
-                    let equal = self.builder.ins().icmp_imm_u(
+                    let candidate = self.vm_binding_word(VmBindingKind::ClassKey, candidate)?;
+                    let equal = self.builder.ins().icmp(
                         IntCC::Equal,
                         actual,
-                        candidate as i64,
+                        candidate,
                     );
                     let equal = self.bool32(equal);
                     known = self.bool_or(known, equal);
@@ -8314,29 +8556,32 @@ impl CraneliftLoweringState<'_, '_> {
                 let value = self.lower_value(*value)?;
                 let class = self.heap_entry_receiver_class(entry);
                 if classes.len() == 1 {
-                    let failure = self.builder.ins().icmp_imm_u(
+                    let expected = self.vm_binding_word(VmBindingKind::ClassKey, classes[0])?;
+                    let failure = self.builder.ins().icmp(
                         IntCC::NotEqual,
                         class,
-                        classes[0] as i64,
+                        expected,
                     );
                     self.emit_side_exit(*exit, failure)?;
                 } else {
                     let mut classes = classes.iter().copied();
                     let mut matches = if let Some(expected) = classes.next() {
-                        let equal = self.builder.ins().icmp_imm_u(
+                        let expected = self.vm_binding_word(VmBindingKind::ClassKey, expected)?;
+                        let equal = self.builder.ins().icmp(
                             IntCC::Equal,
                             class,
-                            expected as i64,
+                            expected,
                         );
                         self.bool32(equal)
                     } else {
                         self.builder.ins().iconst(types::I32, 0)
                     };
                     for expected in classes {
-                        let equal = self.builder.ins().icmp_imm_u(
+                        let expected = self.vm_binding_word(VmBindingKind::ClassKey, expected)?;
+                        let equal = self.builder.ins().icmp(
                             IntCC::Equal,
                             class,
-                            expected as i64,
+                            expected,
                         );
                         let equal = self.bool32(equal);
                         matches = self.bool_or(matches, equal);
@@ -8349,7 +8594,7 @@ impl CraneliftLoweringState<'_, '_> {
 
             GuardMethodEpoch { expected, exit } => {
                 let epoch = self.method_epoch_value();
-                let expected = self.builder.ins().iconst(types::I64, *expected as i64);
+                let expected = self.vm_binding_word(VmBindingKind::MethodEpoch, *expected)?;
                 let failure = self.builder.ins().icmp(IntCC::NotEqual, epoch, expected);
                 self.emit_side_exit(*exit, failure)?;
             }
@@ -8674,7 +8919,7 @@ impl CraneliftLoweringState<'_, '_> {
                     value
                 } else {
                     let data = self.heap_entry_data(entry);
-                    let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                    let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.heap_element_address(data, index);
                     let value = self.builder.ins().load(
                         types::I64,
@@ -8695,7 +8940,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
                 let data = self.heap_entry_data(entry);
-                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
@@ -8846,7 +9091,7 @@ impl CraneliftLoweringState<'_, '_> {
                     value
                 } else {
                     let data = self.heap_entry_data(entry);
-                    let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                    let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                     let address = self.heap_element_address(data, index);
                     let value = self.builder.ins().load(
                         types::I64,
@@ -8871,14 +9116,15 @@ impl CraneliftLoweringState<'_, '_> {
                 let mut matched = self.builder.ins().iconst(types::I32, 0);
                 let mut selected_slot = self.builder.ins().iconst(types::I64, 0);
                 for candidate in entries {
-                    let is_shape = self.builder.ins().icmp_imm_u(
+                    let expected_shape = self.vm_binding_i32(VmBindingKind::ShapeId, candidate.shape)?;
+                    let is_shape = self.builder.ins().icmp(
                         IntCC::Equal,
                         shape,
-                        candidate.shape as i64,
+                        expected_shape,
                     );
                     let is_shape32 = self.bool32(is_shape);
                     matched = self.builder.ins().bor(matched, is_shape32);
-                    let slot = self.builder.ins().iconst(types::I64, candidate.slot as i64);
+                    let slot = self.vm_binding_word(VmBindingKind::DenseSlot, candidate.slot as u64)?;
                     selected_slot = self.builder.ins().select(is_shape, slot, selected_slot);
                 }
                 let miss = self.builder.ins().icmp_imm(IntCC::Equal, matched, 0);
@@ -8912,7 +9158,7 @@ impl CraneliftLoweringState<'_, '_> {
                 // Exact shape identity also proves this existing dense slot is in
                 // range. Shaped native stores never append/remove properties.
                 let data = self.heap_entry_data(entry);
-                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
@@ -9058,6 +9304,84 @@ struct LoopKey {
     location: TraceLocation,
 }
 
+/// Cross-worker hotness aggregation used by isolated concurrent Interpreters.
+///
+/// Only monotonic heat is shared. Compiled traces, retry state, blacklists,
+/// side-exit feedback and every VM-specific value remain private to each
+/// `TracingJit`. Counters are indexed by raw bytecode PC so all worker VMs for
+/// the same immutable `BytecodeProgram` address the same locations.
+pub(crate) struct SharedJitProfile {
+    /// FuncId is allocated from a dense u32 sequence. Keep a direct table so the
+    /// interpreter's cold entry hook does not introduce another HashMap probe.
+    functions: Vec<Option<SharedFunctionHeat>>,
+}
+
+struct SharedFunctionHeat {
+    entries: Box<[AtomicU32]>,
+    loops: Box<[AtomicU32]>,
+}
+
+impl SharedJitProfile {
+    pub(crate) fn new(program: &BytecodeProgram) -> Self {
+        let slots = program
+            .functions
+            .iter()
+            .map(|function| function.id.0 as usize)
+            .max()
+            .map_or(0, |max| max.saturating_add(1));
+        let mut functions = Vec::with_capacity(slots);
+        functions.resize_with(slots, || None);
+
+        for function in &program.functions {
+            let words = function.chunk.code.len();
+            let heat = SharedFunctionHeat {
+                entries: (0..words)
+                    .map(|_| AtomicU32::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                loops: (0..words)
+                    .map(|_| AtomicU32::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            };
+            functions[function.id.0 as usize] = Some(heat);
+        }
+
+        Self { functions }
+    }
+
+    #[inline]
+    fn heat(&self, location: TraceLocation) -> Option<&SharedFunctionHeat> {
+        self.functions
+            .get(location.function.0 as usize)?
+            .as_ref()
+    }
+
+    #[inline]
+    fn bump(counter: &AtomicU32) -> u32 {
+        const SATURATION: u32 = 1 << 30;
+        let current = counter.load(Ordering::Relaxed);
+        if current >= SATURATION {
+            return current;
+        }
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    #[inline]
+    pub(crate) fn bump_entry(&self, location: TraceLocation) -> u32 {
+        self.heat(location)
+            .and_then(|heat| heat.entries.get(location.pc.0 as usize))
+            .map_or(0, Self::bump)
+    }
+
+    #[inline]
+    pub(crate) fn bump_loop(&self, location: TraceLocation) -> u32 {
+        self.heat(location)
+            .and_then(|heat| heat.loops.get(location.pc.0 as usize))
+            .map_or(0, Self::bump)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct LoopState {
     hotness: u32,
@@ -9065,6 +9389,9 @@ struct LoopState {
     failures: u16,
     trace: Option<TraceId>,
     blacklisted: bool,
+    /// A globally-hot location primes this worker only once. After a local
+    /// recording failure the normal worker-local retry/backoff policy takes over.
+    shared_primed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -9099,6 +9426,9 @@ enum SideExitDispatch {
 pub struct TracingJit {
     options: TracingJitOptions,
     backend: Option<CraneliftBackend>,
+    /// Aggregate heat is the only JIT state shared by concurrent workers in
+    /// phase 2. Native code and every speculative/runtime binding stay private.
+    shared_profile: Option<Arc<SharedJitProfile>>,
     loops: HashMap<LoopKey, LoopState>,
     entries: HashMap<TraceLocation, LoopState>,
     traces: Vec<Option<CompiledTrace>>,
@@ -9107,6 +9437,9 @@ pub struct TracingJit {
     /// dispatcher invocation, so pointers installed in TraceActivation stay valid.
     entry_table: Vec<usize>,
     link_table_ptrs: Vec<usize>,
+    /// Parallel TraceId -> per-worker relocation table. Keeping this private to
+    /// the TracingJit is the explicit phase-2 boundary: only profile heat is shared.
+    vm_binding_table_ptrs: Vec<usize>,
     next_trace_id: u32,
     stats: TracingJitStats,
 }
@@ -9154,11 +9487,13 @@ impl TracingJit {
         Self {
             options,
             backend: None,
+            shared_profile: None,
             loops: HashMap::default(),
             entries: HashMap::default(),
             traces: Vec::new(),
             entry_table: Vec::new(),
             link_table_ptrs: Vec::new(),
+            vm_binding_table_ptrs: Vec::new(),
             next_trace_id: 0,
             stats: TracingJitStats::default(),
         }
@@ -9166,6 +9501,23 @@ impl TracingJit {
 
     pub fn options(&self) -> &TracingJitOptions {
         &self.options
+    }
+
+    pub(crate) fn set_shared_profile(&mut self, profile: Option<Arc<SharedJitProfile>>) {
+        self.shared_profile = profile;
+    }
+
+    pub(crate) fn shared_profile(&self) -> Option<Arc<SharedJitProfile>> {
+        self.shared_profile.clone()
+    }
+
+    /// Increment the shared cold-entry counter without entering the manager
+    /// HashMap. This is called by the interpreter's dense entry hook.
+    #[inline]
+    pub(crate) fn shared_entry_hit(&self, location: TraceLocation) -> u32 {
+        self.shared_profile
+            .as_ref()
+            .map_or(0, |profile| profile.bump_entry(location))
     }
 
     pub fn stats(&self) -> &TracingJitStats {
@@ -9213,9 +9565,11 @@ impl TracingJit {
         if self.entry_table.len() <= index {
             self.entry_table.resize(index + 1, 0);
             self.link_table_ptrs.resize(index + 1, 0);
+            self.vm_binding_table_ptrs.resize(index + 1, 0);
         }
         self.entry_table[index] = compiled.entry as usize;
         self.link_table_ptrs[index] = compiled.native_links.as_ptr() as usize;
+        self.vm_binding_table_ptrs[index] = compiled.vm_bindings.as_ptr() as usize;
         self.traces[index] = Some(compiled);
     }
 
@@ -9258,6 +9612,19 @@ impl TracingJit {
     pub(crate) fn preheat_entry(&mut self, location: TraceLocation) {
         let threshold = self.options.hot_entry_threshold.max(1);
         let state = self.entries.entry(location).or_default();
+        state.hotness = state.hotness.max(threshold.max(state.retry_after));
+    }
+
+    /// Prime a worker-local entry from aggregate cross-worker heat exactly once.
+    /// Subsequent recording failures obey this worker's local retry/backoff
+    /// instead of being retriggered by the monotonic shared counter.
+    pub(crate) fn preheat_entry_from_shared(&mut self, location: TraceLocation) {
+        let threshold = self.options.hot_entry_threshold.max(1);
+        let state = self.entries.entry(location).or_default();
+        if state.shared_primed {
+            return;
+        }
+        state.shared_primed = true;
         state.hotness = state.hotness.max(threshold.max(state.retry_after));
     }
 
@@ -9367,10 +9734,21 @@ impl TracingJit {
     ) -> Result<JitAction, TracingJitError> {
         let location = runtime.trace_current_location();
         let key = LoopKey { location };
+        let shared_hotness = self
+            .shared_profile
+            .as_ref()
+            .map_or(0, |profile| profile.bump_loop(location));
 
         self.stats.loop_header_hits += 1;
 
         let state = self.loops.entry(key).or_default();
+        if !state.shared_primed
+            && shared_hotness >= self.options.hot_loop_threshold.max(1)
+        {
+            state.shared_primed = true;
+            let threshold = self.options.hot_loop_threshold.max(state.retry_after).max(1);
+            state.hotness = state.hotness.max(threshold.saturating_sub(1));
+        }
         if state.blacklisted {
             return Ok(JitAction::Blacklisted);
         }
@@ -9565,6 +9943,7 @@ impl TracingJit {
             activation.method_epoch = runtime.trace_method_epoch();
             activation.trace_entries = self.entry_table.as_ptr();
             activation.trace_link_tables = self.link_table_ptrs.as_ptr();
+            activation.trace_vm_bindings = self.vm_binding_table_ptrs.as_ptr();
             activation.trace_entries_len = self.entry_table.len() as u32;
             activation.next_trace = trace_id.0;
             activation.dispatch_links_remaining = if self.options.native_loop_iteration_budget == 0 {
@@ -10151,7 +10530,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         activation.exit_id
     }
 
@@ -10241,7 +10620,7 @@ mod tests {
                 for initial in [42.0f64, -10.0] {
                     cell.0 = initial.to_bits();
                     activation.reset_result();
-                    assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     assert_eq!(f64::from_bits(cell.0), 7.0);
                     assert_eq!(f64::from_bits(registers[1].0), if budget == 1 { initial } else { 7.0 });
                 }
@@ -10332,7 +10711,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
-                    assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     let actual = f64::from_bits(general[1].0);
                     assert!(if expected.is_nan() { actual.is_nan() }
                         else { actual.to_bits() == expected.to_bits() },
@@ -10380,7 +10759,7 @@ mod tests {
                         // Failed entry specialization must leave all VM state intact.
                         general[0] = RegisterWord(TAG_TRUE);
                         let before = general.map(|v| v.0);
-                        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                         assert_eq!(general.map(|v| v.0), before);
                         general[0] = RegisterWord(0.0f64.to_bits());
                     }
@@ -10388,7 +10767,7 @@ mod tests {
                     // Finite test bound also catches a broken loop-carried PRE value.
                     for _ in 0..6 {
                         activation.reset_result();
-                        let result = unsafe { invoke_native_trace(compiled.entry, &mut activation) };
+                        let result = unsafe { invoke_native_trace(&compiled, &mut activation) };
                         assert_eq!(result, TRACE_RESULT_SIDE_EXIT);
                         snapshots.push(general.map(|v| v.0));
                         let counter = if tagged { f64::from_bits(general[0].0) as u64 }
@@ -10537,7 +10916,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
@@ -10607,7 +10986,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0], RegisterWord(0x1111));
         assert_eq!(general[1], RegisterWord(0xdead_beef));
@@ -10694,7 +11073,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2], RegisterWord(0xfeed_face));
 
@@ -10706,7 +11085,7 @@ mod tests {
         );
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
         entry.kind.store(
@@ -10720,7 +11099,7 @@ mod tests {
         entry.len.store(10, Ordering::Relaxed);
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
 
@@ -10729,7 +11108,7 @@ mod tests {
         entry.len.store(9, Ordering::Relaxed);
         entry.kind.store(TraceHeapKind::List as u32, Ordering::Release);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
     }
@@ -10790,7 +11169,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[1], answer);
 
@@ -10801,8 +11180,91 @@ mod tests {
         );
         activation.reset_result();
         general[1] = RegisterWord(0);
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
+    }
+
+    #[test]
+    fn phase2_binding_categories_do_not_alias_equal_raw_words() {
+        let mut words = Vec::new();
+        let mut keys = Vec::new();
+        let mut slots = HashMap::default();
+        push_vm_binding(
+            &mut words,
+            &mut keys,
+            &mut slots,
+            VmBindingKey::new(VmBindingKind::StableTagged, 7),
+        );
+        push_vm_binding(
+            &mut words,
+            &mut keys,
+            &mut slots,
+            VmBindingKey::new(VmBindingKind::MethodEpoch, 7),
+        );
+        assert_eq!(words, vec![7, 7]);
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn phase2_stable_tagged_is_loaded_from_activation_binding_table() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        const RECORDED: u64 = 0xfffc_0000_0000_1111;
+        const REBOUND: u64 = 0xfffc_0000_0000_2222;
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::napalm_trace_ir::TraceBuilder::new(
+            TraceId(78),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let value = builder.constant(TraceConstant::StableTagged(RECORDED));
+        builder.emit0(TraceInst::CommitFrameSlot {
+            slot: FrameSlot::General(Reg(0)),
+            value,
+        });
+        builder.set_terminator(TraceTerminator::RuntimeReturn);
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let mut compiled = jit.compile_trace(&trace).unwrap();
+        let binding = compiled
+            .vm_bindings
+            .iter()
+            .position(|&word| word == RECORDED)
+            .expect("StableTagged binding was not collected");
+
+        let mut general = [RegisterWord(0); 1];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: unexpected_runtime,
+            heap_chunks: std::ptr::null(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        assert_eq!(
+            unsafe { invoke_native_trace(&compiled, &mut activation) },
+            TRACE_RESULT_RUNTIME,
+        );
+        assert_eq!(general[0].0, RECORDED);
+
+        // Rebind the same compiled machine code to a different VM-local word.
+        // If RECORDED had been emitted as an iconst, this second assertion would
+        // still observe RECORDED instead of REBOUND.
+        compiled.vm_bindings[binding] = REBOUND;
+        general[0] = RegisterWord(0);
+        activation.reset_result();
+        assert_eq!(
+            unsafe { invoke_native_trace(&compiled, &mut activation) },
+            TRACE_RESULT_RUNTIME,
+        );
+        assert_eq!(general[0].0, REBOUND);
     }
 
     #[test]
@@ -10859,7 +11321,7 @@ mod tests {
 
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(3);
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2].0 as u32 as i32, 7);
 
@@ -10867,7 +11329,7 @@ mod tests {
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(0);
         general[2] = RegisterWord(0xdead_beef);
-        assert_eq!(unsafe { invoke_native_trace(compiled.entry, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, invalid.0);
         assert_eq!(general[2].0, 0xdead_beef);
     }

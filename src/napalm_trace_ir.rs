@@ -65,9 +65,11 @@ pub enum TraceConstant {
     NumBits(u64),
     Int32(i32),
     F64Bits(u64),
-    /// VM-lifetime-stable tagged value materialized while recording. Interned
-    /// strings and builtin class objects are persistent GC roots, so embedding
-    /// their handle word is safe across collections and removes runtime loads.
+    /// VM-lifetime-stable tagged value materialized while recording. This raw
+    /// word is trace metadata only: native lowering must route it through the
+    /// current TraceActivation VM-binding table instead of embedding it in code.
+    /// Persistent roots (for example interned strings/builtin objects) therefore
+    /// remain valid across GC while the machine code stays VM-relocatable.
     StableTagged(u64),
     String(StringId),
     BuiltinClass(BuiltinId),
@@ -147,12 +149,14 @@ pub enum TraceInst {
     /// may survive it, but it avoids bouncing through the tiering manager merely
     /// because a call pushed a temporary bytecode frame.
     RuntimeCall { location: TraceLocation, next: BytecodePc },
-    /// Direct access to a VM-owned, lifetime-stable tagged Value slot. Module
-    /// globals and class static fields use fixed-size backing arrays, so their
-    /// addresses are stable for the lifetime of one Interpreter/JIT instance.
+    /// Access to a VM-owned, lifetime-stable tagged Value slot. `address` is
+    /// recording metadata only; native lowering resolves it through the current
+    /// TraceActivation VM-binding table so no Interpreter address is baked into
+    /// machine code.
     LoadAbsoluteValue { address: u64 },
     StoreAbsoluteValue { address: u64, value: TraceValueId },
-    /// Saturating increment of a lifetime-stable u64 profile counter.
+    /// Saturating increment of a lifetime-stable u64 profile counter. The raw
+    /// address is likewise relocation metadata, never a native immediate.
     IncrementProfileCounter { address: u64 },
     /// Specialized `IsInstance`: the class operand is guarded against the
     /// observed class object and the tested value is compared against the

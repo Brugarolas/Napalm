@@ -59,7 +59,7 @@ mod interfaces;
 use self::interfaces::h_bind_interface;
 use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
-    JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
+    JitAction, SharedJitProfile, TraceActivation, TraceActivationInputs, TraceHeapEntry,
     TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
     TRACE_HEAP_CHUNK_BITS, TRACE_HEAP_CHUNK_MASK, TRACE_HEAP_CHUNK_SIZE,
     TRACE_PROMISE_CANCELLED, TRACE_PROMISE_FULFILLED, TRACE_PROMISE_PENDING, TRACE_PROMISE_REJECTED,
@@ -5621,6 +5621,12 @@ impl<'p> Interpreter<'p> {
         self.is_concurrent_worker = worker;
     }
 
+    pub(crate) fn set_shared_jit_profile(&mut self, profile: Arc<SharedJitProfile>) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_shared_profile(Some(profile));
+        }
+    }
+
     #[inline]
     fn gc_root_registration(&mut self) -> GcRootRegistration {
         let provider: Arc<dyn GcRootProvider> = Arc::new(VmRootProvider {
@@ -5698,8 +5704,13 @@ impl<'p> Interpreter<'p> {
         let entry_threshold = options
             .as_ref()
             .map_or(0, |options| options.hot_entry_threshold);
+        let shared_profile = self.jit.as_ref().and_then(|jit| jit.shared_profile());
         self.jit_entry_threshold = entry_threshold;
-        self.jit = options.map(|options| Box::new(TracingJit::new(options)));
+        self.jit = options.map(|options| {
+            let mut jit = TracingJit::new(options);
+            jit.set_shared_profile(shared_profile.clone());
+            Box::new(jit)
+        });
 
         if entry_threshold != 0 {
             for function in &mut self.prepared.functions {
@@ -5716,8 +5727,14 @@ impl<'p> Interpreter<'p> {
 
     fn invalidate_method_traces(&mut self) {
         self.method_epoch = self.method_epoch.wrapping_add(1);
-        if let Some(options) = self.jit.as_ref().map(|jit| jit.options().clone()) {
-            self.jit = Some(Box::new(TracingJit::new(options)));
+        if let Some((options, shared_profile)) = self
+            .jit
+            .as_ref()
+            .map(|jit| (jit.options().clone(), jit.shared_profile()))
+        {
+            let mut jit = TracingJit::new(options);
+            jit.set_shared_profile(shared_profile);
+            self.jit = Some(Box::new(jit));
         }
         for function in &mut self.prepared.functions {
             function.jit_disabled_headers.fill(0);
@@ -11200,13 +11217,25 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     if !*(&(*function_ptr).jit_entry_disabled).get_unchecked(index) {
         let cached = *(&(*function_ptr).jit_entry_traces).get_unchecked(index);
 
-        // Keep cold entry traffic entirely out of the manager HashMap. A compiled
-        // trace bypasses this counter; failed recordings reset it for a bounded
-        // retry interval.
+        // Keep cold entry traffic entirely out of the manager HashMap. Concurrent
+        // workers additionally contribute to one aggregate counter per raw PC. A
+        // globally-hot location may therefore enter this worker's manager before
+        // its private dense counter reaches the threshold.
+        let mut shared_ready = false;
         if cached == NO_INDEX {
             let hotness = (&mut (*function_ptr).jit_entry_hotness).get_unchecked_mut(index);
             *hotness = hotness.saturating_add(1);
-            if *hotness < threshold {
+            let local_ready = *hotness >= threshold;
+
+            let raw_pc = (&(*function_ptr).original_ops).get_unchecked(index).raw_pc;
+            let shared_location = TraceLocation::new((*function_ptr).id, BytecodePc(raw_pc));
+            let shared_hotness = vm
+                .jit
+                .as_ref()
+                .map_or(0, |jit| jit.shared_entry_hit(shared_location));
+            shared_ready = shared_hotness >= threshold;
+
+            if !local_ready && !shared_ready {
                 let prepared = vm.current_prepared();
                 let handler = prepared
                     .jit_entry_handlers
@@ -11221,7 +11250,11 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         let location = vm.trace_current_location();
         let mut jit = vm.jit.take().unwrap();
         if cached == NO_INDEX {
-            jit.preheat_entry(location);
+            if shared_ready {
+                jit.preheat_entry_from_shared(location);
+            } else {
+                jit.preheat_entry(location);
+            }
         }
         let result = if cached == NO_INDEX {
             jit.on_entry(vm)

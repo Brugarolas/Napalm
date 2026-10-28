@@ -1,7 +1,13 @@
-fn fibonacci(n) {
+let start = System.clock
+
+function fibonacci(n) {
     if (n <= 1) {
         return n;
     }
     return fibonacci(n - 1) + fibonacci(n - 2);
 }
-print(fibonacci(50));
+
+System.print(fibonacci(20));
+
+let elapsed = System.clock - start
+System.print(`elapsed: ${elapsed}`)
