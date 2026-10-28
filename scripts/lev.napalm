@@ -1,8 +1,8 @@
 // src/scripts/levenshtein.napalm
 
-print("===== Levenshtein distance =====");
+System.print("===== Levenshtein distance =====");
 
-fn levenshtein(a, b) {
+function levenshtein(a, b) {
     if (a == b) { return 0; }
 
     var m = a.length;
@@ -62,4 +62,4 @@ fn levenshtein(a, b) {
 var A = "kitten";
 var B = "sitting";
 var d = levenshtein(A, B);
-print(d); // expect 3
+System.print(d); // expect 3

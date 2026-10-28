@@ -13,7 +13,7 @@ use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::napalm_collections::HashMap;
 use std::ffi::{
     CString, c_char, c_int, c_long, c_longlong, c_short, c_uchar, c_uint, c_ulong,
     c_ulonglong, c_ushort, c_void,
@@ -292,7 +292,7 @@ pub struct FfiRuntime {
 }
 
 thread_local! {
-    static FFI_CIF_CACHE: RefCell<HashMap<FfiSignature, Cif>> = RefCell::new(HashMap::new());
+    static FFI_CIF_CACHE: RefCell<HashMap<FfiSignature, Cif>> = RefCell::new(HashMap::default());
 }
 
 impl fmt::Debug for FfiRuntime {

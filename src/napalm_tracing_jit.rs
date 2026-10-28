@@ -44,7 +44,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -1006,7 +1006,7 @@ struct RecordedOp {
     x: u32,
     y: u32,
     next_pc: BytecodePc,
-    args: Vec<Reg>,
+    args: smallvec::SmallVec<[Reg; 4]>,
 }
 
 fn decode_at(
@@ -1058,13 +1058,14 @@ fn decode_at(
         0
     };
 
-    let mut args = Vec::new();
+    let mut args = smallvec::SmallVec::new();
     if matches!(
         opcode,
         Opcode::Invoke
             | Opcode::InvokeSuper
             | Opcode::CallDirect
             | Opcode::CallClosure
+            | Opcode::Launch
             | Opcode::CallPrimitive
             | Opcode::CallForeign
     ) {
@@ -1985,7 +1986,7 @@ impl<'a> TraceRecorder<'a> {
                 let terminal = matches!(op.opcode,
                     Opcode::Trap | Opcode::Return | Opcode::Return2 | Opcode::Bailout
                     | Opcode::Switch | Opcode::Invoke | Opcode::InvokeSpread | Opcode::InvokeSuper
-                    | Opcode::CallDirect | Opcode::CallClosure | Opcode::ImportModule
+                    | Opcode::CallDirect | Opcode::CallClosure | Opcode::Launch | Opcode::ImportModule
                     | Opcode::FiberCall | Opcode::FiberTry | Opcode::FiberTransfer
                     | Opcode::FiberTransferError | Opcode::FiberYield | Opcode::FiberSuspend
                     | Opcode::FiberAbort | Opcode::Await);
@@ -2125,7 +2126,7 @@ impl<'a> TraceRecorder<'a> {
         }
 
         let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
-        if callee.is_async
+        if callee.is_async || callee.is_concurrent
             || callee.capture_count != 0
             || callee.frame.return_kind != RegisterKind::Value
             || !crate::napalm_bytecode::function_kind_uses_this(callee.kind)
@@ -2266,7 +2267,7 @@ impl<'a> TraceRecorder<'a> {
         guard_method_epoch: bool,
     ) -> Result<ExpectedStep, RecordingAbort> {
         let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
-        if callee.is_async
+        if callee.is_async || callee.is_concurrent
             || crate::napalm_bytecode::function_kind_uses_this(callee.kind)
             || callee.arity as usize != op.args.len()
             || callee.frame.return_kind != RegisterKind::Value
@@ -2399,7 +2400,7 @@ impl<'a> TraceRecorder<'a> {
         }
 
         let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
-        if callee.is_async
+        if callee.is_async || callee.is_concurrent
             || callee.capture_count != 0
             || callee.frame.return_kind != RegisterKind::Value
             || !crate::napalm_bytecode::function_kind_uses_this(callee.kind)
@@ -2502,7 +2503,7 @@ impl<'a> TraceRecorder<'a> {
         let callee = program
             .function(target)
             .ok_or(RecordingAbort::UnsupportedCall)?;
-        if callee.is_async
+        if callee.is_async || callee.is_concurrent
             || callee.capture_count != 0
             || !callee.chunk.exception_handlers.is_empty()
             || callee.frame.return_kind != RegisterKind::Value
@@ -4923,6 +4924,7 @@ impl<'a> TraceRecorder<'a> {
             | FiberTransferError
             | FiberYield
             | FiberSuspend
+            | Launch
             | FiberAbort => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
         }
     }
@@ -5071,7 +5073,7 @@ impl<'a> TraceRecorder<'a> {
 
         let mut steps = 0usize;
         let mut runtime_end = false;
-        let mut visited = HashSet::with_capacity(self.options.max_trace_steps.min(4096));
+        let mut visited = HashSet::with_capacity_and_hasher(self.options.max_trace_steps.min(4096), Default::default());
 
         loop {
             if steps >= self.options.max_trace_steps {
@@ -5434,7 +5436,7 @@ impl CompiledExitPlan {
         }
 
         let mut dynamic_values = Vec::<CompiledExitValue>::new();
-        let mut dynamic_index = HashMap::<(TraceValueId, TraceRep), u16>::new();
+        let mut dynamic_index = HashMap::<(TraceValueId, TraceRep), u16>::default();
         let mut writes = Vec::with_capacity(frame.writes.len());
 
         for write in &frame.writes {
@@ -5587,7 +5589,7 @@ impl CraneliftBackend {
         binary_signature.params.push(AbiParam::new(types::F64));
         binary_signature.returns.push(AbiParam::new(types::F64));
 
-        let mut scalar_helpers = HashMap::with_capacity(scalar_symbols.len());
+        let mut scalar_helpers = HashMap::with_capacity_and_hasher(scalar_symbols.len(), Default::default());
         for &(name, address) in &scalar_symbols {
             let signature = if address == native_frem as usize {
                 &binary_signature
@@ -5824,11 +5826,11 @@ struct CraneliftLoweringState<'a, 'p> {
     heap_barrier_signature: codegen::ir::SigRef,
     /// Direct CLIF references to JITModule-imported scalar helpers.
     scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
-    values: Vec<Option<Value>>,
+    values: &'p mut [Option<Value>],
     /// Current moving-object address for a GuardHeapObject result. Valid only
     /// until the next full runtime/GC epoch. This is a backend-local lowering
     /// cache, not a Trace IR optimization pass.
-    heap_addresses: Vec<Option<Value>>,
+    heap_addresses: &'p mut [Option<Value>],
     /// Dominating kind/liveness proofs for tagged operands within a GC epoch.
     /// Metadata is reloaded separately because promise state can change.
     heap_entries: HashMap<(TraceValueId, u32), (Value, Value)>,
@@ -5981,8 +5983,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
     fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
-        let scalar_helpers = backend.scalar_helpers.clone();
-        let CraneliftBackend { module, context, function_context, .. } = backend;
+        let CraneliftBackend { module, context, function_context, scalar_helpers, .. } = backend;
+        let arena = bumpalo::Bump::new();
         context.clear();
         let pointer_type = module.target_config().pointer_type();
 
@@ -6045,23 +6047,23 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 runtime_signature,
                 heap_barrier_signature,
                 scalar_helper_refs,
-                values: vec![None; self.trace.values.len()],
-                heap_addresses: vec![None; self.trace.values.len()],
-                heap_entries: HashMap::new(),
-                heap_live_entries: HashMap::new(),
-                heap_data: HashMap::new(),
-                heap_len: HashMap::new(),
-                heap_metadata: HashMap::new(),
-                heap_receiver_class: HashMap::new(),
-                list_indices: HashMap::new(),
-                list_lengths: HashMap::new(),
-                bounds_proofs: HashSet::new(),
-                constant_index_proofs: HashSet::new(),
-                map_shape_proofs: HashSet::new(),
-                string_key_proofs: HashSet::new(),
-                shared_constant_exit_blocks: HashMap::new(),
-                forwarded_heap_loads: HashMap::new(),
-                forwarded_absolute_loads: HashMap::new(),
+                values: arena.alloc_slice_fill_copy(self.trace.values.len(), None),
+                heap_addresses: arena.alloc_slice_fill_copy(self.trace.values.len(), None),
+                heap_entries: HashMap::default(),
+                heap_live_entries: HashMap::default(),
+                heap_data: HashMap::default(),
+                heap_len: HashMap::default(),
+                heap_metadata: HashMap::default(),
+                heap_receiver_class: HashMap::default(),
+                list_indices: HashMap::default(),
+                list_lengths: HashMap::default(),
+                bounds_proofs: HashSet::default(),
+                constant_index_proofs: HashSet::default(),
+                map_shape_proofs: HashSet::default(),
+                string_key_proofs: HashSet::default(),
+                shared_constant_exit_blocks: HashMap::default(),
+                forwarded_heap_loads: HashMap::default(),
+                forwarded_absolute_loads: HashMap::default(),
                 runtime_context: None,
                 execute_callee: None,
                 heap_barrier_callee: None,
@@ -6088,7 +6090,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 }
             }
 
-            let mut preheader_nodes = vec![false; self.trace.nodes.len()];
+            let preheader_nodes = arena.alloc_slice_fill_copy(self.trace.nodes.len(), false);
             for &id in &self.trace.preheader {
                 preheader_nodes[id] = true;
                 let node = &self.trace.nodes[id];
@@ -6876,11 +6878,10 @@ impl CraneliftLoweringState<'_, '_> {
         exit_id: SideExitId,
         failure_condition: Value,
     ) -> Result<(), TracingJitError> {
-        let plan = self
-            .exit_plans
+        let exit_plans = self.exit_plans;
+        let plan = exit_plans
             .get(exit_id.0 as usize)
-            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
-            .clone();
+            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?;
 
         let failure_condition = self.bool32(failure_condition);
         let resume = self.builder.create_block();
@@ -6929,11 +6930,10 @@ impl CraneliftLoweringState<'_, '_> {
         &mut self,
         exit_id: SideExitId,
     ) -> Result<(), TracingJitError> {
-        let plan = self
-            .exit_plans
+        let exit_plans = self.exit_plans;
+        let plan = exit_plans
             .get(exit_id.0 as usize)
-            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
-            .clone();
+            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?;
         self.materialize_exit_or_native_link(&plan)
     }
 
@@ -9154,8 +9154,8 @@ impl TracingJit {
         Self {
             options,
             backend: None,
-            loops: HashMap::new(),
-            entries: HashMap::new(),
+            loops: HashMap::default(),
+            entries: HashMap::default(),
             traces: Vec::new(),
             entry_table: Vec::new(),
             link_table_ptrs: Vec::new(),
@@ -10091,6 +10091,54 @@ impl TracingJit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_decodes_arguments_and_stops_recording_before_runtime_effects() {
+        struct NoRuntime;
+        impl TraceRuntime for NoRuntime {
+            type RuntimeError = std::io::Error;
+            fn trace_program(&self) -> &BytecodeProgram { panic!("unexpected runtime access") }
+            fn trace_current_location(&self) -> TraceLocation { panic!("unexpected runtime access") }
+            fn trace_read_slot(&self, _: FrameSlot) -> Result<RegisterWord, Self::RuntimeError> { panic!("unexpected runtime access") }
+            fn trace_write_slot(&mut self, _: FrameSlot, _: RegisterWord) -> Result<(), Self::RuntimeError> { panic!("unexpected runtime access") }
+            fn trace_set_location(&mut self, _: TraceLocation) -> Result<(), Self::RuntimeError> { panic!("unexpected runtime access") }
+            fn trace_execute_unfused_step(&mut self) -> Result<TraceStep, Self::RuntimeError> { panic!("unexpected execution") }
+            fn trace_execute_call_to_return(&mut self) -> Result<TraceStep, Self::RuntimeError> { panic!("unexpected execution") }
+            fn trace_activation_inputs(&mut self) -> Result<TraceActivationInputs, Self::RuntimeError> { panic!("unexpected runtime access") }
+            fn trace_unsupported_constant_error(&self, _: TraceConstant) -> Self::RuntimeError { panic!("unexpected runtime access") }
+        }
+
+        // Exercise both inline and spilled argument storage in the decoder.
+        for count in [0, 4, 16] {
+            let args: Vec<_> = (0..count).map(Reg).collect();
+            let mut assembler = crate::napalm_bytecode::Assembler::new();
+            let pc = assembler.emit_launch(Reg(17), Reg(16), &args).unwrap();
+            let mut program = BytecodeProgram::new();
+            program.push_function(BytecodeFunction {
+                id: FuncId(0), module: crate::napalm_ir::ModuleId(0),
+                kind: crate::napalm_ir::FunctionKind::ModuleBody,
+                is_async: false, is_concurrent: false, field_owner: None,
+                name: StringId(0), arity: 0, capture_count: 0,
+                frame: crate::napalm_bytecode::FrameLayout {
+                    general_register_count: 18, parameters: vec![], captures: vec![],
+                    return_kind: RegisterKind::Value,
+                },
+                chunk: assembler.finish().unwrap(),
+            }).unwrap();
+            let location = TraceLocation::new(FuncId(0), pc);
+            let op = decode_at(&program, location).unwrap();
+            assert_eq!(op.args.as_slice(), args.as_slice());
+            let options = TracingJitOptions::default();
+            let recorder = TraceRecorder::new(&options, TraceId(0), location);
+            let mut builder = crate::napalm_trace_ir::TraceBuilder::new(
+                TraceId(0), TraceAnchor { kind: TraceKind::Loop, location },
+            );
+            let result = recorder.translate_native(&NoRuntime, &program,
+                &program.functions[0], &op, &mut builder);
+            assert!(matches!(result, Err(RecordingAbort::UnsupportedOpcode(Opcode::Launch))));
+            assert!(builder.trace().nodes.is_empty());
+        }
+    }
 
     fn run_scalar_trace(trace: &Trace, registers: &mut [RegisterWord], epoch: u64, budget: u32) -> u32 {
         unsafe extern "C" fn unexpected_runtime(_: *mut TraceActivation, _: u32, _: u32, _: u32) -> u32 { panic!("unexpected runtime") }

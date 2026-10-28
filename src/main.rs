@@ -37,6 +37,7 @@
 #![allow(warnings)]
 
 pub mod napalm_builtin;
+pub mod napalm_collections;
 pub mod napalm_bytecode;
 pub mod napalm_bytecodecompiler;
 pub mod napalm_front;
@@ -54,6 +55,10 @@ pub mod napalm_ir_optimizer;
 pub mod napalm_ir_optimizing;
 pub mod napalm_ir_escape;
 pub mod napalm_pipeline;
+
+#[cfg(test)]
+#[path = "tests/compiler_perf.rs"]
+mod compiler_perf;
 
 use std::env;
 use std::ffi::OsStr;

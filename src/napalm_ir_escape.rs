@@ -36,7 +36,7 @@
 
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::napalm_ir::{
@@ -1034,7 +1034,7 @@ impl Analysis {
     fn run(function: &Function) -> Self {
         let cfg = Cfg::build(function);
         let mut candidates = Vec::new();
-        let mut index_of: HashMap<ValueId, usize> = HashMap::new();
+        let mut index_of: HashMap<ValueId, usize> = HashMap::default();
 
         for &block in &cfg.rpo {
             for (pos, &inst) in function.blocks[block].insts.iter().enumerate() {
@@ -1086,7 +1086,7 @@ impl Analysis {
             }
         }
 
-        let mut uses: Vec<HashMap<usize, Vec<Use>>> = vec![HashMap::new(); candidates.len()];
+        let mut uses: Vec<HashMap<usize, Vec<Use>>> = vec![HashMap::default(); candidates.len()];
         let mut seen: SmallVec<[ValueId; 8]> = SmallVec::new();
         for &block in &cfg.rpo {
             for (pos, &inst) in function.blocks[block].insts.iter().enumerate() {
@@ -1503,8 +1503,8 @@ struct SsaBuilder {
 impl SsaBuilder {
     fn new(blocks: usize, var_types: Vec<Option<Type>>) -> Self {
         Self {
-            defs: vec![HashMap::new(); blocks],
-            entry: vec![HashMap::new(); blocks],
+            defs: vec![HashMap::default(); blocks],
+            entry: vec![HashMap::default(); blocks],
             processed: vec![false; blocks],
             pending: Vec::new(),
             new_params: vec![Vec::new(); blocks],
@@ -1597,8 +1597,8 @@ fn run_round(function: &mut Function, stats: &mut ScalarReplacementStats) -> boo
     let layout = VarLayout::new(&analysis.candidates, &selected);
     let mut var_types = vec![None; layout.total];
     let mut selected_mask = vec![false; analysis.candidates.len()];
-    let mut alloc_of = HashMap::new();
-    let mut events: HashMap<(usize, usize), SmallVec<[(usize, UseOp); 2]>> = HashMap::new();
+    let mut alloc_of = HashMap::default();
+    let mut events: HashMap<(usize, usize), SmallVec<[(usize, UseOp); 2]>> = HashMap::default();
     for &index in &selected {
         selected_mask[index] = true;
         var_types[layout.reference(index)] = Some(analysis.candidates[index].ty.clone());
@@ -1635,7 +1635,7 @@ fn run_round(function: &mut Function, stats: &mut ScalarReplacementStats) -> boo
         events,
         fixed: vec![SmallVec::new(); analysis.candidates.len()],
         state: vec![VState::Unknown; analysis.candidates.len()],
-        rewritten: HashSet::new(),
+        rewritten: HashSet::default(),
         stats: ScalarReplacementStats::default(),
     };
 

@@ -5,7 +5,7 @@
 //! are much simpler and therefore permit stronger forwarding.
 
 use super::*;
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 
 fn execution_order(trace: &Trace) -> Vec<usize> {
     let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
@@ -40,8 +40,8 @@ pub struct ArchitecturalLoadForwarding;
 
 impl TraceOptimization for ArchitecturalLoadForwarding {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut frames = HashMap::<(FrameSlot, TraceRep), TraceValueId>::new();
-        let mut absolute = HashMap::<u64, TraceValueId>::new();
+        let mut frames = HashMap::<(FrameSlot, TraceRep), TraceValueId>::default();
+        let mut absolute = HashMap::<u64, TraceValueId>::default();
         let mut changed = false;
 
         for id in execution_order(trace) {
@@ -129,7 +129,7 @@ pub struct DeadStoreElimination;
 
 impl TraceOptimization for DeadStoreElimination {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut pending = HashMap::<DeadStoreKey, usize>::new();
+        let mut pending = HashMap::<DeadStoreKey, usize>::default();
         let mut changed = false;
 
         for id in execution_order(trace) {

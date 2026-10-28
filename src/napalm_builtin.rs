@@ -242,6 +242,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::FfiLibrary,
         BuiltinClass::FfiFunction,
         BuiltinClass::FfiPointer,
+        BuiltinClass::Response,
+        BuiltinClass::Headers,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
@@ -476,6 +478,28 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, static_(BuiltinId::Timer), "microtask", MethodKind::Method, 1, NativeBuiltin::TimerMicrotask);
     manifest.register_native(program, static_(BuiltinId::Timer), "every", MethodKind::Method, 2, NativeBuiltin::TimerEvery);
 
+    // Global fetch() is represented by the ordinary core-static callable object.
+    // The VM-native implementation starts asynchronous HTTP work and immediately
+    // returns a cancellable Napalm Promise<Response>.
+    manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);
+    manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 2, NativeBuiltin::FetchCall);
+
+    let response = instance(BuiltinClass::Response);
+    manifest.register_native(program, response, "status", MethodKind::Getter, 0, NativeBuiltin::ResponseStatus);
+    manifest.register_native(program, response, "statusText", MethodKind::Getter, 0, NativeBuiltin::ResponseStatusText);
+    manifest.register_native(program, response, "ok", MethodKind::Getter, 0, NativeBuiltin::ResponseOk);
+    manifest.register_native(program, response, "url", MethodKind::Getter, 0, NativeBuiltin::ResponseUrl);
+    manifest.register_native(program, response, "redirected", MethodKind::Getter, 0, NativeBuiltin::ResponseRedirected);
+    manifest.register_native(program, response, "headers", MethodKind::Getter, 0, NativeBuiltin::ResponseHeaders);
+    manifest.register_native(program, response, "data", MethodKind::Getter, 0, NativeBuiltin::ResponseData);
+    manifest.register_native(program, response, "bodyUsed", MethodKind::Getter, 0, NativeBuiltin::ResponseBodyUsed);
+    manifest.register_native(program, response, "json", MethodKind::Method, 0, NativeBuiltin::ResponseJson);
+    manifest.register_native(program, response, "text", MethodKind::Method, 0, NativeBuiltin::ResponseText);
+
+    let headers = instance(BuiltinClass::Headers);
+    manifest.register_native(program, headers, "get", MethodKind::Method, 1, NativeBuiltin::HeadersGet);
+    manifest.register_native(program, headers, "has", MethodKind::Method, 1, NativeBuiltin::HeadersHas);
+
     // Dynamic C FFI. The embedding Host::call_foreign API remains a separate
     // mechanism; these objects are user-visible handles to dlopen/LoadLibrary +
     // libffi calls made by the VM itself.
@@ -551,6 +575,10 @@ pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &Builtin
             }
         }
     }
+    // Worker VMs need the same stock primitive/native manifest as the parent.
+    // Store a clone only after all bindings have been installed so `launch` can
+    // lazily create isolated worker interpreters with identical core semantics.
+    interpreter.set_builtin_manifest(manifest.clone());
 }
 
 pub struct BuiltinHost {

@@ -17,12 +17,13 @@
 #![allow(clippy::needless_return)]
 
 use std::any::Any;
-use hashbrown::HashMap;
+use crate::napalm_collections::HashMap;
 use std::collections::VecDeque;
 use std::mem::{discriminant, replace, Discriminant};
 use std::marker::PhantomData;
 
 use smallvec::SmallVec;
+use smallbox::{SmallBox, smallbox, space::S1};
 
 use crate::napalm_ir::{
     verify_function, BlockId, EffectBehavior, EffectDef, EffectId, EffectValue, Function, Inst,
@@ -737,7 +738,7 @@ pub trait OptimizationWIR {
 
 pub struct OptimizationPass {
     pub optimizations: SmallVec<[Box<dyn OptimizationWIR>; 8]>,
-    pass_meta: Option<Box<dyn Any>>,
+    pass_meta: Option<SmallBox<dyn Any, S1>>,
     by_tag: HashMap<Discriminant<Inst>, SmallVec<[usize; 8]>>,
 }
 
@@ -746,12 +747,12 @@ impl OptimizationPass {
         Self {
             optimizations: SmallVec::from_vec(optimizations),
             pass_meta: None,
-            by_tag: HashMap::new(),
+            by_tag: HashMap::default(),
         }
     }
 
     pub fn initialize(&mut self, meta: impl Any) {
-        self.pass_meta = Some(Box::new(meta));
+        self.pass_meta = Some(smallbox!(meta));
         let metadata: &dyn Any = self.pass_meta.as_deref().expect("metadata just installed");
         for optimization in &mut self.optimizations {
             optimization.set_metadata_any(metadata);
@@ -884,7 +885,7 @@ pub trait FunctionOptimization {
 
 enum OptimizationStage {
     Nodes(OptimizationPass),
-    Function(Box<dyn FunctionOptimization>),
+    Function(SmallBox<dyn FunctionOptimization, S1>),
 }
 
 pub struct Optimize {
@@ -918,7 +919,7 @@ impl Optimize {
         pass: impl FunctionOptimization + 'static,
     ) -> Self {
         self.stages
-            .push(OptimizationStage::Function(Box::new(pass)));
+            .push(OptimizationStage::Function(smallbox!(pass)));
         self
     }
 

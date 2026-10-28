@@ -5,7 +5,7 @@
 //! registers but preserve unaffected SSA values across the call. Runtime-written result
 //! slots are explicitly reloaded afterwards.
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_NAPALM_ARITY};
 use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId, Type};
 
@@ -377,7 +377,7 @@ impl TraceInst {
     }
 }
 #[derive(Clone, Debug)]
-pub struct TraceNode { pub id: usize, pub kind: TraceInst, pub results: Vec<TraceValueId>, pub source: TraceLocation }
+pub struct TraceNode { pub id: usize, pub kind: TraceInst, pub results: smallvec::SmallVec<[TraceValueId; 1]>, pub source: TraceLocation }
 #[derive(Clone, Copy, Debug)]
 pub enum ExitReason { GuardTruthy, GuardFalsey, GuardValue, GuardNotNull, GuardInteger, GuardUnsignedInteger, GuardNumber, GuardBounds }
 #[derive(Clone, Copy, Debug)]
@@ -521,7 +521,7 @@ impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
-            slots: HashMap::new(), proven_types: HashMap::new(), dirty: vec![], dirty_set: HashSet::new(), memory_epoch: false }
+            slots: HashMap::default(), proven_types: HashMap::default(), dirty: vec![], dirty_set: HashSet::default(), memory_epoch: false }
     }
     /// Reserve the arenas used by one bounded recording up front. Tracing is hot
     /// enough that repeated Vec/HashMap growth is measurable, while the reservation
@@ -583,12 +583,12 @@ impl TraceBuilder {
     }
     pub fn emit0(&mut self, kind: TraceInst) {
         let id = self.trace.nodes.len();
-        self.trace.nodes.push(TraceNode { id, kind, results: vec![], source: self.source });
+        self.trace.nodes.push(TraceNode { id, kind, results: smallvec::smallvec![], source: self.source });
     }
     pub fn emit1(&mut self, kind: TraceInst, ty: TraceType, rep: TraceRep) -> TraceValueId {
         let node = self.trace.nodes.len();
         let v = self.value(ty, rep, TraceValueOrigin::InstResult { node });
-        self.trace.nodes.push(TraceNode { id: node, kind, results: vec![v], source: self.source }); v
+        self.trace.nodes.push(TraceNode { id: node, kind, results: smallvec::smallvec![v], source: self.source }); v
     }
     pub fn add_side_exit(&mut self, _reason: ExitReason, pc: BytecodePc) -> SideExitId {
         let writes = self.dirty.iter().map(|slot| {
@@ -866,7 +866,7 @@ impl TraceBuilder {
             if let Some(slot) = slot {
                 value.origin = TraceValueOrigin::InstResult { node: prefix.len() };
                 prefix.push(TraceNode { id: prefix.len(), kind: TraceInst::LoadFrameSlot { slot },
-                    results: vec![value.id], source: self.trace.anchor.location });
+                    results: smallvec::smallvec![value.id], source: self.trace.anchor.location });
             }
         }
         prefix.append(&mut self.trace.nodes);
@@ -884,7 +884,8 @@ impl TraceBuilder {
 /// before handing a trace to the unsafe native backend.
 pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     let mut errors = vec![];
-    let mut available = vec![false; t.values.len()];
+    let arena = bumpalo::Bump::new();
+    let mut available = arena.alloc_slice_fill_copy(t.values.len(), false);
     for (index, value) in t.values.iter().enumerate() {
         if value.id.0 as usize != index { errors.push("noncanonical value ID".into()); }
         available[index] = matches!(value.origin,
@@ -905,7 +906,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
                 if expected_key.len() > 64 {
                     errors.push("structural map PIC key exceeds shaped-key limit".into());
                 }
-                let mut shapes = HashSet::new();
+                let mut shapes = HashSet::default();
                 if entries.iter().any(|entry| !shapes.insert(entry.shape)) {
                     errors.push("structural map PIC contains duplicate shapes".into());
                 }
@@ -1009,7 +1010,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             } else { errors.push("unknown result".into()); }
         }
     };
-    let mut preheader = vec![false; t.nodes.len()];
+    let preheader = arena.alloc_slice_fill_copy(t.nodes.len(), false);
     for &id in &t.preheader {
         let Some(node) = t.nodes.get(id) else {
             errors.push("unknown preheader node".into());
@@ -1028,7 +1029,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     }
     // Check all initial values before publishing any loop parameters. This
     // rejects body-only initializers even when the backedge could supply them.
-    let mut phi_values = HashSet::new();
+    let mut phi_values = HashSet::default();
     for phi in &t.loop_phis {
         let initial_ok = is_available(phi.initial, &available)
             && t.value(t.canonical_value(phi.initial)).is_some_and(|v| {

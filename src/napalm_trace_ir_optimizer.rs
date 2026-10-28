@@ -4,6 +4,7 @@
 //! become aliases; all uses, including deoptimization snapshots, are repaired.
 
 use crate::napalm_trace_ir::*;
+use smallbox::{SmallBox, smallbox, space::S1};
 
 pub trait TraceOptimization {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool;
@@ -14,7 +15,8 @@ pub trait TraceOptimization {
 }
 
 pub struct Optimize {
-    passes: Vec<Box<dyn TraceOptimization>>,
+    // Most passes are zero-sized; S1 also fits their small configuration flags.
+    passes: Vec<SmallBox<dyn TraceOptimization, S1>>,
     verify_after_each_pass: bool,
 }
 
@@ -33,7 +35,7 @@ impl Optimize {
     }
 
     pub fn with_pass(mut self, pass: impl TraceOptimization + 'static) -> Self {
-        self.passes.push(Box::new(pass));
+        self.passes.push(smallbox!(pass));
         self
     }
 
@@ -44,9 +46,14 @@ impl Optimize {
 
     pub fn optimize_trace(&mut self, trace: &mut Trace) -> Result<(), Vec<String>> {
         verify_trace(trace)?;
+        let mut arena = bumpalo::Bump::new();
         for pass in &mut self.passes {
             pass.optimize_trace(trace);
-            canonicalize_references(trace);
+            arena.reset();
+            let aliases = arena.alloc_slice_fill_with(trace.values.len(), |index| {
+                trace.canonical_value(TraceValueId(index as u32))
+            });
+            apply_canonical_references(trace, aliases);
             if self.verify_after_each_pass {
                 verify_trace(trace).map_err(|errors| {
                     errors
@@ -84,11 +91,15 @@ pub(crate) fn alias_value(trace: &mut Trace, from: TraceValueId, to: TraceValueI
 }
 
 pub(crate) fn canonicalize_references(trace: &mut Trace) {
-    let aliases: Vec<_> = trace
+    let aliases: smallvec::SmallVec<[TraceValueId; 32]> = trace
         .values
         .iter()
         .map(|v| trace.canonical_value(v.id))
         .collect();
+    apply_canonical_references(trace, &aliases);
+}
+
+fn apply_canonical_references(trace: &mut Trace, aliases: &[TraceValueId]) {
     // Preserve invalid references for the verifier instead of panicking when a
     // custom pass produces malformed IR.
     let resolve = |v: &mut TraceValueId| {
@@ -144,7 +155,7 @@ pub(crate) fn append_preheader(
     trace.nodes.push(TraceNode {
         id: node,
         kind,
-        results: vec![id],
+        results: smallvec::smallvec![id],
         source,
     });
     trace.preheader.push(node);

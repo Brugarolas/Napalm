@@ -21,9 +21,10 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
-use hashbrown::HashMap;
+use crate::napalm_collections::HashMap;
 use std::fmt;
 use smallvec::SmallVec;
+use compact_str::CompactString;
 
 macro_rules! id_newtype {
     ($name:ident, $repr:ty) => {
@@ -459,14 +460,16 @@ pub enum BuiltinId {
     Promise = 14,
     Timer = 15,
     FFI = 16,
+    /// Global JavaScript-compatible asynchronous HTTP function object.
+    Fetch = 17,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
-        Self::Timer, Self::FFI,
+        Self::Timer, Self::FFI, Self::Fetch,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -480,6 +483,7 @@ impl BuiltinId {
             Self::Promise => "Promise",
             Self::Timer => "Timer",
             Self::FFI => "FFI",
+            Self::Fetch => "fetch",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
@@ -822,6 +826,13 @@ pub enum Inst {
     /// Known closure value after proving the callee is a closure.
     CallClosure {
         conv: CallConv,
+        closure: ValueId,
+        args: Vec<ValueId>,
+    },
+    /// Launch a closure marked `concurrent` on the isolated worker pool. The
+    /// result is always a Promise; arguments cross the boundary through the
+    /// structured-copy transport and never expose caller heap objects.
+    Launch {
         closure: ValueId,
         args: Vec<ValueId>,
     },
@@ -1204,6 +1215,7 @@ impl Inst {
             | InvokeSuper { .. }
             | CallDirect { .. }
             | CallClosure { .. }
+            | Launch { .. }
             | CallPrimitive { .. } => B::Chain(E::Call),
 
             CallForeign { .. } => B::Chain(E::Foreign),
@@ -1306,6 +1318,7 @@ impl Inst {
                 | InvokeSuper { .. }
                 | CallDirect { .. }
                 | CallClosure { .. }
+                | Launch { .. }
                 | TailInvoke { .. }
                 | TailInvokeSuper { .. }
                 | TailCallDirect { .. }
@@ -1416,6 +1429,7 @@ impl Inst {
             | InvokeSuper { .. }
             | CallDirect { .. }
             | CallClosure { .. }
+            | Launch { .. }
             | CallPrimitive { .. }
             | CallForeign { .. }
             | CreateClass { .. }
@@ -1583,6 +1597,7 @@ impl Inst {
             | CallPrimitive { args, .. }
             | CallForeign { args, .. } => out.extend_from_slice(args),
             CallClosure { closure, args, .. }
+            | Launch { closure, args }
             | TailCallClosure { closure, args, .. } => {
                 out.push(*closure);
                 out.extend_from_slice(args);
@@ -1810,6 +1825,7 @@ impl Inst {
                 }
             }
             CallClosure { closure, args, .. }
+            | Launch { closure, args }
             | TailCallClosure { closure, args, .. } => {
                 f(closure);
                 for value in args {
@@ -2053,6 +2069,9 @@ pub struct Function {
     /// contain `Await` instructions. The ordinary FunctionKind remains unchanged
     /// so method/receiver ABI rules stay identical.
     pub is_async: bool,
+    /// Concurrent functions are isolated worker entrypoints. Ordinary calls to
+    /// them are rejected by the runtime; `launch` is the only legal entry path.
+    pub is_concurrent: bool,
     /// Class whose instance-field layout this function was compiled against.
     ///
     /// This is set for methods and for closures lexically nested inside methods.
@@ -2111,8 +2130,8 @@ pub struct Program {
     pub structural_layouts: Vec<StructuralLayoutInfo>,
     structural_layout_index: HashMap<Type, StructuralLayoutId>,
 
-    strings: Vec<String>,
-    string_index: HashMap<String, StringId>,
+    strings: Vec<CompactString>,
+    string_index: HashMap<CompactString, StringId>,
     methods: Vec<MethodSignature>,
     method_index: HashMap<MethodSignature, MethodSymbol>,
 }
@@ -2129,14 +2148,14 @@ impl Program {
         }
 
         let id = StringId(self.strings.len() as u32);
-        let owned = value.to_owned();
+        let owned = CompactString::new(value);
         self.strings.push(owned.clone());
         self.string_index.insert(owned, id);
         id
     }
 
     pub fn string(&self, id: StringId) -> Option<&str> {
-        self.strings.get(id.0 as usize).map(String::as_str)
+        self.strings.get(id.0 as usize).map(CompactString::as_str)
     }
 
     /// Canonicalize a structural interface/record independently from hidden
@@ -2393,6 +2412,7 @@ impl<'p> Builder<'p> {
             module,
             kind,
             is_async: false,
+            is_concurrent: false,
             field_owner: None,
             signature: Signature {
                 name,
@@ -2943,6 +2963,11 @@ impl<'p> Builder<'p> {
         self.function.is_async = is_async;
     }
 
+    /// Marks this function as an isolated parallel entrypoint.
+    pub fn set_concurrent(&mut self, is_concurrent: bool) {
+        self.function.is_concurrent = is_concurrent;
+    }
+
     pub fn finish(self) -> FuncId {
         for (index, node) in self.function.nodes.iter().enumerate() {
             debug_assert_eq!(node.id.0 as usize, index);
@@ -3347,8 +3372,11 @@ impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "func {:?} {:?}{}({:?}) -> {:?}",
-            self.id, self.kind, if self.is_async { " async" } else { "" }, self.signature.params, self.signature.result
+            "func {:?} {:?}{}{}({:?}) -> {:?}",
+            self.id, self.kind,
+            if self.is_async { " async" } else { "" },
+            if self.is_concurrent { " concurrent" } else { "" },
+            self.signature.params, self.signature.result
         )?;
 
         if !self.captures.is_empty() {

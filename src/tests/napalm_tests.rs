@@ -52,7 +52,7 @@ fn napalm_spread_and_destructuring_use_dedicated_bytecode() {
     let lowered = lower_module(&mut hir, "ops.nap", source, "ops", &parsed.module);
     assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
     let mut program = compile_program(&mut hir).unwrap();
-    let opcodes: std::collections::HashSet<_> = program.functions.iter()
+    let opcodes: crate::napalm_collections::HashSet<_> = program.functions.iter()
         .flat_map(|function| Decoder::new(&function.chunk.code).map(|op| op.unwrap().opcode)).collect();
     for opcode in [Opcode::ListSpread, Opcode::MapSpread, Opcode::DestructureCheck,
         Opcode::DestructureGet, Opcode::DestructureRest, Opcode::InvokeSpread] {

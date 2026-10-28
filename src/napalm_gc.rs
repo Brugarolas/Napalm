@@ -17,7 +17,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
-use std::rc::Rc;
+use rclite::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock};
 use std::sync::{Arc, Weak};

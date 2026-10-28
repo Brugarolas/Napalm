@@ -17,20 +17,23 @@ ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 #papaya = "0.2.5" # Concurrent hash map
 #small-map = "0.1.5" # Small map optimization
-#smallbox = "0.8.8" # Small Box<T> optimization
+smallbox = "0.8.8" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
-#compact_str = "0.10.0" # String drop-in replacement
+compact_str = "0.10.0" # String drop-in replacement
 parking_lot = "0.13.0" # Concurrency primitives
 #trc = "1.2.4" # Alternative to Trc with one non-atomic counter per thread and another general atomic-counter for all threads
 #archery = "1.2.1" # Faster Arc
 triomphe = "0.1.14" # Faster Arc
-#rclite = "0.4.2" # Optimized Rc for memory usage
-simd-json = "0.19.0" # High-performance JSON parsing and serialization
-reqwest = "0.13.5" # HTTP client
+rclite = "0.4.2" # Optimized Rc for memory usage
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
 
-#bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
-cranelift = { version = "0.137.0", features = ["jit", "module", "native"] } #JIT
-mmtk = { version = "0.33.0", path = "crates/mmtk/" }
 libffi = "5.2.0" # Native C calls
 libloading = "0.9.0" # Dynamic library loading
+crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
+
+bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
+cranelift = { version = "0.137.0", features = ["jit", "module", "native"] } #JIT
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net"] }
+simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] }
+mmtk = { version = "0.33.0", path = "crates/mmtk/" } # Garbage Collector, my own fork for having Windows support

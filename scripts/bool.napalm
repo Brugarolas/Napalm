@@ -1,22 +1,22 @@
-print("===== Boolean basics =====");
+System.print("===== Boolean basics =====");
 let t = true;
 let f = false;
-print(t);           // expect true
-print(f);           // expect false
-print(!t);          // expect false
-print(!f);          // expect true
+System.print(t);           // expect true
+System.print(f);           // expect false
+System.print(!t);          // expect false
+System.print(!f);          // expect true
 
-print("===== Boolean control flow =====");
+System.print("===== Boolean control flow =====");
 if (t) {
-    print("true branch");   // expect "true branch"
+    System.print("true branch");   // expect "true branch"
 }
 
 if (f) {
-    print("unreachable");
+    System.print("unreachable");
 } else {
-    print("false branch");  // expect "false branch"
+    System.print("false branch");  // expect "false branch"
 }
 
-print("===== Boolean equality =====");
-print(t == f);      // expect false
-print(t != f);      // expect true
+System.print("===== Boolean equality =====");
+System.print(t == f);      // expect false
+System.print(t != f);      // expect true

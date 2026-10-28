@@ -17,7 +17,7 @@ use crate::napalm_front::{self, Diagnostic, ModuleAst};
 use crate::napalm_ir::Program;
 use crate::napalm_lowerer::{self, LowerOptions, LoweredModule};
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -412,7 +412,7 @@ pub fn compile_module_graph_with_resolver(
 ) -> Result<CompiledModuleGraph, ModuleError> {
     let entry = resolver.resolve_entry(entry)?;
     let mut modules = Vec::<ParsedModule>::new();
-    let mut module_by_path = HashMap::<PathBuf, usize>::new();
+    let mut module_by_path = HashMap::<PathBuf, usize>::default();
     let mut pending = Vec::<usize>::new();
     let mut diagnostics = Vec::<ModuleDiagnosticSource>::new();
 
@@ -547,7 +547,7 @@ fn load_parsed_module(
         canonical_name: resolved.canonical_name.clone(),
         source,
         ast: parsed.module,
-        import_map: HashMap::new(),
+        import_map: HashMap::default(),
     });
     module_by_path.insert(resolved.path.clone(), index);
     pending.push(index);
@@ -591,7 +591,7 @@ fn extend_env_paths(out: &mut Vec<PathBuf>, variable: &str) {
 }
 
 fn dedupe_roots(roots: &mut Vec<PathBuf>) {
-    let mut seen = HashSet::<OsString>::new();
+    let mut seen = HashSet::<OsString>::default();
     roots.retain(|root| {
         let normalized = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         seen.insert(normalized.into_os_string())

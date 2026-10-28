@@ -28,9 +28,11 @@
 #![allow(clippy::type_complexity)]
 
 use std::cmp::Reverse;
-use hashbrown::HashMap;
+use crate::napalm_collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
+use bumpalo::{Bump, collections::Vec as BumpVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::napalm_bytecode::{
     encode_bailout_reason, function_kind_uses_this, opcode_for_f64_bin,
@@ -103,7 +105,7 @@ impl Default for CompileOptions {
             omit_fallthrough_jumps: true,
             emit_source_map: true,
             instrument_blocks: false,
-            resume_bindings: HashMap::new(),
+            resume_bindings: HashMap::default(),
         }
     }
 }
@@ -329,15 +331,15 @@ pub fn compile_program_with_options(
 // =============================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BitSet {
-    words: Vec<u64>,
+struct BitSet<'arena> {
+    words: BumpVec<'arena, u64>,
     bits: usize,
 }
 
-impl BitSet {
-    fn new(bits: usize) -> Self {
+impl<'arena> BitSet<'arena> {
+    fn new(bits: usize, arena: &'arena Bump) -> Self {
         Self {
-            words: vec![0; (bits + 63) / 64],
+            words: bumpalo::vec![in arena; 0; bits.div_ceil(64)],
             bits,
         }
     }
@@ -378,7 +380,7 @@ impl BitSet {
     }
 
 
-    fn iter_ones(&self) -> BitSetOnes<'_> {
+    fn iter_ones(&self) -> BitSetOnes<'_, 'arena> {
         BitSetOnes {
             set: self,
             word_index: 0,
@@ -387,13 +389,13 @@ impl BitSet {
     }
 }
 
-struct BitSetOnes<'a> {
-    set: &'a BitSet,
+struct BitSetOnes<'a, 'arena> {
+    set: &'a BitSet<'arena>,
     word_index: usize,
     current: u64,
 }
 
-impl Iterator for BitSetOnes<'_> {
+impl Iterator for BitSetOnes<'_, '_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -506,30 +508,31 @@ fn build_cfg(function: &Function) -> Result<CfgInfo, CompileError> {
 }
 
 #[derive(Clone, Debug)]
-struct DeadCodeInfo {
+struct DeadCodeInfo<'arena> {
     live_nodes: Vec<bool>,
-    materialized_values: BitSet,
+    materialized_values: BitSet<'arena>,
 }
 
-fn mark_non_edge_operands(kind: &Inst) -> Vec<ValueId> {
+fn mark_non_edge_operands(kind: &Inst) -> SmallVec<[ValueId; 4]> {
     match kind {
-        Inst::Jump { .. } => Vec::new(),
-        Inst::Branch { cond, .. } => vec![*cond],
-        Inst::Switch { tag, .. } => vec![*tag],
-        _ => kind.operands().into_vec(),
+        Inst::Jump { .. } => SmallVec::new(),
+        Inst::Branch { cond, .. } => smallvec![*cond],
+        Inst::Switch { tag, .. } => smallvec![*tag],
+        _ => kind.operands(),
     }
 }
 
-fn analyze_dead_code(
+fn analyze_dead_code<'arena>(
+    arena: &'arena Bump,
     function: &Function,
     cfg: &CfgInfo,
     eliminate: bool,
-) -> Result<DeadCodeInfo, CompileError> {
+) -> Result<DeadCodeInfo<'arena>, CompileError> {
     let value_count = function.values.len();
     let node_count = function.nodes.len();
 
     if !eliminate {
-        let mut needed_values = BitSet::new(value_count);
+        let mut needed_values = BitSet::new(value_count, arena);
         for value in 0..value_count {
             needed_values.insert(value);
         }
@@ -540,7 +543,7 @@ fn analyze_dead_code(
     }
 
     let mut live_nodes = vec![false; node_count];
-    let mut needed_values = BitSet::new(value_count);
+    let mut needed_values = BitSet::new(value_count, arena);
     let mut node_queue = VecDeque::new();
     let mut value_queue = VecDeque::new();
 
@@ -775,12 +778,12 @@ fn filtered_edge_operands(
     function: &Function,
     edge: &crate::napalm_ir::Edge,
     materialized: &BitSet,
-) -> Result<Vec<ValueId>, CompileError> {
+) -> Result<SmallVec<[ValueId; 4]>, CompileError> {
     let target = function.block(edge.target).ok_or(CompileError::UnknownBlock {
         function: function.id,
         block: edge.target,
     })?;
-    let mut out = Vec::new();
+    let mut out = SmallVec::new();
     for (index, &arg) in edge.args.iter().enumerate() {
         let param = target.params[index];
         if materialized.contains(param.0 as usize) {
@@ -804,7 +807,7 @@ fn node_deopt_id(kind: &Inst) -> Option<DeoptId> {
     }
 }
 
-fn append_deopt_uses(function: &Function, node: &crate::napalm_ir::Node, out: &mut Vec<ValueId>) {
+fn append_deopt_uses(function: &Function, node: &crate::napalm_ir::Node, out: &mut SmallVec<[ValueId; 4]>) {
     let Some(deopt) = node_deopt_id(&node.kind) else {
         return;
     };
@@ -821,8 +824,8 @@ fn lowering_operands(
     function: &Function,
     node: &crate::napalm_ir::Node,
     materialized: &BitSet,
-) -> Result<Vec<ValueId>, CompileError> {
-    let mut out = Vec::new();
+) -> Result<SmallVec<[ValueId; 4]>, CompileError> {
+    let mut out = SmallVec::new();
     match &node.kind {
         Inst::Jump { edge } => {
             out.extend(filtered_edge_operands(function, edge, materialized)?);
@@ -856,23 +859,24 @@ fn lowering_operands(
 }
 
 #[derive(Clone, Debug)]
-struct LivenessInfo {
-    live_out: Vec<BitSet>,
+struct LivenessInfo<'arena> {
+    live_out: Vec<BitSet<'arena>>,
 }
 
-fn compute_liveness(
+fn compute_liveness<'arena>(
+    arena: &'arena Bump,
     function: &Function,
     cfg: &CfgInfo,
     dce: &DeadCodeInfo,
     layout: &[BlockId],
-) -> Result<LivenessInfo, CompileError> {
+) -> Result<LivenessInfo<'arena>, CompileError> {
     let value_count = function.values.len();
     let block_count = function.blocks.len();
     let mut uses = (0..block_count)
-        .map(|_| BitSet::new(value_count))
+        .map(|_| BitSet::new(value_count, arena))
         .collect::<Vec<_>>();
     let mut defs = (0..block_count)
-        .map(|_| BitSet::new(value_count))
+        .map(|_| BitSet::new(value_count, arena))
         .collect::<Vec<_>>();
 
     for block in &function.blocks {
@@ -914,29 +918,31 @@ fn compute_liveness(
     }
 
     let mut live_in = (0..block_count)
-        .map(|_| BitSet::new(value_count))
+        .map(|_| BitSet::new(value_count, arena))
         .collect::<Vec<_>>();
     let mut live_out = live_in.clone();
+    let mut new_out = BitSet::new(value_count, arena);
+    let mut new_in = BitSet::new(value_count, arena);
 
     loop {
         let mut changed = false;
         for &block in layout.iter().rev() {
             let index = block.0 as usize;
-            let mut new_out = BitSet::new(value_count);
+            new_out.words.fill(0);
             for successor in &cfg.successors[index] {
                 new_out.union_with(&live_in[successor.0 as usize]);
             }
 
-            let mut new_in = new_out.clone();
+            new_in.words.copy_from_slice(&new_out.words);
             new_in.subtract(&defs[index]);
             new_in.union_with(&uses[index]);
 
             if new_out != live_out[index] {
-                live_out[index] = new_out;
+                std::mem::swap(&mut live_out[index], &mut new_out);
                 changed = true;
             }
             if new_in != live_in[index] {
-                live_in[index] = new_in;
+                std::mem::swap(&mut live_in[index], &mut new_in);
                 changed = true;
             }
         }
@@ -1065,7 +1071,7 @@ fn build_intervals(
         let block_index = block_id.0 as usize;
         let block_start = positions.block_start[block_index];
         let block_end = positions.block_end[block_index];
-        let mut local: HashMap<usize, LiveRange> = HashMap::new();
+        let mut local: HashMap<usize, LiveRange> = HashMap::default();
 
         for value in liveness.live_out[block_index].iter_ones() {
             if dce.materialized_values.contains(value) {
@@ -1323,7 +1329,7 @@ fn allocate_registers(
         let interval = &intervals[interval_index];
         let value = interval.value;
 
-        let mut preferred_scores: HashMap<usize, u64> = HashMap::new();
+        let mut preferred_scores: HashMap<usize, u64> = HashMap::default();
         for &(other, weight) in &affinities.edges[value.0 as usize] {
             if let Some(reg) = value_regs[other.0 as usize] {
                 let score = preferred_scores.entry(reg.index()).or_default();
@@ -1554,7 +1560,7 @@ struct FunctionEmitter<'a> {
     program: &'a Program,
     function: &'a Function,
     options: &'a CompileOptions,
-    dce: &'a DeadCodeInfo,
+    dce: &'a DeadCodeInfo<'a>,
     allocation: &'a RegisterAllocation,
     positions: &'a PositionTable,
     layout: &'a [BlockId],
@@ -1575,7 +1581,7 @@ impl<'a> FunctionEmitter<'a> {
         program: &'a Program,
         function: &'a Function,
         options: &'a CompileOptions,
-        dce: &'a DeadCodeInfo,
+        dce: &'a DeadCodeInfo<'a>,
         allocation: &'a RegisterAllocation,
         positions: &'a PositionTable,
         layout: &'a [BlockId],
@@ -1602,11 +1608,11 @@ impl<'a> FunctionEmitter<'a> {
                 before_inst: vec![None; function.nodes.len()],
                 after_inst: vec![None; function.nodes.len()],
             },
-            constant_cache: HashMap::new(),
-            type_guard_cache: HashMap::new(),
-            class_guard_cache: HashMap::new(),
-            ic_cache: HashMap::new(),
-            trampoline_cache: HashMap::new(),
+            constant_cache: HashMap::default(),
+            type_guard_cache: HashMap::default(),
+            class_guard_cache: HashMap::default(),
+            ic_cache: HashMap::default(),
+            trampoline_cache: HashMap::default(),
             trampolines: Vec::new(),
             stats: FunctionCompileStats {
                 function: function.id,
@@ -1822,7 +1828,7 @@ impl<'a> FunctionEmitter<'a> {
         use Opcode::*;
         match opcode {
             Safepoint => SafepointKind::ExplicitPoll,
-            Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | CallPrimitive => SafepointKind::Call,
+            Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | Launch | CallPrimitive => SafepointKind::Call,
             CallForeign => SafepointKind::Foreign,
             ImportModule | ImportVariable => SafepointKind::Module,
             Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
@@ -2318,6 +2324,25 @@ impl FunctionEmitter<'_> {
                         self.result_reg(node)?,
                         self.reg(*closure)?,
                         *conv,
+                        &arg_regs,
+                    )
+                    .map_err(|error| self.assemble_error(error))?;
+                safepoint_transfer = CallTransfer::Closure {
+                    closure: *closure,
+                    args,
+                };
+                pc
+            }
+            Launch { closure, args } => {
+                let arg_regs = args
+                    .iter()
+                    .map(|value| self.reg(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let pc = self
+                    .assembler
+                    .emit_launch(
+                        self.result_reg(node)?,
+                        self.reg(*closure)?,
                         &arg_regs,
                     )
                     .map_err(|error| self.assemble_error(error))?;
@@ -2945,18 +2970,17 @@ impl FunctionEmitter<'_> {
         let _ = block;
     }
 
-    fn emit(mut self) -> Result<(BytecodeFunction, FunctionCompileInfo, FunctionCompileStats), CompileError> {
-        let layout = self.layout.to_vec();
+    fn emit(mut self) -> Result<(BytecodeFunction, PcMap, FunctionCompileStats), CompileError> {
+        let layout = self.layout;
+        let function = self.function;
         for (layout_index, &block_id) in layout.iter().enumerate() {
-            let insts = self
-                .function
+            let insts = &function
                 .block(block_id)
                 .ok_or(CompileError::UnknownBlock {
                     function: self.function.id,
                     block: block_id,
                 })?
-                .insts
-                .clone();
+                .insts;
             let label = self.block_labels[block_id.0 as usize];
             self.assembler.bind(label);
             self.pc_map.block_start[block_id.0 as usize] = Some(self.assembler.pc());
@@ -2964,13 +2988,11 @@ impl FunctionEmitter<'_> {
             self.emit_block_profile_counter(block_id);
             let next_block = layout.get(layout_index + 1).copied();
 
-            for inst_id in insts {
+            for &inst_id in insts {
                 let before = self.assembler.pc();
                 self.pc_map.before_inst[inst_id.0 as usize] = Some(before);
-                let node = self
-                    .function
+                let node = function
                     .node(inst_id)
-                    .cloned()
                     .ok_or_else(|| CompileError::Internal {
                         function: Some(self.function.id),
                         message: format!("emission references missing node {inst_id:?}"),
@@ -2979,7 +3001,7 @@ impl FunctionEmitter<'_> {
                 let live = if self.dce.live_nodes[inst_id.0 as usize] {
                     self.stats.emitted_hir_nodes += 1;
                     let live = self.live_register_map(self.instruction_position(inst_id));
-                    self.emit_control_node(block_id, &node, next_block)?;
+                    self.emit_control_node(block_id, node, next_block)?;
                     Some(live)
                 } else {
                     self.stats.eliminated_hir_nodes += 1;
@@ -3060,7 +3082,7 @@ impl FunctionEmitter<'_> {
             (entry.start_pc.0, entry.end_pc.0, std::cmp::Reverse(entry.depth))
         });
 
-        for trampoline in self.trampolines.clone() {
+        for trampoline in std::mem::take(&mut self.trampolines) {
             self.assembler.bind(trampoline.label);
             self.emit_parallel_moves(&trampoline.moves);
             self.assembler
@@ -3100,6 +3122,7 @@ impl FunctionEmitter<'_> {
             module: self.function.module,
             kind: self.function.kind,
             is_async: self.function.is_async,
+            is_concurrent: self.function.is_concurrent,
             field_owner: self.function.field_owner,
             name: self.function.signature.name,
             arity,
@@ -3107,11 +3130,7 @@ impl FunctionEmitter<'_> {
             frame,
             chunk,
         };
-        let info = FunctionCompileInfo {
-            allocation: self.allocation.clone(),
-            pc_map: self.pc_map,
-        };
-        Ok((bytecode, info, self.stats))
+        Ok((bytecode, self.pc_map, self.stats))
     }
 }
 
@@ -3133,11 +3152,14 @@ fn compile_function(
         }
     }
 
+    // All analysis bitsets share one function-scoped arena. No arena-backed
+    // data escapes into the emitted bytecode or its metadata.
+    let arena = Bump::new();
     let cfg = build_cfg(function)?;
-    let dce = analyze_dead_code(function, &cfg, options.eliminate_dead_code)?;
+    let dce = analyze_dead_code(&arena, function, &cfg, options.eliminate_dead_code)?;
     let layout = layout_blocks(function, &cfg, options.profile_guided_layout);
     let positions = assign_positions(function, &layout);
-    let liveness = compute_liveness(function, &cfg, &dce, &layout)?;
+    let liveness = compute_liveness(&arena, function, &cfg, &dce, &layout)?;
     let intervals = build_intervals(function, &dce, &liveness, &positions, &layout)?;
     let affinities = build_affinities(function, &cfg, &dce, options.coalesce_registers);
     let allocation = allocate_registers(function, intervals, &affinities)?;
@@ -3190,7 +3212,7 @@ fn compile_function(
         }
     }
 
-    FunctionEmitter::new(
+    let (bytecode, pc_map, stats) = FunctionEmitter::new(
         program,
         function,
         options,
@@ -3199,7 +3221,8 @@ fn compile_function(
         &positions,
         &layout,
     )
-    .emit()
+    .emit()?;
+    Ok((bytecode, FunctionCompileInfo { allocation, pc_map }, stats))
 }
 
 fn lower_runtime_metadata(hir: &Program) -> Result<RuntimeMetadata, CompileError> {
@@ -3354,12 +3377,12 @@ fn finalize_deopts(
     infos: &HashMap<FuncId, FunctionCompileInfo>,
     options: &CompileOptions,
 ) -> Result<(), CompileError> {
-    let mut function_indices = HashMap::new();
+    let mut function_indices = HashMap::default();
     for (index, function) in bytecode.functions.iter().enumerate() {
         function_indices.insert(function.id, index);
     }
 
-    let mut resume_entries: HashMap<FuncId, HashMap<ResumeId, BytecodePc>> = HashMap::new();
+    let mut resume_entries: HashMap<FuncId, HashMap<ResumeId, BytecodePc>> = HashMap::default();
 
     for function in &hir.functions {
         let info = infos
@@ -3440,7 +3463,7 @@ fn compile_program_impl(
     let mut bytecode = BytecodeProgram::new();
     bytecode.metadata = lower_runtime_metadata(hir)?;
 
-    let mut infos = HashMap::new();
+    let mut infos = HashMap::default();
     let mut stats = CompileStats::default();
 
     for function in &hir.functions {

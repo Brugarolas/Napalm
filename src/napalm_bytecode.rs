@@ -33,7 +33,7 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::napalm_ir::{
@@ -1079,6 +1079,10 @@ define_opcodes! {
     // PEA-only rematerialization helper. A/B/C match StoreProperty; X=layout;
     // Y[15:0]=logical slot, Y[23:16]=presence GPR.
     StorePropertyIfPresent = 133,
+
+    // Isolated parallel call. A=result Promise, B=concurrent closure, C=argc;
+    // x0 is reserved for transport flags, followed by packed argument GPRs.
+    Launch = 134,
 }
 
 impl Opcode {
@@ -1087,7 +1091,7 @@ impl Opcode {
     pub const fn fixed_word_len(self) -> Option<usize> {
         use Opcode::*;
         match self {
-            Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign
+            Invoke | InvokeSuper | CallDirect | CallClosure | Launch | CallPrimitive | CallForeign
             | MakeClosure => None,
 
             LoadProperty | StoreProperty | StorePropertyIfPresent => Some(3),
@@ -1155,6 +1159,7 @@ impl Opcode {
                 | InvokeSuper
                 | CallDirect
                 | CallClosure
+                | Launch
                 | CallPrimitive
                 | CallForeign
                 | AllocInstance
@@ -1205,7 +1210,7 @@ pub fn instruction_word_len(first: Word) -> Result<usize, DecodeError> {
     let len = match opcode {
         Invoke | InvokeSuper => 2 + packed_register_word_count(first.c() as usize),
         CallDirect => 2 + packed_register_word_count(first.c() as usize),
-        CallClosure => 2 + packed_register_word_count(first.c() as usize),
+        CallClosure | Launch => 2 + packed_register_word_count(first.c() as usize),
         CallPrimitive | CallForeign => 2 + packed_register_word_count(first.c() as usize),
         MakeClosure => 2 + packed_register_word_count(first.bx() as usize),
         _ => unreachable!("fixed-size opcode reached variable-size decoder"),
@@ -1569,6 +1574,8 @@ pub struct BytecodeFunction {
     pub kind: FunctionKind,
     /// Async functions return a Promise at call sites and execute on the VM task scheduler.
     pub is_async: bool,
+    /// Functions marked `concurrent` may only be entered through Opcode::Launch.
+    pub is_concurrent: bool,
     /// Declaring class for class-local instance FieldSlot operands.
     ///
     /// The interpreter relocates LoadField/StoreField operands in the prepared
@@ -1583,7 +1590,7 @@ pub struct BytecodeFunction {
     pub chunk: BytecodeChunk,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeMetadata {
     pub strings: Vec<String>,
     pub methods: Vec<MethodSignature>,
@@ -1675,7 +1682,7 @@ impl RuntimeMetadata {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BytecodeProgram {
     pub functions: Vec<BytecodeFunction>,
     pub metadata: RuntimeMetadata,
@@ -1769,6 +1776,7 @@ impl<'a> DecodedInstruction<'a> {
             | Opcode::InvokeSuper
             | Opcode::CallDirect
             | Opcode::CallClosure
+            | Opcode::Launch
             | Opcode::CallPrimitive
             | Opcode::CallForeign => Some(self.first.c() as usize),
             _ => None,
@@ -2064,7 +2072,7 @@ impl Assembler {
 
     fn validate_call_count(opcode: Opcode, count: usize) -> Result<(), AssembleError> {
         let valid = match opcode {
-            Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure => count <= MAX_NAPALM_ARITY,
+            Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure | Opcode::Launch => count <= MAX_NAPALM_ARITY,
             Opcode::CallDirect | Opcode::CallPrimitive | Opcode::CallForeign => {
                 count <= MAX_DIRECT_FRAME_VALUES
             }
@@ -2134,6 +2142,15 @@ impl Assembler {
     ) -> Result<BytecodePc, AssembleError> {
         let pc = self.emit_packed_call(Opcode::CallClosure, dst.0, closure.0, args, encode_call_conv(conv) as u32)?;
         Ok(pc)
+    }
+
+    pub fn emit_launch(
+        &mut self,
+        dst: Reg,
+        closure: Reg,
+        args: &[Reg],
+    ) -> Result<BytecodePc, AssembleError> {
+        self.emit_packed_call(Opcode::Launch, dst.0, closure.0, args, 0)
     }
 
     pub fn emit_call_primitive(
@@ -2464,7 +2481,7 @@ impl BytecodeVerifier {
             }
         }
 
-        let mut module_ids = HashSet::new();
+        let mut module_ids = HashSet::default();
         for module in &program.metadata.modules {
             if !module_ids.insert(module.id) {
                 return Err(VerificationError::function(format!(
@@ -2480,7 +2497,7 @@ impl BytecodeVerifier {
             }
         }
 
-        let mut class_ids = HashSet::new();
+        let mut class_ids = HashSet::default();
         for class in &program.metadata.classes {
             if !class_ids.insert(class.id) {
                 return Err(VerificationError::function(format!(
@@ -2569,7 +2586,7 @@ impl BytecodeVerifier {
             }
         }
 
-        let mut foreign_ids = HashSet::new();
+        let mut foreign_ids = HashSet::default();
         for foreign in &program.metadata.foreign_functions {
             if !foreign_ids.insert(foreign.id) {
                 return Err(VerificationError::function(format!(
@@ -2601,7 +2618,7 @@ impl BytecodeVerifier {
     pub fn verify_program(program: &BytecodeProgram) -> Result<(), VerificationError> {
         Self::verify_metadata(program)?;
 
-        let mut function_ids = HashSet::new();
+        let mut function_ids = HashSet::default();
         for function in &program.functions {
             if !function_ids.insert(function.id) {
                 return Err(VerificationError::function(format!(
@@ -2694,9 +2711,9 @@ impl BytecodeVerifier {
             }
         }
 
-        let mut boundaries_by_function: HashMap<FuncId, HashSet<BytecodePc>> = HashMap::new();
+        let mut boundaries_by_function: HashMap<FuncId, HashSet<BytecodePc>> = HashMap::default();
         for function in &program.functions {
-            let mut boundaries = HashSet::new();
+            let mut boundaries = HashSet::default();
             boundaries.insert(BytecodePc(function.chunk.code.len() as u32));
             for decoded in Decoder::new(&function.chunk.code) {
                 let decoded = decoded.map_err(|error| VerificationError {
@@ -2997,7 +3014,7 @@ impl BytecodeVerifier {
 
         let chunk = &function.chunk;
         let mut instructions = Vec::new();
-        let mut boundaries = HashSet::new();
+        let mut boundaries = HashSet::default();
         boundaries.insert(BytecodePc(chunk.code.len() as u32));
 
         for decoded in Decoder::new(&chunk.code) {
@@ -3194,7 +3211,7 @@ impl BytecodeVerifier {
             last_resume_pc = Some(entry.pc.0);
         }
 
-        let mut deopt_ids = HashSet::new();
+        let mut deopt_ids = HashSet::default();
         for point in &chunk.deopts {
             if !deopt_ids.insert(point.id) {
                 return Err(VerificationError::function(format!(
@@ -3509,6 +3526,23 @@ impl BytecodeVerifier {
                     Self::verify_reg(function, inst.pc, reg)?;
                 }
             }
+            Launch => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.extension(0).unwrap_or(1) != 0 {
+                    return Err(VerificationError::at(inst.pc, "Launch reserved flags must be zero"));
+                }
+                let argc = inst.first.c() as usize;
+                if argc > MAX_NAPALM_ARITY {
+                    return Err(VerificationError::at(inst.pc, "Launch arity exceeds 16"));
+                }
+                for reg in inst.call_arguments().map_err(|error| VerificationError {
+                    pc: error.pc,
+                    message: error.message,
+                })? {
+                    Self::verify_reg(function, inst.pc, reg)?;
+                }
+            }
             CallPrimitive | CallForeign => {
                 Self::verify_reg(function, inst.pc, a)?;
                 let argc = inst.first.c() as usize;
@@ -3672,10 +3706,10 @@ impl BytecodeVerifier {
             Await => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
-                if !function.is_async && function.kind != FunctionKind::ModuleBody {
+                if !function.is_async && !function.is_concurrent && function.kind != FunctionKind::ModuleBody {
                     return Err(VerificationError::at(
                         inst.pc,
-                        "Await is only valid in async functions or module bodies",
+                        "Await is only valid in async/concurrent functions or module bodies",
                     ));
                 }
             }
@@ -3778,7 +3812,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         Bailout => [SmallImmediate, None, None],
         Invoke | InvokeSuper => [General, General, SmallImmediate],
         CallDirect => [General, Flag, SmallImmediate],
-        CallClosure => [General, General, SmallImmediate],
+        CallClosure | Launch => [General, General, SmallImmediate],
         CallPrimitive | CallForeign => [General, None, SmallImmediate],
         CreateClass => [General, General, Flag],
         BindMethod | BindForeignMethod => [General, Flag, None],
@@ -3834,6 +3868,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         Invoke | InvokeSuper => "x0=IcSlot, then packed explicit argument GPRs",
         CallDirect => "x0=FuncId, then packed complete call-frame GPRs",
         CallClosure => "x0=CallConv, then packed argument GPRs",
+        Launch => "x0=reserved(0), then packed argument GPRs",
         CallPrimitive => "x0=PrimitiveId, then packed call-frame GPRs",
         CallForeign => "x0=ForeignFnId, then packed call-frame GPRs",
         CreateClass | AllocInstance | AllocForeign => "x0=ClassId",
@@ -3862,11 +3897,12 @@ pub fn disassemble(function: &BytecodeFunction) -> Result<String, DecodeError> {
 
     writeln!(
         &mut out,
-        "func {:?} module={:?} kind={:?} async={} arity={} captures={} gprs={}",
+        "func {:?} module={:?} kind={:?} async={} concurrent={} arity={} captures={} gprs={}",
         function.id,
         function.module,
         function.kind,
         function.is_async,
+        function.is_concurrent,
         function.arity,
         function.capture_count,
         function.frame.general_register_count

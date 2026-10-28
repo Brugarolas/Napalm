@@ -1,7 +1,7 @@
 //! Source -> parser -> HIR -> bytecode -> interpreter regression tests.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use rclite::Rc;
 
 use crate::napalm_bytecode::BytecodeProgram;
 use crate::napalm_interpreter::{

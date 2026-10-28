@@ -15,7 +15,7 @@ use crate::napalm_trace_ir_optimizer::{
 // import `super::*`, while the public pipeline signatures use an unambiguous
 // Trace-specific name.
 pub(crate) type Optimize = TraceOptimize;
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 
 mod advanced;
 pub use advanced::*;
@@ -178,7 +178,7 @@ pub use GlobalValueNumbering as CommonSubexpressionElimination;
 impl TraceOptimization for GlobalValueNumbering {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
         let mut changed = false;
-        let mut constants = HashMap::new();
+        let mut constants = HashMap::default();
         for index in 0..trace.values.len() {
             let value = &trace.values[index];
             let TraceValueOrigin::Constant(constant) = value.origin else {
@@ -200,7 +200,7 @@ impl TraceOptimization for GlobalValueNumbering {
             .copied()
             .chain((0..trace.nodes.len()).filter(|id| !preheader.contains(id)))
             .collect();
-        let mut values = HashMap::<Expression, TraceValueId>::new();
+        let mut values = HashMap::<Expression, TraceValueId>::default();
         for id in order {
             if matches!(trace.nodes[id].kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }) {
                 values.clear();
@@ -560,7 +560,7 @@ impl TraceCanonicalization {
             });
         }
 
-        let mut hoisted = HashMap::<(TraceValueId, TraceRep), TraceValueId>::new();
+        let mut hoisted = HashMap::<(TraceValueId, TraceRep), TraceValueId>::default();
         for candidate in candidates {
             let key = (candidate.source, candidate.rep);
             let guarded = if let Some(value) = hoisted.get(&key).copied() {
@@ -788,7 +788,7 @@ impl TraceCanonicalization {
     }
 
     fn used_values(trace: &Trace) -> HashSet<TraceValueId> {
-        let mut used = HashSet::new();
+        let mut used = HashSet::default();
         for node in &trace.nodes {
             let mut kind = node.kind.clone();
             kind.visit_operands(|value| {

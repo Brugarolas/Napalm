@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
+use bumpalo::{Bump, collections::Vec as BumpVec};
+use smallvec::SmallVec;
 
 use crate::napalm_ir::{
     BlockId, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
@@ -71,16 +73,16 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
     // instead of fixed contiguous chunks. Each `&mut Function` is produced once
     // by `iter_mut`, preserving exclusive ownership without unsafe code.
     let (work_tx, work_rx) = std::sync::mpsc::channel::<&mut Function>();
-    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    let work_rx = parking_lot::Mutex::new(work_rx);
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let work_rx = std::sync::Arc::clone(&work_rx);
+            let work_rx = &work_rx;
             scope.spawn(move || {
                 let mut optimizer = optimization_passes();
                 loop {
                     let function = {
-                        let receiver = work_rx.lock().expect("WIR optimizer queue poisoned");
+                        let receiver = work_rx.lock();
                         receiver.recv()
                     };
                     let Ok(function) = function else {
@@ -269,7 +271,8 @@ impl FunctionOptimization for DominatorCSE {
             return false;
         }
 
-        let mut succs = vec![Vec::<usize>::new(); n];
+        let arena = Bump::new();
+        let mut succs = bumpalo::vec![in &arena; SmallVec::<[usize; 2]>::new(); n];
         for (block_ix, block) in function.blocks.iter().enumerate() {
             if let Some(term) = block.insts.last().and_then(|id| function.node(*id)) {
                 for edge in term.kind.edges() {
@@ -298,10 +301,10 @@ impl FunctionOptimization for DominatorCSE {
         if entry >= n {
             return false;
         }
-        let mut reachable = vec![false; n];
-        let mut post = Vec::with_capacity(n);
+        let reachable = arena.alloc_slice_fill_copy(n, false);
+        let mut post = BumpVec::with_capacity_in(n, &arena);
         reachable[entry] = true;
-        let mut stack = vec![(entry, 0usize)];
+        let mut stack = bumpalo::vec![in &arena; (entry, 0usize)];
         while let Some((block, next)) = stack.last_mut() {
             if *next < succs[*block].len() {
                 let child = succs[*block][*next];
@@ -315,15 +318,16 @@ impl FunctionOptimization for DominatorCSE {
                 stack.pop();
             }
         }
-        let rpo: Vec<usize> = post.into_iter().rev().collect();
+        post.reverse();
+        let rpo = post;
         if rpo.is_empty() {
             return false;
         }
-        let mut rpo_index = vec![usize::MAX; n];
+        let rpo_index = arena.alloc_slice_fill_copy(n, usize::MAX);
         for (index, &block) in rpo.iter().enumerate() {
             rpo_index[block] = index;
         }
-        let mut preds = vec![Vec::<usize>::new(); n];
+        let mut preds = bumpalo::vec![in &arena; SmallVec::<[usize; 2]>::new(); n];
         for &block in &rpo {
             for &succ in &succs[block] {
                 if reachable[succ] {
@@ -331,7 +335,7 @@ impl FunctionOptimization for DominatorCSE {
                 }
             }
         }
-        let mut idom = vec![usize::MAX; n];
+        let idom = arena.alloc_slice_fill_copy(n, usize::MAX);
         idom[entry] = entry;
         let intersect = |idom: &[usize], mut a: usize, mut b: usize| -> usize {
             while a != b {
@@ -366,7 +370,7 @@ impl FunctionOptimization for DominatorCSE {
             }
         }
 
-        let mut children = vec![Vec::<usize>::new(); n];
+        let mut children = bumpalo::vec![in &arena; SmallVec::<[usize; 2]>::new(); n];
         for &block in rpo.iter().skip(1) {
             if idom[block] != usize::MAX {
                 children[idom[block]].push(block);
@@ -376,15 +380,16 @@ impl FunctionOptimization for DominatorCSE {
         fn visit(
             function: &mut Function,
             block: usize,
-            children: &[Vec<usize>],
-            inherited: &HashMap<PureKey, ValueId>,
+            children: &[SmallVec<[usize; 2]>],
+            values: &mut HashMap<PureKey, ValueId>,
+            arena: &Bump,
             changed: &mut bool,
         ) {
-            let mut values = inherited.clone();
-            let insts = function.blocks[block].insts.clone();
-            for id in insts {
-                let kind = function.nodes[id.0 as usize].kind.clone();
-                let Some(key) = pure_key(&kind) else {
+            // Undo only bindings introduced in this dominator subtree.
+            let mut inserted = BumpVec::new_in(arena);
+            for index in 0..function.blocks[block].insts.len() {
+                let id = function.blocks[block].insts[index];
+                let Some(key) = pure_key(&function.nodes[id.0 as usize].kind) else {
                     continue;
                 };
                 let Some(result) = single_result(function, id) else {
@@ -396,16 +401,20 @@ impl FunctionOptimization for DominatorCSE {
                         *changed = true;
                     }
                 } else {
+                    inserted.push(key.clone());
                     values.insert(key, result);
                 }
             }
             for &child in &children[block] {
-                visit(function, child, children, &values, changed);
+                visit(function, child, children, values, arena, changed);
+            }
+            for key in inserted {
+                values.remove(&key);
             }
         }
 
         let mut changed = false;
-        visit(function, entry, &children, &HashMap::new(), &mut changed);
+        visit(function, entry, &children, &mut HashMap::default(), &arena, &mut changed);
         changed
     }
 }
@@ -1102,21 +1111,21 @@ impl FunctionOptimization for FastLocalSimplify {
                 continue;
             }
 
-            let mut pure_values: HashMap<PureKey, ValueId> = HashMap::new();
-            let mut guards: HashMap<GuardKey, Option<ValueId>> = HashMap::new();
+            let mut pure_values: HashMap<PureKey, ValueId> = HashMap::default();
+            let mut guards: HashMap<GuardKey, Option<ValueId>> = HashMap::default();
 
-            let mut field_values: HashMap<FieldKey, ValueId> = HashMap::new();
-            let mut static_values: HashMap<StaticFieldKey, ValueId> = HashMap::new();
-            let mut cell_values: HashMap<ValueId, ValueId> = HashMap::new();
-            let mut module_values: HashMap<ModuleKey, ValueId> = HashMap::new();
-            let mut list_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
-            let mut map_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
-            let mut string_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
+            let mut field_values: HashMap<FieldKey, ValueId> = HashMap::default();
+            let mut static_values: HashMap<StaticFieldKey, ValueId> = HashMap::default();
+            let mut cell_values: HashMap<ValueId, ValueId> = HashMap::default();
+            let mut module_values: HashMap<ModuleKey, ValueId> = HashMap::default();
+            let mut list_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
+            let mut map_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
+            let mut string_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
 
-            let mut last_field_store: HashMap<FieldKey, InstId> = HashMap::new();
-            let mut last_static_store: HashMap<StaticFieldKey, InstId> = HashMap::new();
-            let mut last_cell_store: HashMap<ValueId, InstId> = HashMap::new();
-            let mut last_module_store: HashMap<ModuleKey, InstId> = HashMap::new();
+            let mut last_field_store: HashMap<FieldKey, InstId> = HashMap::default();
+            let mut last_static_store: HashMap<StaticFieldKey, InstId> = HashMap::default();
+            let mut last_cell_store: HashMap<ValueId, InstId> = HashMap::default();
+            let mut last_module_store: HashMap<ModuleKey, InstId> = HashMap::default();
 
             let mut effect_shape_changed = false;
 
@@ -1771,7 +1780,7 @@ impl FunctionOptimization for ControlFlowCleanup {
                     .unwrap_or(false)
             });
 
-            let mut live_sites: HashSet<SiteId> = HashSet::new();
+            let mut live_sites: HashSet<SiteId> = HashSet::default();
             for block in &function.blocks {
                 for id in block.insts.iter().copied() {
                     match &function.nodes[id.0 as usize].kind {
@@ -1828,7 +1837,7 @@ fn simplify_terminator(function: &Function, kind: Inst) -> Option<Inst> {
             }
 
             let old_len = cases.len();
-            let mut seen = HashSet::with_capacity(cases.len());
+            let mut seen = HashSet::with_capacity_and_hasher(cases.len(), Default::default());
             cases.retain(|case| {
                 seen.insert(case.value) && !same_edge_payload(&case.edge, &default_edge)
             });
@@ -2193,8 +2202,9 @@ impl FunctionOptimization for DeadCodeElimination {
             return false;
         }
 
-        let mut live = vec![false; function.nodes.len()];
-        let mut uses = vec![0usize; function.values.len()];
+        let arena = Bump::new();
+        let live = arena.alloc_slice_fill_copy(function.nodes.len(), false);
+        let uses = arena.alloc_slice_fill_copy(function.values.len(), 0usize);
 
         for block in &function.blocks {
             for id in block.insts.iter().copied() {
@@ -2224,7 +2234,7 @@ impl FunctionOptimization for DeadCodeElimination {
             }
         }
 
-        let mut worklist = Vec::new();
+        let mut worklist = BumpVec::new_in(&arena);
         for id in live_instruction_ids(function) {
             if dce_candidate(function, id, &uses) {
                 worklist.push(id);
@@ -2335,6 +2345,41 @@ fn live_instruction_ids(function: &Function) -> Vec<InstId> {
 mod typed_object_tests {
     use super::*;
     use crate::napalm_ir::{Builder, FunctionKind, InterfaceFieldType, Program};
+
+    #[test]
+    fn dominator_cse_does_not_leak_sibling_bindings() {
+        let mut program = Program::new();
+        let module = program.add_module("cse", 0);
+        let mut builder = Builder::new(&mut program, module, "diamond",
+            FunctionKind::Closure, vec![Type::Bool, Type::Int32, Type::Int32], Type::Int32);
+        let condition = builder.param(0);
+        let lhs = builder.param(1);
+        let rhs = builder.param(2);
+        let left = builder.new_block(&[]);
+        let right = builder.new_block(&[]);
+        let join = builder.new_block(&[Type::Int32]);
+        builder.branch(condition, left, vec![], right, vec![]);
+        let expression = Inst::IntBin { op: IntBinOp::Add, left: lhs, right: rhs };
+        builder.position_at(left);
+        let first = builder.emit1(expression.clone(), Type::Int32);
+        let duplicate = builder.emit1(expression.clone(), Type::Int32);
+        builder.jump(join, vec![duplicate]);
+        builder.position_at(right);
+        let sibling = builder.emit1(expression, Type::Int32);
+        builder.jump(join, vec![sibling]);
+        builder.position_at(join);
+        builder.ret(builder.block_param(join, 0));
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(DominatorCSE.optimize_function(function));
+        let kind = |value| {
+            let ValueDef::InstResult(id, _) = function.value(value).unwrap().def else { panic!() };
+            &function.nodes[id.0 as usize].kind
+        };
+        assert!(matches!(kind(duplicate), Inst::Move(value) if *value == first));
+        assert!(matches!(kind(sibling), Inst::IntBin { .. }));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
 
     #[test]
     fn closed_required_record_has_constant_map_length() {

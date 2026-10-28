@@ -4,7 +4,10 @@
 //! spans. The legacy Napalm parser is used only by historical backend regressions.
 pub use crate::napalm_front::*;
 use logos::Logos;
-use std::collections::{HashMap, HashSet};
+use bumpalo::{Bump, collections::Vec as BumpVec};
+use smallvec::SmallVec;
+use compact_str::CompactString;
+use crate::napalm_collections::{HashMap, HashSet};
 
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(skip r"[ \t\r]+")]
@@ -141,7 +144,10 @@ struct Parser<'a> {
     interfaces: Vec<InterfaceDecl>,
     type_aliases: Vec<TypeAliasDecl>,
     source: &'a str,
-    tokens: Vec<Tok>,
+    arena: &'a Bump,
+    tokens: BumpVec<'a, Tok>,
+    // Only splitting a `>>` token mutates the stream during type lookahead.
+    token_splits: SmallVec<[(usize, Tok); 4]>,
     pos: usize,
     depth: usize,
     diagnostics: Vec<Diagnostic>,
@@ -157,7 +163,8 @@ fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
             .map(|part| classify_variable_type(part, span)).collect()), span);
     }
     if source.trim_start().starts_with('{') {
-        let mut parser = Parser::new(source, 0, source.len());
+        let arena = Bump::new();
+        let mut parser = Parser::new(source, 0, source.len(), &arena);
         parser.lines();
         if let Ok(fields) = parser.interface_fields() {
             let mut annotation = TypeAnnotation::new(TypeAnnotationKind::Object(fields), span);
@@ -184,7 +191,7 @@ fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
             source = rest.trim_start();
         }
     }
-    let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let compact: CompactString = source.chars().filter(|ch| !ch.is_whitespace()).collect();
     classify_compact_type(&compact, span)
 }
 
@@ -349,7 +356,8 @@ fn encloses_complete_type(source: &str, open: char, close: char) -> bool {
 }
 
 pub fn parse(_name: &str, source: &str) -> ParseOutput {
-    let mut p = Parser::new(source, 0, source.len());
+    let arena = Bump::new();
+    let mut p = Parser::new(source, 0, source.len(), &arena);
     let statements = p.statements(None);
     let module = ModuleAst {
         interfaces: p.interfaces,
@@ -366,7 +374,7 @@ pub fn parse(_name: &str, source: &str) -> ParseOutput {
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, mut start: usize, end: usize) -> Self {
+    fn new(source: &'a str, mut start: usize, end: usize, arena: &'a Bump) -> Self {
         if start == 0 {
             if source.starts_with('\u{feff}') {
                 start = 3;
@@ -375,7 +383,7 @@ impl<'a> Parser<'a> {
                 start += source[start..].find('\n').unwrap_or(end - start);
             }
         }
-        let mut tokens = Vec::new();
+        let mut tokens = BumpVec::new_in(arena);
         let mut diagnostics = Vec::new();
         let mut lexer = Kind::lexer(&source[start..end]);
         while let Some(kind) = lexer.next() {
@@ -406,12 +414,14 @@ impl<'a> Parser<'a> {
             type_aliases: Vec::new(),
             source,
             tokens,
+            arena,
+            token_splits: SmallVec::new(),
             pos: 0,
             depth: 0,
             diagnostics,
             exports: Vec::new(),
-            immutable: HashSet::new(),
-            parameter_patterns: HashMap::new(),
+            immutable: HashSet::default(),
+            parameter_patterns: HashMap::default(),
         }
     }
     fn peek(&self) -> Tok {
@@ -618,7 +628,8 @@ impl<'a> Parser<'a> {
             && !self.at("abstract")
             && !self.at("interface")
             && !self.at("function")
-            && !(self.at("async") && self.next_text() == "function")
+            && !(self.at("async") && matches!(self.next_text(), "function" | "concurrent"))
+            && !(self.at("concurrent") && matches!(self.next_text(), "function" | "async"))
         {
             let name = Spanned::new("<default>".into(), self.peek().span);
             let initializer = self.expr(0)?;
@@ -775,8 +786,24 @@ impl<'a> Parser<'a> {
             let declarations = self.variables(immutable)?;
             self.boundary()?;
             declarations
-        } else if self.at("function") || (self.at("async") && self.next_text() == "function") {
-            let async_ = self.eat("async");
+        } else if self.at("function")
+            || (self.at("async") && matches!(self.next_text(), "function" | "concurrent"))
+            || (self.at("concurrent") && matches!(self.next_text(), "function" | "async"))
+        {
+            let mut async_ = false;
+            let mut concurrent_ = false;
+            loop {
+                if !async_ && self.eat("async") {
+                    async_ = true;
+                } else if !concurrent_ && self.eat("concurrent") {
+                    concurrent_ = true;
+                } else {
+                    break;
+                }
+            }
+            if async_ && concurrent_ {
+                return self.error("a `concurrent` function is already asynchronous at its call boundary; use `launch` + `await` instead of `async concurrent`");
+            }
             self.expect("function")?;
             let name = if default_export && self.at("(") {
                 Spanned::new("<default>".into(), self.peek().span)
@@ -794,7 +821,9 @@ impl<'a> Parser<'a> {
             }
             let body = self.function_body(params, start)?;
             let initializer = Expr::new(
-                if async_ {
+                if concurrent_ {
+                    ExprKind::ConcurrentClosure(body)
+                } else if async_ {
                     ExprKind::AsyncClosure(body)
                 } else {
                     ExprKind::Closure(body)
@@ -888,7 +917,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         let saved_pos = self.pos;
-        let saved_tokens = self.tokens.clone();
+        let saved_splits = self.token_splits.len();
         let saved_diagnostics = self.diagnostics.len();
         let saved_depth = self.depth;
         if self.type_arguments().is_ok() {
@@ -901,7 +930,7 @@ impl<'a> Parser<'a> {
             self.pos = after;
         }
         self.pos = saved_pos;
-        self.tokens = saved_tokens;
+        self.restore_token_splits(saved_splits);
         self.diagnostics.truncate(saved_diagnostics);
         self.depth = saved_depth;
         false
@@ -1626,10 +1655,20 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+    fn restore_token_splits(&mut self, checkpoint: usize) {
+        while self.token_splits.len() > checkpoint {
+            let (position, original) = self.token_splits.pop().unwrap();
+            self.tokens.remove(position + 1);
+            self.tokens[position] = original;
+        }
+    }
+
     fn type_close(&mut self) -> Result<()> {
         self.lines();
         if self.at(">>") {
-            let span = self.peek().span;
+            let original = self.peek();
+            let span = original.span;
+            self.token_splits.push((self.pos, original));
             self.tokens[self.pos].span = Span::new(span.start, span.start + 1);
             self.tokens.insert(
                 self.pos + 1,
@@ -2311,14 +2350,14 @@ impl<'a> Parser<'a> {
         let start = self.peek().span.start;
         if self.at("<") {
             let saved_pos = self.pos;
-            let saved_tokens = self.tokens.clone();
+            let saved_splits = self.token_splits.len();
             let saved_diagnostics = self.diagnostics.len();
             let saved_depth = self.depth;
             if self.type_parameters().is_ok() && self.arrow_ahead() {
                 return self.closure(start, false, false);
             }
             self.pos = saved_pos;
-            self.tokens = saved_tokens;
+            self.restore_token_splits(saved_splits);
             self.diagnostics.truncate(saved_diagnostics);
             self.depth = saved_depth;
 
@@ -2328,6 +2367,23 @@ impl<'a> Parser<'a> {
             self.type_close()?;
             self.lines();
             return self.expr(16);
+        }
+        if self.eat("launch") {
+            self.lines();
+            let call = self.expr(16)?;
+            return Ok(Expr::new(ExprKind::Launch(Box::new(call)), self.end(start)));
+        }
+        if self.eat("concurrent") {
+            if self.eat("async") {
+                return self.error("`concurrent async` is redundant; concurrent functions are launched asynchronously and return a Promise");
+            }
+            let function = self.eat("function");
+            let closure = self.closure(start, false, function)?;
+            let span = closure.span;
+            return match closure.kind {
+                ExprKind::Closure(body) => Ok(Expr::new(ExprKind::ConcurrentClosure(body), span)),
+                _ => unreachable!("non-async closure parser returned a non-closure expression"),
+            };
         }
         if self.eat("async") {
             let function = self.eat("function");
@@ -2563,6 +2619,7 @@ impl<'a> Parser<'a> {
             "null" => ExprKind::Null,
             "this" => ExprKind::This,
             "construct" | "is" | "in" | "of" | "let" | "const" | "return" | "throw" | "class"
+            | "concurrent" | "launch"
             | "import" | "export" | "else" | "undefined" => {
                 return self.error("unexpected keyword in expression");
             }
@@ -2586,7 +2643,7 @@ impl<'a> Parser<'a> {
             if template && bytes[i..].starts_with(b"${") {
                 parts.push(StringPart::Bytes(self.decode(segment, i)?));
                 let close = interpolation_end(bytes, i + 2, 1).ok_or(())?;
-                let mut nested = Parser::new(self.source, i + 2, close);
+                let mut nested = Parser::new(self.source, i + 2, close, self.arena);
                 nested.lines();
                 let value = nested.expr(0);
                 nested.lines();
@@ -3155,7 +3212,7 @@ fn validate_bindings(
             }
         }
         fn body(&mut self, body: &FunctionBody, params: &[Ident]) {
-            self.scopes.push(HashMap::new());
+            self.scopes.push(HashMap::default());
             for p in params {
                 self.declare(p);
             }
@@ -3197,7 +3254,7 @@ fn validate_bindings(
                     }
                 }
                 StmtKind::Block(s) => {
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(HashMap::default());
                     self.statements(s);
                     self.scopes.pop();
                 }
@@ -3233,7 +3290,7 @@ fn validate_bindings(
                     body,
                 } => {
                     self.expr(iterable);
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(HashMap::default());
                     self.declare(name);
                     self.stmt(body);
                     self.scopes.pop();
@@ -3243,7 +3300,7 @@ fn validate_bindings(
                     error_binding,
                     ..
                 } => {
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(HashMap::default());
                     if let Some(n) = error_binding {
                         self.declare(n);
                     }
@@ -3257,7 +3314,7 @@ fn validate_bindings(
                 } => {
                     self.stmt(body);
                     if let Some(c) = catch {
-                        self.scopes.push(HashMap::new());
+                        self.scopes.push(HashMap::default());
                         if let Some(n) = &c.binding {
                             self.declare(n);
                         }
@@ -3296,7 +3353,7 @@ fn validate_bindings(
                     self.assignment(target);
                     self.expr(value);
                 }
-                ExprKind::Closure(b) | ExprKind::AsyncClosure(b) => self.body(b, &b.params),
+                ExprKind::Closure(b) | ExprKind::AsyncClosure(b) | ExprKind::ConcurrentClosure(b) => self.body(b, &b.params),
                 ExprKind::Invoke(i) => {
                     if let Some(e) = &i.receiver {
                         self.expr(e);
@@ -3334,6 +3391,7 @@ fn validate_bindings(
                 ExprKind::Unary { operand, .. }
                 | ExprKind::Grouped(operand)
                 | ExprKind::Await(operand)
+                | ExprKind::Launch(operand)
                 | ExprKind::DestructureCheck { source: operand, .. }
                 | ExprKind::Spread(operand) => self.expr(operand),
                 ExprKind::DestructureGet { source: left, key: right }
@@ -3380,11 +3438,11 @@ fn validate_bindings(
     }
     let mut v = Validator {
         immutable,
-        scopes: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
         diagnostics,
     };
     v.statements(&module.statements);
-    let mut exported = HashSet::new();
+    let mut exported = HashSet::default();
     for (local, public) in module.exports.as_ref().unwrap() {
         if !v.scopes[0].contains_key(&local.value) {
             v.diagnostics.push(Diagnostic::error(
@@ -3406,6 +3464,30 @@ fn validate_bindings(
 #[cfg(test)]
 mod napalm_syntax_tests {
     use super::*;
+
+    #[test]
+    fn speculative_types_restore_split_shift_tokens() {
+        let source = "<Outer<Inner>> + 1";
+        let arena = Bump::new();
+        let mut parser = Parser::new(source, 0, source.len(), &arena);
+        let original: Vec<_> = parser.tokens.iter().map(|t| (t.kind, t.span)).collect();
+        // Parsing the nested type splits >>, but the following + rejects a call.
+        for _ in 0..3 {
+            assert!(!parser.try_call_type_arguments());
+            assert_eq!(parser.pos, 0);
+            assert!(parser.diagnostics.is_empty());
+            assert_eq!(parser.tokens.iter().map(|t| (t.kind, t.span)).collect::<Vec<_>>(), original);
+        }
+
+        let module = assert_parses(r#"
+            const id = <T>(x: T) => x;
+            const first = id<Array<number>>([1]);
+            const second = <Array<number>>first;
+            const text = `nested ${id<Array<number>>(second)}`;
+            const shifted = 8 >> 1;
+        "#);
+        assert_eq!(module.statements.len(), 5);
+    }
 
     fn assert_parses(source: &str) -> ModuleAst {
         let parsed = parse("syntax.np", source);

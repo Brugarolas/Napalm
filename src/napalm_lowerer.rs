@@ -33,8 +33,10 @@ use crate::napalm_ir::{
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use smallvec::SmallVec;
+use compact_str::{CompactString, ToCompactString};
+use bumpalo::{Bump, collections::Vec as BumpVec};
 use std::io;
 
 const MAX_NAPALM_ARITY: usize = 16;
@@ -63,7 +65,7 @@ pub struct LowerOptions {
 impl Default for LowerOptions {
     fn default() -> Self {
         Self {
-            import_map: HashMap::new(),
+            import_map: HashMap::default(),
             require_static_super_layout_for_fields: true,
             warn_shadowing: false,
         }
@@ -261,7 +263,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             direct(K::List(element))
         }
         ExprKind::Map(_) => direct(K::Map),
-        ExprKind::Closure(_) | ExprKind::AsyncClosure(_) => direct(K::Closure),
+        ExprKind::Closure(_) | ExprKind::AsyncClosure(_) | ExprKind::ConcurrentClosure(_) => direct(K::Closure),
         ExprKind::Grouped(inner) => infer_surface_type_annotation(inner),
         ExprKind::Unary { operator, operand } => match operator {
             UnaryOp::Not => direct(K::Bool),
@@ -344,6 +346,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         }
         ExprKind::DestructureCheck { source, .. }
         | ExprKind::Await(source) => infer_surface_type_annotation(source),
+        ExprKind::Launch(_) => None,
         ExprKind::Name(_)
         | ExprKind::Field(_)
         | ExprKind::StaticField(_)
@@ -594,15 +597,15 @@ struct BindingInfo {
 }
 
 #[derive(Clone, Debug)]
-enum FunctionAst {
-    Statements(Vec<Stmt>),
-    Body(FunctionBody),
+enum FunctionAst<'ast> {
+    Statements(&'ast [Stmt]),
+    Body(&'ast FunctionBody),
 }
 
 #[derive(Clone, Debug)]
-struct FunctionNode {
+struct FunctionNode<'ast> {
     parent: Option<FunctionNodeId>,
-    ast: FunctionAst,
+    ast: FunctionAst<'ast>,
     formal_params: Vec<Ident>,
     param_bindings: Vec<BindingId>,
     captures: Vec<BindingId>,
@@ -610,26 +613,27 @@ struct FunctionNode {
     this_binding: Option<BindingId>,
     closure_span: Option<Span>,
     is_async: bool,
+    is_concurrent: bool,
     has_structured_exceptions: bool,
 }
 
 #[derive(Clone, Debug)]
-struct RootAnalysis {
-    nodes: Vec<FunctionNode>,
+struct RootAnalysis<'ast> {
+    nodes: Vec<FunctionNode<'ast>>,
     bindings: Vec<BindingInfo>,
     declaration_map: HashMap<Span, BindingId>,
     use_map: HashMap<Span, BindingId>,
     closure_map: HashMap<Span, FunctionNodeId>,
 }
 
-impl RootAnalysis {
+impl RootAnalysis<'_> {
     fn binding(&self, id: BindingId) -> &BindingInfo {
         &self.bindings[id.0 as usize]
     }
 }
 
-struct Analyzer {
-    analysis: RootAnalysis,
+struct Analyzer<'ast> {
+    analysis: RootAnalysis<'ast>,
     scopes: Vec<HashMap<String, BindingId>>,
     current_function: FunctionNodeId,
     function_stack: Vec<FunctionNodeId>,
@@ -638,29 +642,30 @@ struct Analyzer {
     warn_shadowing: bool,
 }
 
-impl Analyzer {
-    fn module(module: &ModuleAst, warn_shadowing: bool) -> (RootAnalysis, Vec<Diagnostic>) {
+impl<'ast> Analyzer<'ast> {
+    fn module(module: &'ast ModuleAst, warn_shadowing: bool) -> (RootAnalysis<'ast>, Vec<Diagnostic>) {
         let root = FunctionNode {
             parent: None,
-            ast: FunctionAst::Statements(module.statements.clone()),
+            ast: FunctionAst::Statements(&module.statements),
             formal_params: Vec::new(),
             param_bindings: Vec::new(),
             captures: Vec::new(),
-            capture_set: HashSet::new(),
+            capture_set: HashSet::default(),
             this_binding: None,
             closure_span: None,
             is_async: false,
+            is_concurrent: false,
             has_structured_exceptions: false,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
                 nodes: vec![root],
                 bindings: Vec::new(),
-                declaration_map: HashMap::new(),
-                use_map: HashMap::new(),
-                closure_map: HashMap::new(),
+                declaration_map: HashMap::default(),
+                use_map: HashMap::default(),
+                closure_map: HashMap::default(),
             },
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: true,
@@ -674,36 +679,34 @@ impl Analyzer {
     }
 
     fn method(
-        method: &MethodDecl,
+        method: &'ast MethodDecl,
         formal_params: Vec<Ident>,
         warn_shadowing: bool,
-    ) -> (RootAnalysis, Vec<Diagnostic>) {
-        let body = method.body.clone().unwrap_or(FunctionBody {
-            params: Vec::new(),
-            kind: FunctionBodyKind::Statements(Vec::new()),
-            span: method.span,
-        });
+    ) -> (RootAnalysis<'ast>, Vec<Diagnostic>) {
+        // Foreign/bodyless methods are handled before analysis.
+        let body = method.body.as_ref().expect("analyzed method has a body");
         let root = FunctionNode {
             parent: None,
-            ast: FunctionAst::Body(body.clone()),
+            ast: FunctionAst::Body(body),
             formal_params: formal_params.clone(),
             param_bindings: Vec::new(),
             captures: Vec::new(),
-            capture_set: HashSet::new(),
+            capture_set: HashSet::default(),
             this_binding: None,
             closure_span: None,
             is_async: method.is_async,
+            is_concurrent: false,
             has_structured_exceptions: false,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
                 nodes: vec![root],
                 bindings: Vec::new(),
-                declaration_map: HashMap::new(),
-                use_map: HashMap::new(),
-                closure_map: HashMap::new(),
+                declaration_map: HashMap::default(),
+                use_map: HashMap::default(),
+                closure_map: HashMap::default(),
             },
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: false,
@@ -830,14 +833,14 @@ impl Analyzer {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    fn visit_stmt(&mut self, stmt: &Stmt, module_level: bool) {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt, module_level: bool) {
         match &stmt.kind {
             StmtKind::Variable { name, annotation, initializer } => {
                 if module_level && self.module_root {
@@ -959,7 +962,7 @@ impl Analyzer {
         }
     }
 
-    fn visit_expr(&mut self, expr: &Expr) {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
         match &expr.kind {
             ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::String(_) => {}
             ExprKind::InterpolatedString(parts) => {
@@ -1044,13 +1047,14 @@ impl Analyzer {
                     }
                 }
             }
-            ExprKind::Await(value) => self.visit_expr(value),
-            ExprKind::Closure(body) => self.visit_closure(body, false),
-            ExprKind::AsyncClosure(body) => self.visit_closure(body, true),
+            ExprKind::Await(value) | ExprKind::Launch(value) => self.visit_expr(value),
+            ExprKind::Closure(body) => self.visit_closure(body, false, false),
+            ExprKind::AsyncClosure(body) => self.visit_closure(body, true, false),
+            ExprKind::ConcurrentClosure(body) => self.visit_closure(body, false, true),
         }
     }
 
-    fn visit_assignment_target(&mut self, target: &Expr) {
+    fn visit_assignment_target(&mut self, target: &'ast Expr) {
         match &target.kind {
             ExprKind::List(items) => for item in items { self.visit_assignment_target(item); },
             ExprKind::Map(entries) => for entry in entries {
@@ -1082,19 +1086,20 @@ impl Analyzer {
         }
     }
 
-    fn visit_closure(&mut self, body: &FunctionBody, is_async: bool) {
+    fn visit_closure(&mut self, body: &'ast FunctionBody, is_async: bool, is_concurrent: bool) {
         let parent = self.current_function;
         let id = FunctionNodeId(self.analysis.nodes.len());
         self.analysis.nodes.push(FunctionNode {
             parent: Some(parent),
-            ast: FunctionAst::Body(body.clone()),
+            ast: FunctionAst::Body(body),
             formal_params: body.params.clone(),
             param_bindings: Vec::new(),
             captures: Vec::new(),
-            capture_set: HashSet::new(),
+            capture_set: HashSet::default(),
             this_binding: self.analysis.nodes[parent.0].this_binding,
             closure_span: Some(body.span),
             is_async,
+            is_concurrent,
             has_structured_exceptions: false,
         });
         self.analysis.closure_map.insert(body.span, id);
@@ -1115,7 +1120,7 @@ impl Analyzer {
         self.current_function = parent;
     }
 
-    fn visit_function_body_contents(&mut self, body: &FunctionBody) {
+    fn visit_function_body_contents(&mut self, body: &'ast FunctionBody) {
         match &body.kind {
             FunctionBodyKind::Expression(expr) => self.visit_expr(expr),
             FunctionBodyKind::Statements(statements) => {
@@ -1138,6 +1143,20 @@ struct MethodKey {
     arity: u8,
 }
 
+// Match MethodKey's hash field order without allocating a name on every lookup.
+#[derive(Hash)]
+struct MethodKeyRef<'a> {
+    name: &'a str,
+    kind: MethodKind,
+    arity: u8,
+}
+
+impl hashbrown::Equivalent<MethodKey> for MethodKeyRef<'_> {
+    fn equivalent(&self, key: &MethodKey) -> bool {
+        self.name == key.name && self.kind == key.kind && self.arity == key.arity
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SymbolTable {
     methods: HashMap<MethodKey, MethodSymbol>,
@@ -1147,8 +1166,8 @@ impl SymbolTable {
     fn get(&self, name: &str, kind: MethodKind, arity: usize) -> Option<MethodSymbol> {
         let arity = u8::try_from(arity).ok()?;
         self.methods
-            .get(&MethodKey {
-                name: name.to_owned(),
+            .get(&MethodKeyRef {
+                name,
                 kind,
                 arity,
             })
@@ -1208,6 +1227,7 @@ struct ModuleLowerer<'p, 's, 'a> {
     program: &'p mut ir::Program,
     source_name: &'s str,
     source: &'s str,
+    line_starts: Vec<usize>,
     module_name: &'s str,
     ast: &'a ModuleAst,
     options: LowerOptions,
@@ -1220,11 +1240,11 @@ struct ModuleLowerer<'p, 's, 'a> {
     class_plans: HashMap<Span, ClassPlan>,
     top_level_classes: HashMap<String, ClassId>,
     interface_types: HashMap<String, Type>,
-    string_ids: HashMap<String, ir::StringId>,
+    string_ids: HashMap<CompactString, ir::StringId>,
     /// Source import spelling -> canonical resolved module StringId. Kept
     /// separate from string_ids so an ordinary literal like "./dep" retains
     /// its exact source value even when the same bytes name an import.
-    import_ids: HashMap<String, ir::StringId>,
+    import_ids: HashMap<CompactString, ir::StringId>,
     closure_functions: HashMap<(usize, usize), FuncId>,
     method_functions: HashMap<Span, FuncId>,
 }
@@ -1239,10 +1259,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         options: LowerOptions,
     ) -> Self {
         let source_file = program.intern_string(source_name);
+        let line_starts = source_line_starts(source);
         Self {
             program,
             source_name,
             source,
+            line_starts,
             module_name,
             ast,
             options,
@@ -1250,17 +1272,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             source_file,
             module_id: None,
             module_layout: ModuleLayout {
-                slots: HashMap::new(),
+                slots: HashMap::default(),
             },
-            module_binding_types: HashMap::new(),
+            module_binding_types: HashMap::default(),
             symbols: SymbolTable::default(),
-            class_plans: HashMap::new(),
-            top_level_classes: HashMap::new(),
-            interface_types: HashMap::new(),
-            string_ids: HashMap::new(),
-            import_ids: HashMap::new(),
-            closure_functions: HashMap::new(),
-            method_functions: HashMap::new(),
+            class_plans: HashMap::default(),
+            top_level_classes: HashMap::default(),
+            interface_types: HashMap::default(),
+            string_ids: HashMap::default(),
+            import_ids: HashMap::default(),
+            closure_functions: HashMap::default(),
+            method_functions: HashMap::default(),
         }
     }
 
@@ -1301,6 +1323,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             constructor: false,
             static_method: false,
             is_async: false,
+            is_concurrent: false,
         };
         let entry = self.compile_function_node(module_id, &analysis, FunctionNodeId(0), spec)?;
 
@@ -1531,7 +1554,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // lexical class roots deliberately stay private. Imported bindings are
         // included, matching Napalm's ordinary module-variable semantics.
         let mut names = Vec::<(String, ModuleSlot)>::new();
-        let mut seen = HashSet::<String>::new();
+        let mut seen = HashSet::<String>::default();
 
         for statement in &self.ast.statements {
             match &statement.kind {
@@ -1628,10 +1651,10 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     name: class.name.value.clone(),
                     declaration_span: class.name.span,
                     superclass: None,
-                    fields: HashMap::new(),
-                    field_types: HashMap::new(),
-                    static_fields: HashMap::new(),
-                    static_field_types: HashMap::new(),
+                    fields: HashMap::default(),
+                    field_types: HashMap::default(),
+                    static_fields: HashMap::default(),
+                    static_field_types: HashMap::default(),
                     methods: Vec::new(),
                 },
             );
@@ -1639,8 +1662,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         // Field names are lexical to the class and can appear in nested closures
         // inside methods, so gather the complete set before assigning slots.
-        let mut local_instance_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::new();
-        let mut local_static_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::new();
+        let mut local_instance_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::default();
+        let mut local_static_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::default();
         for &(class_ptr, _) in &declarations {
             let class = unsafe { &*class_ptr };
             let mut instance = SmallVec::<[&str; 8]>::new();
@@ -1660,8 +1683,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // diagnostics. Instance field slots remain local to the declaring class;
         // runtime class linking relocates them after the actual superclass is
         // known, so imported/dynamic superclasses are fully supported.
-        let mut resolving = HashSet::new();
-        let mut resolved = HashSet::new();
+        let mut resolving = HashSet::default();
+        let mut resolved = HashSet::default();
         for &(class_ptr, _) in &declarations {
             let class = unsafe { &*class_ptr };
             self.resolve_class_layout(
@@ -1742,18 +1765,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         //   absolute = superclass.total_instance_fields + local_slot
         //
         // once, when CreateClass executes.
-        let mut fields = HashMap::new();
+        let mut fields = HashMap::default();
         for (index, name) in locals.into_iter().enumerate() {
             fields.insert(name.to_owned(), FieldSlot(index as u16));
         }
 
-        let mut static_fields = HashMap::new();
+        let mut static_fields = HashMap::default();
         for (index, name) in statics.into_iter().enumerate() {
             static_fields.insert(name.to_owned(), StaticFieldSlot(index as u16));
         }
 
-        let mut field_types = HashMap::new();
-        let mut static_field_types = HashMap::new();
+        let mut field_types = HashMap::default();
+        let mut static_field_types = HashMap::default();
         for field in &class.fields {
             let expected = field
                 .annotation
@@ -1813,7 +1836,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     }
 
     fn collect_and_intern_symbols(&mut self) {
-        let mut keys = HashSet::new();
+        let mut keys = HashSet::default();
         collect_method_keys_in_statements(&self.ast.statements, &mut keys);
 
         // Compiler-generated protocol calls.
@@ -1851,14 +1874,15 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     }
 
     fn preintern_strings(&mut self) {
-        self.string_ids.insert(self.source_name.to_owned(), self.program.intern_string(self.source_name));
-        self.string_ids.insert(self.module_name.to_owned(), self.program.intern_string(self.module_name));
-        let mut strings = Vec::new();
+        self.string_ids.insert(self.source_name.to_compact_string(), self.program.intern_string(self.source_name));
+        self.string_ids.insert(self.module_name.to_compact_string(), self.program.intern_string(self.module_name));
+        let arena = Bump::new();
+        let mut strings = BumpVec::new_in(&arena);
         collect_strings_in_statements(&self.ast.statements, &mut strings);
         for bytes in strings {
             if let Ok(text) = std::str::from_utf8(&bytes) {
                 let id = self.program.intern_string(text);
-                self.string_ids.insert(text.to_owned(), id);
+                self.string_ids.insert(text.to_compact_string(), id);
             }
         }
         // Import names are needed by every compilation root, including methods
@@ -1867,11 +1891,11 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         for import in front::module_imports(self.ast) {
             if let Ok(module_name) = std::str::from_utf8(&import.module) {
                 let id = self.program.intern_string(module_name);
-                self.string_ids.insert(module_name.to_owned(), id);
+                self.string_ids.insert(module_name.to_compact_string(), id);
             }
             for binding in &import.bindings {
                 let id = self.program.intern_string(&binding.imported.value);
-                self.string_ids.insert(binding.imported.value.clone(), id);
+                self.string_ids.insert(binding.imported.value.to_compact_string(), id);
             }
         }
 
@@ -1881,19 +1905,15 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // an import specifier, and that literal must preserve its source value.
         for (source_spelling, canonical) in &self.options.import_map {
             let id = self.program.intern_string(canonical);
-            self.string_ids.insert(canonical.clone(), id);
-            self.import_ids.insert(source_spelling.clone(), id);
+            self.string_ids.insert(canonical.to_compact_string(), id);
+            self.import_ids.insert(source_spelling.to_compact_string(), id);
         }
     }
 
     fn compile_methods(&mut self, module: ModuleId) {
         let mut class_refs = Vec::new();
         collect_class_declarations(&self.ast.statements, &mut class_refs);
-        let classes: Vec<ClassDecl> = class_refs
-            .into_iter()
-            .map(|(class, _)| class.clone())
-            .collect();
-        for class in classes {
+        for (class, _) in class_refs {
             let class_plan = self.class_plans[&class.name.span].clone();
             let mut plans = Vec::new();
             for method in &class.methods {
@@ -1975,6 +1995,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     constructor: method.is_constructor,
                     static_method: method.is_static,
                     is_async: method.is_async,
+                    is_concurrent: false,
                 };
                 if let Some(function) = self.compile_function_node(module, &analysis, FunctionNodeId(0), spec) {
                     self.method_functions.insert(method.span, function);
@@ -2071,6 +2092,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     .map(|context| context.static_method)
                     .unwrap_or(false),
                 is_async: analysis.nodes[child.0].is_async,
+                is_concurrent: analysis.nodes[child.0].is_concurrent,
             };
             if let Some(function) = self.compile_function_node(module, analysis, child, spec) {
                 self.closure_functions
@@ -2114,6 +2136,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             Type::Top,
         );
         builder.set_async(spec.is_async);
+        builder.set_concurrent(spec.is_concurrent);
         if let Some(class) = spec.class {
             // Methods and closures nested inside them use field slots local to
             // this declaring class. The runtime relocates them exactly once when
@@ -2121,8 +2144,25 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             builder.set_field_owner(class);
         }
 
+        // Concurrent functions execute in a separate Interpreter/heap. Capturing a
+        // lexical binding would create an implicit cross-heap edge, so require all
+        // data to cross explicitly through `launch` arguments.
+        if spec.is_concurrent && !node.captures.is_empty() {
+            let span = node.closure_span.unwrap_or_else(|| function_node_span(node));
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "NAPALM-L041",
+                    "a concurrent function cannot capture lexical state",
+                    span,
+                )
+                .with_primary_label(span, "pass captured values explicitly as `launch` arguments")
+                .with_note("Concurrent workers have isolated heaps and no shared mutable memory."),
+            );
+            return None;
+        }
+
         // Captures must be declared before *any* emitted instruction.
-        let mut capture_values = HashMap::new();
+        let mut capture_values = HashMap::default();
         for binding in &node.captures {
             let info = analysis.binding(*binding);
             let mode = if info.mutated {
@@ -2174,6 +2214,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let context = FunctionCompilerContext {
             source_name: self.source_name,
             source: self.source,
+            line_starts: &self.line_starts,
             source_file: self.source_file,
             module,
             module_layout: &self.module_layout,
@@ -2190,7 +2231,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             closure_ids,
             method_context,
             has_receiver,
-            allows_await: node.is_async || (node_id.0 == 0 && spec.kind == FunctionKind::ModuleBody),
+            is_concurrent: spec.is_concurrent,
+            allows_await: node.is_async || node.is_concurrent || (node_id.0 == 0 && spec.kind == FunctionKind::ModuleBody),
         };
         let diagnostics = &mut self.diagnostics;
         let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values);
@@ -2230,6 +2272,7 @@ struct FunctionSpec {
     constructor: bool,
     static_method: bool,
     is_async: bool,
+    is_concurrent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2312,6 +2355,7 @@ struct LoopContext {
 struct FunctionCompilerContext<'a> {
     source_name: &'a str,
     source: &'a str,
+    line_starts: &'a [usize],
     source_file: ir::StringId,
     module: ModuleId,
     module_layout: &'a ModuleLayout,
@@ -2321,13 +2365,14 @@ struct FunctionCompilerContext<'a> {
     implicit_this: bool,
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
-    string_ids: &'a HashMap<String, ir::StringId>,
-    import_ids: &'a HashMap<String, ir::StringId>,
-    analysis: &'a RootAnalysis,
+    string_ids: &'a HashMap<CompactString, ir::StringId>,
+    import_ids: &'a HashMap<CompactString, ir::StringId>,
+    analysis: &'a RootAnalysis<'a>,
     node_id: FunctionNodeId,
     closure_ids: HashMap<FunctionNodeId, FuncId>,
     method_context: Option<MethodContext>,
     has_receiver: bool,
+    is_concurrent: bool,
     allows_await: bool,
 }
 
@@ -2385,7 +2430,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             exit_actions: Vec::new(),
             exception_regions: Vec::new(),
             active_regions: Vec::new(),
-            suppressed_regions: HashSet::new(),
+            suppressed_regions: HashSet::default(),
             in_cleanup: 0,
         }
     }
@@ -2595,13 +2640,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_body(&mut self) {
-        let node = self.context.analysis.nodes[self.context.node_id.0].clone();
-        match node.ast {
+        let analysis = self.context.analysis;
+        let node = &analysis.nodes[self.context.node_id.0];
+        match &node.ast {
             FunctionAst::Statements(statements) => {
                 self.lower_statements(&statements, self.context.node_id.0 == 0 && self.context.method_context.is_none());
                 self.emit_default_return();
             }
-            FunctionAst::Body(body) => match body.kind {
+            FunctionAst::Body(body) => match &body.kind {
                 FunctionBodyKind::Expression(expr) => {
                     let value = self.lower_expr(&expr);
                     if !self.current_terminated() {
@@ -2650,7 +2696,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn set_source(&mut self, span: Span) {
         self.builder
-            .set_source(Some(source_span(self.context.source, self.context.source_file, span)));
+            .set_source(Some(source_span(self.context.source, self.context.line_starts,
+                self.context.source_file, span)));
     }
 
     fn error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
@@ -3131,7 +3178,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         );
 
         for binding in &import.bindings {
-            let Some(name_id) = self.context.string_ids.get(&binding.imported.value).copied() else {
+            let Some(name_id) = self.context.string_ids.get(binding.imported.value.as_str()).copied() else {
                 self.error("NAPALM-L013", "imported name was not preinterned", binding.imported.span);
                 continue;
             };
@@ -3269,7 +3316,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let header = self.new_block(&[]);
-        let mut header_params = HashMap::new();
+        let mut header_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(header, ty);
@@ -3287,7 +3334,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             })
             .collect();
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::new();
+        let mut exit_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(exit, ty);
@@ -3347,14 +3394,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let body_block = self.new_block(&[]);
-        let mut body_params = HashMap::new();
+        let mut body_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             body_params.insert(*binding, self.builder.add_block_param(body_block, ty));
         }
 
         let condition_block = self.new_block(&[]);
-        let mut condition_params = HashMap::new();
+        let mut condition_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             condition_params.insert(
@@ -3364,7 +3411,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
 
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::new();
+        let mut exit_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -3431,14 +3478,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
-        let mut header_params = HashMap::new();
+        let mut header_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             header_params.insert(*binding, self.builder.add_block_param(header, ty));
         }
         let body_block = self.new_block(&[]);
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::new();
+        let mut exit_params = HashMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -3568,7 +3615,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn loop_carried_bindings(&self, condition: &Expr, body: &Stmt) -> Vec<BindingId> {
-        let mut writes = HashSet::new();
+        let mut writes = HashSet::default();
         collect_written_bindings_expr(condition, self.context.analysis, &mut writes);
         collect_written_bindings_stmt(body, self.context.analysis, &mut writes);
         let mut result: Vec<_> = writes
@@ -3660,13 +3707,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 if !self.context.allows_await {
                     self.error(
                         "NAPALM-L040",
-                        "`await` is only valid inside an async function or at module scope",
+                        "`await` is only valid inside an async/concurrent function or at module scope",
                         expr.span,
                     );
                 }
                 self.builder.emit1(Inst::Await { promise }, Type::Top)
             }
-            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => self.lower_closure(body),
+            ExprKind::Launch(call) => self.lower_launch(call, expr.span),
+            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => self.lower_closure(body),
         }
     }
 
@@ -3725,6 +3773,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.builder.invoke(receiver, method, Vec::new());
         }
         if let Some(slot) = self.context.module_layout.get(&name.value) {
+            if self.context.is_concurrent
+                && !BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value)
+            {
+                self.error(
+                    "NAPALM-L045",
+                    format!("concurrent function cannot read module global '{}'", name.value),
+                    name.span,
+                );
+                return self.builder.const_null();
+            }
             return self.builder.emit1(
                 Inst::LoadModuleVar {
                     module: self.context.module,
@@ -4625,6 +4683,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             format!("cannot assign to core global '{}'", name.value),
                             name.span,
                         );
+                    } else if self.context.is_concurrent {
+                        self.error(
+                            "NAPALM-L046",
+                            format!("concurrent function cannot write module global '{}'", name.value),
+                            name.span,
+                        );
                     } else {
                         let value = self.check_module_assignment(&name.value, value, name.span);
                         self.builder.emit0(Inst::StoreModuleVar {
@@ -4757,6 +4821,48 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
         value
+    }
+
+    fn lower_launch(&mut self, call: &Expr, span: Span) -> ValueId {
+        let ExprKind::Invoke(invoke) = &call.kind else {
+            self.error(
+                "NAPALM-L042",
+                "`launch` must be followed by a function call",
+                span,
+            );
+            return self.builder.const_null();
+        };
+
+        // Ordinary function-value calls are represented as `<callee>.call(args)`
+        // by the TypeScript frontend. Launch deliberately does not support method
+        // receivers because that would imply transferring `this` implicitly.
+        if invoke.name.value != "call" || invoke.syntax != InvokeSyntax::Method {
+            self.error(
+                "NAPALM-L043",
+                "`launch` only accepts a direct function-value call",
+                call.span,
+            );
+            return self.builder.const_null();
+        }
+        let Some(callee) = invoke.receiver.as_deref() else {
+            self.error(
+                "NAPALM-L043",
+                "`launch` requires an explicit concurrent function value",
+                call.span,
+            );
+            return self.builder.const_null();
+        };
+        if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
+            self.error(
+                "NAPALM-L044",
+                "spread arguments are not supported at a concurrent launch boundary",
+                call.span,
+            );
+            return self.builder.const_null();
+        }
+        let closure = self.lower_expr(callee);
+        let args = self.lower_call_args(&invoke.args, call.span);
+        self.builder.emit1(Inst::Launch { closure, args }, Type::Top)
     }
 
     fn lower_call(&mut self, receiver: ValueId, name: &str, kind: MethodKind,
@@ -5098,11 +5204,21 @@ fn function_node_span(node: &FunctionNode) -> Span {
     }
 }
 
-fn source_span(source: &str, file: ir::StringId, span: Span) -> SourceSpan {
+fn source_line_starts(source: &str) -> Vec<usize> {
+    // Index once per module, instead of rescanning the source prefix for every
+    // emitted IR instruction (quadratic in the size of a multiline module).
+    std::iter::once(0)
+        .chain(source.bytes().enumerate().filter_map(|(index, byte)| {
+            (byte == b'\n').then_some(index + 1)
+        }))
+        .collect()
+}
+
+fn source_span(source: &str, line_starts: &[usize], file: ir::StringId, span: Span) -> SourceSpan {
     let start = span.start.min(source.len());
-    let prefix = &source[..start];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
-    let line_start = prefix.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let line_index = line_starts.partition_point(|&offset| offset <= start) - 1;
+    let line = line_index as u32 + 1;
+    let line_start = line_starts[line_index];
     let column = source[line_start..start].chars().count() as u32 + 1;
     SourceSpan {
         file: Some(file),
@@ -5386,8 +5502,8 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 }
             }
         }
-        ExprKind::Await(value) => collect_fields_expr(value, instance, statics),
-        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => collect_fields_in_body(body, instance, statics),
+        ExprKind::Await(value) | ExprKind::Launch(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_fields_in_body(body, instance, statics),
         ExprKind::Super(super_expr) => {
             for arg in &super_expr.args {
                 collect_fields_expr(arg, instance, statics)
@@ -5403,7 +5519,7 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
 }
 
 fn dedup_preserve_order(values: &mut SmallVec<[&str; 8]>) {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     values.retain(|value| seen.insert(*value));
 }
 
@@ -5661,8 +5777,8 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(then_expr, out);
             collect_method_keys_expr(else_expr, out)
         }
-        ExprKind::Await(value) => collect_method_keys_expr(value, out),
-        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => collect_method_keys_body(body, out),
+        ExprKind::Await(value) | ExprKind::Launch(value) => collect_method_keys_expr(value, out),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_method_keys_body(body, out),
         ExprKind::Name(name) => {
             out.insert(MethodKey {
                 name: name.value.clone(),
@@ -5685,13 +5801,13 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
     }
 }
 
-fn collect_strings_in_statements(statements: &[Stmt], out: &mut Vec<Vec<u8>>) {
+fn collect_strings_in_statements<'ast>(statements: &'ast [Stmt], out: &mut BumpVec<'_, &'ast [u8]>) {
     for statement in statements {
         collect_strings_stmt(statement, out)
     }
 }
 
-fn collect_strings_stmt(stmt: &Stmt, out: &mut Vec<Vec<u8>>) {
+fn collect_strings_stmt<'ast>(stmt: &'ast Stmt, out: &mut BumpVec<'_, &'ast [u8]>) {
     match &stmt.kind {
         StmtKind::Variable { initializer, .. } => {
             if let Some(expr) = initializer {
@@ -5753,13 +5869,13 @@ fn collect_strings_stmt(stmt: &Stmt, out: &mut Vec<Vec<u8>>) {
     }
 }
 
-fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
+fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]>) {
     match &expr.kind {
-        ExprKind::String(bytes) => out.push(bytes.clone()),
+        ExprKind::String(bytes) => out.push(bytes.as_slice()),
         ExprKind::InterpolatedString(parts) => {
             for part in parts {
                 match part {
-                    StringPart::Bytes(bytes) => out.push(bytes.clone()),
+                    StringPart::Bytes(bytes) => out.push(bytes.as_slice()),
                     StringPart::Expression(expr) => collect_strings_expr(expr, out),
                 }
             }
@@ -5829,8 +5945,8 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
                 }
             }
         }
-        ExprKind::Await(value) => collect_strings_expr(value, out),
-        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => match &body.kind {
+        ExprKind::Await(value) | ExprKind::Launch(value) => collect_strings_expr(value, out),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => match &body.kind {
             FunctionBodyKind::Expression(expr) => collect_strings_expr(expr, out),
             FunctionBodyKind::Statements(statements) => collect_strings_in_statements(statements, out),
         },
@@ -6018,9 +6134,10 @@ fn collect_written_bindings_expr(
         }
         // Do not descend into closures: their writes happen when the closure is
         // invoked, and captured mutable bindings are cells already.
-        ExprKind::Await(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::Await(value) | ExprKind::Launch(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::Closure(_)
         | ExprKind::AsyncClosure(_)
+        | ExprKind::ConcurrentClosure(_)
         | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
@@ -6039,6 +6156,20 @@ fn collect_written_bindings_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_source_positions_preserve_unicode_crlf_and_eof() {
+        let source = "a\r\nñ🙂\n";
+        let lines = source_line_starts(source);
+        for (offset, line, column) in [(0, 1, 1), (2, 1, 3), (3, 2, 1),
+            (5, 2, 2), (9, 2, 3), (10, 3, 1), (99, 3, 1)] {
+            let span = source_span(source, &lines, ir::StringId(7), Span::empty(offset));
+            assert_eq!((span.line, span.column), (line, column));
+            assert_eq!(span.file, Some(ir::StringId(7)));
+        }
+        let empty = source_span("", &source_line_starts(""), ir::StringId(0), Span::empty(0));
+        assert_eq!((empty.line, empty.column), (1, 1));
+    }
 
     fn parse(source: &str) -> ModuleAst {
         let parsed = front::parse("test.napalm", source);
@@ -6410,8 +6541,8 @@ class Child is Parent {
     #[test]
     fn jit_benchmark_scripts_lower_with_valid_ssa_edges() {
         for source in [
-            include_str!("../scripts/jit.nap"),
-            include_str!("../scripts/jit_entries.nap"),
+            include_str!("../scripts/jit.napalm"),
+            include_str!("../scripts/jit_entries.napalm"),
         ] {
             let module = parse_typescript(source);
             let output = lower_new_program("jit.nap", source, "jit", &module);

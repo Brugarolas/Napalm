@@ -282,6 +282,10 @@ enum RawTokenKind {
     Async,
     #[token("await")]
     Await,
+    #[token("concurrent")]
+    Concurrent,
+    #[token("launch")]
+    Launch,
     #[token("break")]
     Break,
     #[token("catch")]
@@ -435,6 +439,8 @@ pub enum TokenKind {
     As,
     Async,
     Await,
+    Concurrent,
+    Launch,
     Break,
     Catch,
     Class,
@@ -512,6 +518,8 @@ impl TokenKind {
             As => "`as`",
             Async => "`async`",
             Await => "`await`",
+            Concurrent => "`concurrent`",
+            Launch => "`launch`",
             Break => "`break`",
             Catch => "`catch`",
             Class => "`class`",
@@ -693,6 +701,8 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::As => T::As,
         R::Async => T::Async,
         R::Await => T::Await,
+        R::Concurrent => T::Concurrent,
+        R::Launch => T::Launch,
         R::Break => T::Break,
         R::Catch => T::Catch,
         R::Class => T::Class,
@@ -1352,8 +1362,12 @@ pub enum ExprKind {
     },
     /// NapalmJIT extension: suspend the current async execution until a Promise settles.
     Await(Box<Expr>),
+    /// Executes a concurrent function on the parallel worker pool and returns a Promise.
+    Launch(Box<Expr>),
     Closure(FunctionBody),
     AsyncClosure(FunctionBody),
+    /// A closure that may only be entered through `launch`; it cannot capture lexical state.
+    ConcurrentClosure(FunctionBody),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1456,6 +1470,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
             | ExprKind::Await(inner)
+            | ExprKind::Launch(inner)
             | ExprKind::DestructureCheck { source: inner, .. }
             | ExprKind::Spread(inner) => visit_expr(inner, out),
             ExprKind::DestructureGet { source: left, key: right }
@@ -1514,7 +1529,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                     }
                 }
             }
-            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => visit_body(body, out),
+            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => visit_body(body, out),
             ExprKind::Null
             | ExprKind::Bool(_)
             | ExprKind::Number(_)
@@ -2953,6 +2968,23 @@ impl<'a> Parser<'a> {
                 let span = token.span.join(operand.span);
                 Ok(Expr::new(ExprKind::Await(Box::new(operand)), span))
             }
+            TokenKind::Launch => {
+                self.skip_newlines();
+                let operand = self.parse_precedence(15)?;
+                let span = token.span.join(operand.span);
+                Ok(Expr::new(ExprKind::Launch(Box::new(operand)), span))
+            }
+            TokenKind::Concurrent => {
+                self.skip_newlines();
+                self.expect(
+                    TokenKind::LeftBrace,
+                    "NAPALM-P077",
+                    "expected `{` after `concurrent`",
+                )?;
+                let body = self.parse_function_body_after_open(token.span.start, true)?;
+                let span = Span::new(token.span.start, body.span.end);
+                Ok(Expr::new(ExprKind::ConcurrentClosure(body), span))
+            }
             TokenKind::Async => {
                 self.skip_newlines();
                 self.expect(
@@ -3121,11 +3153,12 @@ impl<'a> Parser<'a> {
     fn attach_block_argument(&mut self, mut expression: Expr) -> PResult<Expr> {
         let body = self.parse_function_body_after_open(self.previous().span.start, true)?;
         let end = body.span.end;
-        let closure = Expr::new(ExprKind::Closure(body.clone()), body.span);
+        let body_span = body.span;
+        let closure = Expr::new(ExprKind::Closure(body), body_span);
 
         match &mut expression.kind {
             ExprKind::Name(name) => {
-                let name = name.clone();
+                let name = std::mem::replace(name, Spanned::new(String::new(), name.span));
                 expression.kind = ExprKind::Invoke(InvokeExpr {
                     receiver: None,
                     name,
@@ -3141,7 +3174,7 @@ impl<'a> Parser<'a> {
                         Diagnostic::error(
                             "NAPALM-P058",
                             "block argument exceeds the maximum method arity",
-                            body.span,
+                            body_span,
                         )
                         .with_note("A block argument is the final explicit method argument."),
                     );
@@ -3155,7 +3188,7 @@ impl<'a> Parser<'a> {
                         Diagnostic::error(
                             "NAPALM-P058",
                             "block argument exceeds the maximum method arity",
-                            body.span,
+                            body_span,
                         )
                         .with_note("A block argument is the final explicit method argument."),
                     );

@@ -192,7 +192,7 @@ impl TraceOptimization for AlgebraicSimplification {
 pub struct RedundantGuardElimination;
 impl TraceOptimization for RedundantGuardElimination {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut seen: HashMap<TraceInst, Option<TraceValueId>> = HashMap::new();
+        let mut seen: HashMap<TraceInst, Option<TraceValueId>> = HashMap::default();
         let mut changed = false;
         for id in order(trace) {
             let kind = trace.nodes[id].kind.clone();

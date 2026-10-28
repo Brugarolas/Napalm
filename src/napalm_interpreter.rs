@@ -17,13 +17,15 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
+use simd_json::prelude::*;
 use crate::napalm_gc::{
     Collector as GcCollector, Config as GcConfig, Descriptor as GcDescriptor, Mutator as GcMutator,
     Object as GcObject, RootProvider as GcRootProvider, RootRegistration as GcRootRegistration,
@@ -39,6 +41,16 @@ pub mod napalm_ffi;
 use self::napalm_ffi::{
     FfiFunction, FfiLibrary, FfiRuntime, FfiSignature, FfiType, NativeArg as FfiNativeArg,
     NativeResult as FfiNativeResult,
+};
+#[path = "napalm_fetch.rs"]
+mod fetch_backend;
+use self::fetch_backend::{
+    FetchCompletion, FetchId, FetchRequest, FetchResponse, FetchRuntime, RedirectMode,
+};
+#[path = "napalm_concurrent.rs"]
+mod concurrent_runtime;
+use self::concurrent_runtime::{
+    ConcurrentCompletion, ConcurrentJobId, ConcurrentKey, ConcurrentRuntime, ConcurrentValue,
 };
 #[path = "napalm_collection_ops.rs"]
 mod collection_ops;
@@ -231,7 +243,7 @@ fn f64_word(value: f64) -> RegisterWord {
 
 // The PRNG and both hardware backends live here, in the interpreter file.
 // This module deliberately has no dependency on the collection wrappers in utils.rs.
-mod runtime_hash {
+pub(crate) mod runtime_hash {
     use std::hash::{BuildHasher, Hasher};
     #[cfg(test)]
     use std::hash::Hash;
@@ -923,8 +935,8 @@ pub(crate) fn fast_random_seed() -> u64 {
 
 use self::runtime_hash::AesBuildHasher;
 
-type FastMap<K, V> = HashMap<K, V, AesBuildHasher>;
-type FastSet<K> = HashSet<K, AesBuildHasher>;
+type FastMap<K, V> = HashMap<K, V>;
+type FastSet<K> = HashSet<K>;
 
 // Cached string hashes must use one seed across every thread and interpreter
 // instance in this process. Per-map seeds apply when hashing those cached values
@@ -1531,6 +1543,8 @@ enum CancelHandle {
     Event(EventId),
     Task(u32),
     Promise(Value),
+    Fetch(FetchId),
+    Concurrent(ConcurrentJobId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1644,6 +1658,33 @@ impl fmt::Debug for PromiseCell {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseDecodedKind {
+    Json,
+    Text,
+}
+
+#[derive(Debug)]
+struct NapalmResponse {
+    status: u16,
+    status_text: Arc<str>,
+    url: Arc<str>,
+    redirected: bool,
+    headers: Arc<[(Arc<str>, Arc<str>)]>,
+    headers_object: Option<Value>,
+    content_type: Option<Arc<str>>,
+    body: Vec<u8>,
+    body_used: bool,
+    decoded: Option<(ResponseDecodedKind, Value)>,
+}
+
+#[derive(Debug)]
+struct NapalmHeaders {
+    /// Headers is a zero-copy managed view over its owning Response. Keeping the
+    /// Response alive preserves one authoritative external-memory accounting owner.
+    response: Value,
+}
+
 #[derive(Debug)]
 enum HeapObject {
     Random { state: u64 },
@@ -1689,6 +1730,8 @@ enum HeapObject {
     Promise {
         state: Arc<PromiseCell>,
     },
+    Response(NapalmResponse),
+    Headers(NapalmHeaders),
     /// Scheduler-owned execution context for an async function. It deliberately
     /// reuses FiberState's frame/register storage without being a Napalm Fiber.
     AsyncTaskObject {
@@ -1728,7 +1771,7 @@ type HandleEntry = TraceHeapEntry;
 
 struct HandleTable {
     chunks: Box<[AtomicPtr<HandleEntry>]>,
-    install_lock: StdMutex<()>,
+    install_lock: Mutex<()>,
     next: AtomicU32,
     free_head: AtomicU32,
     live: AtomicUsize,
@@ -1741,7 +1784,7 @@ impl HandleTable {
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            install_lock: StdMutex::new(()),
+            install_lock: Mutex::new(()),
             next: AtomicU32::new(0),
             free_head: AtomicU32::new(FREE_HANDLE_NONE),
             live: AtomicUsize::new(0),
@@ -1750,7 +1793,7 @@ impl HandleTable {
 
     #[cold]
     fn install_chunk(&self, chunk_index: usize) -> *mut HandleEntry {
-        let _guard = self.install_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.install_lock.lock();
         let current = self.chunks[chunk_index].load(Ordering::Acquire);
         if !current.is_null() {
             return current;
@@ -2164,6 +2207,25 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     }
 }
 
+unsafe fn trace_response(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Response(response) = &managed.object {
+        if let Some((_, value)) = response.decoded {
+            visit_value(value, visitor);
+        }
+        if let Some(value) = response.headers_object {
+            visit_value(value, visitor);
+        }
+    }
+}
+
+unsafe fn trace_headers(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Headers(headers) = &managed.object {
+        visit_value(headers.response, visitor);
+    }
+}
+
 unsafe fn trace_async_task(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
     let HeapObject::AsyncTaskObject { state, trace_metadata, promise, .. } = &managed.object else {
@@ -2209,6 +2271,7 @@ gc_descriptor!(GC_FOREIGN, "Napalm.Foreign", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FFI_LIBRARY, "Napalm.FFI.Library", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FFI_FUNCTION, "Napalm.FFI.Function", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FFI_POINTER, "Napalm.FFI.Pointer", GcTraceLayout::Leaf);
+gc_descriptor!(GC_HEADERS, "Napalm.Headers", GcTraceLayout::Custom(trace_headers));
 gc_descriptor!(GC_MODULE, "Napalm.Module", GcTraceLayout::Leaf);
 gc_descriptor!(GC_LIST, "Napalm.List", GcTraceLayout::Custom(trace_list));
 gc_descriptor!(GC_MAP, "Napalm.Map", GcTraceLayout::Custom(trace_map));
@@ -2217,6 +2280,7 @@ gc_descriptor!(GC_CELL, "Napalm.Cell", GcTraceLayout::Custom(trace_cell));
 gc_descriptor!(GC_CLOSURE, "Napalm.Closure", GcTraceLayout::Custom(trace_closure));
 gc_descriptor!(GC_INSTANCE, "Napalm.Instance", GcTraceLayout::Custom(trace_instance));
 gc_descriptor!(GC_PROMISE, "Napalm.Promise", GcTraceLayout::Custom(trace_promise));
+gc_descriptor!(GC_RESPONSE, "Napalm.Response", GcTraceLayout::Custom(trace_response));
 gc_descriptor!(GC_ASYNC_TASK, "Napalm.AsyncTask", GcTraceLayout::Custom(trace_async_task));
 gc_descriptor!(GC_FIBER, "Napalm.Fiber", GcTraceLayout::Custom(trace_fiber));
 
@@ -2239,6 +2303,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::FfiFunction { .. } => &GC_FFI_FUNCTION,
         HeapObject::FfiPointer { .. } => &GC_FFI_POINTER,
         HeapObject::Promise { .. } => &GC_PROMISE,
+        HeapObject::Response(_) => &GC_RESPONSE,
+        HeapObject::Headers(_) => &GC_HEADERS,
         HeapObject::AsyncTaskObject { .. } => &GC_ASYNC_TASK,
         HeapObject::FiberObject { .. } => &GC_FIBER,
         HeapObject::ModuleObject { .. } => &GC_MODULE,
@@ -2259,6 +2325,16 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         },
         HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
+        HeapObject::Response(response) => {
+            response.body.capacity()
+                + response.status_text.len()
+                + response.url.len()
+                + response.content_type.as_ref().map_or(0, |value| value.len())
+                + response.headers.len() * std::mem::size_of::<(Arc<str>, Arc<str>)>()
+                + response.headers.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>()
+        }
+        // Headers is only a managed view; Response owns all native header storage.
+        HeapObject::Headers(_) => 0,
         HeapObject::Promise { state } => {
             // SAFETY: this is queried by the owning mutator.
             match unsafe { state.get() } {
@@ -2436,6 +2512,17 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                     push_value_handle(*value, roots);
                 }
             }
+        }
+        HeapObject::Response(response) => {
+            if let Some((_, value)) = response.decoded {
+                push_value_handle(value, roots);
+            }
+            if let Some(value) = response.headers_object {
+                push_value_handle(value, roots);
+            }
+        }
+        HeapObject::Headers(headers) => {
+            push_value_handle(headers.response, roots);
         }
         HeapObject::AsyncTaskObject { state, trace_metadata, promise, .. } => {
             push_value_handle(*promise, roots);
@@ -3139,7 +3226,7 @@ impl Heap {
 
 #[derive(Default)]
 struct HandleRootSet {
-    handles: StdMutex<Vec<u32>>,
+    handles: Mutex<Vec<u32>>,
 }
 
 impl HandleRootSet {
@@ -3147,7 +3234,6 @@ impl HandleRootSet {
         if let Some(handle) = value.heap_handle() {
             self.handles
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(handle);
         }
     }
@@ -3155,8 +3241,7 @@ impl HandleRootSet {
     fn replace(&self, handles: Vec<u32>) {
         *self
             .handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handles;
+            .lock() = handles;
     }
 }
 
@@ -3164,8 +3249,7 @@ unsafe impl GcRootProvider for HandleRootSet {
     fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
         let roots = self
             .handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         for &handle in roots.iter() {
             if let Some(slot) = handles().gc_slot(handle) {
                 visitor.slot(slot);
@@ -3531,6 +3615,8 @@ impl HostContext<'_> {
                 PromiseState::Rejected(_) => "<promise:rejected>".to_owned(),
                 PromiseState::Cancelled(_) => "<promise:cancelled>".to_owned(),
             },
+            Some(HeapObject::Response(response)) => format!("<Response {}>", response.status),
+            Some(HeapObject::Headers(_)) => "<Headers>".to_owned(),
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
@@ -3804,6 +3890,7 @@ struct PreparedFunction {
     kind: FunctionKind,
     uses_this: bool,
     is_async: bool,
+    is_concurrent: bool,
     arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
@@ -3969,6 +4056,7 @@ impl PreparedProgram {
                     | Opcode::InvokeSuper
                     | Opcode::CallDirect
                     | Opcode::CallClosure
+                    | Opcode::Launch
                     | Opcode::CallPrimitive
                     | Opcode::CallForeign
             );
@@ -4296,6 +4384,7 @@ impl PreparedProgram {
             kind: function.kind,
             uses_this,
             is_async: function.is_async,
+            is_concurrent: function.is_concurrent,
             arity: function.arity,
             return_kind: function.frame.return_kind,
             capture_count: function.capture_count,
@@ -4527,6 +4616,19 @@ pub enum NativeBuiltin {
     TimerDelay,
     TimerMicrotask,
     TimerEvery,
+    FetchCall,
+    ResponseStatus,
+    ResponseStatusText,
+    ResponseOk,
+    ResponseUrl,
+    ResponseRedirected,
+    ResponseHeaders,
+    ResponseData,
+    ResponseBodyUsed,
+    ResponseJson,
+    ResponseText,
+    HeadersGet,
+    HeadersHas,
     FfiOpen,
     FfiNull,
     FfiLastError,
@@ -4561,9 +4663,11 @@ pub enum BuiltinClass {
     FfiLibrary,
     FfiFunction,
     FfiPointer,
+    Response,
+    Headers,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 16;
+const BUILTIN_CLASS_COUNT: usize = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -4595,6 +4699,10 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Closure as u64),
         HeapObject::Promise { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Promise as u64),
+        HeapObject::Response(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Response as u64),
+        HeapObject::Headers(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Headers as u64),
         HeapObject::FiberObject { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Fiber as u64),
         HeapObject::ClassObject { class_slot } =>
@@ -5119,6 +5227,21 @@ pub struct Interpreter<'p> {
     /// Microtasks and timer deadlines. Runtime events hold managed Values and are
     /// therefore included in both active and persistent GC root snapshots.
     event_loop: NapalmEventLoop<RuntimeEvent>,
+    /// HTTP is initialized lazily on the first fetch() call so ordinary Napalm
+    /// programs pay no Tokio threads, reqwest client construction, or TLS setup.
+    /// Managed Promise values never cross into the HTTP runtime.
+    fetch: Option<FetchRuntime>,
+    pending_fetches: FastMap<FetchId, Value>,
+    /// Lazily created isolated N:M worker pool. No managed Value crosses this
+    /// boundary; only ConcurrentValue snapshots do.
+    concurrent: Option<ConcurrentRuntime>,
+    pending_concurrent: FastMap<ConcurrentJobId, Value>,
+    concurrent_manifest: Option<crate::napalm_builtin::BuiltinManifest>,
+    is_concurrent_worker: bool,
+    /// Shared wake channel used to multiplex timers, HTTP and parallel workers
+    /// without polling while the VM has no runnable continuation.
+    external_wake_tx: mpsc::Sender<()>,
+    external_wake_rx: mpsc::Receiver<()>,
     /// Dynamic-library lifetime and OS-error snapshot. Prepared libffi CIFs are
     /// cached per OS thread because libffi::middle::Cif is !Send/!Sync.
     ffi: FfiRuntime,
@@ -5215,6 +5338,8 @@ unsafe impl GcRootProvider for VmRootProvider {
             }
         }
         vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
+        for &promise in vm.pending_fetches.values() { root(promise); }
+        for &promise in vm.pending_concurrent.values() { root(promise); }
         root(vm.cancelled_error);
         root(vm.result);
     }
@@ -5425,7 +5550,7 @@ impl<'p> Interpreter<'p> {
         let last_gc_collections = heap.collection_count();
         let jit = Box::new(TracingJit::default());
         let jit_entry_threshold = jit.options().hot_entry_threshold;
-
+        let (external_wake_tx, external_wake_rx) = mpsc::channel();
         Ok(Self {
             jit: Some(jit),
             jit_entry_threshold,
@@ -5444,6 +5569,14 @@ impl<'p> Interpreter<'p> {
             free_fibers: Vec::new(),
             ready_async: VecDeque::new(),
             event_loop: NapalmEventLoop::default(),
+            fetch: None,
+            pending_fetches: FastMap::default(),
+            concurrent: None,
+            pending_concurrent: FastMap::default(),
+            concurrent_manifest: None,
+            is_concurrent_worker: false,
+            external_wake_tx,
+            external_wake_rx,
             ffi: FfiRuntime::default(),
             cancelled_error,
             fiber_trace_metadata,
@@ -5480,6 +5613,14 @@ impl<'p> Interpreter<'p> {
         self.gc_enabled = enabled;
     }
 
+    pub(crate) fn set_builtin_manifest(&mut self, manifest: crate::napalm_builtin::BuiltinManifest) {
+        self.concurrent_manifest = Some(manifest);
+    }
+
+    pub(crate) fn set_concurrent_worker(&mut self, worker: bool) {
+        self.is_concurrent_worker = worker;
+    }
+
     #[inline]
     fn gc_root_registration(&mut self) -> GcRootRegistration {
         let provider: Arc<dyn GcRootProvider> = Arc::new(VmRootProvider {
@@ -5496,6 +5637,8 @@ impl<'p> Interpreter<'p> {
                 + self.modules.len()
                 + self.roots.len()
                 + self.event_loop.len() * 3
+                + self.pending_fetches.len()
+                + self.pending_concurrent.len()
                 + 8,
         );
         let mut push = |value: Value| {
@@ -5527,6 +5670,8 @@ impl<'p> Interpreter<'p> {
             }
         }
         self.event_loop.for_each_payload(|event| (*event).visit_values(&mut push));
+        for &promise in self.pending_fetches.values() { push(promise); }
+        for &promise in self.pending_concurrent.values() { push(promise); }
         push(self.cancelled_error);
         push(self.result);
         self.persistent_roots.replace(roots);
@@ -5739,6 +5884,18 @@ impl<'p> Interpreter<'p> {
             return Err(RuntimeError::new("too many entry arguments"));
         }
 
+        // Reject direct concurrent entry before mutating VM/fiber state. A failed
+        // direct call must leave the caller idle and immediately reusable.
+        let (entry_is_concurrent, entry_kind, entry_module_slot) = {
+            let entry = unsafe { self.prepared.functions.get_unchecked(function_index as usize) };
+            (entry.is_concurrent, entry.kind, entry.module_slot)
+        };
+        if entry_is_concurrent && !self.is_concurrent_worker {
+            return Err(RuntimeError::new(
+                "concurrent functions cannot be called directly; use `launch function(args...)`",
+            ));
+        }
+
         self.run_state = RunState::Running;
         self.result = Value::NULL;
         self.error = None;
@@ -5747,9 +5904,8 @@ impl<'p> Interpreter<'p> {
 
         // Mark directly executed module bodies as initializing too. This keeps
         // cyclic imports from recursively entering the same body.
-        let entry = unsafe { self.prepared.functions.get_unchecked(function_index as usize) };
-        if entry.kind == FunctionKind::ModuleBody {
-            let module = unsafe { self.modules.get_unchecked_mut(entry.module_slot as usize) };
+        if entry_kind == FunctionKind::ModuleBody {
+            let module = unsafe { self.modules.get_unchecked_mut(entry_module_slot as usize) };
             module.initializing = true;
         }
         let mut words = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
@@ -6770,14 +6926,43 @@ impl<'p> Interpreter<'p> {
         false
     }
 
-    /// Select the next runnable continuation. Promise deliveries and explicit
-    /// Timer.microtask jobs have priority at every cooperative task boundary.
+    /// Select the next runnable continuation. External I/O completions are first
+    /// converted into Promise settlements; their continuation edges then enter
+    /// the ordinary microtask queue before another execution is selected.
     fn schedule_next_ready(&mut self) -> bool {
+        self.drain_fetch_completions();
+        self.drain_concurrent_completions();
         self.drain_runtime_microtasks();
         if self.run_state == RunState::Failed {
             return false;
         }
         self.schedule_next_ready_raw()
+    }
+
+    fn drain_fetch_completions(&mut self) {
+        loop {
+            let completion = self.fetch.as_mut().and_then(FetchRuntime::try_completion);
+            let Some(completion) = completion else {
+                break;
+            };
+            self.process_fetch_completion(completion);
+            if self.run_state == RunState::Failed {
+                break;
+            }
+        }
+    }
+
+    fn drain_concurrent_completions(&mut self) {
+        loop {
+            let completion = self.concurrent.as_mut().and_then(ConcurrentRuntime::try_completion);
+            let Some(completion) = completion else {
+                break;
+            };
+            self.process_concurrent_completion(completion);
+            if self.run_state == RunState::Failed {
+                break;
+            }
+        }
     }
 
     fn drain_runtime_microtasks(&mut self) {
@@ -6789,12 +6974,15 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    /// Drive timers only when no ordinary continuation is runnable. The current
-    /// single-thread runtime parks until the nearest deadline instead of polling.
-    /// The future N:M scheduler can replace park_timeout with worker unpark/reactor
-    /// integration without changing Timer/Promise semantics.
+    /// Drive timers and external completions only when no ordinary continuation
+    /// is runnable. HTTP and parallel workers both signal `external_wake_rx`, so
+    /// the VM can sleep until either external source completes or the nearest
+    /// timer deadline arrives without polling.
     fn drive_event_loop_until_runnable(&mut self) -> bool {
         loop {
+            self.drain_fetch_completions();
+            self.drain_concurrent_completions();
+            while self.external_wake_rx.try_recv().is_ok() {}
             self.drain_runtime_microtasks();
             if self.run_state == RunState::Failed {
                 return false;
@@ -6805,6 +6993,23 @@ impl<'p> Interpreter<'p> {
 
             if let Some(event) = self.event_loop.pop_due_timer() {
                 self.process_runtime_event(event);
+                continue;
+            }
+
+            let external_pending = self.fetch.as_ref().is_some_and(FetchRuntime::has_pending)
+                || self.concurrent.as_ref().is_some_and(ConcurrentRuntime::has_pending);
+            if external_pending {
+                match self.event_loop.time_until_next() {
+                    Some(timeout) if timeout.is_zero() => continue,
+                    Some(timeout) => {
+                        let _ = self.external_wake_rx.recv_timeout(timeout);
+                    }
+                    None => {
+                        if self.external_wake_rx.recv().is_err() {
+                            return false;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -6904,6 +7109,10 @@ impl<'p> Interpreter<'p> {
         unsafe { self.advance(op); }
         self.flush_hot_pc();
 
+        if self.prepared.functions[function as usize].is_concurrent {
+            self.fail_at(op, "concurrent functions cannot be called directly; use `launch`");
+            return;
+        }
         if self.prepared.functions[function as usize].is_async {
             self.maybe_collect();
             match self.spawn_async_task(function, receiver, args, closure) {
@@ -6941,6 +7150,10 @@ impl<'p> Interpreter<'p> {
         unsafe { self.advance(op); }
         self.flush_hot_pc();
 
+        if self.prepared.functions[function as usize].is_concurrent {
+            self.fail_at(op, "staged direct closure call cannot target concurrent bytecode");
+            return;
+        }
         if self.prepared.functions[function as usize].is_async {
             self.fail_at(op, "staged direct closure call cannot target async bytecode");
             return;
@@ -7282,7 +7495,1033 @@ impl<'p> Interpreter<'p> {
                 let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
                 Ok(true)
             }
+            CancelHandle::Fetch(id) => {
+                let cancelled = self.fetch.as_mut().is_some_and(|fetch| fetch.cancel(id));
+                if !cancelled {
+                    return Ok(false);
+                }
+                self.pending_fetches.remove(&id);
+                let reason = self.cancellation_reason();
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                Ok(true)
+            }
+            CancelHandle::Concurrent(id) => {
+                let cancelled = self.concurrent.as_mut().is_some_and(|runtime| runtime.cancel(id));
+                if !cancelled {
+                    return Ok(false);
+                }
+                self.pending_concurrent.remove(&id);
+                let reason = self.cancellation_reason();
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                Ok(true)
+            }
         }
+    }
+
+    fn fetch_string(&self, value: Value, what: &str) -> Result<String, RuntimeError> {
+        match self.heap.get(value) {
+            Some(HeapObject::String(string)) => std::str::from_utf8(string.as_ref())
+                .map(str::to_owned)
+                .map_err(|_| RuntimeError::new(format!("{what} must be a UTF-8 String"))),
+            _ => Err(RuntimeError::new(format!("{what} must be a String"))),
+        }
+    }
+
+    fn fetch_option_value(&self, options: Value, name: &str) -> Result<Value, RuntimeError> {
+        if options.is_null() {
+            return Ok(Value::NULL);
+        }
+        if !matches!(self.heap.get(options), Some(HeapObject::Map(_))) {
+            return Err(RuntimeError::new("fetch options must be a Map"));
+        }
+        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(name.as_bytes())));
+        self.heap.map_get_encoded(options, &key)
+    }
+
+    fn fetch_headers_from_value(&self, value: Value) -> Result<Vec<(String, String)>, RuntimeError> {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        if let Some(HeapObject::Headers(headers)) = self.heap.get(value) {
+            let response = headers.response;
+            let entries = match self.heap.get(response) {
+                Some(HeapObject::Response(response)) => &response.headers,
+                _ => return Err(RuntimeError::new("Headers owner is not a Response")),
+            };
+            return Ok(entries
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect());
+        }
+        let len = self
+            .heap
+            .map_len(value)
+            .ok_or_else(|| RuntimeError::new("fetch headers must be a Map or Headers"))?;
+        let mut headers = Vec::with_capacity(len);
+        for index in 0..len {
+            let (key, item) = match self.heap.get(value) {
+                Some(HeapObject::Map(map)) => (
+                    map.nth_key(&self.heap.map_shapes, index)
+                        .ok_or_else(|| RuntimeError::new("fetch header key disappeared"))?,
+                    map.nth_value(index)
+                        .ok_or_else(|| RuntimeError::new("fetch header value disappeared"))?,
+                ),
+                _ => return Err(RuntimeError::new("fetch headers must be a Map or Headers")),
+            };
+            let name = match key {
+                MapKey::String(key) => std::str::from_utf8(key.as_ref())
+                    .map_err(|_| RuntimeError::new("fetch header name must be UTF-8"))?
+                    .to_owned(),
+                _ => return Err(RuntimeError::new("fetch header names must be Strings")),
+            };
+            let item = self.fetch_string(item, "fetch header value")?;
+            headers.push((name, item));
+        }
+        Ok(headers)
+    }
+
+    fn parse_fetch_request(
+        &self,
+        url: Value,
+        options: Option<Value>,
+    ) -> Result<FetchRequest, RuntimeError> {
+        let url = self.fetch_string(url, "fetch URL")?;
+        let options = options.unwrap_or(Value::NULL);
+        if !options.is_null() && !matches!(self.heap.get(options), Some(HeapObject::Map(_))) {
+            return Err(RuntimeError::new("fetch options must be a Map"));
+        }
+
+        let method_value = self.fetch_option_value(options, "method")?;
+        let mut method = if method_value.is_null() {
+            "GET".to_owned()
+        } else {
+            self.fetch_string(method_value, "fetch method")?
+        };
+        if method.is_empty() {
+            return Err(RuntimeError::new("fetch method cannot be empty"));
+        }
+        if matches!(method.to_ascii_uppercase().as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            return Err(RuntimeError::new(format!(
+                "fetch method `{method}` is forbidden by Fetch semantics"
+            )));
+        }
+        // WHATWG Fetch normalizes the standard methods but leaves extension/custom
+        // method spelling intact. reqwest validates the token before the request is
+        // spawned, so malformed custom methods still reject the returned Promise.
+        if matches!(
+            method.to_ascii_uppercase().as_str(),
+            "DELETE" | "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT"
+        ) {
+            method.make_ascii_uppercase();
+        }
+
+        let headers_value = self.fetch_option_value(options, "headers")?;
+        let mut headers = self.fetch_headers_from_value(headers_value)?;
+        let body_value = self.fetch_option_value(options, "body")?;
+        let (body, inferred_content_type) = if body_value.is_null() {
+            (None, None)
+        } else if let Some(HeapObject::String(string)) = self.heap.get(body_value) {
+            (
+                Some(string.as_ref().to_vec()),
+                Some("text/plain;charset=UTF-8"),
+            )
+        } else if matches!(self.heap.get(body_value), Some(HeapObject::Map(_) | HeapObject::List(_))) {
+            (
+                Some(self.serialize_fetch_json(body_value)?),
+                Some("application/json"),
+            )
+        } else {
+            return Err(RuntimeError::new(
+                "fetch body must be a String, Map, List, or null",
+            ));
+        };
+
+        if body.is_some() && matches!(method.as_str(), "GET" | "HEAD") {
+            return Err(RuntimeError::new("fetch GET/HEAD requests cannot have a body"));
+        }
+        if let Some(content_type) = inferred_content_type {
+            if !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            {
+                headers.push(("content-type".to_owned(), content_type.to_owned()));
+            }
+        }
+
+        let redirect_value = self.fetch_option_value(options, "redirect")?;
+        let redirect = if redirect_value.is_null() {
+            RedirectMode::Follow
+        } else {
+            match self.fetch_string(redirect_value, "fetch redirect")?.as_str() {
+                "follow" => RedirectMode::Follow,
+                "manual" => RedirectMode::Manual,
+                "error" => RedirectMode::Error,
+                _ => {
+                    return Err(RuntimeError::new(
+                        "fetch redirect must be `follow`, `manual`, or `error`",
+                    ));
+                }
+            }
+        };
+
+        Ok(FetchRequest {
+            url,
+            method,
+            headers,
+            body,
+            redirect,
+        })
+    }
+
+    fn serialize_fetch_json(&self, value: Value) -> Result<Vec<u8>, RuntimeError> {
+        let mut out = Vec::with_capacity(256);
+        let mut seen = FastSet::default();
+        self.serialize_fetch_json_value(value, &mut out, &mut seen, 0)?;
+        Ok(out)
+    }
+
+    fn serialize_fetch_json_value(
+        &self,
+        value: Value,
+        out: &mut Vec<u8>,
+        seen: &mut FastSet<u32>,
+        depth: usize,
+    ) -> Result<(), RuntimeError> {
+        const MAX_JSON_DEPTH: usize = 256;
+        if depth > MAX_JSON_DEPTH {
+            return Err(RuntimeError::new("fetch JSON body exceeds maximum nesting depth"));
+        }
+        if value.is_null() {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        if let Some(value) = value.as_bool() {
+            out.extend_from_slice(if value { b"true" } else { b"false" });
+            return Ok(());
+        }
+        if let Some(number) = value.as_num() {
+            if !number.is_finite() {
+                out.extend_from_slice(b"null");
+            } else if number == 0.0 {
+                out.push(b'0');
+            } else {
+                out.extend_from_slice(number.to_string().as_bytes());
+            }
+            return Ok(());
+        }
+
+        let handle = value
+            .heap_handle()
+            .ok_or_else(|| RuntimeError::new("value cannot be serialized as JSON"))?;
+        match self.heap.get(value) {
+            Some(HeapObject::String(string)) => {
+                let text = std::str::from_utf8(string.as_ref())
+                    .map_err(|_| RuntimeError::new("fetch JSON strings must be UTF-8"))?;
+                Self::push_json_string(out, text);
+                Ok(())
+            }
+            Some(HeapObject::List(values)) => {
+                if !seen.insert(handle) {
+                    return Err(RuntimeError::new("fetch JSON body contains a cycle"));
+                }
+                out.push(b'[');
+                for (index, value) in values.iter().copied().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    self.serialize_fetch_json_value(value, out, seen, depth + 1)?;
+                }
+                out.push(b']');
+                seen.remove(&handle);
+                Ok(())
+            }
+            Some(HeapObject::Map(map)) => {
+                if !seen.insert(handle) {
+                    return Err(RuntimeError::new("fetch JSON body contains a cycle"));
+                }
+                let len = map.len();
+                out.push(b'{');
+                for index in 0..len {
+                    let (key, item) = match self.heap.get(value) {
+                        Some(HeapObject::Map(map)) => (
+                            map.nth_key(&self.heap.map_shapes, index)
+                                .ok_or_else(|| RuntimeError::new("Map key disappeared during JSON serialization"))?,
+                            map.nth_value(index)
+                                .ok_or_else(|| RuntimeError::new("Map value disappeared during JSON serialization"))?,
+                        ),
+                        _ => return Err(RuntimeError::new("JSON Map disappeared during serialization")),
+                    };
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    match key {
+                        MapKey::String(key) => {
+                            let key = std::str::from_utf8(key.as_ref()).map_err(|_| {
+                                RuntimeError::new("fetch JSON object keys must be UTF-8 Strings")
+                            })?;
+                            Self::push_json_string(out, key);
+                        }
+                        _ => {
+                            return Err(RuntimeError::new(
+                                "fetch JSON object keys must be Strings",
+                            ));
+                        }
+                    }
+                    out.push(b':');
+                    self.serialize_fetch_json_value(item, out, seen, depth + 1)?;
+                }
+                out.push(b'}');
+                seen.remove(&handle);
+                Ok(())
+            }
+            _ => Err(RuntimeError::new(
+                "fetch JSON body supports only null, Bool, Num, String, List, and Map values",
+            )),
+        }
+    }
+
+    fn push_json_string(out: &mut Vec<u8>, value: &str) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(b'"');
+        for &byte in value.as_bytes() {
+            match byte {
+                b'"' => out.extend_from_slice(br#"\""#),
+                b'\\' => out.extend_from_slice(br#"\\"#),
+                0x08 => out.extend_from_slice(br#"\b"#),
+                0x0c => out.extend_from_slice(br#"\f"#),
+                b'\n' => out.extend_from_slice(br#"\n"#),
+                b'\r' => out.extend_from_slice(br#"\r"#),
+                b'\t' => out.extend_from_slice(br#"\t"#),
+                0x00..=0x1f => {
+                    out.extend_from_slice(br#"\u00"#);
+                    out.push(HEX[(byte >> 4) as usize]);
+                    out.push(HEX[(byte & 0x0f) as usize]);
+                }
+                _ => out.push(byte),
+            }
+        }
+        out.push(b'"');
+    }
+
+    fn allocate_rejected_promise_message(&mut self, message: impl Into<String>) -> Value {
+        let message = message.into();
+        let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            message.into_bytes(),
+        ))));
+        let reason_root = self.add_root(reason);
+        let promise = self.allocate_promise(PromiseState::Rejected(reason));
+        self.release_root(reason_root);
+        promise
+    }
+
+    fn settled_promise_from_result(&mut self, result: Result<Value, RuntimeError>) -> Value {
+        match result {
+            Ok(value) => {
+                let root = self.add_root(value);
+                let promise = self.allocate_promise(PromiseState::Fulfilled(value));
+                self.release_root(root);
+                promise
+            }
+            Err(error) => self.allocate_rejected_promise_message(error.message),
+        }
+    }
+
+    fn start_fetch(&mut self, request: FetchRequest) -> Value {
+        if self.fetch.is_none() {
+            match FetchRuntime::new_with_waker(self.external_wake_tx.clone()) {
+                Ok(fetch) => self.fetch = Some(fetch),
+                Err(error) => {
+                    return self.allocate_rejected_promise_message(format!(
+                        "TypeError: failed to initialize fetch(): {}",
+                        error.message
+                    ));
+                }
+            }
+        }
+
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            cancel: None,
+            cancel_requested: false,
+        });
+        let promise_root = self.add_root(promise);
+        let spawned = self
+            .fetch
+            .as_mut()
+            .expect("fetch runtime must exist after initialization")
+            .spawn(request);
+        match spawned {
+            Ok(id) => {
+                self.pending_fetches.insert(id, promise);
+                if let Err(error) = self.set_promise_cancel_handle(promise, Some(CancelHandle::Fetch(id))) {
+                    if let Some(fetch) = self.fetch.as_mut() {
+                        fetch.cancel(id);
+                    }
+                    self.pending_fetches.remove(&id);
+                    let _ = self.settle_promise_outcome(
+                        promise,
+                        PromiseOutcome::Rejected(Value::NULL),
+                    );
+                    self.release_root(promise_root);
+                    self.fail(error);
+                    return promise;
+                }
+            }
+            Err(error) => {
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    format!("TypeError: {}", error.message).into_bytes(),
+                ))));
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(reason));
+            }
+        }
+        self.release_root(promise_root);
+        promise
+    }
+
+    fn process_fetch_completion(&mut self, completion: FetchCompletion) {
+        let Some(&promise) = self.pending_fetches.get(&completion.id) else {
+            // Cancellation removes the managed edge immediately. A completion
+            // already queued by reqwest is therefore intentionally stale.
+            return;
+        };
+        let promise_root = self.add_root(promise);
+        self.pending_fetches.remove(&completion.id);
+
+        let outcome = match completion.result {
+            Ok(response) => {
+                let value = self.allocate_response(response);
+                PromiseOutcome::Fulfilled(value)
+            }
+            Err(error) => {
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    format!("TypeError: {}", error.message).into_bytes(),
+                ))));
+                PromiseOutcome::Rejected(reason)
+            }
+        };
+        let _ = self.settle_promise_outcome(promise, outcome);
+        self.release_root(promise_root);
+    }
+
+    fn allocate_response(&mut self, response: FetchResponse) -> Value {
+        let headers: Arc<[(Arc<str>, Arc<str>)]> = response
+            .headers
+            .into_iter()
+            .map(|(name, value)| (Arc::<str>::from(name), Arc::<str>::from(value)))
+            .collect::<Vec<_>>()
+            .into();
+        self.heap.alloc(HeapObject::Response(NapalmResponse {
+            status: response.status,
+            status_text: Arc::<str>::from(response.status_text),
+            url: Arc::<str>::from(response.url),
+            redirected: response.redirected,
+            headers,
+            headers_object: None,
+            content_type: response.content_type.map(Arc::<str>::from),
+            body: response.body,
+            body_used: false,
+            decoded: None,
+        }))
+    }
+
+    fn response_headers_object(&mut self, response_value: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get(response_value) {
+            Some(HeapObject::Response(response)) => {
+                if let Some(value) = response.headers_object {
+                    return Ok(value);
+                }
+            }
+            _ => return Err(RuntimeError::new("Response.headers receiver is not a Response")),
+        }
+        let headers = self.heap.alloc(HeapObject::Headers(NapalmHeaders {
+            response: response_value,
+        }));
+        // The wrapper keeps its owner alive, and Response caches the wrapper so the
+        // same Headers identity is returned on repeated property reads.
+        self.heap.remember_if_reference(headers, response_value);
+        self.heap.remember_if_reference(response_value, headers);
+        match self.heap.get_mut(response_value) {
+            Some(HeapObject::Response(response)) => response.headers_object = Some(headers),
+            _ => return Err(RuntimeError::new("Response disappeared while materializing Headers")),
+        }
+        Ok(headers)
+    }
+
+    fn response_decode_auto(&mut self, response_value: Value) -> Result<Value, RuntimeError> {
+        // `data` is Napalm's memoized convenience view. If a body method already
+        // decoded the response, expose that cached value rather than consuming the
+        // body a second time. Repeated `data` reads likewise stay allocation-free.
+        let json = match self.heap.get(response_value) {
+            Some(HeapObject::Response(response)) => {
+                if let Some((_, value)) = response.decoded {
+                    return Ok(value);
+                }
+                if response.body_used {
+                    return Err(RuntimeError::new("Response body has already been consumed"));
+                }
+                response
+                    .content_type
+                    .as_deref()
+                    .is_some_and(Self::content_type_is_json)
+            }
+            _ => return Err(RuntimeError::new("Response.data receiver is not a Response")),
+        };
+        self.response_decode_once(
+            response_value,
+            if json { ResponseDecodedKind::Json } else { ResponseDecodedKind::Text },
+        )
+    }
+
+    fn content_type_is_json(content_type: &str) -> bool {
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        mime == "application/json" || mime == "text/json" || mime.ends_with("+json")
+    }
+
+    /// JavaScript Body-mixin semantics for explicit `.json()` / `.text()` calls:
+    /// once consumption starts, every later body method rejects even if Napalm has
+    /// a cached decoded value for the `data` convenience getter.
+    fn response_consume(
+        &mut self,
+        response_value: Value,
+        kind: ResponseDecodedKind,
+    ) -> Result<Value, RuntimeError> {
+        match self.heap.get(response_value) {
+            Some(HeapObject::Response(response)) if response.body_used => {
+                return Err(RuntimeError::new("TypeError: Response body has already been consumed"));
+            }
+            Some(HeapObject::Response(_)) => {}
+            _ => return Err(RuntimeError::new("body decoder receiver is not a Response")),
+        }
+        self.response_decode_once(response_value, kind)
+    }
+
+    fn response_decode_once(
+        &mut self,
+        response_value: Value,
+        kind: ResponseDecodedKind,
+    ) -> Result<Value, RuntimeError> {
+        let body = match self.heap.get_mut(response_value) {
+            Some(HeapObject::Response(response)) if !response.body_used => {
+                response.body_used = true;
+                std::mem::take(&mut response.body)
+            }
+            Some(HeapObject::Response(_)) => {
+                return Err(RuntimeError::new("Response body has already been consumed"));
+            }
+            _ => return Err(RuntimeError::new("body decoder receiver is not a Response")),
+        };
+
+        // The native body buffer is no longer retained by Response even when
+        // JSON parsing fails, so update external-memory accounting immediately.
+        let external = self.heap.get(response_value).map_or(0, external_bytes_for);
+        self.heap.set_external_bytes(response_value, external);
+
+        let decoded = match kind {
+            ResponseDecodedKind::Json => self.parse_json_response_body(body)?,
+            ResponseDecodedKind::Text => {
+                let text = String::from_utf8_lossy(&body);
+                self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    text.as_bytes(),
+                ))))
+            }
+        };
+
+        self.heap.remember_if_reference(response_value, decoded);
+        match self.heap.get_mut(response_value) {
+            Some(HeapObject::Response(response)) => response.decoded = Some((kind, decoded)),
+            _ => return Err(RuntimeError::new("Response disappeared while decoding its body")),
+        }
+        Ok(decoded)
+    }
+
+    fn parse_json_response_body(&mut self, mut body: Vec<u8>) -> Result<Value, RuntimeError> {
+        // The tape view preserves the source order of object members. That matters
+        // for Napalm because Map insertion order is observable and because feeding
+        // identical JSON layouts through the same property order maximizes hidden-
+        // shape sharing and keeps property PICs monomorphic.
+        let tape = simd_json::to_tape(body.as_mut_slice())
+            .map_err(|error| RuntimeError::new(format!("SyntaxError: invalid JSON response body: {error}")))?;
+        self.json_tape_to_napalm(tape.as_value(), 0)
+    }
+
+    fn json_tape_to_napalm(
+        &mut self,
+        value: simd_json::tape::Value<'_, '_>,
+        depth: usize,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_JSON_DEPTH: usize = 256;
+        if depth > MAX_JSON_DEPTH {
+            return Err(RuntimeError::new("JSON response exceeds maximum nesting depth"));
+        }
+
+        use simd_json::ValueType;
+        match value.value_type() {
+            ValueType::Null => Ok(Value::NULL),
+            ValueType::Bool => Ok(Value::from_bool(
+                value.as_bool().ok_or_else(|| RuntimeError::new("invalid JSON Bool"))?,
+            )),
+            ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128 | ValueType::F64 => {
+                let number = value
+                    .cast_f64()
+                    .ok_or_else(|| RuntimeError::new("JSON number cannot be represented as Napalm Number"))?;
+                Ok(Value::from_num(number))
+            }
+            ValueType::String => {
+                let string = value
+                    .as_str()
+                    .ok_or_else(|| RuntimeError::new("invalid JSON String"))?;
+                Ok(self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    string.as_bytes(),
+                )))))
+            }
+            ValueType::Array => {
+                let array = value
+                    .as_array()
+                    .ok_or_else(|| RuntimeError::new("invalid JSON Array"))?;
+                let result = self.heap.alloc(HeapObject::List(Vec::with_capacity(array.len())));
+                let root = self.add_root(result);
+                let converted = (|| -> Result<(), RuntimeError> {
+                    for item in array.iter() {
+                        let item = self.json_tape_to_napalm(item, depth + 1)?;
+                        self.heap.remember_if_reference(result, item);
+                        match self.heap.get_mut(result) {
+                            Some(HeapObject::List(values)) => values.push(item),
+                            _ => return Err(RuntimeError::new("JSON List disappeared during conversion")),
+                        }
+                    }
+                    Ok(())
+                })();
+                self.release_root(root);
+                converted?;
+                let external = self.heap.get(result).map_or(0, external_bytes_for);
+                self.heap.set_external_bytes(result, external);
+                self.heap.refresh_jit_view(result);
+                Ok(result)
+            }
+            ValueType::Object => {
+                let object = value
+                    .as_object()
+                    .ok_or_else(|| RuntimeError::new("invalid JSON Object"))?;
+                let result = self.heap.alloc(HeapObject::Map(NapalmMap::default()));
+                let root = self.add_root(result);
+                let converted = (|| -> Result<(), RuntimeError> {
+                    // Tape object iteration follows JSON parse order. Duplicate keys
+                    // therefore naturally implement JSON.parse's last-value-wins
+                    // semantics while retaining the first insertion position.
+                    for (key, item) in object.iter() {
+                        let item = self.json_tape_to_napalm(item, depth + 1)?;
+                        self.heap.remember_if_reference(result, item);
+                        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(key.as_bytes())));
+                        self.heap.map_set_encoded(result, key, item, None)?;
+                    }
+                    Ok(())
+                })();
+                self.release_root(root);
+                converted?;
+                let external = self.heap.get(result).map_or(0, external_bytes_for);
+                self.heap.set_external_bytes(result, external);
+                self.heap.refresh_jit_view(result);
+                Ok(result)
+            }
+            ValueType::Extended(_) | ValueType::Custom(_) => {
+                Err(RuntimeError::new("unsupported extended value in JSON response"))
+            }
+        }
+    }
+
+    fn headers_lookup(&self, headers: Value, name: Value) -> Result<Option<String>, RuntimeError> {
+        let name = self.fetch_string(name, "Headers key")?;
+        let response_value = match self.heap.get(headers) {
+            Some(HeapObject::Headers(headers)) => headers.response,
+            _ => return Err(RuntimeError::new("Headers method receiver is not Headers")),
+        };
+        let entries = match self.heap.get(response_value) {
+            Some(HeapObject::Response(response)) => &response.headers,
+            _ => return Err(RuntimeError::new("Headers owner is not a Response")),
+        };
+        Ok(entries
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&name))
+            .map(|(_, value)| value.to_string()))
+    }
+
+
+    pub(crate) fn snapshot_concurrent_value(&self, value: Value) -> Result<ConcurrentValue, RuntimeError> {
+        let mut visiting = HashSet::default();
+        let mut memo = FastMap::default();
+        let mut next_id = 1u32;
+        self.snapshot_concurrent_value_inner(value, 0, &mut visiting, &mut memo, &mut next_id)
+    }
+
+    fn snapshot_concurrent_arguments(&self, values: &[Value]) -> Result<Vec<ConcurrentValue>, RuntimeError> {
+        let mut visiting = HashSet::default();
+        let mut memo = FastMap::default();
+        let mut next_id = 1u32;
+        let mut snapshots = Vec::with_capacity(values.len());
+        for &value in values {
+            snapshots.push(self.snapshot_concurrent_value_inner(
+                value,
+                0,
+                &mut visiting,
+                &mut memo,
+                &mut next_id,
+            )?);
+        }
+        Ok(snapshots)
+    }
+
+    fn snapshot_concurrent_value_inner(
+        &self,
+        value: Value,
+        depth: usize,
+        visiting: &mut HashSet<u32>,
+        memo: &mut FastMap<u32, ConcurrentValue>,
+        next_id: &mut u32,
+    ) -> Result<ConcurrentValue, RuntimeError> {
+        const MAX_DEPTH: usize = 256;
+        if depth > MAX_DEPTH {
+            return Err(RuntimeError::new("concurrent argument graph is nested too deeply"));
+        }
+        if value.is_null() {
+            return Ok(ConcurrentValue::Null);
+        }
+        if let Some(value) = value.as_bool() {
+            return Ok(ConcurrentValue::Bool(value));
+        }
+        if value.is_num() {
+            return Ok(ConcurrentValue::Num(value.raw_bits()));
+        }
+
+        let handle = value
+            .heap_handle()
+            .ok_or_else(|| RuntimeError::new("value cannot cross a concurrent boundary"))?;
+        if let Some(snapshot) = memo.get(&handle) {
+            return Ok(snapshot.clone());
+        }
+        if !visiting.insert(handle) {
+            return Err(RuntimeError::new(
+                "cyclic List/Map graphs cannot cross a concurrent boundary yet",
+            ));
+        }
+
+        let snapshot = match self.heap.get(value) {
+            Some(HeapObject::String(string)) => {
+                ConcurrentValue::String(string.bytes.clone())
+            }
+            Some(HeapObject::List(values)) => {
+                let id = *next_id;
+                *next_id = (*next_id).wrapping_add(1).max(1);
+                let mut items = Vec::with_capacity(values.len());
+                for &item in values {
+                    items.push(self.snapshot_concurrent_value_inner(
+                        item,
+                        depth + 1,
+                        visiting,
+                        memo,
+                        next_id,
+                    )?);
+                }
+                ConcurrentValue::List {
+                    id,
+                    items: Arc::from(items.into_boxed_slice()),
+                }
+            }
+            Some(HeapObject::Map(map)) => {
+                let id = *next_id;
+                *next_id = (*next_id).wrapping_add(1).max(1);
+                let mut entries = Vec::with_capacity(map.len());
+                for index in 0..map.len() {
+                    let key = map
+                        .nth_key(&self.heap.map_shapes, index)
+                        .ok_or_else(|| RuntimeError::new("Map changed while creating concurrent snapshot"))?;
+                    let key = match key {
+                        MapKey::Null => ConcurrentKey::Null,
+                        MapKey::Bool(value) => ConcurrentKey::Bool(value),
+                        MapKey::Num(bits) => ConcurrentKey::Num(bits),
+                        MapKey::String(string) => ConcurrentKey::String(string.bytes.clone()),
+                        MapKey::Object(_) => {
+                            return Err(RuntimeError::new(
+                                "Map object keys cannot cross a concurrent boundary",
+                            ));
+                        }
+                    };
+                    let item = map
+                        .nth_value(index)
+                        .ok_or_else(|| RuntimeError::new("Map changed while creating concurrent snapshot"))?;
+                    let item = self.snapshot_concurrent_value_inner(
+                        item,
+                        depth + 1,
+                        visiting,
+                        memo,
+                        next_id,
+                    )?;
+                    entries.push((key, item));
+                }
+                ConcurrentValue::Map {
+                    id,
+                    entries: Arc::from(entries.into_boxed_slice()),
+                }
+            }
+            Some(HeapObject::Closure { .. }) => {
+                return Err(RuntimeError::new("functions cannot be passed as concurrent arguments"));
+            }
+            Some(HeapObject::Promise { .. }) => {
+                return Err(RuntimeError::new("Promises cannot cross a concurrent boundary; await them first"));
+            }
+            Some(HeapObject::FiberObject { .. }) | Some(HeapObject::AsyncTaskObject { .. }) => {
+                return Err(RuntimeError::new("Fibers/tasks cannot cross a concurrent boundary"));
+            }
+            Some(HeapObject::Response(_)) | Some(HeapObject::Headers(_)) => {
+                return Err(RuntimeError::new("HTTP Response/Headers objects cannot cross a concurrent boundary"));
+            }
+            Some(HeapObject::Foreign { .. })
+            | Some(HeapObject::FfiLibrary { .. })
+            | Some(HeapObject::FfiFunction { .. })
+            | Some(HeapObject::FfiPointer { .. }) => {
+                return Err(RuntimeError::new("native/foreign objects cannot cross a concurrent boundary"));
+            }
+            Some(HeapObject::Instance { .. }) | Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => {
+                return Err(RuntimeError::new("class instances/objects cannot cross a concurrent boundary yet"));
+            }
+            Some(HeapObject::Cell(_)) => {
+                return Err(RuntimeError::new("captured mutable cells cannot cross a concurrent boundary"));
+            }
+            Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
+            | Some(HeapObject::MapEntry { .. }) | Some(HeapObject::MapKeys { .. })
+            | Some(HeapObject::ModuleObject { .. }) => {
+                return Err(RuntimeError::new("this runtime object cannot cross a concurrent boundary yet"));
+            }
+            None => return Err(RuntimeError::new("dead heap object at concurrent boundary")),
+        };
+        visiting.remove(&handle);
+        memo.insert(handle, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub(crate) fn materialize_concurrent_value(
+        &mut self,
+        value: &ConcurrentValue,
+    ) -> Result<Value, RuntimeError> {
+        let mut memo = FastMap::default();
+        self.materialize_concurrent_value_inner(value, 0, &mut memo)
+    }
+
+    pub(crate) fn materialize_concurrent_arguments(
+        &mut self,
+        values: &[ConcurrentValue],
+    ) -> Result<(Vec<Value>, Vec<u32>), RuntimeError> {
+        let mut memo = FastMap::default();
+        let mut materialized = Vec::with_capacity(values.len());
+        let mut roots = Vec::with_capacity(values.len());
+        for value in values {
+            match self.materialize_concurrent_value_inner(value, 0, &mut memo) {
+                Ok(value) => {
+                    materialized.push(value);
+                    roots.push(self.add_root(value));
+                }
+                Err(error) => {
+                    for root in roots {
+                        self.release_root(root);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok((materialized, roots))
+    }
+
+    fn materialize_concurrent_value_inner(
+        &mut self,
+        value: &ConcurrentValue,
+        depth: usize,
+        memo: &mut FastMap<u32, Value>,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_DEPTH: usize = 256;
+        if depth > MAX_DEPTH {
+            return Err(RuntimeError::new("concurrent transfer graph is nested too deeply"));
+        }
+        match value {
+            ConcurrentValue::Null => Ok(Value::NULL),
+            ConcurrentValue::Bool(value) => Ok(Value::from_bool(*value)),
+            ConcurrentValue::Num(bits) => Ok(Value::from_num(f64::from_bits(*bits))),
+            ConcurrentValue::String(bytes) => Ok(self.heap.alloc(HeapObject::String(
+                NapalmString::new(bytes.clone()),
+            ))),
+            ConcurrentValue::List { id, items } => {
+                if let Some(&value) = memo.get(id) {
+                    return Ok(value);
+                }
+                let result = self.heap.alloc(HeapObject::List(Vec::with_capacity(items.len())));
+                memo.insert(*id, result);
+                let root = self.add_root(result);
+                let converted = (|| -> Result<(), RuntimeError> {
+                    for item in items.iter() {
+                        let item = self.materialize_concurrent_value_inner(item, depth + 1, memo)?;
+                        self.heap.check_list_write(result, item)?;
+                        self.heap.remember_if_reference(result, item);
+                        match self.heap.get_mut(result) {
+                            Some(HeapObject::List(values)) => values.push(item),
+                            _ => return Err(RuntimeError::new("concurrent List materialization lost destination")),
+                        }
+                    }
+                    Ok(())
+                })();
+                self.release_root(root);
+                if let Err(error) = converted {
+                    memo.remove(id);
+                    return Err(error);
+                }
+                let external = self.heap.get(result).map_or(0, external_bytes_for);
+                self.heap.set_external_bytes(result, external);
+                self.heap.refresh_jit_view(result);
+                Ok(result)
+            }
+            ConcurrentValue::Map { id, entries } => {
+                if let Some(&value) = memo.get(id) {
+                    return Ok(value);
+                }
+                let result = self.heap.alloc(HeapObject::Map(NapalmMap::default()));
+                memo.insert(*id, result);
+                let root = self.add_root(result);
+                let converted = (|| -> Result<(), RuntimeError> {
+                    for (key, item) in entries.iter() {
+                        let item = self.materialize_concurrent_value_inner(item, depth + 1, memo)?;
+                        self.heap.remember_if_reference(result, item);
+                        let key = match key {
+                            ConcurrentKey::Null => MapKey::Null,
+                            ConcurrentKey::Bool(value) => MapKey::Bool(*value),
+                            ConcurrentKey::Num(bits) => MapKey::Num(*bits),
+                            ConcurrentKey::String(bytes) => {
+                                MapKey::String(MapStringKey::new(bytes.clone()))
+                            }
+                        };
+                        self.heap.map_set_encoded(result, key, item, None)?;
+                    }
+                    Ok(())
+                })();
+                self.release_root(root);
+                if let Err(error) = converted {
+                    memo.remove(id);
+                    return Err(error);
+                }
+                let external = self.heap.get(result).map_or(0, external_bytes_for);
+                self.heap.set_external_bytes(result, external);
+                self.heap.refresh_jit_view(result);
+                Ok(result)
+            }
+        }
+    }
+
+    fn start_concurrent_launch(
+        &mut self,
+        closure: Value,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        if self.is_concurrent_worker {
+            return Err(RuntimeError::new(
+                "nested `launch` from a concurrent worker is disabled to avoid recursive worker-pool creation",
+            ));
+        }
+        let (function_index, capture_count) = match self.heap.get(closure) {
+            Some(HeapObject::Closure { function_index, captures, .. }) => (*function_index, captures.len()),
+            _ => return Err(RuntimeError::new("`launch` target is not a function")),
+        };
+        let (function_id, function_arity, function_capture_count, is_concurrent, is_async) = {
+            let function = self
+                .program
+                .functions
+                .get(function_index as usize)
+                .ok_or_else(|| RuntimeError::new("`launch` target function index is invalid"))?;
+            (
+                function.id,
+                function.arity,
+                function.capture_count,
+                function.is_concurrent,
+                function.is_async,
+            )
+        };
+        if !is_concurrent {
+            return Err(RuntimeError::new("`launch` target was not declared `concurrent`"));
+        }
+        if is_async {
+            return Err(RuntimeError::new("a concurrent function cannot also be async"));
+        }
+        if capture_count != 0 || function_capture_count != 0 {
+            return Err(RuntimeError::new(
+                "concurrent functions cannot capture lexical state; pass values as arguments",
+            ));
+        }
+        if args.len() != function_arity as usize {
+            return Err(RuntimeError::new(format!(
+                "concurrent function expects {} arguments but launch received {}",
+                function_arity,
+                args.len()
+            )));
+        }
+
+        let transfer_args = self.snapshot_concurrent_arguments(args)?;
+
+        if self.concurrent.is_none() {
+            let manifest = self.concurrent_manifest.clone().ok_or_else(|| RuntimeError::new(
+                "concurrent runtime requires the stock builtin manifest to be installed",
+            ))?;
+            self.concurrent = Some(ConcurrentRuntime::new(
+                self.program.clone(),
+                manifest,
+                self.external_wake_tx.clone(),
+            )?);
+        }
+
+        let promise = self.allocate_pending_promise();
+        let promise_root = self.add_root(promise);
+        let id = self
+            .concurrent
+            .as_mut()
+            .expect("concurrent runtime disappeared after initialization")
+            .submit(function_id, transfer_args);
+        self.pending_concurrent.insert(id, promise);
+        if let Err(error) = self.set_promise_cancel_handle(promise, Some(CancelHandle::Concurrent(id))) {
+            if let Some(runtime) = self.concurrent.as_mut() {
+                runtime.cancel(id);
+            }
+            self.pending_concurrent.remove(&id);
+            self.release_root(promise_root);
+            return Err(error);
+        }
+        self.release_root(promise_root);
+        Ok(promise)
+    }
+
+    fn process_concurrent_completion(&mut self, completion: ConcurrentCompletion) {
+        let Some(promise) = self.pending_concurrent.remove(&completion.id) else {
+            return;
+        };
+        let promise_root = self.add_root(promise);
+        let outcome = match completion.result {
+            Ok(snapshot) => match self.materialize_concurrent_value(&snapshot) {
+                Ok(value) => PromiseOutcome::Fulfilled(value),
+                Err(error) => {
+                    let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(
+                        format!("ConcurrentError: {}", error.message).into_bytes(),
+                    ))));
+                    PromiseOutcome::Rejected(reason)
+                }
+            },
+            Err(message) => {
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(
+                    format!("ConcurrentError: {message}").into_bytes(),
+                ))));
+                PromiseOutcome::Rejected(reason)
+            }
+        };
+        let _ = self.settle_promise_outcome(promise, outcome);
+        self.release_root(promise_root);
     }
 
     fn timer_duration(value: Value, require_positive: bool) -> Result<Duration, RuntimeError> {
@@ -8753,6 +9992,133 @@ impl Interpreter<'_> {
                     Err(error) => self.fail_at(op, error.message),
                 }
             }
+            NativeBuiltin::FetchCall => {
+                let request = self.parse_fetch_request(
+                    arg(0),
+                    (args.len() > 1).then(|| arg(1)),
+                );
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let promise = match request {
+                    Ok(request) => self.start_fetch(request),
+                    Err(error) => self.allocate_rejected_promise_message(format!(
+                        "TypeError: {}",
+                        error.message
+                    )),
+                };
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseStatus => {
+                let status = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => response.status,
+                    _ => { self.fail_at(op, "Response.status receiver is not a Response"); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_num(status as f64).word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseStatusText => {
+                let text = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => response.status_text.clone(),
+                    _ => { self.fail_at(op, "Response.statusText receiver is not a Response"); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    text.as_bytes(),
+                ))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseOk => {
+                let ok = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => (200..=299).contains(&response.status),
+                    _ => { self.fail_at(op, "Response.ok receiver is not a Response"); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(ok).word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseUrl => {
+                let url = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => response.url.clone(),
+                    _ => { self.fail_at(op, "Response.url receiver is not a Response"); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    url.as_bytes(),
+                ))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseRedirected => {
+                let redirected = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => response.redirected,
+                    _ => { self.fail_at(op, "Response.redirected receiver is not a Response"); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(redirected).word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseHeaders => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.response_headers_object(Value::from_word(receiver)) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ResponseData => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.response_decode_auto(Value::from_word(receiver)) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ResponseBodyUsed => {
+                let used = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::Response(response)) => response.body_used,
+                    _ => { self.fail_at(op, "Response.bodyUsed receiver is not a Response"); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(used).word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseJson => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let result = self.response_consume(
+                    Value::from_word(receiver),
+                    ResponseDecodedKind::Json,
+                );
+                let promise = self.settled_promise_from_result(result);
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::ResponseText => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let result = self.response_consume(
+                    Value::from_word(receiver),
+                    ResponseDecodedKind::Text,
+                );
+                let promise = self.settled_promise_from_result(result);
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::HeadersGet => {
+                let result = match self.headers_lookup(Value::from_word(receiver), arg(0)) {
+                    Ok(value) => value,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let value = if let Some(result) = result {
+                    self.mark_gc_point(op);
+                    self.maybe_collect();
+                    self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                        result.into_bytes(),
+                    ))))
+                } else {
+                    Value::NULL
+                };
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::HeadersHas => {
+                let present = match self.headers_lookup(Value::from_word(receiver), arg(0)) {
+                    Ok(value) => value.is_some(),
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(present).word()); self.advance(op); }
+            }
             NativeBuiltin::FfiOpen => {
                 let path = match self.heap.get(arg(0)) {
                     Some(HeapObject::String(string)) => match std::str::from_utf8(string.as_ref()) {
@@ -9180,6 +10546,11 @@ impl Interpreter<'_> {
                 "Fiber.new cannot wrap an async closure; call the async closure directly",
             ));
         }
+        if function.is_concurrent {
+            return Err(RuntimeError::new(
+                "Fiber.new cannot wrap a concurrent closure; use `launch` instead",
+            ));
+        }
         if function.arity > 1 {
             return Err(RuntimeError::new("Fiber function cannot take more than one parameter"));
         }
@@ -9483,7 +10854,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 134;
+const OPCODE_COUNT: usize = 135;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -9620,6 +10991,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_load_property,
     h_store_property,
     h_store_property_if_present,
+    h_launch, // Launch
 ];
 
 #[inline(always)]
@@ -9881,7 +11253,7 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
             let opcode = vm.program.functions[vm.hot_function_index as usize]
                 .chunk.code[current.raw_pc as usize].opcode().unwrap();
             if matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallDirect
-                | Opcode::CallClosure | Opcode::CallPrimitive | Opcode::CallForeign | Opcode::Await)
+                | Opcode::CallClosure | Opcode::Launch | Opcode::CallPrimitive | Opcode::CallForeign | Opcode::Await)
             {
                 let next = current.next as usize;
                 let function = vm.current_function_index();
@@ -10567,6 +11939,47 @@ unsafe fn h_store_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
     }
 }
 
+unsafe fn h_launch(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let closure = Value::from_word(unsafe { vm.reg(op.b) });
+
+    // Launch is a GC/runtime boundary. Read arguments from architectural registers
+    // only after publishing the stack map; stable heap handles remain valid if GC
+    // runs while constructing the transferable snapshot.
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+
+    if op.c <= 4 {
+        let mut words = [RegisterWord(0); 4];
+        let count = unsafe { vm.gather_call_words_small(op, &mut words) };
+        let mut args = [Value::NULL; 4];
+        for index in 0..count {
+            args[index] = Value::from_word(words[index]);
+        }
+        match vm.start_concurrent_launch(closure, &args[..count]) {
+            Ok(promise) => unsafe {
+                vm.set_reg(op.a, promise.word());
+                vm.advance(op);
+            },
+            Err(error) => vm.fail_at(op, error.message),
+        }
+    } else {
+        let mut words = [RegisterWord(0); 17];
+        let count = unsafe { vm.gather_call_words_large(op, &mut words) };
+        let mut args = [Value::NULL; 17];
+        for index in 0..count {
+            args[index] = Value::from_word(words[index]);
+        }
+        match vm.start_concurrent_launch(closure, &args[..count]) {
+            Ok(promise) => unsafe {
+                vm.set_reg(op.a, promise.word());
+                vm.advance(op);
+            },
+            Err(error) => vm.fail_at(op, error.message),
+        }
+    }
+}
+
 unsafe fn h_store_property_if_present(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let op = unsafe { &*ptr };
     let presence_reg = Reg(((op.y >> 16) & 0xff) as u8);
@@ -10891,6 +12304,8 @@ impl Interpreter<'_> {
                 PromiseState::Rejected(_) => "<promise:rejected>".into(),
                 PromiseState::Cancelled(_) => "<promise:cancelled>".into(),
             },
+            Some(HeapObject::Response(response)) => format!("<Response {}>", response.status),
+            Some(HeapObject::Headers(_)) => "<Headers>".into(),
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module:{}>", self.program.metadata.string(self.modules[*module_slot as usize].name).unwrap_or("module")),
@@ -11248,6 +12663,7 @@ impl TraceRuntime for Interpreter<'_> {
         // because some handlers fuse the following branch.
         let handler = match opcode {
             Opcode::CallDirect | Opcode::CallClosure => handler_for_prepared(opcode, op.c as u8),
+            Opcode::Launch => h_launch,
             Opcode::Invoke => {
                 let prepared = self.current_prepared();
                 let index = self.hot_pc as usize;
@@ -11293,6 +12709,7 @@ impl TraceRuntime for Interpreter<'_> {
                 | Opcode::InvokeSuper
                 | Opcode::CallDirect
                 | Opcode::CallClosure
+                | Opcode::Launch
                 | Opcode::CallPrimitive
                 | Opcode::CallForeign
                 | Opcode::ImportModule
@@ -11569,7 +12986,7 @@ impl Interpreter<'_> {
         {
             return Err(RuntimeError::new("invalid direct trace call metadata"));
         }
-        let (callee_is_async, callee_arity, callee_return_kind, callee_capture_count, callee_uses_this) = {
+        let (callee_is_async, callee_is_concurrent, callee_arity, callee_return_kind, callee_capture_count, callee_uses_this) = {
             let callee = self
                 .prepared
                 .functions
@@ -11577,12 +12994,18 @@ impl Interpreter<'_> {
                 .ok_or_else(|| RuntimeError::new("direct trace call target is unavailable"))?;
             (
                 callee.is_async,
+                callee.is_concurrent,
                 callee.arity as usize,
                 callee.return_kind,
                 callee.capture_count as usize,
                 callee.uses_this,
             )
         };
+        if callee_is_concurrent {
+            return Err(RuntimeError::new(
+                "native direct-call path cannot enter a concurrent function; replay `launch` semantics",
+            ));
+        }
         let closure_call =
             activation.direct_call_reserved & crate::napalm_tracing_jit::TRACE_DIRECT_CALL_FLAG_CLOSURE != 0;
         let staged_captures = activation.direct_call_reserved
@@ -11901,7 +13324,7 @@ mod tests {
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
             field_owner: None,
-            name: StringId(0), is_async: false, arity: 0, capture_count: 0,
+            name: StringId(0), is_async: false, is_concurrent: false, arity: 0, capture_count: 0,
             frame: FrameLayout { general_register_count: gprs, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value },
             chunk,
         }).unwrap();
@@ -11945,6 +13368,62 @@ mod tests {
         let mut vm = Interpreter::with_host(program, host).expect("VM should initialize");
         napalm_builtin::install_vm_builtins(&mut vm, manifest);
         vm
+    }
+
+    #[test]
+    fn simd_json_tape_materializes_maps_in_source_order() {
+        let (program, _entry, manifest) = compile_napalm_module("var sentinel = null");
+        let mut vm = source_vm(&program, &manifest);
+        let value = vm
+            .parse_json_response_body(br#"{"id":1,"name":"napalm","ok":true}"#.to_vec())
+            .expect("JSON should decode");
+
+        let map = match vm.heap.get(value) {
+            Some(HeapObject::Map(map)) => map,
+            other => panic!("expected JSON object Map, got {other:?}"),
+        };
+        let keys = (0..map.len())
+            .map(|index| match map.nth_key(&vm.heap.map_shapes, index).expect("JSON key") {
+                MapKey::String(key) => std::str::from_utf8(key.as_ref()).unwrap().to_owned(),
+                _ => panic!("JSON object key was not a String"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["id", "name", "ok"]);
+
+        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"id"[..])));
+        assert_eq!(vm.heap.map_get_encoded(value, &key).unwrap().as_num(), Some(1.0));
+    }
+
+    #[test]
+    fn response_data_lazily_decodes_and_caches_json() {
+        let (program, _entry, manifest) = compile_napalm_module("var sentinel = null");
+        let mut vm = source_vm(&program, &manifest);
+        let response = vm.allocate_response(FetchResponse {
+            status: 200,
+            status_text: "OK".to_owned(),
+            url: "https://example.invalid/data".to_owned(),
+            redirected: false,
+            headers: vec![("content-type".to_owned(), "application/json; charset=utf-8".to_owned())],
+            content_type: Some("application/json; charset=utf-8".to_owned()),
+            body: br#"{"answer":42}"#.to_vec(),
+        });
+        let response_root = vm.add_root(response);
+
+        let first = vm.response_decode_auto(response).expect("Response.data should decode JSON");
+        let second = vm.response_decode_auto(response).expect("Response.data should be memoized");
+        assert_eq!(first.raw_bits(), second.raw_bits());
+        assert!(matches!(
+            vm.heap.get(response),
+            Some(HeapObject::Response(NapalmResponse { body_used: true, .. }))
+        ));
+        // Explicit Body methods retain JavaScript's one-consumption rule even
+        // though Napalm keeps the decoded value for subsequent `.data` reads.
+        assert!(vm.response_consume(response, ResponseDecodedKind::Json).is_err());
+        assert!(vm.response_consume(response, ResponseDecodedKind::Text).is_err());
+
+        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"answer"[..])));
+        assert_eq!(vm.heap.map_get_encoded(first, &key).unwrap().as_num(), Some(42.0));
+        vm.release_root(response_root);
     }
 
     #[test]
@@ -14419,13 +15898,13 @@ var result = CallLoop.run()
         use crate::napalm_gc::{Descriptor, Mutator, RootFrame, TraceLayout, RAW_CODEC};
         static FINALIZED: AtomicUsize = AtomicUsize::new(0);
         static CLEANED: AtomicUsize = AtomicUsize::new(0);
-        static RESURRECTED: StdMutex<Option<crate::napalm_gc::GlobalRoot>> = StdMutex::new(None);
+        static RESURRECTED: Mutex<Option<crate::napalm_gc::GlobalRoot>> = Mutex::new(None);
         unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
         fn finalize(mutator: &mut Mutator, root: &RootFrame) {
             assert!(root.get(mutator, 0).is_some());
             mutator.collect_full();
             assert!(root.get(mutator, 0).is_some(), "finalizer argument must stay rooted");
-            *RESURRECTED.lock().unwrap() = Some(unsafe {
+            *RESURRECTED.lock() = Some(unsafe {
                 mutator.global_root(root.get(mutator, 0).unwrap())
             });
             FINALIZED.fetch_add(1, Ordering::Relaxed);
@@ -14460,7 +15939,7 @@ var result = CallLoop.run()
         assert_eq!(FINALIZED.load(Ordering::Relaxed), 1);
         mutator.collect_full();
         assert_eq!(CLEANED.load(Ordering::Relaxed), 0, "resurrection must retain native resources");
-        RESURRECTED.lock().unwrap().take();
+        RESURRECTED.lock().take();
         mutator.collect_full();
         assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
         assert_eq!(mutator.run_finalizers(1), 0);

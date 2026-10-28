@@ -222,8 +222,8 @@ impl TraceOptimization for InductionVariableSimplification {
                 changed = true;
             }
         }
-        let mut seen = HashMap::new();
-        let mut remove = HashSet::new();
+        let mut seen = HashMap::default();
+        let mut remove = HashSet::default();
         for phi in trace.loop_phis.clone() {
             if phi.entry_exit.is_some() { continue; }
             let initial = trace.canonical_value(phi.initial);
@@ -272,7 +272,7 @@ impl TraceOptimization for StrengthReduction {
                         let next = TraceValueId(trace.values.len() as u32);
                         let node = trace.nodes.len();
                         trace.values.push(TraceValue { id: next, ty: TraceType::Int32, rep: TraceRep::Int32, origin: TraceValueOrigin::InstResult { node } });
-                        trace.nodes.push(TraceNode { id: node, kind: TraceInst::IntBinary { op: IntBinOp::Add, lhs: value, rhs: delta }, results: vec![next], source });
+                        trace.nodes.push(TraceNode { id: node, kind: TraceInst::IntBinary { op: IntBinOp::Add, lhs: value, rhs: delta }, results: smallvec::smallvec![next], source });
                         trace.loop_phis.push(LoopPhi { value, initial: start, backedge: Some(next), rep: TraceRep::Int32, entry_exit: None });
                         replace(trace, id, value);
                         trace.stats.strength_reduced += 1;
@@ -299,8 +299,8 @@ impl TraceOptimization for StrengthReduction {
 pub struct ClassTypePropagation;
 impl TraceOptimization for ClassTypePropagation {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut types = HashMap::new();
-        let mut classes: HashMap<TraceValueId, Vec<u64>> = HashMap::new();
+        let mut types = HashMap::default();
+        let mut classes: HashMap<TraceValueId, Vec<u64>> = HashMap::default();
         let mut changed = false;
         for id in order(trace) {
             match trace.nodes[id].kind.clone() {
@@ -424,7 +424,7 @@ fn comparison(trace: &Trace, value: TraceValueId, truth: bool) -> Option<(CmpKin
 pub struct RangeAnalysis;
 impl TraceOptimization for RangeAnalysis {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut ranges = HashMap::new();
+        let mut ranges = HashMap::default();
         // Checked monotone recurrences cannot wrap on the successful backedge.
         // Unchecked arithmetic must retain the full range, even for i = i + 1.
         for phi in &trace.loop_phis {
@@ -444,7 +444,7 @@ impl TraceOptimization for RangeAnalysis {
                 else { Range::point(initial) };
             ranges.insert(phi.value, bounds);
         }
-        let mut less_than = HashSet::new();
+        let mut less_than = HashSet::default();
         let mut changed = false;
         for id in order(trace) {
             let kind = trace.nodes[id].kind.clone();
@@ -622,8 +622,8 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
 pub struct LoadStorePRE;
 impl TraceOptimization for LoadStorePRE {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut available: HashMap<Memory, TraceValueId> = HashMap::new();
-        let mut validated_stores = HashSet::new();
+        let mut available: HashMap<Memory, TraceValueId> = HashMap::default();
+        let mut validated_stores = HashSet::default();
         let mut changed = false;
         for id in order(trace) {
             let kind = trace.nodes[id].kind.clone();
@@ -708,7 +708,7 @@ impl TraceOptimization for LoadStorePRE {
                     let start = TraceValueId(trace.values.len() as u32);
                     let node = trace.nodes.len();
                     trace.values.push(TraceValue { id: start, ty, rep, origin: TraceValueOrigin::InstResult { node } });
-                    trace.nodes.push(TraceNode { id: node, kind: entry_kind, results: vec![start], source: trace.nodes[id].source });
+                    trace.nodes.push(TraceNode { id: node, kind: entry_kind, results: smallvec::smallvec![start], source: trace.nodes[id].source });
                     trace.preheader.push(node);
                     let value = TraceValueId(trace.values.len() as u32);
                     trace.values.push(TraceValue { id: value, ty, rep, origin: TraceValueOrigin::LoopTemporary });
@@ -1282,9 +1282,9 @@ pub struct GuardCoalescing;
 impl TraceOptimization for GuardCoalescing {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
         let mut seen: Vec<(GuardFingerprint, Option<TraceValueId>)> = Vec::new();
-        let mut numeric = HashSet::<TraceValueId>::new();
-        let mut non_null = HashSet::<TraceValueId>::new();
-        let mut truthy = HashSet::<TraceValueId>::new();
+        let mut numeric = HashSet::<TraceValueId>::default();
+        let mut non_null = HashSet::<TraceValueId>::default();
+        let mut truthy = HashSet::<TraceValueId>::default();
         let mut changed = false;
 
         for id in order(trace) {
@@ -1439,7 +1439,7 @@ pub struct HeapFactPropagation;
 impl TraceOptimization for HeapFactPropagation {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
         let mut facts = Vec::<(TraceValueId, TraceHeapObjectKind, TraceValueId)>::new();
-        let mut non_null = HashSet::<TraceValueId>::new();
+        let mut non_null = HashSet::<TraceValueId>::default();
         let mut changed = false;
         for id in order(trace) {
             let kind = trace.nodes[id].kind.clone();
@@ -1527,7 +1527,7 @@ impl TraceOptimization for DeadCodeElimination {
                 .unwrap_or(value)
         };
 
-        let mut live_values = HashSet::<TraceValueId>::new();
+        let mut live_values = HashSet::<TraceValueId>::default();
         let mut work = Vec::<TraceValueId>::new();
         let mut live_nodes = vec![false; trace.nodes.len()];
         let push = |value: TraceValueId,
@@ -1549,7 +1549,7 @@ impl TraceOptimization for DeadCodeElimination {
                 kind.visit_operands(|value| push(*value, &mut live_values, &mut work));
             }
         }
-        let mut referenced_exits = HashSet::<SideExitId>::new();
+        let mut referenced_exits = HashSet::<SideExitId>::default();
         for node in &trace.nodes {
             if !matches!(node.kind, TraceInst::Nop) {
                 if let Some(exit) = node.kind.exit() {

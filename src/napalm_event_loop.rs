@@ -16,7 +16,8 @@
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
+use crate::napalm_collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,7 +104,7 @@ impl<T> Default for NapalmEventLoop<T> {
             next_id: 1,
             microtasks: VecDeque::new(),
             timers: BinaryHeap::new(),
-            active: HashMap::new(),
+            active: HashMap::default(),
         }
     }
 }
