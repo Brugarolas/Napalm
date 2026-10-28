@@ -178,6 +178,8 @@ enum BuiltinPrimitive {
     ListIteratorValue,
     ListToString,
     ListFilled,
+    ListNew,
+    ListNewNumber,
 
     MapCount,
     MapContainsKey,
@@ -297,6 +299,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let st = instance(BuiltinClass::String);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
+        ("length", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::StringIsEmpty),
         ("+", MethodKind::Method, 1, BuiltinPrimitive::StringAdd),
         ("==", MethodKind::Method, 1, BuiltinPrimitive::StringEq),
@@ -318,6 +321,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let list = instance(BuiltinClass::List);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
+        ("length", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::ListIsEmpty),
         ("+", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
         ("add", MethodKind::Method, 1, BuiltinPrimitive::ListAdd),
@@ -333,6 +337,10 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         manifest.register(program, list, name, kind, arity, op);
     }
     manifest.register(program, static_(BuiltinId::List), "filled", MethodKind::Method, 2, BuiltinPrimitive::ListFilled);
+    manifest.register(program, static_(BuiltinId::List), "new", MethodKind::Method, 1, BuiltinPrimitive::ListNew);
+    // Compiler-only target for `new Array<Number>(n)`. Keeping it on List avoids
+    // introducing a second runtime class identity for Array.
+    manifest.register(program, static_(BuiltinId::List), "__newNumberArray", MethodKind::Method, 1, BuiltinPrimitive::ListNewNumber);
     let remove = program.intern_method("remove", MethodKind::Method, 1);
     let equals = program.intern_method("==", MethodKind::Method, 1);
     let module = program.add_module("<core:list>", 0);
@@ -997,6 +1005,25 @@ fn execute_primitive(
             let count = integer(argument(args,0)?, "count")?;
             if count < 0 || count > 16_777_216 { return Err(RuntimeError::new("invalid List.filled size")); }
             Ok(context.allocate_list(vec![argument(args,1)?; count as usize]))
+        }
+        ListNew => {
+            let count = integer(argument(args,0)?, "Array size")?;
+            if count < 0 || count > 16_777_216 {
+                return Err(RuntimeError::new("invalid Array size"));
+            }
+            // Napalm has no user-visible `undefined`; fresh sparse Array slots read
+            // as null until written.
+            Ok(context.allocate_list(vec![Value::NULL; count as usize]))
+        }
+        ListNewNumber => {
+            let count = integer(argument(args,0)?, "Array<Number> size")?;
+            if count < 0 || count > 16_777_216 {
+                return Err(RuntimeError::new("invalid Array<Number> size"));
+            }
+            context.allocate_typed_list(
+                vec![Value::from_num(0.0); count as usize],
+                Type::Num,
+            )
         }
 
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),

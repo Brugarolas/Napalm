@@ -715,6 +715,32 @@ pub enum CallConv {
     Foreign,
 }
 
+/// Static auto-memoization decision produced by the WIR optimizer.
+///
+/// Runtime memoization is deliberately restricted to scalar call keys/results, so
+/// this metadata is safe to carry through bytecode without rooting managed values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MemoizationKind {
+    #[default]
+    None,
+    /// Pure for scalar arguments, but not part of a recursive SCC.
+    Pure,
+    /// Pure for scalar arguments and recursive (directly or through a pure SCC).
+    Recursive,
+}
+
+impl MemoizationKind {
+    #[inline]
+    pub const fn enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[inline]
+    pub const fn is_recursive(self) -> bool {
+        matches!(self, Self::Recursive)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Edge {
     pub target: BlockId,
@@ -2072,6 +2098,8 @@ pub struct Function {
     /// Concurrent functions are isolated worker entrypoints. Ordinary calls to
     /// them are rejected by the runtime; `launch` is the only legal entry path.
     pub is_concurrent: bool,
+    /// Auto-memoization classification computed after WIR optimization.
+    pub memoization: MemoizationKind,
     /// Class whose instance-field layout this function was compiled against.
     ///
     /// This is set for methods and for closures lexically nested inside methods.
@@ -2413,6 +2441,7 @@ impl<'p> Builder<'p> {
             kind,
             is_async: false,
             is_concurrent: false,
+            memoization: MemoizationKind::None,
             field_owner: None,
             signature: Signature {
                 name,
@@ -2859,6 +2888,16 @@ impl<'p> Builder<'p> {
         method: MethodSymbol,
         args: Vec<ValueId>,
     ) -> ValueId {
+        self.invoke_typed(receiver, method, args, Type::Top)
+    }
+
+    pub fn invoke_typed(
+        &mut self,
+        receiver: ValueId,
+        method: MethodSymbol,
+        args: Vec<ValueId>,
+        result: Type,
+    ) -> ValueId {
         let site = self.program.fresh_site();
         self.emit1(
             Inst::Invoke {
@@ -2867,7 +2906,7 @@ impl<'p> Builder<'p> {
                 method,
                 args,
             },
-            Type::Top,
+            result,
         )
     }
 

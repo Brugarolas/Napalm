@@ -20,6 +20,7 @@ impl TraceRecorder<'_> {
         } else { (FuncId(op.x), None) };
         let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
         if callee.is_async || callee.capture_count != 0 || !callee.chunk.exception_handlers.is_empty()
+            || callee.memoization.enabled()
             || callee.frame.return_kind != RegisterKind::Value || target == op.location.function
             || builder.trace().stats.inlined_calls >= 8 {
             return Err(RecordingAbort::UnsupportedCall);

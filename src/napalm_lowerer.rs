@@ -4808,6 +4808,22 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         ));
                     }
                 }
+                if lowered.len() == 1 {
+                    if let Type::List(Some(expected)) = semantic_source_type(self.builder.value_type(receiver)) {
+                        let actual = self.builder.value_type(value).clone();
+                        if assignment_is_known_incompatible(&expected, &actual) {
+                            self.diagnostics.push(Diagnostic::error(
+                                "NAPALM-T001",
+                                format!(
+                                    "array element expects {}, got {}",
+                                    display_source_type(&expected),
+                                    display_source_type(&semantic_source_type(&actual))
+                                ),
+                                target.span,
+                            ));
+                        }
+                    }
+                }
                 lowered.push(value);
                 let method = self.context.symbols.expect(
                     "[]=",
@@ -4882,6 +4898,21 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_invoke(&mut self, invoke: &front::InvokeExpr, span: Span) -> ValueId {
+        // `new Array(...)` is surface syntax over the List builtin. Preserve the
+        // precise semantic List type here so ordinary variable inference and typed
+        // subscript stores can see it instead of losing the information to Top.
+        let sized_array_type = invoke.receiver.as_deref().and_then(|receiver| {
+            let ExprKind::Name(name) = &receiver.kind else { return None; };
+            if name.value != "List" || invoke.syntax != InvokeSyntax::Method {
+                return None;
+            }
+            match invoke.name.value.as_str() {
+                "new" => Some(Type::List(None)),
+                "__newNumberArray" => Some(Type::List(Some(Box::new(Type::Num)))),
+                _ => None,
+            }
+        });
+
         let receiver = invoke.receiver.as_ref().map(|e| self.lower_expr(e))
             .unwrap_or_else(|| self.lower_this(span));
         let kind = match invoke.syntax {
@@ -4898,6 +4929,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     ty,
                 );
             }
+        }
+        if let Some(result_type) = sized_array_type {
+            if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
+                return self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span);
+            }
+            let args = self.lower_call_args(&invoke.args, span);
+            let symbol = self.builder.intern_method(&invoke.name.value, kind, args.len() as u8);
+            return self.builder.invoke_typed(receiver, symbol, args, result_type);
         }
         self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
     }
@@ -6801,6 +6840,61 @@ class Child is Alias {
             child.superclass, None,
             "Alias is intentionally dynamic from the lowerer's point of view"
         );
+    }
+
+
+    #[test]
+    fn sized_array_constructors_preserve_list_element_type() {
+        let source = r#"
+            function build(size: number) {
+                const genericNew = new Array(size);
+                const genericCall = Array(size);
+                const numbersNew = new Array<Number>(size);
+                const numbersCall = Array<Number>(size);
+                numbersNew[0] = 1;
+                numbersCall[0] = 2;
+                return numbersCall;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("arrays.nap", source, "arrays", &module);
+        assert!(
+            !output.has_errors(),
+            "array constructor lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let mut saw_generic = false;
+        let mut saw_numbers = false;
+        for function in &output.program.functions {
+            for value in &function.values {
+                match &value.ty {
+                    Type::List(None) => saw_generic = true,
+                    Type::List(Some(element)) if **element == Type::Num => saw_numbers = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_generic, "Array(size) and new Array(size) must infer List<any>");
+        assert!(saw_numbers, "Array<Number>(size) and new Array<Number>(size) must infer List<Number>");
+    }
+
+
+    #[test]
+    fn sized_number_array_rejects_known_non_number_store() {
+        let source = r#"
+            function build(size: number) {
+                const numbers = Array<Number>(size);
+                numbers[0] = "wrong";
+                return numbers;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("arrays.nap", source, "arrays", &module);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "NAPALM-T001"
+                && diagnostic.message.contains("array element expects Number")
+        }));
     }
 
 }

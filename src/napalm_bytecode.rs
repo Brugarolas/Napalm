@@ -39,7 +39,7 @@ use std::fmt;
 use crate::napalm_ir::{
     BailoutReason, CallConv, ClassId, ClassInfo, ClassSet, CmpKind, Constant, DeoptId,
     F64BinOp, F64UnaryOp, ForeignFnId, ForeignFunctionInfo, FuncId,
-    FunctionKind, IntBinOp, IntUnaryOp, MethodSignature, MethodSymbol, ModuleId,
+    FunctionKind, IntBinOp, IntUnaryOp, MemoizationKind, MethodSignature, MethodSymbol, ModuleId,
     ModuleInfo, ModuleSlot, PrimitiveId, PropertySlotId, ResumeId, SiteId, SourceSpan,
     StringId, StructuralLayoutId, StructuralLayoutInfo, StructuralLayoutKind, Type,
 };
@@ -1576,6 +1576,8 @@ pub struct BytecodeFunction {
     pub is_async: bool,
     /// Functions marked `concurrent` may only be entered through Opcode::Launch.
     pub is_concurrent: bool,
+    /// Static WIR auto-memoization classification.
+    pub memoization: MemoizationKind,
     /// Declaring class for class-local instance FieldSlot operands.
     ///
     /// The interpreter relocates LoadField/StoreField operands in the prepared

@@ -10496,7 +10496,7 @@ mod tests {
             program.push_function(BytecodeFunction {
                 id: FuncId(0), module: crate::napalm_ir::ModuleId(0),
                 kind: crate::napalm_ir::FunctionKind::ModuleBody,
-                is_async: false, is_concurrent: false, field_owner: None,
+                is_async: false, is_concurrent: false, memoization: crate::napalm_ir::MemoizationKind::None, field_owner: None,
                 name: StringId(0), arity: 0, capture_count: 0,
                 frame: crate::napalm_bytecode::FrameLayout {
                     general_register_count: 18, parameters: vec![], captures: vec![],

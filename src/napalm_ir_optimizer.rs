@@ -883,6 +883,12 @@ pub trait FunctionOptimization {
     fn optimize_function(&mut self, function: &mut Function) -> bool;
 }
 
+/// Whole-program finalization stage. Use this for analyses that need the complete
+/// call graph or immutable module/function metadata after function-local rewrites.
+pub trait ProgramOptimization {
+    fn optimize_program(&mut self, program: &mut Program) -> bool;
+}
+
 enum OptimizationStage {
     Nodes(OptimizationPass),
     Function(SmallBox<dyn FunctionOptimization, S1>),
@@ -890,6 +896,7 @@ enum OptimizationStage {
 
 pub struct Optimize {
     stages: SmallVec<[OptimizationStage; 4]>,
+    program_finalizers: SmallVec<[SmallBox<dyn ProgramOptimization, S1>; 2]>,
     verify_after_each_pass: bool,
 }
 
@@ -897,6 +904,7 @@ impl Default for Optimize {
     fn default() -> Self {
         Self {
             stages: SmallVec::new(),
+            program_finalizers: SmallVec::new(),
             verify_after_each_pass: cfg!(debug_assertions),
         }
     }
@@ -923,6 +931,15 @@ impl Optimize {
         self
     }
 
+    /// Add a whole-program finalizer that runs after every function-local stage.
+    pub fn with_program_finalizer(
+        mut self,
+        pass: impl ProgramOptimization + 'static,
+    ) -> Self {
+        self.program_finalizers.push(smallbox!(pass));
+        self
+    }
+
     pub fn verify_after_each_pass(mut self, enabled: bool) -> Self {
         self.verify_after_each_pass = enabled;
         self
@@ -931,6 +948,19 @@ impl Optimize {
     pub fn optimize_program(&mut self, program: &mut Program) {
         for function in &mut program.functions {
             self.optimize_function(function);
+        }
+        for finalizer in &mut self.program_finalizers {
+            let _ = finalizer.optimize_program(program);
+        }
+        if self.verify_after_each_pass {
+            for function in &program.functions {
+                if let Err(errors) = verify_function(function) {
+                    panic!(
+                        "WIR verification failed after whole-program optimization for {:?}: {errors:#?}",
+                        function.id
+                    );
+                }
+            }
         }
     }
 

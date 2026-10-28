@@ -6,11 +6,14 @@ use smallvec::SmallVec;
 
 use crate::napalm_ir::{
     BlockId, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
-    FieldSlot, Function, Inst, InstId, IntBinOp, IntUnaryOp, ModuleId, ModuleSlot, Node, Program, SiteId,
-    StaticFieldSlot, StringId, Type, ValueDef, ValueId,
+    FieldSlot, FuncId, Function, FunctionKind, Inst, InstId, IntBinOp, IntUnaryOp, MemoizationKind,
+    MethodKind, ModuleId, ModuleSlot, Node, Program, SiteId, StaticFieldSlot, StringId, Type, ValueDef,
+    ValueId,
 };
 use crate::napalm_ir_escape::ScalarReplacement;
-use crate::napalm_ir_optimizer::{repair_effect_chain, FunctionOptimization, Optimize};
+use crate::napalm_ir_optimizer::{
+    repair_effect_chain, FunctionOptimization, Optimize, ProgramOptimization,
+};
 
 #[path = "typed_object_specialization.rs"]
 mod typed_object_specialization;
@@ -26,7 +29,9 @@ pub fn optimization_passes() -> Optimize {
     // Keep the default pipeline as a single optimizer stage. In debug builds the
     // framework verifies after every stage, so bundling the cheap transforms also
     // avoids repeatedly paying verifier cost during development.
-    Optimize::new().with_function_pass(InterpreterOptimizationBundle::default())
+    Optimize::new()
+        .with_function_pass(InterpreterOptimizationBundle::default())
+        .with_program_finalizer(AutoMemoization::default())
 }
 
 /// Optimize independent WIR functions concurrently using one optimizer instance
@@ -72,34 +77,332 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
     // expensive than its neighbours), so use a tiny synchronized work queue
     // instead of fixed contiguous chunks. Each `&mut Function` is produced once
     // by `iter_mut`, preserving exclusive ownership without unsafe code.
-    let (work_tx, work_rx) = std::sync::mpsc::channel::<&mut Function>();
-    let work_rx = parking_lot::Mutex::new(work_rx);
+    //
+    // Keep the queue in its own lexical scope. The channel stores `&mut Function`
+    // values, so its Receiver carries the exclusive borrow of `program.functions`
+    // in its type until the Receiver is dropped. AutoMemoization needs `&mut Program`
+    // afterwards; ending this scope before that pass makes the borrow end explicitly.
+    {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<&mut Function>();
+        let work_rx = parking_lot::Mutex::new(work_rx);
 
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let work_rx = &work_rx;
-            scope.spawn(move || {
-                let mut optimizer = optimization_passes();
-                loop {
-                    let function = {
-                        let receiver = work_rx.lock();
-                        receiver.recv()
-                    };
-                    let Ok(function) = function else {
-                        break;
-                    };
-                    optimizer.optimize_function(function);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let work_rx = &work_rx;
+                scope.spawn(move || {
+                    let mut optimizer = optimization_passes();
+                    loop {
+                        let function = {
+                            let receiver = work_rx.lock();
+                            receiver.recv()
+                        };
+                        let Ok(function) = function else {
+                            break;
+                        };
+                        optimizer.optimize_function(function);
+                    }
+                });
+            }
+
+            for function in &mut program.functions {
+                work_tx
+                    .send(function)
+                    .expect("all WIR optimizer workers stopped unexpectedly");
+            }
+            drop(work_tx);
+        });
+    }
+
+    // Function-local optimization is parallel; memoization needs the finalized
+    // whole-program call graph and therefore runs once after all workers join.
+    let mut memoization = AutoMemoization::default();
+    let _ = memoization.optimize_program(program);
+}
+
+/// Static auto-memoization for scalar-key pure functions.
+///
+/// The current TypeScript-like frontend lowers a source call through the ordinary
+/// `Invoke("call")` protocol, including recursion through module bindings. This
+/// pass therefore reconstructs immutable module-function bindings and a small
+/// pure call graph instead of relying on `CallDirect` alone. Runtime caching is
+/// conditional on scalar arguments/results, so `any` parameters remain safe.
+#[derive(Default)]
+pub struct AutoMemoization;
+
+#[derive(Clone, Debug, Default)]
+struct MemoCandidate {
+    locally_pure: bool,
+    callees: Vec<FuncId>,
+}
+
+impl ProgramOptimization for AutoMemoization {
+    fn optimize_program(&mut self, program: &mut Program) -> bool {
+        analyze_auto_memoization(program)
+    }
+}
+
+fn analyze_auto_memoization(program: &mut Program) -> bool {
+    let module_functions = discover_module_function_bindings(program);
+    let mut summaries: HashMap<FuncId, MemoCandidate> = HashMap::default();
+
+    for function in &program.functions {
+        summaries.insert(
+            function.id,
+            analyze_memo_candidate(program, function, &module_functions),
+        );
+    }
+
+    // Purity is a closed property over the statically known call graph. Start
+    // from locally valid functions and remove anything that calls an invalid or
+    // unknown target. Self/mutual recursion naturally survives this fixed point.
+    let mut pure: HashSet<FuncId> = summaries
+        .iter()
+        .filter_map(|(&id, summary)| summary.locally_pure.then_some(id))
+        .collect();
+    loop {
+        let mut removed = Vec::new();
+        for &id in &pure {
+            let Some(summary) = summaries.get(&id) else { continue; };
+            if summary.callees.iter().any(|callee| !pure.contains(callee)) {
+                removed.push(id);
+            }
+        }
+        if removed.is_empty() { break; }
+        for id in removed { pure.remove(&id); }
+    }
+
+    let mut changed = false;
+    let recursive = recursive_memo_functions(&pure, &summaries);
+    for function in &mut program.functions {
+        let next = if pure.contains(&function.id) {
+            if recursive.contains(&function.id) {
+                MemoizationKind::Recursive
+            } else {
+                MemoizationKind::Pure
+            }
+        } else {
+            MemoizationKind::None
+        };
+        if function.memoization != next {
+            function.memoization = next;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn discover_module_function_bindings(program: &Program) -> HashMap<(ModuleId, ModuleSlot), FuncId> {
+    let mut found: HashMap<(ModuleId, ModuleSlot), FuncId> = HashMap::default();
+    let mut ambiguous: HashSet<(ModuleId, ModuleSlot)> = HashSet::default();
+
+    // A module binding is usable as a static function identity only when every
+    // write is part of module initialization and stores the same closure target.
+    // A later assignment from any ordinary function makes the binding mutable,
+    // even if the module body itself looked like a simple declaration.
+    for function in &program.functions {
+        for block in &function.blocks {
+            for &id in &block.insts {
+                let node = &function.nodes[id.0 as usize];
+                let Inst::StoreModuleVar { module, slot, value } = &node.kind else { continue; };
+                let key = (*module, *slot);
+                if function.kind != FunctionKind::ModuleBody {
+                    ambiguous.insert(key);
+                    continue;
                 }
-            });
+                let Some(target) = resolve_local_closure(function, *value, 0) else {
+                    ambiguous.insert(key);
+                    continue;
+                };
+                match found.get(&key).copied() {
+                    None => { found.insert(key, target); }
+                    Some(previous) if previous == target => {}
+                    Some(_) => { ambiguous.insert(key); }
+                }
+            }
         }
+    }
+    for key in ambiguous { found.remove(&key); }
+    found
+}
 
-        for function in &mut program.functions {
-            work_tx
-                .send(function)
-                .expect("all WIR optimizer workers stopped unexpectedly");
+fn resolve_local_closure(function: &Function, value: ValueId, depth: u8) -> Option<FuncId> {
+    if depth >= 16 { return None; }
+    let value = function.value(value)?;
+    if let Type::Closure(Some(target)) = &value.ty {
+        return Some(*target);
+    }
+    let ValueDef::InstResult(inst, 0) = value.def else { return None; };
+    match &function.node(inst)?.kind {
+        Inst::MakeClosure { function, .. } => Some(*function),
+        Inst::Move(source) => resolve_local_closure(function, *source, depth + 1),
+        _ => None,
+    }
+}
+
+fn resolve_known_callee(
+    function: &Function,
+    value: ValueId,
+    module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
+    depth: u8,
+) -> Option<FuncId> {
+    if depth >= 16 { return None; }
+    let value_info = function.value(value)?;
+    if let Type::Closure(Some(target)) = &value_info.ty {
+        return Some(*target);
+    }
+    let ValueDef::InstResult(inst, 0) = value_info.def else { return None; };
+    match &function.node(inst)?.kind {
+        Inst::MakeClosure { function, .. } => Some(*function),
+        Inst::Move(source) => resolve_known_callee(function, *source, module_functions, depth + 1),
+        Inst::LoadModuleVar { module, slot } => module_functions.get(&(*module, *slot)).copied(),
+        _ => None,
+    }
+}
+
+fn analyze_memo_candidate(
+    program: &Program,
+    function: &Function,
+    module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
+) -> MemoCandidate {
+    // Receiver-bearing methods and closures with captures have hidden inputs that
+    // are not represented by the explicit scalar memo key. Async/concurrent code
+    // also has scheduling semantics that must never be elided by a cache hit.
+    if function.kind != FunctionKind::Closure
+        || function.is_async
+        || function.is_concurrent
+        || !function.captures.is_empty()
+        || !(1..=4).contains(&function.signature.params.len())
+    {
+        return MemoCandidate::default();
+    }
+
+    let mut callees = Vec::new();
+    for block in &function.blocks {
+        for &id in &block.insts {
+            let inst = &function.nodes[id.0 as usize].kind;
+            match inst {
+                Inst::Jump { .. }
+                | Inst::Branch { .. }
+                | Inst::Switch { .. }
+                | Inst::Return(_)
+                | Inst::Unreachable
+                | Inst::Safepoint
+                | Inst::OSRPoint
+                | Inst::Const(_)
+                | Inst::Move(_)
+                | Inst::GuardType { .. }
+                | Inst::GuardClass { .. }
+                | Inst::GuardBounds { .. }
+                | Inst::GuardNotNull { .. }
+                | Inst::GuardInt32 { .. }
+                | Inst::GuardF64 { .. }
+                | Inst::Bailout { .. }
+                | Inst::IntUnary { .. }
+                | Inst::IntBin { .. }
+                | Inst::F64Unary { .. }
+                | Inst::F64Bin { .. }
+                | Inst::CmpInt { .. }
+                | Inst::CmpF64 { .. }
+                | Inst::RefEq { .. }
+                | Inst::NumToInt32 { .. }
+                | Inst::NumToF64 { .. }
+                | Inst::Int32ToNum { .. }
+                | Inst::F64ToNum { .. } => {}
+
+                Inst::LoadModuleVar { module, slot } => {
+                    if !module_functions.contains_key(&(*module, *slot)) {
+                        return MemoCandidate::default();
+                    }
+                }
+
+                Inst::CallDirect { callee, .. } | Inst::TailCallDirect { callee, .. } => {
+                    callees.push(*callee);
+                }
+                Inst::CallClosure { closure, .. } | Inst::TailCallClosure { closure, .. } => {
+                    let Some(callee) = resolve_known_callee(function, *closure, module_functions, 0) else {
+                        return MemoCandidate::default();
+                    };
+                    callees.push(callee);
+                }
+                Inst::Invoke { receiver, method, .. } | Inst::TailInvoke { receiver, method, .. } => {
+                    let Some(signature) = program.method(*method) else {
+                        return MemoCandidate::default();
+                    };
+                    let Some(name) = program.string(signature.name) else {
+                        return MemoCandidate::default();
+                    };
+                    if signature.kind == MethodKind::Method && name == "call" {
+                        let Some(callee) = resolve_known_callee(function, *receiver, module_functions, 0) else {
+                            return MemoCandidate::default();
+                        };
+                        callees.push(callee);
+                    } else if !is_scalar_pure_method(name, signature.kind, signature.arity) {
+                        return MemoCandidate::default();
+                    }
+                }
+
+                // Every remaining operation touches mutable/external state, allocates
+                // observable identity, invokes unknown code, or participates in an
+                // async/fiber boundary. Be conservative: a false negative only loses
+                // an optimization, while a false positive changes program semantics.
+                _ => return MemoCandidate::default(),
+            }
         }
-        drop(work_tx);
-    });
+    }
+
+    callees.sort_unstable_by_key(|id| id.0);
+    callees.dedup();
+    MemoCandidate { locally_pure: true, callees }
+}
+
+fn is_scalar_pure_method(name: &str, kind: MethodKind, arity: u8) -> bool {
+    match (kind, name, arity) {
+        (MethodKind::Method, "-" | "!" | "~", 0) => true,
+        (MethodKind::Method,
+            "**" | "*" | "/" | "%" | "+" | "-" | "<<" | ">>" | "&" | "^" | "|"
+                | "<" | "<=" | ">" | ">=" | "is" | "==" | "!=",
+            1,
+        ) => true,
+        // Stock Number scalar getters are deterministic and allocate no managed
+        // result. Method-epoch invalidation still protects user rebinding.
+        (MethodKind::Getter,
+            "abs" | "floor" | "ceil" | "round" | "sqrt" | "sin" | "cos"
+                | "tan" | "log" | "exp" | "isInteger" | "isNan" | "isInfinity",
+            0,
+        ) => true,
+        _ => false,
+    }
+}
+
+fn recursive_memo_functions(
+    pure: &HashSet<FuncId>,
+    summaries: &HashMap<FuncId, MemoCandidate>,
+) -> HashSet<FuncId> {
+    fn reaches_start(
+        start: FuncId,
+        current: FuncId,
+        pure: &HashSet<FuncId>,
+        summaries: &HashMap<FuncId, MemoCandidate>,
+        seen: &mut HashSet<FuncId>,
+    ) -> bool {
+        if !seen.insert(current) { return false; }
+        let Some(summary) = summaries.get(&current) else { return false; };
+        for &callee in &summary.callees {
+            if !pure.contains(&callee) { continue; }
+            if callee == start { return true; }
+            if reaches_start(start, callee, pure, summaries, seen) { return true; }
+        }
+        false
+    }
+
+    let mut recursive = HashSet::default();
+    for &id in pure {
+        let mut seen = HashSet::default();
+        if reaches_start(id, id, pure, summaries, &mut seen) {
+            recursive.insert(id);
+        }
+    }
+    recursive
 }
 
 /// Cold-start-conscious optimizer bundle for interpreter-visible WIR.
@@ -2456,4 +2759,165 @@ mod typed_object_tests {
             Some(Inst::MapLen { .. })
         ));
     }
+
+    #[test]
+    fn auto_memoization_marks_recursive_scalar_function() {
+        let mut program = Program::new();
+        let module = program.add_module("memo", 0);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "countdown",
+            FunctionKind::Closure,
+            vec![Type::Int32],
+            Type::Int32,
+        );
+        let function = builder.function_id();
+        let n = builder.param(0);
+        let zero = builder.const_i32(0);
+        let done = builder.emit1(
+            Inst::CmpInt { kind: CmpKind::Le, left: n, right: zero },
+            Type::Bool,
+        );
+        let base = builder.new_block(&[]);
+        let recurse = builder.new_block(&[]);
+        builder.branch(done, base, vec![], recurse, vec![]);
+        builder.position_at(base);
+        builder.ret(zero);
+        builder.position_at(recurse);
+        let one = builder.const_i32(1);
+        let next = builder.emit1(
+            Inst::IntBin { op: IntBinOp::Sub, left: n, right: one },
+            Type::Int32,
+        );
+        let result = builder.emit1(
+            Inst::CallDirect {
+                conv: crate::napalm_ir::CallConv::Napalm,
+                callee: function,
+                args: vec![next],
+            },
+            Type::Int32,
+        );
+        builder.ret(result);
+        let id = builder.finish();
+
+        assert!(AutoMemoization.optimize_program(&mut program));
+        assert_eq!(program.functions[id.0 as usize].memoization, MemoizationKind::Recursive);
+    }
+
+    #[test]
+    fn auto_memoization_recognizes_source_style_module_recursive_call() {
+        let mut program = Program::new();
+        let module = program.add_module("memo", 1);
+        let slot = ModuleSlot(0);
+
+        // The TypeScript frontend represents `function fibonacci` as an immutable
+        // module binding containing a closure. Recursive source calls load that
+        // binding and invoke the ordinary `call` method rather than emitting an
+        // early CallDirect, so exercise that exact WIR shape here.
+        let mut fib = Builder::new(
+            &mut program,
+            module,
+            "fibonacci",
+            FunctionKind::Closure,
+            vec![Type::Int32],
+            Type::Int32,
+        );
+        let fib_id = fib.function_id();
+        let call = fib.intern_method("call", MethodKind::Method, 1);
+        let n = fib.param(0);
+        let zero = fib.const_i32(0);
+        let done = fib.emit1(
+            Inst::CmpInt { kind: CmpKind::Le, left: n, right: zero },
+            Type::Bool,
+        );
+        let base = fib.new_block(&[]);
+        let recurse = fib.new_block(&[]);
+        fib.branch(done, base, vec![], recurse, vec![]);
+        fib.position_at(base);
+        fib.ret(zero);
+        fib.position_at(recurse);
+        let one = fib.const_i32(1);
+        let next = fib.emit1(
+            Inst::IntBin { op: IntBinOp::Sub, left: n, right: one },
+            Type::Int32,
+        );
+        let closure = fib.emit1(
+            Inst::LoadModuleVar { module, slot },
+            Type::Closure(Some(fib_id)),
+        );
+        let result = fib.invoke_typed(closure, call, vec![next], Type::Int32);
+        fib.ret(result);
+        fib.finish();
+
+        let mut init = Builder::new(
+            &mut program,
+            module,
+            "<module>",
+            FunctionKind::ModuleBody,
+            vec![],
+            Type::Null,
+        );
+        let closure = init.make_closure(fib_id, vec![]);
+        init.emit0(Inst::StoreModuleVar { module, slot, value: closure });
+        let null = init.const_null();
+        init.ret(null);
+        init.finish();
+
+        assert!(AutoMemoization.optimize_program(&mut program));
+        assert_eq!(
+            program.functions[fib_id.0 as usize].memoization,
+            MemoizationKind::Recursive
+        );
+    }
+
+    #[test]
+    fn auto_memoization_marks_nonrecursive_pure_function() {
+        let mut program = Program::new();
+        let module = program.add_module("memo", 0);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "square",
+            FunctionKind::Closure,
+            vec![Type::Int32],
+            Type::Int32,
+        );
+        let n = builder.param(0);
+        let result = builder.emit1(
+            Inst::IntBin { op: IntBinOp::Mul, left: n, right: n },
+            Type::Int32,
+        );
+        builder.ret(result);
+        let id = builder.finish();
+
+        assert!(AutoMemoization.optimize_program(&mut program));
+        assert_eq!(program.functions[id.0 as usize].memoization, MemoizationKind::Pure);
+    }
+
+    #[test]
+    fn auto_memoization_rejects_mutable_module_state() {
+        let mut program = Program::new();
+        let module = program.add_module("memo", 1);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "impure",
+            FunctionKind::Closure,
+            vec![Type::Int32],
+            Type::Int32,
+        );
+        let n = builder.param(0);
+        builder.emit0(Inst::StoreModuleVar {
+            module,
+            slot: ModuleSlot(0),
+            value: n,
+        });
+        builder.ret(n);
+        let id = builder.finish();
+
+        let _ = AutoMemoization.optimize_program(&mut program);
+        assert_eq!(program.functions[id.0 as usize].memoization, MemoizationKind::None);
+    }
+
 }

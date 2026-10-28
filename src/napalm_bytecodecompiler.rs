@@ -3123,6 +3123,7 @@ impl FunctionEmitter<'_> {
             kind: self.function.kind,
             is_async: self.function.is_async,
             is_concurrent: self.function.is_concurrent,
+            memoization: self.function.memoization,
             field_owner: self.function.field_owner,
             name: self.function.signature.name,
             arity,

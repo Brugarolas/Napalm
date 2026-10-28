@@ -24,7 +24,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{mpsc, Arc, OnceLock};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use simd_json::prelude::*;
 use crate::napalm_gc::{
     Collector as GcCollector, Config as GcConfig, Descriptor as GcDescriptor, Mutator as GcMutator,
@@ -74,7 +74,7 @@ use crate::napalm_bytecode::{
 };
 use crate::napalm_ir::{
     BailoutReason, BuiltinId, ClassId, ClassSet, Constant, ForeignFnId, FuncId, FunctionKind,
-    MethodSymbol, ModuleId, PrimitiveId, PropertySlotId, StringId, StructuralLayoutId,
+    MemoizationKind, MethodSymbol, ModuleId, PrimitiveId, PropertySlotId, StringId, StructuralLayoutId,
     StructuralLayoutInfo, Type,
 };
 
@@ -3342,6 +3342,16 @@ impl HostContext<'_> {
         self.heap.alloc(HeapObject::List(values))
     }
 
+    pub fn allocate_typed_list(
+        &mut self,
+        values: Vec<Value>,
+        element: Type,
+    ) -> Result<Value, RuntimeError> {
+        let value = self.heap.alloc(HeapObject::List(values));
+        self.heap.install_fresh_list_contract(value, element)?;
+        Ok(value)
+    }
+
     pub fn allocate_map(&mut self) -> Value {
         self.heap.alloc(HeapObject::Map(NapalmMap::default()))
     }
@@ -3891,6 +3901,8 @@ struct PreparedFunction {
     uses_this: bool,
     is_async: bool,
     is_concurrent: bool,
+    memoization: MemoizationKind,
+    memo_arg_kinds: [RegisterKind; 4],
     arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
@@ -4348,6 +4360,16 @@ impl PreparedProgram {
         );
         let gc_map_by_op = temps.iter().map(|temp| temp.gc_map).collect();
 
+        let mut memo_arg_kinds = [RegisterKind::Value; 4];
+        for binding in &function.frame.parameters {
+            if let IncomingSource::Argument(argument) = binding.source {
+                let index = argument.index();
+                if index < memo_arg_kinds.len() {
+                    memo_arg_kinds[index] = binding.kind;
+                }
+            }
+        }
+
         Ok(PreparedFunction {
             handlers,
             jit_entry_handlers,
@@ -4385,6 +4407,8 @@ impl PreparedProgram {
             uses_this,
             is_async: function.is_async,
             is_concurrent: function.is_concurrent,
+            memoization: function.memoization,
+            memo_arg_kinds,
             arity: function.arity,
             return_kind: function.frame.return_kind,
             capture_count: function.capture_count,
@@ -5105,6 +5129,9 @@ struct FiberState {
     object: Value,
     status: FiberStatus,
     frames: Vec<Frame>,
+    /// Memo keys parallel to frame depth. Miss keys are retained only until the
+    /// corresponding pure function returns successfully.
+    memo_keys: Vec<Option<MemoKey>>,
     /// Parallel architectural banks, one slot per frame depth. Entries are kept
     /// after pop and reused, just like the GPR high-water storage below.
     banks: Vec<FrameBanks>,
@@ -5129,6 +5156,7 @@ impl FiberState {
             object,
             status,
             frames: Vec::with_capacity(64),
+            memo_keys: Vec::with_capacity(64),
             banks: Vec::with_capacity(64),
             registers: Vec::with_capacity(1024),
             register_top: 0,
@@ -5204,6 +5232,105 @@ enum RunState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MemoKey {
+    // Arity is a per-function invariant, so keeping it in every key only bloats
+    // the SwissTable entry. Unused words remain zero for 1..3 argument calls.
+    words: [u64; 4],
+}
+
+enum MemoProbe {
+    Bypass,
+    Hit(RegisterWord),
+    Miss(MemoKey),
+}
+
+#[derive(Clone, Copy)]
+struct MemoEntry {
+    value: RegisterWord,
+    generation: u32,
+}
+
+struct MemoTable {
+    policy: MemoizationKind,
+    entries: FastMap<MemoKey, MemoEntry>,
+    probes: u32,
+    hits: u32,
+    disabled: bool,
+    generation: u32,
+    maintenance_probes: u32,
+    last_maintenance: Instant,
+    method_epoch: u64,
+}
+
+impl MemoTable {
+    fn new(policy: MemoizationKind, method_epoch: u64) -> Self {
+        Self {
+            policy,
+            entries: FastMap::default(),
+            probes: 0,
+            hits: 0,
+            disabled: false,
+            generation: 0,
+            maintenance_probes: 0,
+            last_maintenance: Instant::now(),
+            method_epoch,
+        }
+    }
+
+    #[inline]
+    fn probe(&mut self, key: MemoKey, method_epoch: u64) -> MemoProbe {
+        if self.disabled { return MemoProbe::Bypass; }
+        if self.method_epoch != method_epoch {
+            self.entries.clear();
+            self.method_epoch = method_epoch;
+        }
+        self.probes = self.probes.saturating_add(1);
+        self.maintenance_probes = self.maintenance_probes.wrapping_add(1);
+        if self.maintenance_probes & 0x0fff == 0 {
+            self.maintain();
+        }
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.generation = self.generation;
+            self.hits = self.hits.saturating_add(1);
+            return MemoProbe::Hit(entry.value);
+        }
+        if self.policy == MemoizationKind::Pure
+            && self.probes >= 256
+            && self.hits.saturating_mul(10) < self.probes
+        {
+            self.disabled = true;
+            self.entries.clear();
+            return MemoProbe::Bypass;
+        }
+        MemoProbe::Miss(key)
+    }
+
+    #[cold]
+    fn maintain(&mut self) {
+        if self.last_maintenance.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+        let live_generation = self.generation;
+        // Keep entries used during the most recent generation. Entries that go
+        // untouched for a full maintenance interval are discarded on the next
+        // sweep without adding a timestamp to every lookup.
+        self.entries
+            .retain(|_, entry| entry.generation == live_generation);
+        self.generation = self.generation.wrapping_add(1);
+        self.last_maintenance = Instant::now();
+    }
+
+    #[inline]
+    fn insert(&mut self, key: MemoKey, value: RegisterWord) {
+        if self.disabled { return; }
+        let limit = if self.policy.is_recursive() { 65_536 } else { 4_096 };
+        if self.entries.len() < limit || self.entries.contains_key(&key) {
+            self.entries.insert(key, MemoEntry { value, generation: self.generation });
+        }
+    }
+}
+
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
     jit_entry_threshold: u32,
@@ -5260,6 +5387,9 @@ pub struct Interpreter<'p> {
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
     megamorphic_cache: FastMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
     profile_counters: Vec<Vec<u64>>,
+    /// Per-function scalar memo tables. Managed Values are intentionally excluded
+    /// from keys/results, so these tables require no GC root registration.
+    memo_tables: Vec<Option<MemoTable>>,
     roots: Vec<Option<Value>>,
     free_roots: Vec<u32>,
     /// Stable idle snapshot. Active execution additionally installs an exact
@@ -5527,6 +5657,12 @@ impl<'p> Interpreter<'p> {
         let profile_counters = program.functions.iter().map(|function| {
             vec![0; function.chunk.profile_counters.len()]
         }).collect();
+        let memo_tables = prepared.functions.iter().map(|function| {
+            function
+                .memoization
+                .enabled()
+                .then(|| MemoTable::new(function.memoization, 0))
+        }).collect();
 
         // FiberState lives in stable Arc storage. The managed Fiber object owns
         // another Arc plus immutable GC-map metadata, so tracing never depends on
@@ -5589,6 +5725,7 @@ impl<'p> Interpreter<'p> {
             builtin_methods: vec![vec![None; program.metadata.methods.len()]; BUILTIN_CLASS_COUNT],
             megamorphic_cache: FastMap::default(),
             profile_counters,
+            memo_tables,
             roots: Vec::new(),
             free_roots: Vec::new(),
             persistent_roots: init_roots,
@@ -6405,6 +6542,7 @@ impl<'p> Interpreter<'p> {
         {
             let fiber = self.fiber_mut(current);
             fiber.frames.truncate(target_depth + 1);
+            fiber.memo_keys.truncate(target_depth + 1);
             fiber.register_top = reg_top;
             let frame_reg_base = {
                 let frame = fiber
@@ -6820,15 +6958,21 @@ impl<'p> Interpreter<'p> {
 
     fn return_from_frame(&mut self, value0: RegisterWord, value1: Option<RegisterWord>) {
         let current = self.current_fiber;
-        let (return_dst, base, finished_function) = {
+        let (return_dst, base, finished_function, memo_key) = {
             let fiber = self.fiber_mut(current);
             // Return is reachable only with a live verified frame. Keep malformed
             // internal state diagnosable in debug builds without a release branch
             // on every function return.
             debug_assert!(!fiber.frames.is_empty(), "return with empty frame stack");
+            let depth = fiber.frames.len() - 1;
+            let memo_key = fiber.memo_keys.get_mut(depth).and_then(Option::take);
             let frame = unsafe { fiber.frames.pop().unwrap_unchecked() };
-            (frame.return_dst, frame.reg_base as usize, frame.function)
+            (frame.return_dst, frame.reg_base as usize, frame.function, memo_key)
         };
+
+        if let Some(key) = memo_key {
+            self.store_memoized_return(finished_function, key, value0);
+        }
 
         // A module becomes initialized exactly when its ModuleBody returns.
         // Cyclic imports observe the partially initialized module object, as Napalm
@@ -7112,6 +7256,75 @@ impl<'p> Interpreter<'p> {
         Ok(promise)
     }
 
+    #[inline]
+    fn memo_key_for_call(&self, function: u32, args: &[RegisterWord]) -> Option<MemoKey> {
+        let prepared = self.prepared.functions.get(function as usize)?;
+        if !prepared.memoization.enabled()
+            || prepared.uses_this
+            || prepared.capture_count != 0
+            || args.len() != prepared.arity as usize
+            || !(1..=4).contains(&args.len())
+        {
+            return None;
+        }
+
+        let mut words = [0u64; 4];
+        for (index, &word) in args.iter().enumerate() {
+            words[index] = match prepared.memo_arg_kinds[index] {
+                RegisterKind::Value => {
+                    let value = Value::from_word(word);
+                    if value.is_heap() || !(value.is_null() || value.is_bool() || value.is_num()) {
+                        return None;
+                    }
+                    value.raw_bits()
+                }
+                RegisterKind::Int32 => (word.0 as u32) as u64,
+                RegisterKind::F64 => word.0,
+                RegisterKind::RawPtr => return None,
+            };
+        }
+        Some(MemoKey { words })
+    }
+
+    #[inline]
+    fn probe_memoized_call(&mut self, function: u32, args: &[RegisterWord]) -> MemoProbe {
+        let Some(key) = self.memo_key_for_call(function, args) else {
+            return MemoProbe::Bypass;
+        };
+        let method_epoch = self.method_epoch;
+        let Some(Some(table)) = self.memo_tables.get_mut(function as usize) else {
+            return MemoProbe::Bypass;
+        };
+        table.probe(key, method_epoch)
+    }
+
+    #[inline]
+    fn remember_memo_miss_for_current_frame(&mut self, key: MemoKey) {
+        let state = self.fiber_mut(self.current_fiber);
+        let Some(depth) = state.frames.len().checked_sub(1) else { return; };
+        if state.memo_keys.len() <= depth {
+            state.memo_keys.resize(depth + 1, None);
+        }
+        state.memo_keys[depth] = Some(key);
+    }
+
+    #[inline]
+    fn store_memoized_return(&mut self, function: u32, key: MemoKey, value: RegisterWord) {
+        let Some(prepared) = self.prepared.functions.get(function as usize) else { return; };
+        let cacheable = match prepared.return_kind {
+            RegisterKind::Value => {
+                let value = Value::from_word(value);
+                !value.is_heap() && (value.is_null() || value.is_bool() || value.is_num())
+            }
+            RegisterKind::Int32 | RegisterKind::F64 => true,
+            RegisterKind::RawPtr => false,
+        };
+        if !cacheable { return; }
+        if let Some(Some(table)) = self.memo_tables.get_mut(function as usize) {
+            table.insert(key, value);
+        }
+    }
+
     /// Common bytecode-call boundary. Async callees return a Promise immediately;
     /// synchronous callees retain the existing frame-push fast path.
     fn enter_bytecode_call(
@@ -7126,29 +7339,40 @@ impl<'p> Interpreter<'p> {
         unsafe { self.advance(op); }
         self.flush_hot_pc();
 
-        if self.prepared.functions[function as usize].is_concurrent {
+        let (is_concurrent, is_async) = {
+            let prepared = &self.prepared.functions[function as usize];
+            (prepared.is_concurrent, prepared.is_async)
+        };
+        if is_concurrent {
             self.fail_at(op, "concurrent functions cannot be called directly; use `launch`");
             return;
         }
-        if self.prepared.functions[function as usize].is_async {
+        if is_async {
             self.maybe_collect();
             match self.spawn_async_task(function, receiver, args, closure) {
                 Ok(promise) => unsafe { self.set_reg(op.a, promise.word()) },
                 Err(error) => self.fail_at(op, error.message),
             }
-        } else {
-            match self.push_frame(
-                function,
-                receiver,
-                args,
-                closure,
-                Some(Reg(op.a)),
-            ) {
-                Ok(()) => {
-                    self.current_frame_mut().caller_pc = op.raw_pc;
-                }
-                Err(error) => self.fail_at(op, error.message),
+            return;
+        }
+
+        let memo_key = match self.probe_memoized_call(function, args) {
+            MemoProbe::Hit(value) => {
+                unsafe { self.set_reg(op.a, value); }
+                return;
             }
+            MemoProbe::Miss(key) => Some(key),
+            MemoProbe::Bypass => None,
+        };
+
+        match self.push_frame(function, receiver, args, closure, Some(Reg(op.a))) {
+            Ok(()) => {
+                self.current_frame_mut().caller_pc = op.raw_pc;
+                if let Some(key) = memo_key {
+                    self.remember_memo_miss_for_current_frame(key);
+                }
+            }
+            Err(error) => self.fail_at(op, error.message),
         }
     }
 
@@ -7175,11 +7399,22 @@ impl<'p> Interpreter<'p> {
             self.fail_at(op, "staged direct closure call cannot target async bytecode");
             return;
         }
+        let memo_key = match self.probe_memoized_call(function, args) {
+            MemoProbe::Hit(value) => {
+                unsafe { self.set_reg(op.a, value); }
+                return;
+            }
+            MemoProbe::Miss(key) => Some(key),
+            MemoProbe::Bypass => None,
+        };
         match self.push_frame_with_capture_words(
             function, None, args, Some(closure), Some(captures), Some(Reg(op.a)),
         ) {
             Ok(()) => {
                 self.current_frame_mut().caller_pc = op.raw_pc;
+                if let Some(key) = memo_key {
+                    self.remember_memo_miss_for_current_frame(key);
+                }
             }
             Err(error) => self.fail_at(op, error.message),
         }
@@ -7284,6 +7519,7 @@ impl<'p> Interpreter<'p> {
             state.awaiting_promise = None;
             state.suspend_dst = None;
             state.frames.clear();
+            state.memo_keys.clear();
             state.register_top = 0;
             state.async_promise
         };
@@ -9218,7 +9454,21 @@ impl Interpreter<'_> {
         }
 
         let target = self.lookup_method(class, descriptor.method, home_slot).ok_or_else(|| {
-            RuntimeError::new(format!("method {:?} is not defined for receiver", descriptor.method))
+            let method_name = self
+                .program
+                .metadata
+                .method(descriptor.method)
+                .and_then(|signature| self.program.metadata.string(signature.name));
+            match method_name {
+                Some(name) => RuntimeError::new(format!(
+                    "method `{name}` ({:?}) is not defined for receiver",
+                    descriptor.method
+                )),
+                None => RuntimeError::new(format!(
+                    "method {:?} is not defined for receiver",
+                    descriptor.method
+                )),
+            }
         })?;
         let cache = &mut self.inline_caches[function_index as usize][ic_slot as usize];
         cache.insert(class, target);
@@ -13357,12 +13607,45 @@ mod tests {
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
             field_owner: None,
-            name: StringId(0), is_async: false, is_concurrent: false, arity: 0, capture_count: 0,
+            name: StringId(0), is_async: false, is_concurrent: false, memoization: crate::napalm_ir::MemoizationKind::None, arity: 0, capture_count: 0,
             frame: FrameLayout { general_register_count: gprs, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value },
             chunk,
         }).unwrap();
         program.rebuild_indexes().unwrap();
         program
+    }
+
+
+    #[test]
+    fn recursive_memo_table_stays_enabled_under_initial_misses() {
+        let mut table = MemoTable::new(MemoizationKind::Recursive, 0);
+        for value in 0..512u64 {
+            let key = MemoKey { words: [value, 0, 0, 0] };
+            assert!(matches!(table.probe(key, 0), MemoProbe::Miss(_)));
+        }
+        assert!(!table.disabled);
+    }
+
+    #[test]
+    fn pure_memo_table_disables_when_hit_rate_is_too_low() {
+        let mut table = MemoTable::new(MemoizationKind::Pure, 0);
+        for value in 0..256u64 {
+            let key = MemoKey { words: [value, 0, 0, 0] };
+            let _ = table.probe(key, 0);
+        }
+        assert!(table.disabled);
+        assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn memo_table_invalidates_values_when_method_epoch_changes() {
+        let mut table = MemoTable::new(MemoizationKind::Recursive, 7);
+        let key = MemoKey { words: [42, 0, 0, 0] };
+        let value = RegisterWord(1234);
+        table.insert(key, value);
+        assert!(matches!(table.probe(key, 7), MemoProbe::Hit(hit) if hit == value));
+        assert!(matches!(table.probe(key, 8), MemoProbe::Miss(_)));
+        assert!(table.entries.is_empty());
     }
 
     fn compile_napalm_module(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {

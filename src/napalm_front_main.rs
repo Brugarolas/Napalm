@@ -1872,6 +1872,12 @@ impl<'a> Parser<'a> {
                 left = self.append_chain_subscript(left, key, false, self.end(start));
                 continue;
             }
+            if min <= 18 {
+                if let Some(array) = self.try_array_constructor_call(&left, start)? {
+                    left = array;
+                    continue;
+                }
+            }
             if min <= 18 && self.try_call_type_arguments() {
                 // Type arguments are compile-time only. The following iteration
                 // consumes the actual argument list and emits the normal call AST.
@@ -2143,6 +2149,75 @@ impl<'a> Parser<'a> {
                 span,
             ),
         }
+    }
+
+    /// Parse JavaScript/TypeScript-style `Array(size)` as pure syntax sugar for
+    /// the same List constructor used by `new Array(size)`. Generic element types
+    /// are compile-time only and select the exact same specialized constructor as
+    /// the `new` spelling, so both forms have identical runtime semantics.
+    fn try_array_constructor_call(&mut self, left: &Expr, start: usize) -> Result<Option<Expr>> {
+        let ExprKind::Name(name) = &left.kind else {
+            return Ok(None);
+        };
+        if name.value != "Array" {
+            return Ok(None);
+        }
+
+        if self.at("(") {
+            let args = self.args()?;
+            if args.len() != 1 {
+                return self.error("Array(size) expects exactly one size argument");
+            }
+            let receiver = Expr::new(
+                ExprKind::Name(Spanned::new("List".into(), name.span)),
+                self.end(start),
+            );
+            return Ok(Some(invoke(receiver, "new", args, self.end(start))));
+        }
+
+        if !self.at("<") {
+            return Ok(None);
+        }
+
+        // `Array < value` is a valid relational expression. Speculatively parse
+        // type arguments and commit only if they are followed by an argument list.
+        let saved_pos = self.pos;
+        let saved_splits = self.token_splits.len();
+        let saved_diagnostics = self.diagnostics.len();
+        let saved_depth = self.depth;
+        let type_start = self.peek().span.start;
+        if self.type_arguments().is_err() || !self.at("(") {
+            self.pos = saved_pos;
+            self.restore_token_splits(saved_splits);
+            self.diagnostics.truncate(saved_diagnostics);
+            self.depth = saved_depth;
+            return Ok(None);
+        }
+
+        let type_end = self.tokens[self.pos - 1].span.end;
+        let inner = self.source[type_start + 1..type_end - 1].trim();
+        let parts = split_type_top_level(inner, ',');
+        if parts.len() != 1 {
+            return self.error("Array expects exactly one element type argument");
+        }
+        let constructor = match parts[0].trim().to_ascii_lowercase().as_str() {
+            "number" | "num" => "__newNumberArray",
+            "any" => "new",
+            _ => {
+                return self.error(
+                    "sized generic Array construction currently supports Number or any",
+                );
+            }
+        };
+        let args = self.args()?;
+        if args.len() != 1 {
+            return self.error("Array(size) expects exactly one size argument");
+        }
+        let receiver = Expr::new(
+            ExprKind::Name(Spanned::new("List".into(), name.span)),
+            self.end(start),
+        );
+        Ok(Some(invoke(receiver, constructor, args, self.end(start))))
     }
 
     fn append_chain_call(
@@ -2446,7 +2521,13 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat("new") {
-            let name = self.ident()?;
+            let mut name = self.ident()?;
+            let is_array = name.value == "Array";
+            if is_array {
+                // Array is surface syntax over Napalm's List runtime identity.
+                // Keeping one runtime class avoids duplicate IC/class metadata.
+                name.value = "List".into();
+            }
             let mut receiver = Expr::new(ExprKind::Name(name), self.end(start));
             while self.eat(".") {
                 let name = self.ident()?;
@@ -2460,11 +2541,36 @@ impl<'a> Parser<'a> {
                     self.end(start),
                 );
             }
+
+            let mut constructor = "new";
             if self.at("<") {
-                self.type_arguments()?;
+                if is_array {
+                    let type_start = self.peek().span.start;
+                    self.type_arguments()?;
+                    let type_end = self.tokens[self.pos - 1].span.end;
+                    let inner = self.source[type_start + 1..type_end - 1].trim();
+                    let parts = split_type_top_level(inner, ',');
+                    if parts.len() != 1 {
+                        return self.error("Array expects exactly one element type argument");
+                    }
+                    match parts[0].trim().to_ascii_lowercase().as_str() {
+                        "number" | "num" => constructor = "__newNumberArray",
+                        "any" => {}
+                        _ => {
+                            return self.error(
+                                "sized generic Array construction currently supports Number or any",
+                            );
+                        }
+                    }
+                } else {
+                    self.type_arguments()?;
+                }
             }
             let args = self.args()?;
-            return Ok(invoke(receiver, "new", args, self.end(start)));
+            if is_array && args.len() != 1 {
+                return self.error("Array(size) expects exactly one size argument");
+            }
+            return Ok(invoke(receiver, constructor, args, self.end(start)));
         }
         if self.eat("super") {
             let method = if self.eat(".") {
@@ -3719,4 +3825,58 @@ mod napalm_syntax_tests {
             .iter()
             .any(|d| d.message.contains("rest parameters are not implemented yet")));
     }
+
+    #[test]
+    fn parses_sized_array_constructors() {
+        let module = assert_parses(r#"
+            const genericNew = new Array(4);
+            const genericCall = Array(4);
+            const numbersNew = new Array<Number>(8);
+            const numbersCall = Array<Number>(8);
+            const anyNew = new Array<any>(2);
+            const anyCall = Array<any>(2);
+        "#);
+        assert_eq!(module.statements.len(), 6);
+
+        let constructor = |statement: &Stmt| -> (String, String, usize) {
+            let StmtKind::Variable { initializer: Some(initializer), .. } = &statement.kind else {
+                panic!("expected initialized variable");
+            };
+            let ExprKind::Invoke(call) = &initializer.kind else {
+                panic!("Array constructor must lower to an invoke AST");
+            };
+            let Some(receiver) = call.receiver.as_deref() else {
+                panic!("Array constructor invoke must have a receiver");
+            };
+            let ExprKind::Name(receiver) = &receiver.kind else {
+                panic!("Array constructor receiver must be List");
+            };
+            (receiver.value.clone(), call.name.value.clone(), call.args.len())
+        };
+
+        assert_eq!(constructor(&module.statements[0]), ("List".into(), "new".into(), 1));
+        assert_eq!(constructor(&module.statements[1]), ("List".into(), "new".into(), 1));
+        assert_eq!(constructor(&module.statements[2]), ("List".into(), "__newNumberArray".into(), 1));
+        assert_eq!(constructor(&module.statements[3]), ("List".into(), "__newNumberArray".into(), 1));
+        assert_eq!(constructor(&module.statements[4]), ("List".into(), "new".into(), 1));
+        assert_eq!(constructor(&module.statements[5]), ("List".into(), "new".into(), 1));
+    }
+
+    #[test]
+    fn array_generic_call_does_not_steal_relational_less_than() {
+        let module = assert_parses(r#"
+            const Array = 10;
+            const Number = 20;
+            const comparison = Array < Number;
+        "#);
+        assert_eq!(module.statements.len(), 3);
+        let StmtKind::Variable { initializer: Some(initializer), .. } = &module.statements[2].kind else {
+            panic!("expected comparison initializer");
+        };
+        assert!(matches!(
+            &initializer.kind,
+            ExprKind::Binary { operator: BinaryOp::Less, .. }
+        ));
+    }
+
 }

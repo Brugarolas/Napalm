@@ -55,11 +55,11 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     }
     program.metadata.foreign_functions.push(ForeignFunctionInfo { id: ForeignFnId(0), module: StringId(0), class: StringId(0), signature: MethodSymbol(0), is_static: false });
     let frame = FrameLayout { general_register_count: 8, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value };
-    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, is_async: false, is_concurrent: false, field_owner: matches!(opcode, LoadField | StoreField).then_some(ClassId(0)), arity: 0, capture_count: 0, frame: frame.clone(), chunk }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, is_async: false, is_concurrent: false, field_owner: matches!(opcode, LoadField | StoreField).then_some(ClassId(0)), arity: 0, capture_count: 0, frame: frame.clone(), chunk, memoization: MemoizationKind::None }).unwrap();
     let mut child = Assembler::new();
     child.emit_a(LoadTrue, 0);
     child.emit_a(Return, 0);
-    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, is_async: false, is_concurrent: false, field_owner: None, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap() }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, is_async: false, is_concurrent: false, field_owner: None, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap(), memoization: MemoizationKind::None }).unwrap();
     program.rebuild_indexes().unwrap();
     program
 }

@@ -188,6 +188,24 @@ impl Heap {
         }
     }
 
+    /// Install a typed-list contract on a freshly allocated dense Array without
+    /// validating its initialization slots. The constructor itself owns those
+    /// slots; subsequent writes still go through `check_list_write`.
+    pub(super) fn install_fresh_list_contract(
+        &mut self,
+        value: Value,
+        element: Type,
+    ) -> Result<(), RuntimeError> {
+        if !matches!(self.get(value), Some(HeapObject::List(_))) {
+            return Err(RuntimeError::new("typed Array allocation did not produce a List"));
+        }
+        let contract = Type::List(Some(Box::new(element)));
+        if !self.interface_matches(value, &contract) {
+            self.install_contracts(vec![(value, contract)]);
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_contract(
         &mut self,
         value: Value,

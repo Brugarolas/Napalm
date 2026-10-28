@@ -1,5 +1,7 @@
 // src/scripts/levenshtein.napalm
 
+let start = System.clock
+
 System.print("===== Levenshtein distance =====");
 
 function levenshtein(a, b) {
@@ -63,3 +65,6 @@ var A = "kitten";
 var B = "sitting";
 var d = levenshtein(A, B);
 System.print(d); // expect 3
+
+let elapsed = System.clock - start
+System.print(`elapsed: ${elapsed}`)
