@@ -2,7 +2,7 @@
 //! contracts contain no managed references and move/die with their owner in GC.
 use super::*;
 
-pub(super) const TYPE_ERROR: &str = "Interface type error: ";
+pub(super) const TYPE_ERROR: &str = "Structural type error: ";
 
 fn mismatch(path: &str, expected: &Type) -> RuntimeError {
     RuntimeError::new(format!("{TYPE_ERROR}{path} must satisfy {expected:?}"))
@@ -79,7 +79,9 @@ impl Heap {
                 if matches!(expected, Type::Record(_)) {
                     for index in 0..map.len() {
                         let Some(key) = map.nth_key(&self.map_shapes, index) else {
-                            continue;
+                            return Err(RuntimeError::new(format!(
+                                "{TYPE_ERROR}{path} has inconsistent Map storage"
+                            )));
                         };
                         let declared = match &key {
                             MapKey::String(key) => fields
@@ -89,13 +91,11 @@ impl Heap {
                         };
                         if !declared {
                             let property = match key {
-                                MapKey::String(key) => {
-                                    String::from_utf8_lossy(key.as_ref()).into_owned()
-                                }
+                                MapKey::String(key) => String::from_utf8_lossy(key.as_ref()).into_owned(),
                                 _ => "<non-string key>".to_owned(),
                             };
                             return Err(RuntimeError::new(format!(
-                                "{TYPE_ERROR}property '{property}' is not declared by the closed type"
+                                "{TYPE_ERROR}closed type cannot contain undeclared property '{property}'"
                             )));
                         }
                     }
@@ -182,6 +182,12 @@ impl Heap {
         value: Value,
         expected: &Type,
     ) -> Result<(), RuntimeError> {
+        // Contracts are persistent. Typed parameters and loop-carried aliases may
+        // bind the same object repeatedly; avoid rescanning every structural field
+        // once this exact contract has already been validated and installed.
+        if self.interface_matches(value, expected) {
+            return Ok(());
+        }
         let mut plan = Vec::new();
         self.plan_contract(value, expected, "object", &mut plan)?;
         self.install_contracts(plan);

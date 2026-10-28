@@ -30,7 +30,7 @@ use crate::napalm_gc::{
     RootVisitor as GcRootVisitor, Slot as GcSlot, TraceLayout as GcTraceLayout,
     RAW_CODEC as GC_RAW_CODEC,
 };
-use crate::napalm_trace_ir::{FrameSlot, TraceConstant, TraceHeapObjectKind, TraceId, TraceLocation};
+use crate::napalm_trace_ir::{FrameSlot, TraceConstant, TraceHeapObjectKind, TraceId, TraceLocation, TraceShapeSlot};
 #[path = "napalm_event_loop.rs"]
 pub mod napalm_event_loop;
 use self::napalm_event_loop::{CancelOutcome, EventId, FiredEvent, NapalmEventLoop};
@@ -62,7 +62,8 @@ use crate::napalm_bytecode::{
 };
 use crate::napalm_ir::{
     BailoutReason, BuiltinId, ClassId, ClassSet, Constant, ForeignFnId, FuncId, FunctionKind,
-    MethodSymbol, ModuleId, PrimitiveId, StringId, Type,
+    MethodSymbol, ModuleId, PrimitiveId, PropertySlotId, StringId, StructuralLayoutId,
+    StructuralLayoutInfo, Type,
 };
 
 // =============================================================================
@@ -1107,6 +1108,20 @@ impl ShapeSlotContract {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ShapeFamily {
+    contract: Type,
+    keys: Box<[MapStringKey]>,
+}
+
+#[derive(Clone, Debug)]
+struct ShapeFamilyMembership {
+    family: u32,
+    /// Logical family slot -> physical hidden-shape slot. u16::MAX means an
+    /// optional property is currently absent from this particular shape.
+    physical_slots: Box<[u16]>,
+}
+
 #[derive(Debug)]
 struct MapShape {
     /// Property order is also the physical value-slot order. Keep the prehashed
@@ -1115,6 +1130,9 @@ struct MapShape {
     /// Slot contracts are immutable after shape publication and therefore safe
     /// facts for interpreter PICs and compiled traces.
     slots: Box<[ShapeSlotContract]>,
+    /// Structural layout memberships. These are immutable shape facts and map
+    /// logical interface/record slots to concrete hidden-shape slots.
+    families: Box<[ShapeFamilyMembership]>,
     /// Shared hidden-class transitions. Only string keys participate.
     transitions: FastMap<(MapStringKey, ShapeSlotContract), u32>,
 }
@@ -1140,7 +1158,12 @@ impl MapShape {
 #[derive(Debug)]
 struct MapShapeTable {
     shapes: Vec<MapShape>,
-    typed_variants: FastMap<(u32, Type), u32>,
+    typed_variants: FastMap<(u32, u32), u32>,
+    family_ids: FastMap<Type, u32>,
+    /// Compiler structural layout id -> runtime family id. Dense vector lookup
+    /// keeps property PIC misses independent from hashing the full Type schema.
+    layout_families: Vec<Option<u32>>,
+    families: Vec<ShapeFamily>,
 }
 
 impl Default for MapShapeTable {
@@ -1149,9 +1172,13 @@ impl Default for MapShapeTable {
             shapes: vec![MapShape {
                 keys: Vec::<MapStringKey>::new().into_boxed_slice(),
                 slots: Vec::<ShapeSlotContract>::new().into_boxed_slice(),
+                families: Vec::<ShapeFamilyMembership>::new().into_boxed_slice(),
                 transitions: FastMap::default(),
             }],
             typed_variants: FastMap::default(),
+            family_ids: FastMap::default(),
+            layout_families: Vec::new(),
+            families: Vec::new(),
         }
     }
 }
@@ -1229,9 +1256,27 @@ impl MapShapeTable {
         keys.push(key);
         slots.push(contract);
         let child = self.shapes.len() as u32;
+        let parent_families = self.shapes[parent_index].families.to_vec();
+        let mut child_families = parent_families;
+        for membership in &mut child_families {
+            let Some(family) = self.families.get(membership.family as usize) else { continue };
+            if let Some(logical) = family
+                .keys
+                .iter()
+                .position(|candidate| candidate.hash == transition_key.0.hash
+                    && candidate.as_ref() == transition_key.0.as_ref())
+            {
+                if logical < membership.physical_slots.len()
+                    && membership.physical_slots[logical] == u16::MAX
+                {
+                    membership.physical_slots[logical] = slot as u16;
+                }
+            }
+        }
         self.shapes.push(MapShape {
             keys: keys.into_boxed_slice(),
             slots: slots.into_boxed_slice(),
+            families: child_families.into_boxed_slice(),
             transitions: FastMap::default(),
         });
         self.shapes[parent_index]
@@ -1240,15 +1285,84 @@ impl MapShapeTable {
         Some((child, slot as u16))
     }
 
+    fn ensure_family(&mut self, contract: &Type) -> Option<u32> {
+        if let Some(&family) = self.family_ids.get(contract) {
+            return Some(family);
+        }
+        let fields = match contract {
+            Type::Interface(fields) | Type::Record(fields) => fields,
+            _ => return None,
+        };
+        let family = self.families.len() as u32;
+        let keys = fields
+            .iter()
+            .map(|field| MapStringKey::new(Arc::from(field.name.as_bytes())))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.families.push(ShapeFamily { contract: contract.clone(), keys });
+        self.family_ids.insert(contract.clone(), family);
+        Some(family)
+    }
+
+    #[inline]
+    fn family_id(&self, contract: &Type) -> Option<u32> {
+        self.family_ids.get(contract).copied()
+    }
+
+    fn register_layout_family(&mut self, layout: &StructuralLayoutInfo) -> Option<u32> {
+        let family = self.ensure_family(&layout.contract)?;
+        let index = layout.id.0 as usize;
+        if self.layout_families.len() <= index {
+            self.layout_families.resize(index + 1, None);
+        }
+        match self.layout_families[index] {
+            Some(existing) if existing != family => return None,
+            Some(_) => {}
+            None => self.layout_families[index] = Some(family),
+        }
+        Some(family)
+    }
+
+    #[inline]
+    fn family_slot_by_id(
+        &self,
+        shape: u32,
+        family: u32,
+        logical: PropertySlotId,
+    ) -> Option<Option<u16>> {
+        let shape = self.shapes.get(shape as usize)?;
+        let membership = shape.families.iter().find(|entry| entry.family == family)?;
+        let slot = *membership.physical_slots.get(logical.0 as usize)?;
+        Some((slot != u16::MAX).then_some(slot))
+    }
+
+    fn family_slot_layout(
+        &self,
+        shape: u32,
+        layout: StructuralLayoutId,
+        logical: PropertySlotId,
+    ) -> Option<Option<u16>> {
+        let family = self.layout_families.get(layout.0 as usize).copied().flatten()?;
+        self.family_slot_by_id(shape, family, logical)
+    }
+
+    fn family_slot(
+        &self,
+        shape: u32,
+        contract: &Type,
+        logical: PropertySlotId,
+    ) -> Option<Option<u16>> {
+        let family = self.family_id(contract)?;
+        self.family_slot_by_id(shape, family, logical)
+    }
+
     fn apply_contract(&mut self, shape: u32, contract: &Type) -> Option<u32> {
         let fields = match contract {
             Type::Interface(fields) | Type::Record(fields) => fields,
             _ => return Some(shape),
         };
-        if fields.iter().all(|field| matches!(field.ty, Type::Top) && !field.readonly) {
-            return Some(shape);
-        }
-        let cache_key = (shape, contract.clone());
+        let family = self.ensure_family(contract)?;
+        let cache_key = (shape, family);
         if let Some(&typed) = self.typed_variants.get(&cache_key) {
             return Some(typed);
         }
@@ -1263,17 +1377,43 @@ impl MapShapeTable {
                 slots[slot].merge_type(&field.ty, field.readonly);
             }
         }
+
+        let mut physical_slots = vec![u16::MAX; fields.len()];
+        for (logical, field) in fields.iter().enumerate() {
+            if let Some(physical) = keys
+                .iter()
+                .position(|key| key.as_ref() == field.name.as_bytes())
+            {
+                physical_slots[logical] = physical as u16;
+            } else if !field.optional {
+                // plan_contract() validates required fields before installation.
+                // Reaching this branch would mean shape metadata and map storage
+                // disagree, so fail closed by forcing dictionary fallback.
+                return None;
+            }
+        }
+
+        let mut memberships = parent.families.to_vec();
+        if let Some(existing) = memberships.iter_mut().find(|entry| entry.family == family) {
+            existing.physical_slots = physical_slots.into_boxed_slice();
+        } else {
+            memberships.push(ShapeFamilyMembership {
+                family,
+                physical_slots: physical_slots.into_boxed_slice(),
+            });
+        }
+
         let typed = self.shapes.len() as u32;
         self.shapes.push(MapShape {
             keys,
             slots: slots.into_boxed_slice(),
+            families: memberships.into_boxed_slice(),
             transitions: FastMap::default(),
         });
         self.typed_variants.insert(cache_key, typed);
         Some(typed)
     }
 }
-
 
 #[derive(Debug)]
 enum NapalmMapStorage {
@@ -2510,6 +2650,85 @@ impl Heap {
         Ok(map.get(&self.map_shapes, &key).unwrap_or(Value::NULL))
     }
 
+    fn map_get_property_with_pic(
+        &self,
+        map_value: Value,
+        key_value: Value,
+        layout: StructuralLayoutId,
+        logical: PropertySlotId,
+        cache: &mut MapInlineCacheState,
+    ) -> Result<Value, RuntimeError> {
+        let map = match self.get(map_value) {
+            Some(HeapObject::Map(map)) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        if let Some((shape, values)) = map.shaped() {
+            if let Some(slot) = cache.probe_property(shape) {
+                debug_assert!((slot as usize) < values.len());
+                return Ok(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            if let Some(slot) = self
+                .map_shapes
+                .family_slot_layout(shape, layout, logical)
+            {
+                if let Some(slot) = slot {
+                    debug_assert!((slot as usize) < values.len());
+                    cache.insert(shape, slot);
+                    return Ok(unsafe { *values.get_unchecked(slot as usize) });
+                }
+                // Optional declared property absent from this family member.
+                return Ok(Value::NULL);
+            }
+        }
+        // Dictionary fallback or an unbound/malformed value. Preserve ordinary
+        // Map semantics instead of making the optimization observable.
+        self.map_get_with_pic(map_value, key_value, cache)
+    }
+
+    fn map_set_property_with_pic(
+        &mut self,
+        map_value: Value,
+        key_value: Value,
+        item: Value,
+        layout: StructuralLayoutId,
+        logical: PropertySlotId,
+        cache: &mut MapInlineCacheState,
+    ) -> Result<bool, RuntimeError> {
+        let existing = self.object(map_value).and_then(|object| {
+            let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
+                return None;
+            };
+            let (shape, _) = map.shaped()?;
+            let slot = cache.probe_property(shape).or_else(|| {
+                self.map_shapes
+                    .family_slot_layout(shape, layout, logical)
+                    .flatten()
+            })?;
+            Some((shape, slot))
+        });
+
+        if let Some((shape, slot)) = existing {
+            let key = self.map_shapes.key_at(shape, slot).clone();
+            if self.check_shaped_map_write(shape, slot, &key, item)? {
+                let object = self.object(map_value).expect("validated map owner");
+                let HeapObject::Map(map) = &mut unsafe { managed_object_mut(object) }.object else {
+                    return Err(RuntimeError::new("receiver is not a Map"));
+                };
+                let NapalmMapStorage::Shaped { shape: current_shape, values } = &mut map.storage else {
+                    unreachable!("shape-family slot requires shaped storage")
+                };
+                debug_assert_eq!(*current_shape, shape);
+                unsafe { *values.get_unchecked_mut(slot as usize) = item; }
+                cache.insert(shape, slot);
+                return Ok(false);
+            }
+        }
+
+        // Missing optional field, dictionary map, or a contract combination that
+        // requires runtime validation: reuse the authoritative slow path.
+        self.map_set_with_pic(map_value, key_value, item, cache)
+    }
+
     fn map_slot_contract(&self, owner: Value, key: &[u8]) -> ShapeSlotContract {
         let Some(object) = self.object(owner) else {
             return ShapeSlotContract::default();
@@ -3426,6 +3645,7 @@ struct PreparedOp {
     flags: u8,
     x: u32,
     y: u32,
+    cache: u32,
     next: u32,
     args_offset: u32,
     raw_pc: u32,
@@ -3440,6 +3660,7 @@ impl Default for PreparedOp {
             flags: 0,
             x: 0,
             y: 0,
+            cache: 0,
             next: 0,
             args_offset: 0,
             raw_pc: 0,
@@ -3569,8 +3790,9 @@ struct PreparedFunction {
     /// touching the function/IC metadata hierarchy.
     quick_invokes: Vec<QuickInvokeSite>,
     quickened_invoke_ops: Vec<u32>,
-    /// Only MapGet/MapSet prepared ops allocate entries here. Their PreparedOp.x
-    /// stores this dense cache index, keeping bytecode itself one word wide.
+    /// MapGet/MapSet and typed LoadProperty/StoreProperty prepared ops allocate
+    /// entries here. PreparedOp::cache stores the dense cache index so x/y remain
+    /// available for structural layout and logical-slot metadata.
     map_inline_caches: Vec<MapInlineCacheState>,
     /// Predecoded frame-entry destinations. u16::MAX means the corresponding
     /// source value was dead after bytecode allocation and needs no GPR copy.
@@ -3838,6 +4060,7 @@ impl PreparedProgram {
                 flags: 0,
                 x: temp.x,
                 y: temp.y,
+                cache: 0,
                 next: (index + 1) as u32,
                 args_offset: temp.args_offset,
                 raw_pc: temp.raw_pc,
@@ -3867,8 +4090,8 @@ impl PreparedProgram {
                         RuntimeError::new(format!("unknown module {:?}", module))
                     })?;
                 }
-                Opcode::MapGet | Opcode::MapSet => {
-                    op.x = map_inline_cache_count as u32;
+                Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty => {
+                    op.cache = map_inline_cache_count as u32;
                     map_inline_cache_count += 1;
                 }
                 _ => {}
@@ -4611,6 +4834,29 @@ impl MapInlineCacheState {
         None
     }
 
+    /// Structural-property PIC probe. The bytecode site already fixes the
+    /// layout and logical property, so a shape hit needs no key/hash compare.
+    #[inline(always)]
+    fn probe_property(&self, shape: u32) -> Option<u16> {
+        if self.len > 0 {
+            let entry = unsafe { *self.entries.get_unchecked(0) };
+            if entry.shape == shape { return Some(entry.slot); }
+        }
+        if self.len > 1 {
+            let entry = unsafe { *self.entries.get_unchecked(1) };
+            if entry.shape == shape { return Some(entry.slot); }
+        }
+        if self.len > 2 {
+            let entry = unsafe { *self.entries.get_unchecked(2) };
+            if entry.shape == shape { return Some(entry.slot); }
+        }
+        if self.len > 3 {
+            let entry = unsafe { *self.entries.get_unchecked(3) };
+            if entry.shape == shape { return Some(entry.slot); }
+        }
+        None
+    }
+
     #[inline]
     fn insert(&mut self, shape: u32, slot: u16) {
         if self.megamorphic {
@@ -5009,6 +5255,13 @@ impl<'p> Interpreter<'p> {
                 .into_boxed_slice(),
         });
         let mut heap = Heap::default();
+        for layout in &program.metadata.structural_layouts {
+            if heap.map_shapes.register_layout_family(layout).is_none() {
+                return Err(RuntimeError::new(format!(
+                    "failed to register structural layout family {:?}", layout.id
+                )));
+            }
+        }
         // VM construction itself may allocate enough metadata to trigger MMTk.
         // Keep every object created so far live through one temporary provider;
         // handles are canonical MMTk slots and are updated if a collection moves
@@ -9225,7 +9478,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 131;
+const OPCODE_COUNT: usize = 133;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -9359,6 +9612,8 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_destructure_rest,
     h_invoke_spread,
     h_bind_interface,
+    h_load_property,
+    h_store_property,
 ];
 
 #[inline(always)]
@@ -10226,7 +10481,7 @@ unsafe fn h_map_get(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let map=Value::from_word(vm.reg(op.b));
     let key=Value::from_word(vm.reg(op.c));
-    match map_get_value(vm,map,key,op.x as usize){
+    match map_get_value(vm,map,key,op.cache as usize){
         Ok(value)=>{vm.set_reg(op.a,value.word());vm.advance(op)},
         Err(error)=>vm.fail_at(op,error.message),
     }
@@ -10237,11 +10492,75 @@ unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
     let key=Value::from_word(vm.reg(op.b));
     let value=Value::from_word(vm.reg(op.c));
     vm.mark_gc_point(op);vm.maybe_collect();
-    match map_set_value(vm,map,key,value,op.x as usize){
+    match map_set_value(vm,map,key,value,op.cache as usize){
         Ok(())=>vm.advance(op),
         Err(error)=>vm.fail_at(op,error.message),
     }
 }
+unsafe fn h_load_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let map = Value::from_word(unsafe { vm.reg(op.b) });
+    let key = Value::from_word(unsafe { vm.reg(op.c) });
+    let layout_id = StructuralLayoutId(op.x);
+    let logical = PropertySlotId(op.y as u16);
+    let function = vm.current_function_index();
+    let cache = unsafe {
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .map_inline_caches
+            .as_mut_ptr()
+            .add(op.cache as usize)
+    };
+    match vm.heap.map_get_property_with_pic(
+        map, key, layout_id, logical, unsafe { &mut *cache },
+    ) {
+        Ok(value) => unsafe {
+            vm.set_reg(op.a, value.word());
+            vm.advance(op)
+        },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
+unsafe fn h_store_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let map = Value::from_word(unsafe { vm.reg(op.a) });
+    let key = Value::from_word(unsafe { vm.reg(op.b) });
+    let value = Value::from_word(unsafe { vm.reg(op.c) });
+    let layout_id = StructuralLayoutId(op.x);
+    let logical = PropertySlotId(op.y as u16);
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    // The remembered-set barrier must happen after a collection rendezvous and
+    // immediately before the mutation, matching MapSet's ordering.
+    vm.heap.remember_if_reference(map, key);
+    vm.heap.remember_if_reference(map, value);
+    let function = vm.current_function_index();
+    let cache = unsafe {
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .map_inline_caches
+            .as_mut_ptr()
+            .add(op.cache as usize)
+    };
+    match vm.heap.map_set_property_with_pic(
+        map, key, value, layout_id, logical, unsafe { &mut *cache },
+    ) {
+        Ok(structural) => {
+            if structural {
+                if let Some(bytes) = vm.heap.map_external_bytes(map) {
+                    vm.heap.set_external_bytes(map, bytes);
+                }
+                vm.heap.refresh_jit_view(map);
+            }
+            unsafe { vm.advance(op) }
+        }
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
 unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let map=Value::from_word(vm.reg(op.b));
@@ -10862,14 +11181,16 @@ impl TraceRuntime for Interpreter<'_> {
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
             | Opcode::LoadField | Opcode::StoreField | Opcode::CallDirect
             | Opcode::MakeClosure | Opcode::CreateClass | Opcode::AllocInstance
-            | Opcode::AllocForeign | Opcode::MapGet | Opcode::MapSet) {
+            | Opcode::AllocForeign) {
             // These handlers consume preparation-time patched operands (direct
-            // function/class indices, slot pointers, relocated fields or PIC ids),
-            // while original_ops keeps logical bytecode operands. Preserve the
-            // unfused continuation and copy only x/y from the executable op.
+            // function/class indices, slot pointers or relocated fields), while
+            // original_ops keeps logical bytecode operands.
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
+        }
+        if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty) {
+            op.cache = self.current_prepared().ops[self.hot_pc as usize].cache;
         }
         // Runtime boundaries inside a trace still execute exactly one logical
         // bytecode. Reuse single-op preparation/quickening where it preserves
@@ -11046,6 +11367,82 @@ impl TraceRuntime for Interpreter<'_> {
             readonly: contract.readonly,
             write_runtime_checked: contract.write_runtime_checked,
         })
+    }
+
+    fn trace_structural_map_access(
+        &self,
+        map: RegisterWord,
+        layout: StructuralLayoutId,
+        logical: PropertySlotId,
+    ) -> Option<crate::napalm_tracing_jit::ShapedMapAccess> {
+        let map = match self.heap.get(Value::from_word(map))? {
+            HeapObject::Map(map) => map,
+            _ => return None,
+        };
+        let (shape, _) = map.shaped()?;
+        let slot = self
+            .heap
+            .map_shapes
+            .family_slot_layout(shape, layout, logical)??;
+        let key = self.heap.map_shapes.key_at(shape, slot);
+        let contract = self.heap.map_shapes.slot_contract(shape, slot);
+        Some(crate::napalm_tracing_jit::ShapedMapAccess {
+            shape,
+            slot,
+            key_bytes: key.as_ref().to_vec(),
+            read_type: contract.read_type.clone(),
+            write_type: contract.write_type.clone(),
+            readonly: contract.readonly,
+            write_runtime_checked: contract.write_runtime_checked,
+        })
+    }
+
+    fn trace_structural_map_pic(
+        &self,
+        location: TraceLocation,
+        layout: StructuralLayoutId,
+        logical: PropertySlotId,
+    ) -> Vec<TraceShapeSlot> {
+        let Some(&function_index) = self.prepared.function_by_id.get(&location.function) else {
+            return Vec::new();
+        };
+        let Some(function) = self.prepared.functions.get(function_index as usize) else {
+            return Vec::new();
+        };
+        let Some(&op_index) = function.word_to_op.get(location.pc.0 as usize) else {
+            return Vec::new();
+        };
+        if op_index == NO_INDEX {
+            return Vec::new();
+        }
+        let Some(op) = function.ops.get(op_index as usize) else {
+            return Vec::new();
+        };
+        let Some(cache) = function.map_inline_caches.get(op.cache as usize) else {
+            return Vec::new();
+        };
+
+        let mut entries = Vec::with_capacity(cache.len.min(4) as usize);
+        for cached in &cache.entries[..cache.len.min(4) as usize] {
+            let Some(Some(slot)) = self.heap.map_shapes.family_slot_layout(
+                cached.shape,
+                layout,
+                logical,
+            ) else {
+                continue;
+            };
+            if slot != cached.slot {
+                // Cache corruption or a stale non-structural entry must never be
+                // lifted into native code. The ordinary recorder observation can
+                // still specialize the currently executed shape safely.
+                continue;
+            }
+            entries.push(TraceShapeSlot {
+                shape: cached.shape,
+                slot: slot as u32,
+            });
+        }
+        entries
     }
 
     fn trace_materialize_constant(&self, constant: TraceConstant) -> Result<RegisterWord, RuntimeError> {
@@ -12190,6 +12587,42 @@ var result = Runner.run()
     }
 
     #[test]
+    fn shape_families_map_logical_properties_across_different_physical_shapes() {
+        let mut shapes = MapShapeTable::default();
+        let x = MapStringKey::new(Arc::from(b"x".as_slice()));
+        let y = MapStringKey::new(Arc::from(b"y".as_slice()));
+        let extra = MapStringKey::new(Arc::from(b"extra".as_slice()));
+
+        let (shape_a, _) = shapes.transition(0, x.clone()).unwrap();
+        let (shape_b0, _) = shapes.transition(0, extra).unwrap();
+        let (shape_b, _) = shapes.transition(shape_b0, x.clone()).unwrap();
+        let contract = Type::Interface(vec![
+            crate::napalm_ir::InterfaceFieldType {
+                name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+            crate::napalm_ir::InterfaceFieldType {
+                name: "y".to_owned(), ty: Type::Num, optional: true, readonly: false,
+            },
+        ]);
+
+        let typed_a = shapes.apply_contract(shape_a, &contract).unwrap();
+        let typed_b = shapes.apply_contract(shape_b, &contract).unwrap();
+        assert_eq!(shapes.family_slot(typed_a, &contract, PropertySlotId(0)), Some(Some(0)));
+        assert_eq!(shapes.family_slot(typed_b, &contract, PropertySlotId(0)), Some(Some(1)));
+        assert_eq!(shapes.family_slot(typed_a, &contract, PropertySlotId(1)), Some(None));
+
+        let (grown_a, physical_y) = shapes
+            .transition_with_contract(typed_a, y, ShapeSlotContract::default())
+            .unwrap();
+        assert_eq!(physical_y, 1);
+        assert_eq!(
+            shapes.family_slot(grown_a, &contract, PropertySlotId(1)),
+            Some(Some(physical_y)),
+            "open-interface growth must preserve the family and fill the optional logical slot",
+        );
+    }
+
+    #[test]
     fn structural_contracts_publish_shared_typed_shapes_and_enforce_open_closed_writes() {
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -12286,7 +12719,7 @@ var result = Runner.run()
             .heap
             .bind_contract(preexpanded, &closed_contract)
             .expect_err("closed structural type must reject pre-existing undeclared properties");
-        assert!(error.message.contains("not declared by the closed type"));
+        assert!(error.message.contains("undeclared property"));
 
         vm.release_root(root_preexpanded);
         vm.release_root(root_closed);

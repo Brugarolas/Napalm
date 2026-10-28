@@ -40,8 +40,8 @@ use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::napalm_ir::{
-    BlockId, ClassId, Constant, Edge, FieldSlot, FuncId, Function, Inst, InstId, SourceSpan,
-    Type, Value, ValueDef, ValueId,
+    BlockId, ClassId, Constant, Edge, FieldSlot, FuncId, Function, Inst, InstId, PropertySlotId,
+    SourceSpan, StructuralLayoutId, Type, Value, ValueDef, ValueId,
 };
 use crate::napalm_ir_optimizer::{repair_effect_chain, FunctionOptimization, InstFactory};
 use crate::napalm_ir_optimizing::CopyPropagation;
@@ -324,6 +324,15 @@ enum Shape {
     Map,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StructuralBind {
+    layout: StructuralLayoutId,
+    expected: Type,
+    inst: InstId,
+    block: usize,
+    pos: usize,
+}
+
 #[derive(Clone, Debug)]
 struct Candidate {
     value: ValueId,
@@ -335,12 +344,29 @@ struct Candidate {
     source: Option<SourceSpan>,
     /// Instance field slots accessed through this object (sorted).
     slots: Vec<FieldSlot>,
+    /// Logical structural properties accessed through a Map candidate. The
+    /// physical hidden-shape slot is deliberately not part of PEA state.
+    properties: Vec<(StructuralLayoutId, PropertySlotId)>,
+    /// Typed aliases produced by successful structural binds.
+    aliases: SmallVec<[ValueId; 2]>,
+    /// A single structural contract may be virtualized when its validation is
+    /// statically proven.
+    structural_bind: Option<StructuralBind>,
+    /// Initial insertion order used to rematerialize all-required structural
+    /// Maps without changing observable Map iteration/shape order.
+    structural_materialization_order: Vec<(StructuralLayoutId, PropertySlotId, ValueId)>,
+    /// Optional fields require presence SSA before a partially escaping object can
+    /// be reconstructed. All-required layouts can already use full PEA.
+    structural_partial_escape: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UseOp {
     LoadField(FieldSlot),
     StoreField(FieldSlot),
+    LoadProperty(StructuralLayoutId, PropertySlotId),
+    StoreProperty(StructuralLayoutId, PropertySlotId),
+    BindStructural(StructuralLayoutId),
     LoadCell,
     StoreCell,
     ListLen,
@@ -358,6 +384,7 @@ impl UseOp {
         matches!(
             self,
             UseOp::LoadField(_)
+                | UseOp::LoadProperty(_, _)
                 | UseOp::LoadCell
                 | UseOp::ListLen
                 | UseOp::ListGet(_)
@@ -468,6 +495,24 @@ fn classify_use(
         ) if *object == value && *stored != value && is_napalm_value(function, *stored) => {
             UseOp::StoreField(*slot)
         }
+        (
+            Inst::LoadProperty { object, layout, slot, .. },
+            Shape::Map,
+        ) if *object == value && readable_result() => {
+            UseOp::LoadProperty(*layout, *slot)
+        }
+        (
+            Inst::StoreProperty { object, value: stored, layout, slot, .. },
+            Shape::Map,
+        ) if *object == value && *stored != value && is_napalm_value(function, *stored) => {
+            UseOp::StoreProperty(*layout, *slot)
+        }
+        (
+            Inst::BindInterface { value: source, expected, layout: Some(layout) },
+            Shape::Map,
+        ) if *source == value && matches!(expected, Type::Interface(_) | Type::Record(_)) => {
+            UseOp::BindStructural(*layout)
+        }
         (Inst::LoadCell { cell }, Shape::Cell) if *cell == value && readable_result() => {
             UseOp::LoadCell
         }
@@ -528,6 +573,119 @@ fn classify_use(
     }
 }
 
+fn structural_fields(ty: &Type) -> Option<&[crate::napalm_ir::InterfaceFieldType]> {
+    match ty {
+        Type::Interface(fields) | Type::Record(fields) => Some(fields),
+        _ => None,
+    }
+}
+
+/// Whether validating `ty` can install a persistent contract on a value that is
+/// not the virtual Map itself. Such side effects survive even when the outer
+/// object never escapes, so scalar replacement must preserve the bind until
+/// nested virtual-object rematerialization metadata exists.
+fn structural_field_check_is_pure(ty: &Type) -> bool {
+    match ty {
+        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => false,
+        Type::Union(types) => types.iter().all(structural_field_check_is_pure),
+        Type::Cell(inner) => structural_field_check_is_pure(inner),
+        _ => true,
+    }
+}
+
+/// A virtual structural bind may be removed only when it cannot throw and every
+/// typed write that would have been checked by the persistent contract is already
+/// proven by SSA types. This is intentionally stricter than source type checking:
+/// `any` values keep the runtime bind alive.
+fn prepare_structural_map(
+    function: &Function,
+    candidate: &mut Candidate,
+    uses: &HashMap<usize, Vec<Use>>,
+) -> bool {
+    if !matches!(candidate.shape, Shape::Map) {
+        return true;
+    }
+    let Some(binding) = candidate.structural_bind.clone() else {
+        // Ordinary dynamic Maps still use the historical escape behavior.
+        return candidate.properties.is_empty();
+    };
+    let Some(fields) = structural_fields(&binding.expected) else {
+        return false;
+    };
+    if fields.iter().any(|field| !structural_field_check_is_pure(&field.ty)) {
+        return false;
+    }
+    if binding.block != candidate.block
+        || function.blocks[binding.block].insts.get(binding.pos).copied() != Some(binding.inst)
+    {
+        return false;
+    }
+
+    let mut present = vec![false; fields.len()];
+    let mut materialization_order = Vec::with_capacity(fields.len());
+    let mut escape_before_bind = false;
+
+    for (&block, block_uses) in uses {
+        for use_ in block_uses {
+            match use_.op {
+                UseOp::LoadProperty(found_layout, slot) => {
+                    if found_layout != binding.layout || slot.0 as usize >= fields.len() {
+                        return false;
+                    }
+                }
+                UseOp::StoreProperty(found_layout, slot) => {
+                    if found_layout != binding.layout || slot.0 as usize >= fields.len() {
+                        return false;
+                    }
+                    let Some(&inst) = function.blocks[block].insts.get(use_.pos) else {
+                        return false;
+                    };
+                    let Some(node) = function.node(inst) else { return false };
+                    let Inst::StoreProperty { value, key, .. } = &node.kind else { return false };
+                    let field = &fields[slot.0 as usize];
+                    let Some(actual) = value_type(function, *value) else { return false };
+                    if !field.ty.accepts(actual) {
+                        return false;
+                    }
+                    let before_bind = block == binding.block && use_.pos < binding.pos;
+                    if before_bind {
+                        if !present[slot.0 as usize] {
+                            materialization_order.push((found_layout, slot, *key));
+                        }
+                        present[slot.0 as usize] = true;
+                    } else if field.readonly {
+                        // A persistent contract would reject this write.
+                        return false;
+                    }
+                }
+                UseOp::BindStructural(found_layout) if found_layout != binding.layout => return false,
+                UseOp::Escape if block == binding.block && use_.pos < binding.pos => {
+                    escape_before_bind = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !fields
+        .iter()
+        .enumerate()
+        .all(|(index, field)| field.optional || present[index])
+    {
+        return false;
+    }
+
+    candidate.structural_materialization_order = materialization_order;
+    // Full partial-escape reconstruction is already safe for layouts whose
+    // property set is complete at bind time. Optional properties need explicit
+    // presence SSA to reconstruct branch-dependent insertion state, so those
+    // layouts remain NoEscape-only for now.
+    candidate.structural_partial_escape = !escape_before_bind
+        && fields.iter().all(|field| !field.optional)
+        && candidate.structural_materialization_order.len() == fields.len();
+    true
+}
+
 /// Same normalization as the interpreter's list primitives.
 fn normalize_index(index: i32, len: u32) -> Option<u32> {
     let index = if index < 0 {
@@ -544,6 +702,9 @@ fn virtual_step(len: u32, op: UseOp) -> Option<u32> {
     match op {
         UseOp::LoadField(_)
         | UseOp::StoreField(_)
+        | UseOp::LoadProperty(_, _)
+        | UseOp::StoreProperty(_, _)
+        | UseOp::BindStructural(_)
         | UseOp::LoadCell
         | UseOp::StoreCell
         | UseOp::ListLen
@@ -638,6 +799,11 @@ impl Analysis {
                     ty,
                     source: node.source,
                     slots: Vec::new(),
+                    properties: Vec::new(),
+                    aliases: SmallVec::new(),
+                    structural_bind: None,
+                    structural_materialization_order: Vec::new(),
+                    structural_partial_escape: false,
                 });
             }
         }
@@ -664,8 +830,11 @@ impl Analysis {
                 let Some(node) = function.node(inst) else {
                     continue;
                 };
+                let kind = node.kind.clone();
+                let result = node.results.first().copied();
+                let mut structural_alias = None;
                 seen.clear();
-                for operand in node.kind.operands() {
+                for operand in kind.operands() {
                     if seen.contains(&operand) {
                         continue;
                     }
@@ -680,30 +849,91 @@ impl Analysis {
                         valid[index] = false;
                         continue;
                     }
-                    let op = classify_use(function, inst, &node.kind, operand, &candidate.shape);
-                    if let UseOp::LoadField(slot) | UseOp::StoreField(slot) = op {
-                        if let Err(at) = candidate.slots.binary_search(&slot) {
-                            candidate.slots.insert(at, slot);
+                    let op = classify_use(function, inst, &kind, operand, &candidate.shape);
+                    match op {
+                        UseOp::LoadField(slot) | UseOp::StoreField(slot) => {
+                            if let Err(at) = candidate.slots.binary_search(&slot) {
+                                candidate.slots.insert(at, slot);
+                            }
                         }
+                        UseOp::LoadProperty(layout, slot) | UseOp::StoreProperty(layout, slot) => {
+                            let property = (layout, slot);
+                            if let Err(at) = candidate.properties.binary_search(&property) {
+                                candidate.properties.insert(at, property);
+                            }
+                        }
+                        UseOp::BindStructural(layout) => {
+                            let Inst::BindInterface { expected, .. } = &kind else { unreachable!() };
+                            let binding = StructuralBind {
+                                layout, expected: expected.clone(), inst, block, pos,
+                            };
+                            if candidate.structural_bind.as_ref().is_some_and(|old| old != &binding) {
+                                valid[index] = false;
+                            } else {
+                                candidate.structural_bind = Some(binding);
+                                if let Some(alias) = result {
+                                    if !candidate.aliases.contains(&alias) {
+                                        candidate.aliases.push(alias);
+                                    }
+                                    structural_alias = Some((alias, index));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                     uses[index]
                         .entry(block)
                         .or_default()
                         .push(Use { block, pos, op });
                 }
+                // BindInterface returns the same object with a stronger semantic type.
+                // Teach PEA that the result aliases the allocation so typed property
+                // accesses after the bind remain virtualizable.
+                if let Some((alias, index)) = structural_alias {
+                    index_of.insert(alias, index);
+                }
             }
+        }
+
+        // Structural binds introduce typed aliases after the allocation scan. A
+        // deopt snapshot may reference such an alias rather than the raw AllocMap
+        // result, so repeat the snapshot check after alias discovery.
+        for deopt in &function.deopts {
+            let frames = std::iter::once(&deopt.snapshot.slots)
+                .chain(deopt.snapshot.inlined_frames.iter().map(|frame| &frame.slots));
+            for slots in frames {
+                for slot in slots {
+                    if let Some(&index) = index_of.get(&slot.value) {
+                        valid[index] = false;
+                    }
+                }
+            }
+        }
+
+        let mut structural_safe = vec![true; candidates.len()];
+        for index in 0..candidates.len() {
+            structural_safe[index] = prepare_structural_map(function, &mut candidates[index], &uses[index]);
         }
 
         let plans = candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
-                if !valid[index] || candidate.slots.len() > MAX_FIELDS
+                if !valid[index]
+                    || candidate.slots.len().max(candidate.properties.len()) > MAX_FIELDS
+                    || !structural_safe[index]
                     || crosses_exception(function, &cfg, candidate, &uses[index])
+                {
+                    return Plan::default();
+                }
+                let plan = analyze_candidate(&cfg, candidate, &uses[index]);
+                if candidate.structural_bind.is_some()
+                    && plan.materializations != 0
+                    && !candidate.structural_partial_escape
                 {
                     Plan::default()
                 } else {
-                    analyze_candidate(&cfg, candidate, &uses[index])
+                    plan
                 }
             })
             .collect();
@@ -940,7 +1170,8 @@ impl VarLayout {
                 Shape::Instance { .. } => candidates[index].slots.len(),
                 Shape::Cell => 1,
                 Shape::List { .. } => MAX_FIELDS,
-                Shape::Range { .. } | Shape::Closure { .. } | Shape::Map => 0,
+                Shape::Map => candidates[index].properties.len(),
+                Shape::Range { .. } | Shape::Closure { .. } => 0,
             };
             total += 1 + fields;
         }
@@ -1151,7 +1382,7 @@ impl<'a> Rewriter<'a> {
                         && self.plans[index].forced_end[block]
                         && matches!(self.state[index], VState::Virtual(_))
                     {
-                        self.materialize(function, block, index, &mut new_insts);
+                        self.materialize(function, block, pos, index, &mut new_insts);
                     }
                 }
             }
@@ -1162,7 +1393,7 @@ impl<'a> Rewriter<'a> {
             for &(index, op) in &events {
                 if let VState::Virtual(len) = self.state[index] {
                     if virtual_step(len, op).is_none() {
-                        self.materialize(function, block, index, &mut new_insts);
+                        self.materialize(function, block, pos, index, &mut new_insts);
                     }
                 }
             }
@@ -1172,11 +1403,11 @@ impl<'a> Rewriter<'a> {
                 if self.state[index] == VState::Materialized {
                     let reference = self.layout.reference(index);
                     let value = self.ssa.read(function, self.cfg, block, reference);
-                    let original = self.candidates[index].value;
+                    let candidate = &self.candidates[index];
                     function.nodes[inst.0 as usize]
                         .kind
                         .for_each_operand_mut(|operand| {
-                            if *operand == original {
+                            if *operand == candidate.value || candidate.aliases.contains(operand) {
                                 *operand = value;
                             }
                         });
@@ -1244,6 +1475,19 @@ impl<'a> Rewriter<'a> {
             (Shape::Closure { .. }, Inst::MakeClosure { captures, .. }) => {
                 self.fixed[index] = captures.iter().copied().collect();
             }
+            (Shape::Map, Inst::AllocMap) => {
+                if !candidate.properties.is_empty() {
+                    let (null_inst, results) = InstFactory::new(function).create(
+                        Inst::Const(Constant::Null),
+                        &[Type::Null],
+                        candidate.source,
+                    );
+                    new_insts.push(null_inst);
+                    for field in 0..candidate.properties.len() {
+                        self.ssa.write(block, self.layout.field(index, field), results[0]);
+                    }
+                }
+            }
             _ => {}
         }
         self.state[index] = VState::Virtual(0);
@@ -1269,6 +1513,13 @@ impl<'a> Rewriter<'a> {
                 .expect("accessed slot was collected by the analysis");
             this.layout.field(index, field)
         };
+        let property_var = |this: &Self, layout: StructuralLayoutId, slot: PropertySlotId| {
+            let property = this.candidates[index]
+                .properties
+                .binary_search(&(layout, slot))
+                .expect("accessed structural property was collected by the analysis");
+            this.layout.field(index, property)
+        };
         match (op, &kind) {
             (UseOp::LoadField(slot), _) => {
                 let var = slot_var(self, slot);
@@ -1280,6 +1531,27 @@ impl<'a> Rewriter<'a> {
             (UseOp::StoreField(slot), Inst::StoreField { value, .. }) => {
                 let var = slot_var(self, slot);
                 self.ssa.write(block, var, *value);
+                false
+            }
+            (UseOp::LoadProperty(layout, slot), _) => {
+                let var = property_var(self, layout, slot);
+                let value = self.ssa.read(function, self.cfg, block, var);
+                self.replace_kind(function, inst, Inst::Move(value));
+                self.stats.scalarized_reads += 1;
+                true
+            }
+            (
+                UseOp::StoreProperty(layout, slot),
+                Inst::StoreProperty { value, .. },
+            ) => {
+                let var = property_var(self, layout, slot);
+                self.ssa.write(block, var, *value);
+                false
+            }
+            (UseOp::BindStructural(_), Inst::BindInterface { .. }) => {
+                // Validation and persistent write constraints were proven above.
+                // The virtual object has no aliases outside this scalar web, so
+                // installing a runtime contract would have no observable effect.
                 false
             }
             (UseOp::LoadCell, _) => {
@@ -1321,9 +1593,15 @@ impl<'a> Rewriter<'a> {
             }
             (UseOp::WriteBarrier, _) => false,
             (UseOp::RefEq, Inst::RefEq { left, right }) => {
-                // A virtual object is only identical to itself: it has never
-                // been exposed, so no other value can alias it.
-                let equal = left == right;
+                // A structural bind may create a distinct SSA value that is still
+                // the exact same runtime object. Treat the allocation result and
+                // every proven alias as one identity domain; a virtual object has
+                // never escaped, so any operand outside that domain cannot alias it.
+                let candidate = &self.candidates[index];
+                let is_self = |value: &ValueId| {
+                    *value == candidate.value || candidate.aliases.contains(value)
+                };
+                let equal = is_self(left) && is_self(right);
                 self.replace_kind(function, inst, Inst::Const(Constant::Bool(equal)));
                 self.stats.scalarized_reads += 1;
                 true
@@ -1357,6 +1635,7 @@ impl<'a> Rewriter<'a> {
         &mut self,
         function: &mut Function,
         block: usize,
+        pos: usize,
         index: usize,
         new_insts: &mut Vec<InstId>,
     ) {
@@ -1431,11 +1710,52 @@ impl<'a> Rewriter<'a> {
                     new_insts.push(append);
                 }
             }
+            Shape::Map => {
+                for &(layout, slot, key) in &candidate.structural_materialization_order {
+                    let property = candidate
+                        .properties
+                        .binary_search(&(layout, slot))
+                        .expect("materialized structural property was collected by PEA");
+                    let value = self.ssa.read(
+                        function, self.cfg, block, self.layout.field(index, property),
+                    );
+                    let (store, _) = InstFactory::new(function).create(
+                        Inst::StoreProperty { object, key, value, layout, slot },
+                        &[],
+                        source,
+                    );
+                    new_insts.push(store);
+                }
+            }
             _ => {}
         }
 
+        let mut materialized_reference = object;
+        if let Some(binding) = &candidate.structural_bind {
+            let contract_active = if block == binding.block {
+                pos > binding.pos
+            } else {
+                self.cfg.strictly_dominates(binding.block, block)
+            };
+            if contract_active {
+                let (bind, results) = InstFactory::new(function).create(
+                    Inst::BindInterface {
+                        value: object,
+                        expected: binding.expected.clone(),
+                        layout: Some(binding.layout),
+                    },
+                    &[binding.expected.clone()],
+                    source,
+                );
+                new_insts.push(bind);
+                materialized_reference = results[0];
+            } else {
+                debug_assert!(block == binding.block && pos < binding.pos);
+            }
+        }
+
         let reference = self.layout.reference(index);
-        self.ssa.write(block, reference, object);
+        self.ssa.write(block, reference, materialized_reference);
         self.state[index] = VState::Materialized;
         self.stats.materializations += 1;
     }
@@ -1612,7 +1932,7 @@ mod tests {
     use crate::napalm_bytecodecompiler::BytecodeCompiler;
     use crate::napalm_interpreter::{Interpreter, ExecutionResult};
     use crate::napalm_ir::{
-        verify_function, Builder, DeoptSnapshot, FunctionKind, Program, SnapshotSlot,
+        verify_function, Builder, DeoptSnapshot, FunctionKind, InterfaceFieldType, Program, SnapshotSlot,
     };
     use crate::napalm_ir_optimizer::Optimize;
     use crate::napalm_ir_optimizing::optimization_passes;
@@ -1660,6 +1980,159 @@ mod tests {
         let mut program = Program::new();
         let module = program.add_module("main", 0);
         (program, module)
+    }
+
+    #[test]
+    fn non_escaping_typed_record_is_scalarized_through_structural_bind() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![
+            InterfaceFieldType {
+                name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+            InterfaceFieldType {
+                name: "y".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+        ]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program, module, "record_sroa", FunctionKind::ModuleBody, vec![], Type::Num,
+        );
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_x = b.const_string("x");
+        let key_y = b.const_string("y");
+        let one = b.const_num(1.0);
+        let two = b.const_num(2.0);
+        b.emit0(Inst::StoreProperty {
+            object: map, key: key_x, value: one, layout, slot: PropertySlotId(0),
+        });
+        b.emit0(Inst::StoreProperty {
+            object: map, key: key_y, value: two, layout, slot: PropertySlotId(1),
+        });
+        let bound = b.emit1(Inst::BindInterface {
+            value: map, expected: record.clone(), layout: Some(layout),
+        }, record);
+        let x = b.emit1(Inst::LoadProperty {
+            object: bound, key: key_x, layout, slot: PropertySlotId(0),
+        }, Type::Num);
+        b.ret(x);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.removed_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 0, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 0, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::LoadProperty { .. } | Inst::StoreProperty { .. })), 0, "{function}");
+        assert_eq!(run(&program, entry).as_num(), Some(1.0));
+    }
+
+    #[test]
+    fn structural_bind_alias_preserves_reference_identity_when_virtualized() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![InterfaceFieldType {
+            name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program, module, "record_identity", FunctionKind::ModuleBody, vec![], Type::Bool,
+        );
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key = b.const_string("x");
+        let one = b.const_num(1.0);
+        b.emit0(Inst::StoreProperty {
+            object: map, key, value: one, layout, slot: PropertySlotId(0),
+        });
+        let bound = b.emit1(Inst::BindInterface {
+            value: map, expected: record.clone(), layout: Some(layout),
+        }, record);
+        let same = b.emit1(Inst::RefEq { left: map, right: bound }, Type::Bool);
+        b.ret(same);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.removed_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 0, "{function}");
+        assert_eq!(run(&program, entry).as_bool(), Some(true));
+    }
+
+    #[test]
+    fn all_required_typed_record_is_rematerialized_only_on_escaping_path() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![
+            InterfaceFieldType {
+                name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+            InterfaceFieldType {
+                name: "y".to_owned(), ty: Type::Num, optional: false, readonly: false,
+            },
+        ]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program, module, "record_partial", FunctionKind::ModuleBody, vec![Type::Bool], Type::Top,
+        );
+        let cond = b.param(0);
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key_x = b.const_string("x");
+        let key_y = b.const_string("y");
+        let one = b.const_num(1.0);
+        let two = b.const_num(2.0);
+        b.emit0(Inst::StoreProperty {
+            object: map, key: key_x, value: one, layout, slot: PropertySlotId(0),
+        });
+        b.emit0(Inst::StoreProperty {
+            object: map, key: key_y, value: two, layout, slot: PropertySlotId(1),
+        });
+        let bound = b.emit1(Inst::BindInterface {
+            value: map, expected: record.clone(), layout: Some(layout),
+        }, record);
+        let x = b.emit1(Inst::LoadProperty {
+            object: bound, key: key_x, layout, slot: PropertySlotId(0),
+        }, Type::Num);
+        let escape = b.new_block(&[]);
+        let scalar = b.new_block(&[]);
+        b.branch(cond, escape, vec![], scalar, vec![]);
+        b.position_at(escape);
+        b.ret(bound);
+        b.position_at(scalar);
+        b.ret(x);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.sunk_allocations, 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::LoadProperty { .. })), 0, "{function}");
+    }
+
+    #[test]
+    fn structural_bind_with_dynamic_required_field_is_not_elided() {
+        let (mut program, module) = new_program();
+        let record = Type::Record(vec![InterfaceFieldType {
+            name: "x".to_owned(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let layout = program.intern_structural_layout(&record).unwrap();
+        let mut b = Builder::new(
+            &mut program, module, "record_dynamic", FunctionKind::ModuleBody, vec![Type::Top], Type::Top,
+        );
+        let dynamic = b.param(0);
+        let map = b.emit1(Inst::AllocMap, Type::Map);
+        let key = b.const_string("x");
+        b.emit0(Inst::StoreProperty {
+            object: map, key, value: dynamic, layout, slot: PropertySlotId(0),
+        });
+        let bound = b.emit1(Inst::BindInterface {
+            value: map, expected: record.clone(), layout: Some(layout),
+        }, record);
+        b.ret(bound);
+        let entry = b.finish();
+
+        let stats = sroa(&mut program, entry);
+        let function = program.function(entry).unwrap();
+        assert_eq!(stats.removed_allocations, 0, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
+        assert_eq!(count(function, |i| matches!(i, Inst::BindInterface { .. })), 1, "{function}");
     }
 
     #[test]

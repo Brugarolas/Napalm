@@ -31,6 +31,14 @@ pub enum TraceType { Any, Null, Bool, Num, Int32, UInt32, F64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceClass { Builtin(BuiltinId) }
 
+/// One hidden-shape alternative in a structural-property PIC.
+/// `slot` is the physical dense-map slot selected when `shape` matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TraceShapeSlot {
+    pub shape: u32,
+    pub slot: u32,
+}
+
 /// Heap kind proven by GuardHeapObject. Kept in backend-neutral Trace IR so
 /// recorder and backend can share the proof without depending on the runtime
 /// sidecar's concrete enum definition. Cross-node guard optimization is left to
@@ -215,6 +223,16 @@ pub enum TraceInst {
         slot: u32,
         exit: SideExitId,
     },
+    /// Polymorphic structural-property load. Every entry implements the same
+    /// logical interface/record slot but may place it at a different physical
+    /// hidden-shape offset. The shape comparison selects the physical slot.
+    HeapMapGetPic {
+        map: TraceValueId,
+        key: TraceValueId,
+        expected_key: Vec<u8>,
+        entries: Vec<TraceShapeSlot>,
+        exit: SideExitId,
+    },
     HeapMapSetShaped {
         map: TraceValueId,
         key: TraceValueId,
@@ -272,6 +290,7 @@ impl TraceInst {
             | HeapWriteBarrier { object: lhs, value: rhs, .. }
             | HeapListGet { list: lhs, index: rhs, .. }
             | HeapMapGetShaped { map: lhs, key: rhs, .. }
+            | HeapMapGetPic { map: lhs, key: rhs, .. }
             | HeapStringAsciiCodePointAt { string: lhs, index: rhs, .. }
             | HeapStringCodePointAt { string: lhs, index: rhs, .. } => { f(lhs); f(rhs); },
             HeapListSet { list, index, value, .. }
@@ -310,7 +329,7 @@ impl TraceInst {
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
             | HeapWriteBarrier { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
-            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
+            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
             | HeapStringAsciiCodePointAt { exit, .. }
             | HeapStringCodePointAt { exit, .. }
@@ -332,7 +351,7 @@ impl TraceInst {
     pub fn is_heap_read(&self) -> bool {
         matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. }
             | Self::HeapListLen { .. } | Self::HeapListGet { .. }
-            | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. }
+            | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. } | Self::HeapMapGetPic { .. }
             | Self::HeapStringLen { .. } | Self::HeapStringAsciiCodePointAt { .. }
             | Self::HeapStringCodePointAt { .. })
     }
@@ -350,7 +369,7 @@ impl TraceInst {
             | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. } | IsInstanceObserved { exit, .. }
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
-            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
+            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
             | HeapStringCodePointAt { exit, .. } => *exit = new,
             _ => panic!("instruction does not support entry exit replacement"),
@@ -878,6 +897,33 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     }
     for (index, node) in t.nodes.iter().enumerate() {
         if node.id != index { errors.push("noncanonical node ID".into()); }
+        match &node.kind {
+            TraceInst::HeapMapGetPic { entries, expected_key, .. } => {
+                if entries.len() < 2 || entries.len() > 4 {
+                    errors.push("structural map PIC must contain 2..=4 entries".into());
+                }
+                if expected_key.len() > 64 {
+                    errors.push("structural map PIC key exceeds shaped-key limit".into());
+                }
+                let mut shapes = HashSet::new();
+                if entries.iter().any(|entry| !shapes.insert(entry.shape)) {
+                    errors.push("structural map PIC contains duplicate shapes".into());
+                }
+                if entries.iter().any(|entry| entry.slot > u16::MAX as u32) {
+                    errors.push("structural map PIC slot exceeds runtime slot width".into());
+                }
+            }
+            TraceInst::HeapMapGetShaped { expected_key, slot, .. }
+            | TraceInst::HeapMapSetShaped { expected_key, slot, .. } => {
+                if expected_key.len() > 64 {
+                    errors.push("shaped map key exceeds shaped-key limit".into());
+                }
+                if *slot > u16::MAX as u32 {
+                    errors.push("shaped map slot exceeds runtime slot width".into());
+                }
+            }
+            _ => {}
+        }
         if let TraceInst::Runtime {
             next,
             terminal,

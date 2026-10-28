@@ -66,12 +66,12 @@ use crate::napalm_bytecode::{
 };
 use crate::napalm_ir::{
     ClassId, CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp,
-    MethodKind, MethodSymbol, StringId, Type,
+    MethodKind, MethodSymbol, PropertySlotId, StringId, StructuralLayoutId, Type,
 };
 use crate::napalm_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
-    TraceConstant, TraceHeapObjectKind, TraceId, TraceInst, TraceKind, TraceLocation,
+    TraceConstant, TraceHeapObjectKind, TraceId, TraceInst, TraceKind, TraceLocation, TraceShapeSlot,
     TraceRep, TraceSwitchGuard, TraceMathOp, TraceTerminator, TraceType, TraceValueId,
     TraceValueOrigin,
 };
@@ -676,6 +676,28 @@ pub trait TraceRuntime {
         _key: RegisterWord,
     ) -> Option<ShapedMapAccess> {
         None
+    }
+
+    /// Resolve a compiler-known structural property through the runtime shape
+    /// family. Unlike `trace_shaped_map_access`, no key lookup is required.
+    fn trace_structural_map_access(
+        &self,
+        _map: RegisterWord,
+        _layout: StructuralLayoutId,
+        _slot: PropertySlotId,
+    ) -> Option<ShapedMapAccess> {
+        None
+    }
+
+    /// Shape/physical-slot entries already learned by the baseline structural PIC
+    /// for this bytecode site. The recorder may fold them into one native PIC.
+    fn trace_structural_map_pic(
+        &self,
+        _location: TraceLocation,
+        _layout: StructuralLayoutId,
+        _slot: PropertySlotId,
+    ) -> Vec<TraceShapeSlot> {
+        Vec::new()
     }
 
     /// Observe an already-fulfilled Promise while recording `Await`. Pending and
@@ -3998,6 +4020,86 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
+            LoadProperty => {
+                let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let map_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let layout = StructuralLayoutId(op.x);
+                let slot = PropertySlotId(op.y as u16);
+                if let Some(access) = runtime.trace_structural_map_access(map_word, layout, slot) {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                    // A structural PIC may contain shapes carrying additional
+                    // contracts. Use the logical layout's declared field type as
+                    // the proof common to every family member; a narrower type
+                    // observed on the current shape must not leak across the PIC.
+                    let field_type = program
+                        .metadata
+                        .structural_layout(layout)
+                        .and_then(|layout| layout.property(slot))
+                        .map(|property| property.ty.clone())
+                        .unwrap_or(Type::Top);
+                    let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+                    // The currently recorded shape must always be part of the native
+                    // PIC. Baseline history is supplemental: if its four entries are
+                    // already full, keep at most three of them rather than compiling
+                    // a trace that immediately exits on the observation that created it.
+                    let current = TraceShapeSlot {
+                        shape: access.shape,
+                        slot: access.slot as u32,
+                    };
+                    let mut entries = Vec::with_capacity(4);
+                    entries.push(current);
+                    for entry in runtime.trace_structural_map_pic(op.location, layout, slot) {
+                        if entries.iter().any(|known| known.shape == entry.shape) {
+                            continue;
+                        }
+                        entries.push(entry);
+                        if entries.len() == 4 {
+                            break;
+                        }
+                    }
+                    let kind = if entries.len() > 1 {
+                        TraceInst::HeapMapGetPic {
+                            map,
+                            key,
+                            expected_key: access.key_bytes,
+                            entries,
+                            exit,
+                        }
+                    } else {
+                        let entry = entries.first().copied().unwrap_or(TraceShapeSlot {
+                            shape: access.shape,
+                            slot: access.slot as u32,
+                        });
+                        TraceInst::HeapMapGetShaped {
+                            map,
+                            key,
+                            expected_key: access.key_bytes,
+                            shape: entry.shape,
+                            slot: entry.slot,
+                            exit,
+                        }
+                    };
+                    let result = builder.emit1(kind, trace_ty, trace_rep);
+                    if !matches!(field_type, Type::Top) {
+                        builder.set_proven_type(result, field_type);
+                    }
+                    self.write_gpr(builder, op.a, result);
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    // Optional fields that are absent from the current family shape,
+                    // dictionary Maps and unbound values preserve exact baseline semantics.
+                    self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
+
             MapGet => {
                 let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let key = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
@@ -4045,6 +4147,45 @@ impl<'a> TraceRecorder<'a> {
                         &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
                     )
                 }
+            }
+
+            StoreProperty => {
+                let map = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let map_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let layout = StructuralLayoutId(op.x);
+                let slot = PropertySlotId(op.y as u16);
+                let Some(access) = runtime.trace_structural_map_access(map_word, layout, slot) else {
+                    // An optional field insertion may allocate and transitions to a new
+                    // family member shape, so keep it on the GC-capable baseline path.
+                    return self.runtime_gc_leaf(op, builder, &[]);
+                };
+                if access.readonly || access.write_runtime_checked {
+                    return self.runtime_gc_leaf(op, builder, &[]);
+                }
+                let value = if let Some(expected) = &access.write_type {
+                    let Some(value) = self.guard_store_value(builder, value, expected, op.location.pc) else {
+                        return self.runtime_gc_leaf(op, builder, &[]);
+                    };
+                    value
+                } else {
+                    value
+                };
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                builder.emit0(TraceInst::HeapMapSetShaped {
+                    map,
+                    key,
+                    value,
+                    expected_key: access.key_bytes,
+                    shape: access.shape,
+                    slot: access.slot as u32,
+                    exit,
+                });
+                Ok(ExpectedStep::Exact(next))
             }
 
             MapSet => {
@@ -8708,6 +8849,45 @@ impl CraneliftLoweringState<'_, '_> {
                     value
                 };
                 self.cache_value(one_result(node)?, result);
+            }
+
+            HeapMapGetPic { map, key, expected_key, entries, exit } => {
+                debug_assert!(!entries.is_empty() && entries.len() <= 4);
+                let tagged_key = self.lower_value(*key)?;
+                let (entry, _, metadata) =
+                    self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
+                self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
+
+                let shape = self.heap_metadata_payload(metadata);
+                let mut matched = self.builder.ins().iconst(types::I32, 0);
+                let mut selected_slot = self.builder.ins().iconst(types::I64, 0);
+                for candidate in entries {
+                    let is_shape = self.builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        shape,
+                        candidate.shape as i64,
+                    );
+                    let is_shape32 = self.bool32(is_shape);
+                    matched = self.builder.ins().bor(matched, is_shape32);
+                    let slot = self.builder.ins().iconst(types::I64, candidate.slot as i64);
+                    selected_slot = self.builder.ins().select(is_shape, slot, selected_slot);
+                }
+                let miss = self.builder.ins().icmp_imm(IntCC::Equal, matched, 0);
+                self.emit_side_exit(*exit, miss)?;
+
+                // Every selected slot came from an exact family-member shape, so
+                // the shape match proves both property existence and dense bounds.
+                // Keep this load out of single-slot forwarding: the physical slot
+                // is chosen dynamically and may differ between family members.
+                let data = self.heap_entry_data(entry);
+                let address = self.heap_element_address(data, selected_slot);
+                let value = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                self.cache_value(one_result(node)?, value);
             }
 
             HeapMapSetShaped { map, key, value, expected_key, shape, slot, exit } => {

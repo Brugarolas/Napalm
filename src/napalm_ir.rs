@@ -56,6 +56,8 @@ id_newtype!(PrimitiveId, u32);
 id_newtype!(ModuleSlot, u32);
 id_newtype!(FieldSlot, u16);
 id_newtype!(StaticFieldSlot, u16);
+id_newtype!(StructuralLayoutId, u32);
+id_newtype!(PropertySlotId, u16);
 
 /// A small, canonicalized set of observed/possible runtime classes.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
@@ -158,6 +160,39 @@ pub struct InterfaceFieldType {
     pub ty: Type,
     pub optional: bool,
     pub readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StructuralLayoutKind {
+    Interface,
+    Record,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StructuralPropertyInfo {
+    pub slot: PropertySlotId,
+    pub name: StringId,
+    pub ty: Type,
+    pub optional: bool,
+    pub readonly: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StructuralLayoutInfo {
+    pub id: StructuralLayoutId,
+    pub kind: StructuralLayoutKind,
+    /// Canonical structural contract represented by this layout. Keeping the
+    /// Type here gives the runtime a cheap cold-path bridge from BindInterface
+    /// descriptors to layout IDs without teaching Type about compiler identities.
+    pub contract: Type,
+    pub properties: Vec<StructuralPropertyInfo>,
+}
+
+impl StructuralLayoutInfo {
+    #[inline]
+    pub fn property(&self, slot: PropertySlotId) -> Option<&StructuralPropertyInfo> {
+        self.properties.get(slot.0 as usize).filter(|property| property.slot == slot)
+    }
 }
 
 impl Type {
@@ -718,7 +753,13 @@ pub enum Inst {
 
     /// Validate and permanently attach a heap contract. This is a write, never
     /// a speculative guard: optimizers must preserve it even if the value is dead.
-    BindInterface { value: ValueId, expected: Type },
+    BindInterface {
+        value: ValueId,
+        expected: Type,
+        /// Canonical layout when the top-level contract is structural. Nested
+        /// contracts are resolved through Program/RuntimeMetadata by Type.
+        layout: Option<StructuralLayoutId>,
+    },
 
     // ----- Speculation / deoptimization -----
     GuardType {
@@ -968,10 +1009,26 @@ pub enum Inst {
         map: ValueId,
         key: ValueId,
     },
+    /// Structural property access. `slot` is logical within `layout`; runtime
+    /// shape families translate it to the concrete hidden-shape slot. `key` is
+    /// retained for bytecode fallback, diagnostics and dictionary-mode semantics.
+    LoadProperty {
+        object: ValueId,
+        key: ValueId,
+        layout: StructuralLayoutId,
+        slot: PropertySlotId,
+    },
     MapSet {
         map: ValueId,
         key: ValueId,
         value: ValueId,
+    },
+    StoreProperty {
+        object: ValueId,
+        key: ValueId,
+        value: ValueId,
+        layout: StructuralLayoutId,
+        slot: PropertySlotId,
     },
     MapRemove {
         map: ValueId,
@@ -1161,12 +1218,14 @@ impl Inst {
             | ListGet { .. }
             | MapLen { .. }
             | MapGet { .. }
+            | LoadProperty { .. }
             | StringCodePointAt { .. } => B::Chain(E::Read),
             ListSet { .. }
             | ListAppend { .. }
             | ListInsert { .. }
             | ListRemoveAt { .. }
             | MapSet { .. }
+            | StoreProperty { .. }
             | MapRemove { .. } => B::Chain(E::Write),
 
             Await { .. } => B::Chain(E::Fiber),
@@ -1224,7 +1283,8 @@ impl Inst {
 
         matches!(
             self,
-            ListSpread { .. } | MapSpread { .. } | DestructureGet { .. }
+            BindInterface { .. }
+                | ListSpread { .. } | MapSpread { .. } | DestructureGet { .. }
                 | DestructureRest { .. } | DestructureCheck { .. } | InvokeSpread { .. } |
             // Arbitrary Napalm/host code may raise, and call setup itself can fail.
             Invoke { .. }
@@ -1268,7 +1328,9 @@ impl Inst {
                 | ListRemoveAt { .. }
                 | MapLen { .. }
                 | MapGet { .. }
+                | LoadProperty { .. }
                 | MapSet { .. }
+                | StoreProperty { .. }
                 | MapRemove { .. }
 
                 // String operations validate dynamic operands and bounds.
@@ -1321,6 +1383,7 @@ impl Inst {
             | ListAppend { .. }
             | ListInsert { .. }
             | MapSet { .. }
+            | StoreProperty { .. }
             | FiberAbort { .. }
             | WriteBarrier { .. } => 0,
 
@@ -1357,6 +1420,7 @@ impl Inst {
             | AllocMap
             | MapLen { .. }
             | MapGet { .. }
+            | LoadProperty { .. }
             | MapRemove { .. }
             | StringLen { .. }
             | StringConcat { .. }
@@ -1563,8 +1627,17 @@ impl Inst {
                 out.push(*map);
                 out.push(*key);
             }
+            LoadProperty { object, key, .. } => {
+                out.push(*object);
+                out.push(*key);
+            }
             MapSet { map, key, value } => {
                 out.push(*map);
+                out.push(*key);
+                out.push(*value);
+            }
+            StoreProperty { object, key, value, .. } => {
+                out.push(*object);
                 out.push(*key);
                 out.push(*value);
             }
@@ -1781,8 +1854,17 @@ impl Inst {
                 f(map);
                 f(key);
             }
+            LoadProperty { object, key, .. } => {
+                f(object);
+                f(key);
+            }
             MapSet { map, key, value } => {
                 f(map);
+                f(key);
+                f(value);
+            }
+            StoreProperty { object, key, value, .. } => {
+                f(object);
                 f(key);
                 f(value);
             }
@@ -1997,6 +2079,8 @@ pub struct Program {
     pub classes: Vec<ClassInfo>,
     class_index: HashMap<ClassId, usize>,
     pub foreign_functions: Vec<ForeignFunctionInfo>,
+    pub structural_layouts: Vec<StructuralLayoutInfo>,
+    structural_layout_index: HashMap<Type, StructuralLayoutId>,
 
     strings: Vec<String>,
     string_index: HashMap<String, StringId>,
@@ -2024,6 +2108,49 @@ impl Program {
 
     pub fn string(&self, id: StringId) -> Option<&str> {
         self.strings.get(id.0 as usize).map(String::as_str)
+    }
+
+    /// Canonicalize a structural interface/record independently from hidden
+    /// shapes. Layout slots are logical and survive shape growth/reordering.
+    pub fn intern_structural_layout(&mut self, contract: &Type) -> Option<StructuralLayoutId> {
+        let (kind, fields) = match contract {
+            Type::Interface(fields) => (StructuralLayoutKind::Interface, fields),
+            Type::Record(fields) => (StructuralLayoutKind::Record, fields),
+            _ => return None,
+        };
+        if let Some(&id) = self.structural_layout_index.get(contract) {
+            return Some(id);
+        }
+        if fields.len() > u16::MAX as usize {
+            return None;
+        }
+        let id = StructuralLayoutId(self.structural_layouts.len() as u32);
+        let mut properties = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let name = self.intern_string(&field.name);
+            properties.push(StructuralPropertyInfo {
+                slot: PropertySlotId(index as u16),
+                name,
+                ty: field.ty.clone(),
+                optional: field.optional,
+                readonly: field.readonly,
+            });
+        }
+        self.structural_layouts.push(StructuralLayoutInfo {
+            id, kind, contract: contract.clone(), properties,
+        });
+        self.structural_layout_index.insert(contract.clone(), id);
+        Some(id)
+    }
+
+    #[inline]
+    pub fn structural_layout_id(&self, contract: &Type) -> Option<StructuralLayoutId> {
+        self.structural_layout_index.get(contract).copied()
+    }
+
+    #[inline]
+    pub fn structural_layout(&self, id: StructuralLayoutId) -> Option<&StructuralLayoutInfo> {
+        self.structural_layouts.get(id.0 as usize).filter(|layout| layout.id == id)
     }
 
     pub fn intern_method(
@@ -2369,6 +2496,21 @@ impl<'p> Builder<'p> {
             .value(value)
             .expect("unknown value in Builder::value_type")
             .ty
+    }
+
+    #[inline]
+    pub fn structural_layout_id(&self, contract: &Type) -> Option<StructuralLayoutId> {
+        self.program.structural_layout_id(contract)
+    }
+
+    #[inline]
+    pub fn intern_structural_layout(&mut self, contract: &Type) -> Option<StructuralLayoutId> {
+        self.program.intern_structural_layout(contract)
+    }
+
+    #[inline]
+    pub fn structural_layout(&self, id: StructuralLayoutId) -> Option<&StructuralLayoutInfo> {
+        self.program.structural_layout(id)
     }
 
     /// Refine the semantic type of an already emitted SSA value without changing

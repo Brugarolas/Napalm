@@ -1332,7 +1332,8 @@ impl FunctionOptimization for FastLocalSimplify {
                             &mut effect_shape_changed,
                         );
                     }
-                    Inst::MapGet { map, key } => {
+                    Inst::MapGet { map, key }
+                    | Inst::LoadProperty { object: map, key, .. } => {
                         let map = object_alias_root(function, map);
                         let key = object_alias_root(function, key);
                         cse_read(
@@ -1344,7 +1345,8 @@ impl FunctionOptimization for FastLocalSimplify {
                             &mut effect_shape_changed,
                         );
                     }
-                    Inst::MapSet { map, key, value } => {
+                    Inst::MapSet { map, key, value }
+                    | Inst::StoreProperty { object: map, key, value, .. } => {
                         let map = object_alias_root(function, map);
                         let key = object_alias_root(function, key);
                         map_values.retain(|cached, _| match cached {

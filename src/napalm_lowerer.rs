@@ -2401,7 +2401,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
 
         for (index, binding) in node.param_bindings.iter().copied().enumerate() {
-            let value = self.builder.param(param_offset + index);
+            let mut value = self.builder.param(param_offset + index);
+            if let Some(binding_type) = self.binding_types.get(&binding).cloned() {
+                value = self.bind_interface(value, &binding_type.expected);
+            }
             self.bind_initial(binding, value);
         }
     }
@@ -2491,6 +2494,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         } else {
             Type::Top
         };
+        let _ = self.builder.intern_structural_layout(&expected);
         let origin = annotation
             .map(|annotation| annotation.span)
             .or_else(|| initializer.map(|initializer| initializer.span))
@@ -2518,7 +2522,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
         if contains_structural_contract(expected) {
-            self.builder.emit1(Inst::BindInterface { value, expected: expected.clone() }, expected.clone())
+            let layout = self.builder.intern_structural_layout(expected);
+            self.builder.emit1(
+                Inst::BindInterface { value, expected: expected.clone(), layout },
+                expected.clone(),
+            )
         } else { value }
     }
 
@@ -2954,9 +2962,24 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     self.bind_initial(binding, empty);
                 }
 
+                let explicit_expected = annotation.as_ref().map(|annotation| {
+                    resolve_type_annotation(
+                        annotation,
+                        self.context.top_level_classes,
+                        self.context.interface_types,
+                    )
+                });
+                if let Some(expected) = explicit_expected.as_ref() {
+                    let _ = self.builder.intern_structural_layout(expected);
+                }
                 let value = initializer
                     .as_ref()
-                    .map(|expr| self.lower_expr(expr))
+                    .map(|expr| match (&expr.kind, explicit_expected.as_ref()) {
+                        (ExprKind::Map(entries), Some(expected @ (Type::Interface(_) | Type::Record(_)))) => {
+                            self.lower_structural_map(entries, expected)
+                        }
+                        _ => self.lower_expr(expr),
+                    })
                     .unwrap_or_else(|| self.builder.const_null());
                 let value_span = initializer.as_ref().map_or(name.span, |expr| expr.span);
 
@@ -3924,6 +3947,51 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         map
     }
 
+    /// Contextual structural literal lowering. Declared properties receive a
+    /// logical layout slot before the runtime contract is installed. Hidden
+    /// shapes remain free to choose a different physical slot.
+    fn lower_structural_map(&mut self, entries: &[front::MapEntry], contract: &Type) -> ValueId {
+        let Some(layout) = self
+            .builder
+            .structural_layout_id(contract)
+            .or_else(|| self.builder.intern_structural_layout(contract))
+        else {
+            return self.lower_map(entries);
+        };
+        let fields = match contract {
+            Type::Interface(fields) | Type::Record(fields) => fields.clone(),
+            _ => return self.lower_map(entries),
+        };
+        let map = self.builder.emit1(Inst::AllocMap, Type::Map);
+        for entry in entries {
+            if entry.spread {
+                let source = self.lower_expr(&entry.value);
+                self.copy_map_entries(map, source);
+                continue;
+            }
+            let structural = match &entry.key.kind {
+                ExprKind::String(bytes) => std::str::from_utf8(bytes).ok().and_then(|name| {
+                    fields.iter().position(|field| field.name == name).map(|index| {
+                        (name.to_owned(), ir::PropertySlotId(index as u16))
+                    })
+                }),
+                _ => None,
+            };
+            if let Some((name, slot)) = structural {
+                let key = self.builder.const_string(&name);
+                let value = self.lower_expr(&entry.value);
+                self.builder.emit0(Inst::StoreProperty {
+                    object: map, key, value, layout, slot,
+                });
+            } else {
+                let key = self.lower_expr(&entry.key);
+                let value = self.lower_expr(&entry.value);
+                self.builder.emit0(Inst::MapSet { map, key, value });
+            }
+        }
+        map
+    }
+
     fn copy_map_entries(&mut self, map: ValueId, source: ValueId) {
         self.builder.emit0(Inst::MapSpread { map, source });
     }
@@ -4221,8 +4289,82 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return source;
         }
         let location = self.prepare_assignment(target);
-        let value = self.lower_expr(value);
+        let expected = self.assignment_expected_type(target, location.as_ref());
+        let value = match (&value.kind, expected.as_ref()) {
+            (ExprKind::Map(entries), Some(expected @ (Type::Interface(_) | Type::Record(_)))) => {
+                self.lower_structural_map(entries, expected)
+            }
+            _ => self.lower_expr(value),
+        };
         self.store_assignment(target, value, location)
+    }
+
+    /// Source-level type expected by an assignment destination. This is used only
+    /// for contextual object-literal lowering; `store_assignment` remains the
+    /// authoritative checker and still emits the final BindInterface/diagnostic.
+    fn assignment_expected_type(
+        &self,
+        target: &Expr,
+        location: Option<&(ValueId, Vec<ValueId>)>,
+    ) -> Option<Type> {
+        match &target.kind {
+            ExprKind::Name(name) => {
+                if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
+                    self.binding_types.get(&binding).map(|binding| binding.expected.clone())
+                } else if self.context.implicit_this
+                    && self.context.method_context.is_some()
+                    && is_implicit_receiver_name(&name.value)
+                {
+                    None
+                } else {
+                    self.context
+                        .module_binding_types
+                        .get(&name.value)
+                        .map(|binding| binding.expected.clone())
+                }
+            }
+            ExprKind::Field(name) => self
+                .context
+                .method_context
+                .as_ref()?
+                .field_types
+                .get(&name.value)
+                .cloned(),
+            ExprKind::StaticField(name) => self
+                .context
+                .method_context
+                .as_ref()?
+                .static_field_types
+                .get(&name.value)
+                .cloned(),
+            ExprKind::Invoke(invoke) if invoke.syntax == InvokeSyntax::Getter => {
+                let (receiver, _) = location?;
+                let fields = match self.builder.value_type(*receiver) {
+                    Type::Interface(fields) | Type::Record(fields) => fields,
+                    _ => return None,
+                };
+                fields
+                    .iter()
+                    .find(|field| field.name == invoke.name.value)
+                    .map(|field| field.ty.clone())
+            }
+            ExprKind::Subscript { args, .. } => {
+                let (receiver, _) = location?;
+                let [Expr { kind: ExprKind::String(name), .. }] = args.as_slice() else {
+                    return None;
+                };
+                let name = std::str::from_utf8(name).ok()?;
+                let fields = match self.builder.value_type(*receiver) {
+                    Type::Interface(fields) | Type::Record(fields) => fields,
+                    _ => return None,
+                };
+                fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| field.ty.clone())
+            }
+            _ => None,
+        }
     }
 
     fn prepare_assignment(&mut self, target: &Expr) -> Option<(ValueId, Vec<ValueId>)> {
@@ -4238,12 +4380,23 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
     }
 
-    fn structural_field(&self, receiver: ValueId, name: &str) -> Option<ir::InterfaceFieldType> {
-        let fields = match self.builder.value_type(receiver) {
+    fn structural_field(
+        &mut self,
+        receiver: ValueId,
+        name: &str,
+    ) -> Option<(ir::InterfaceFieldType, ir::StructuralLayoutId, ir::PropertySlotId)> {
+        let contract = self.builder.value_type(receiver).clone();
+        let fields = match &contract {
             Type::Interface(fields) | Type::Record(fields) => fields,
             _ => return None,
         };
-        fields.iter().find(|field| field.name == name).cloned()
+        let index = fields.iter().position(|field| field.name == name)?;
+        let field = fields[index].clone();
+        let layout = self
+            .builder
+            .structural_layout_id(&contract)
+            .or_else(|| self.builder.intern_structural_layout(&contract))?;
+        Some((field, layout, ir::PropertySlotId(index as u16)))
     }
 
     fn structural_object_is_closed(&self, receiver: ValueId) -> bool {
@@ -4266,14 +4419,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             },
             _ => return None,
         };
-        let field = self.structural_field(*receiver, name)?;
+        let (field, layout, slot) = self.structural_field(*receiver, name)?;
         let ty = if field.optional && !field.ty.accepts(&Type::Null) {
             Type::Union(vec![field.ty.clone(), Type::Null])
         } else {
             field.ty.clone()
         };
         let key = self.builder.const_string(name);
-        Some(self.builder.emit1(Inst::MapGet { map: *receiver, key }, ty))
+        Some(self.builder.emit1(
+            Inst::LoadProperty { object: *receiver, key, layout, slot },
+            ty,
+        ))
     }
 
     fn store_structural_field(
@@ -4283,7 +4439,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         value: ValueId,
         span: Span,
     ) -> bool {
-        let Some(field) = self.structural_field(receiver, name) else {
+        let Some((field, layout, slot)) = self.structural_field(receiver, name) else {
             return false;
         };
         if field.readonly {
@@ -4307,7 +4463,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
         let value = self.bind_interface(value, &field.ty);
         let key = self.builder.const_string(name);
-        self.builder.emit0(Inst::MapSet { map: receiver, key, value });
+        self.builder.emit0(Inst::StoreProperty {
+            object: receiver, key, value, layout, slot,
+        });
         true
     }
 
@@ -4625,32 +4783,41 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // Dot syntax preserves builtin Map getter precedence. Brackets always
         // address the property, even for these reserved member names.
         if kind == MethodKind::Getter && !matches!(invoke.name.value.as_str(), "count" | "isEmpty" | "keys" | "toString") {
-            if let Some(ty) = self.interface_field_type(receiver, &invoke.name.value) {
+            if let Some((ty, layout, slot)) = self.structural_property_info(receiver, &invoke.name.value) {
                 let key = self.builder.const_string(&invoke.name.value);
-                return self.builder.emit1(Inst::MapGet { map: receiver, key }, ty);
+                return self.builder.emit1(
+                    Inst::LoadProperty { object: receiver, key, layout, slot },
+                    ty,
+                );
             }
         }
         self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
     }
 
-    fn interface_field_type(&self, receiver: ValueId, name: &str) -> Option<Type> {
-        let fields = match self.builder.value_type(receiver) {
-            Type::Interface(fields) | Type::Record(fields) => fields,
-            _ => return None,
-        };
-        let field = fields.iter().find(|f| f.name == name)?;
-        Some(if field.optional && !field.ty.accepts(&Type::Null) {
+    fn structural_property_info(
+        &mut self,
+        receiver: ValueId,
+        name: &str,
+    ) -> Option<(Type, ir::StructuralLayoutId, ir::PropertySlotId)> {
+        let (field, layout, slot) = self.structural_field(receiver, name)?;
+        let ty = if field.optional && !field.ty.accepts(&Type::Null) {
             Type::Union(vec![field.ty.clone(), Type::Null])
-        } else { field.ty.clone() })
+        } else {
+            field.ty.clone()
+        };
+        Some((ty, layout, slot))
     }
 
     fn lower_subscript(&mut self, receiver: &Expr, args: &[Expr]) -> ValueId {
         let receiver = self.lower_expr(receiver);
         if let [Expr { kind: ExprKind::String(name), .. }] = args {
             let name = String::from_utf8_lossy(name);
-            if let Some(ty) = self.interface_field_type(receiver, &name) {
+            if let Some((ty, layout, slot)) = self.structural_property_info(receiver, &name) {
                 let key = self.builder.const_string(&name);
-                return self.builder.emit1(Inst::MapGet { map: receiver, key }, ty);
+                return self.builder.emit1(
+                    Inst::LoadProperty { object: receiver, key, layout, slot },
+                    ty,
+                );
             }
         }
         let args: Vec<_> = args.iter().map(|arg| self.lower_expr(arg)).collect();
@@ -6114,7 +6281,7 @@ class Child is Parent {
                         Type::Record(_) => saw_closed_contract = true,
                         _ => {}
                     },
-                    Inst::MapGet { .. } => {
+                    Inst::LoadProperty { .. } => {
                         if node.results.iter().any(|result| {
                             function
                                 .value(*result)
@@ -6123,7 +6290,7 @@ class Child is Parent {
                             typed_num_gets += 1;
                         }
                     }
-                    Inst::MapSet { .. } => direct_map_sets += 1,
+                    Inst::StoreProperty { .. } => direct_map_sets += 1,
                     _ => {}
                 }
             }
@@ -6131,7 +6298,7 @@ class Child is Parent {
         assert!(saw_open_contract, "interface binding must stay open");
         assert!(saw_closed_contract, "type alias binding must become a closed record");
         assert!(typed_num_gets >= 2, "typed property reads should expose Number in WIR");
-        assert!(direct_map_sets >= 4, "known structural writes should lower directly to MapSet");
+        assert!(direct_map_sets >= 4, "known structural writes should lower directly to StoreProperty");
     }
 
     #[test]
@@ -6163,6 +6330,7 @@ class Child is Parent {
 
         let mut saw_record_param = false;
         let mut typed_number_gets = 0usize;
+        let mut structural_stores = 0usize;
         for function in &output.program.functions {
             for block in &function.blocks {
                 saw_record_param |= block.params.iter().any(|param| {
@@ -6172,7 +6340,7 @@ class Child is Parent {
                 });
             }
             for node in &function.nodes {
-                if matches!(node.kind, Inst::MapGet { .. })
+                if matches!(node.kind, Inst::LoadProperty { .. })
                     && node.results.iter().any(|result| {
                         function
                             .value(*result)
@@ -6181,12 +6349,19 @@ class Child is Parent {
                 {
                     typed_number_gets += 1;
                 }
+                if matches!(node.kind, Inst::StoreProperty { .. }) {
+                    structural_stores += 1;
+                }
             }
         }
         assert!(saw_record_param, "loop-carried Point must keep its closed record contract");
         assert!(
             typed_number_gets >= 4,
-            "Point property reads after loop merges must stay direct typed MapGet operations"
+            "Point property reads after loop merges must stay direct typed LoadProperty operations"
+        );
+        assert!(
+            structural_stores >= 4,
+            "contextually typed Point literals in declarations and assignments must use StoreProperty"
         );
     }
 

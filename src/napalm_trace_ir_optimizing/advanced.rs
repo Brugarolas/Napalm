@@ -517,7 +517,9 @@ impl TraceOptimization for RangeAnalysis {
 enum Memory {
     Frame(FrameSlot, TraceRep), Field(TraceValueId, u32), Cell(TraceValueId),
     ListLen(TraceValueId), List(TraceValueId, TraceValueId), MapLen(TraceValueId),
-    Map(TraceValueId, TraceValueId, Vec<u8>, u32, u32), StringLen(TraceValueId),
+    Map(TraceValueId, TraceValueId, Vec<u8>, u32, u32),
+    MapPic(TraceValueId, TraceValueId, Vec<u8>, Vec<TraceShapeSlot>),
+    StringLen(TraceValueId),
 }
 fn load(kind: &TraceInst, rep: TraceRep) -> Option<Memory> {
     Some(match kind {
@@ -528,6 +530,7 @@ fn load(kind: &TraceInst, rep: TraceRep) -> Option<Memory> {
         TraceInst::HeapListGet { list, index, .. } => Memory::List(*list, *index),
         TraceInst::HeapMapLen { map, .. } => Memory::MapLen(*map),
         TraceInst::HeapMapGetShaped { map, key, expected_key, shape, slot, .. } => Memory::Map(*map, *key, expected_key.clone(), *shape, *slot),
+        TraceInst::HeapMapGetPic { map, key, expected_key, entries, .. } => Memory::MapPic(*map, *key, expected_key.clone(), entries.clone()),
         TraceInst::HeapStringLen { string, .. } => Memory::StringLen(*string),
         _ => return None,
     })
@@ -587,6 +590,10 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
             // no-alias information.
             store_shape == shape && store_slot == slot
         }
+        (
+            Memory::Map(_, _, _, store_shape, store_slot),
+            Memory::MapPic(_, _, _, entries),
+        ) => entries.iter().any(|entry| entry.shape == *store_shape && entry.slot == *store_slot),
 
         // Element replacement does not change container length. Shaped-map
         // stores update an existing slot and therefore preserve map length.
@@ -602,6 +609,7 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
         // `store()` never produces these read-only memory classes.
         (Memory::ListLen(_), _)
         | (Memory::MapLen(_), _)
+        | (Memory::MapPic(..), _)
         | (Memory::StringLen(_), _) => false,
     }
 }
@@ -1782,6 +1790,80 @@ mod tests {
         Optimize::new().with_pass(LoadStorePRE).optimize_trace(&mut trace).unwrap();
         assert_eq!(trace.canonical_value(forwarded), value);
         assert_eq!(trace.stats.eliminated_stores, 1);
+        assert_eq!(trace.canonical_value(retained), retained);
+    }
+
+    #[test]
+    fn memory_pre_understands_structural_pic_shape_slot_aliasing() {
+        let mut b = builder(TraceKind::Side);
+        let map = input(&mut b, 0, TraceRep::Tagged);
+        let possible_alias = input(&mut b, 1, TraceRep::Tagged);
+        let key = input(&mut b, 2, TraceRep::Tagged);
+        let value = b.constant(TraceConstant::NumBits(7.0f64.to_bits()));
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let entries = vec![
+            TraceShapeSlot { shape: 10, slot: 0 },
+            TraceShapeSlot { shape: 20, slot: 1 },
+        ];
+        let first = b.emit1(
+            TraceInst::HeapMapGetPic {
+                map,
+                key,
+                expected_key: b"x".to_vec(),
+                entries: entries.clone(),
+                exit,
+            },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        // A successful shaped store at shape 30 cannot alias a successful PIC
+        // load whose accepted shapes are only 10 and 20.
+        b.emit0(TraceInst::HeapMapSetShaped {
+            map: possible_alias,
+            key,
+            value,
+            expected_key: b"x".to_vec(),
+            shape: 30,
+            slot: 0,
+            exit,
+        });
+        let forwarded = b.emit1(
+            TraceInst::HeapMapGetPic {
+                map,
+                key,
+                expected_key: b"x".to_vec(),
+                entries: entries.clone(),
+                exit,
+            },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        // Shape 20 / slot 1 is one of the PIC alternatives, so an aliasing
+        // store there must invalidate the cached load.
+        b.emit0(TraceInst::HeapMapSetShaped {
+            map: possible_alias,
+            key,
+            value,
+            expected_key: b"x".to_vec(),
+            shape: 20,
+            slot: 1,
+            exit,
+        });
+        let retained = b.emit1(
+            TraceInst::HeapMapGetPic {
+                map,
+                key,
+                expected_key: b"x".to_vec(),
+                entries,
+                exit,
+            },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        b.write_slot(FrameSlot::General(Reg(3)), retained);
+        let mut trace = finish(b);
+        Optimize::new().with_pass(LoadStorePRE).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.canonical_value(forwarded), first);
         assert_eq!(trace.canonical_value(retained), retained);
     }
 

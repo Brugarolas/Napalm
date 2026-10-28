@@ -1649,7 +1649,8 @@ impl<'a> FunctionEmitter<'a> {
         if let Some(id) = self.type_guard_cache.get(ty) {
             return *id;
         }
-        let id = self.assembler.chunk.push_type_guard(ty.clone());
+        let layout = self.program.structural_layout_id(ty);
+        let id = self.assembler.chunk.push_type_guard(ty.clone(), layout);
         self.type_guard_cache.insert(ty.clone(), id);
         id
     }
@@ -1826,7 +1827,7 @@ impl<'a> FunctionEmitter<'a> {
             ImportModule | ImportVariable => SafepointKind::Module,
             Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
             | FiberSuspend => SafepointKind::FiberSwitch,
-            BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet => {
+            BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet | StoreProperty => {
                 SafepointKind::RuntimeMutation
             }
             _ => SafepointKind::Allocation,
@@ -2165,7 +2166,7 @@ impl FunctionEmitter<'_> {
                 self.assembler.emit_move(dst, src)
             }
 
-            BindInterface { value, expected } => {
+            BindInterface { value, expected, .. } => {
                 let guard = self.type_guard(expected);
                 self.assembler.emit_x32(Opcode::BindInterface, self.result_reg(node)?.0, self.reg(*value)?.0, 0, guard.0)
             }
@@ -2689,11 +2690,27 @@ impl FunctionEmitter<'_> {
                 self.reg(*map)?.0,
                 self.reg(*key)?.0,
             ),
+            LoadProperty { object, key, layout, slot } => self.assembler.emit_x32_y32(
+                Opcode::LoadProperty,
+                self.result_reg(node)?.0,
+                self.reg(*object)?.0,
+                self.reg(*key)?.0,
+                layout.0,
+                slot.0 as u32,
+            ),
             MapSet { map, key, value } => self.assembler.emit_abc(
                 Opcode::MapSet,
                 self.reg(*map)?.0,
                 self.reg(*key)?.0,
                 self.reg(*value)?.0,
+            ),
+            StoreProperty { object, key, value, layout, slot } => self.assembler.emit_x32_y32(
+                Opcode::StoreProperty,
+                self.reg(*object)?.0,
+                self.reg(*key)?.0,
+                self.reg(*value)?.0,
+                layout.0,
+                slot.0 as u32,
             ),
             MapRemove { map, key } => self.assembler.emit_abc(
                 Opcode::MapRemove,
@@ -3196,6 +3213,7 @@ fn lower_runtime_metadata(hir: &Program) -> Result<RuntimeMetadata, CompileError
     metadata.modules = hir.modules.clone();
     metadata.classes = hir.classes.clone();
     metadata.foreign_functions = hir.foreign_functions.clone();
+    metadata.structural_layouts = hir.structural_layouts.clone();
     metadata
         .rebuild_indexes()
         .map_err(CompileError::Metadata)?;

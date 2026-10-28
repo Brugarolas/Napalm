@@ -40,8 +40,8 @@ use crate::napalm_ir::{
     BailoutReason, CallConv, ClassId, ClassInfo, ClassSet, CmpKind, Constant, DeoptId,
     F64BinOp, F64UnaryOp, ForeignFnId, ForeignFunctionInfo, FuncId,
     FunctionKind, IntBinOp, IntUnaryOp, MethodSignature, MethodSymbol, ModuleId,
-    ModuleInfo, ModuleSlot, PrimitiveId, ResumeId, SiteId, SourceSpan,
-    StringId, Type,
+    ModuleInfo, ModuleSlot, PrimitiveId, PropertySlotId, ResumeId, SiteId, SourceSpan,
+    StringId, StructuralLayoutId, StructuralLayoutInfo, StructuralLayoutKind, Type,
 };
 
 // =============================================================================
@@ -1072,8 +1072,10 @@ define_opcodes! {
     DestructureCheck = 126, // A=validated source, B=source, C=is_array
     DestructureGet = 127, // A=value (null when absent), B=source, C=key/index
     DestructureRest = 128, // A=fresh collection, B=source, C=start/excluded keys
-    BindInterface = 130, // A=checked value, B=input; X=type descriptor
     InvokeSpread = 129, // A=result, B=receiver, C=argument List; X=method, Y=home
+    BindInterface = 130, // A=checked value, B=input; X=type descriptor
+    LoadProperty = 131, // A=value, B=object, C=key; X=layout, Y=logical property slot
+    StoreProperty = 132, // A=object, B=key, C=value; X=layout, Y=logical property slot
 }
 
 impl Opcode {
@@ -1084,6 +1086,8 @@ impl Opcode {
         match self {
             Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign
             | MakeClosure => None,
+
+            LoadProperty | StoreProperty => Some(3),
 
             BindInterface
             | LoadI32
@@ -1161,6 +1165,7 @@ impl Opcode {
                 | ListInsert
                 | AllocMap
                 | MapSet
+                | StoreProperty
                 | StringConcat
                 | StringSlice
                 | MakeRange
@@ -1251,6 +1256,9 @@ pub struct InlineCacheDescriptor {
 #[derive(Clone, Debug)]
 pub struct TypeGuardDescriptor {
     pub expected: Type,
+    /// Canonical top-level structural layout when `expected` itself is an
+    /// interface/record. Nested structural types are resolved through metadata.
+    pub layout: Option<StructuralLayoutId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1506,9 +1514,13 @@ impl BytecodeChunk {
         id
     }
 
-    pub fn push_type_guard(&mut self, expected: Type) -> TypeGuardId {
+    pub fn push_type_guard(
+        &mut self,
+        expected: Type,
+        layout: Option<StructuralLayoutId>,
+    ) -> TypeGuardId {
         let id = TypeGuardId(self.type_guards.len() as u32);
-        self.type_guards.push(TypeGuardDescriptor { expected });
+        self.type_guards.push(TypeGuardDescriptor { expected, layout });
         id
     }
 
@@ -1574,10 +1586,12 @@ pub struct RuntimeMetadata {
     pub modules: Vec<ModuleInfo>,
     pub classes: Vec<ClassInfo>,
     pub foreign_functions: Vec<ForeignFunctionInfo>,
+    pub structural_layouts: Vec<StructuralLayoutInfo>,
 
     module_index: HashMap<ModuleId, usize>,
     class_index: HashMap<ClassId, usize>,
     foreign_index: HashMap<ForeignFnId, usize>,
+    structural_layout_index: HashMap<Type, StructuralLayoutId>,
 }
 
 impl RuntimeMetadata {
@@ -1585,6 +1599,7 @@ impl RuntimeMetadata {
         self.module_index.clear();
         self.class_index.clear();
         self.foreign_index.clear();
+        self.structural_layout_index.clear();
 
         for (index, module) in self.modules.iter().enumerate() {
             if self.module_index.insert(module.id, index).is_some() {
@@ -1599,6 +1614,18 @@ impl RuntimeMetadata {
         for (index, foreign) in self.foreign_functions.iter().enumerate() {
             if self.foreign_index.insert(foreign.id, index).is_some() {
                 return Err(format!("duplicate foreign metadata {:?}", foreign.id));
+            }
+        }
+        for (index, layout) in self.structural_layouts.iter().enumerate() {
+            if layout.id.0 as usize != index {
+                return Err(format!("non-dense structural layout metadata {:?}", layout.id));
+            }
+            if self
+                .structural_layout_index
+                .insert(layout.contract.clone(), layout.id)
+                .is_some()
+            {
+                return Err(format!("duplicate structural layout {:?}", layout.id));
             }
         }
         Ok(())
@@ -1631,6 +1658,16 @@ impl RuntimeMetadata {
             .get(&id)
             .and_then(|&index| self.foreign_functions.get(index))
             .or_else(|| self.foreign_functions.iter().find(|foreign| foreign.id == id))
+    }
+
+    #[inline]
+    pub fn structural_layout(&self, id: StructuralLayoutId) -> Option<&StructuralLayoutInfo> {
+        self.structural_layouts.get(id.0 as usize).filter(|layout| layout.id == id)
+    }
+
+    #[inline]
+    pub fn structural_layout_id(&self, contract: &Type) -> Option<StructuralLayoutId> {
+        self.structural_layout_index.get(contract).copied()
     }
 }
 
@@ -2492,6 +2529,42 @@ impl BytecodeVerifier {
             }
         }
 
+        for (index, layout) in program.metadata.structural_layouts.iter().enumerate() {
+            if layout.id.0 as usize != index {
+                return Err(VerificationError::function(format!(
+                    "structural layout {} has non-dense id {:?}", index, layout.id
+                )));
+            }
+            let (expected_kind, fields) = match &layout.contract {
+                Type::Interface(fields) => (StructuralLayoutKind::Interface, fields),
+                Type::Record(fields) => (StructuralLayoutKind::Record, fields),
+                other => {
+                    return Err(VerificationError::function(format!(
+                        "structural layout {:?} has non-structural contract {:?}", layout.id, other
+                    )));
+                }
+            };
+            if layout.kind != expected_kind || layout.properties.len() != fields.len() {
+                return Err(VerificationError::function(format!(
+                    "structural layout {:?} does not match its canonical contract", layout.id
+                )));
+            }
+            for (slot, (property, field)) in layout.properties.iter().zip(fields).enumerate() {
+                if property.slot.0 as usize != slot
+                    || program.metadata.string(property.name) != Some(field.name.as_str())
+                    || property.ty != field.ty
+                    || property.optional != field.optional
+                    || property.readonly != field.readonly
+                {
+                    return Err(VerificationError::function(format!(
+                        "structural layout {:?} property {} disagrees with its contract",
+                        layout.id, slot
+                    )));
+                }
+                Self::verify_type(program, &property.ty)?;
+            }
+        }
+
         let mut foreign_ids = HashSet::new();
         for foreign in &program.metadata.foreign_functions {
             if !foreign_ids.insert(foreign.id) {
@@ -2581,6 +2654,20 @@ impl BytecodeVerifier {
             }
             for guard in &function.chunk.type_guards {
                 Self::verify_type(program, &guard.expected)?;
+                if let Some(layout) = guard.layout {
+                    let metadata = program.metadata.structural_layout(layout).ok_or_else(|| {
+                        VerificationError::function(format!(
+                            "function {:?} type guard references unknown structural layout {:?}",
+                            function.id, layout
+                        ))
+                    })?;
+                    if metadata.contract != guard.expected {
+                        return Err(VerificationError::function(format!(
+                            "function {:?} type guard layout {:?} does not match {:?}",
+                            function.id, layout, guard.expected
+                        )));
+                    }
+                }
             }
             for guard in &function.chunk.class_guards {
                 Self::verify_class_set(program, &guard.expected)?;
@@ -2642,6 +2729,27 @@ impl BytecodeVerifier {
                 })?;
 
                 match inst.opcode {
+                    Opcode::LoadProperty | Opcode::StoreProperty => {
+                        let layout_id = StructuralLayoutId(inst.extension(0).unwrap());
+                        let logical = PropertySlotId(inst.extension(1).unwrap() as u16);
+                        let layout = program.metadata.structural_layout(layout_id).ok_or_else(|| {
+                            VerificationError::at(
+                                inst.pc,
+                                format!("property access references unknown structural layout {:?}", layout_id),
+                            )
+                        })?;
+                        if inst.extension(1).unwrap() > u16::MAX as u32
+                            || layout.property(logical).is_none()
+                        {
+                            return Err(VerificationError::at(
+                                inst.pc,
+                                format!(
+                                    "property access references invalid logical slot {} in {:?}",
+                                    inst.extension(1).unwrap(), layout_id
+                                ),
+                            ));
+                        }
+                    }
                     Opcode::InvokeSpread => {
                         let method = MethodSymbol(inst.extension(0).unwrap());
                         if program.metadata.method(method).is_none() {
@@ -3469,12 +3577,12 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, b)?;
             }
             ListSpread | DestructureGet | DestructureRest | InvokeSpread
-            | ListGet | ListRemoveAt | MapGet | MapRemove | StringCodePointAt => {
+            | ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
             }
-            ListSet | ListInsert | MapSet => {
+            ListSet | ListInsert | MapSet | StoreProperty => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
@@ -3660,8 +3768,8 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         MakeClosure => [General, SmallImmediate, SmallImmediate],
         AllocList | AllocMap => [General, None, None],
         AllocListCap | ListLen | MapLen | StringLen => [General, General, None],
-        ListGet | ListRemoveAt | MapGet | MapRemove | StringCodePointAt => [General, General, General],
-        ListSet | ListInsert | MapSet => [General, General, General],
+        ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => [General, General, General],
+        ListSet | ListInsert | MapSet | StoreProperty => [General, General, General],
         ListAppend => [General, General, None],
         StringConcat | StringSlice | MakeRange => [General, General, General],
         INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => [General, General, None],
