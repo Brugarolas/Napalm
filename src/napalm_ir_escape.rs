@@ -1524,13 +1524,10 @@ impl<'a> Rewriter<'a> {
 }
 
 fn join_types(left: &Type, right: &Type) -> Type {
-    match (left, right) {
-        (Type::Bottom, other) | (other, Type::Bottom) => other.clone(),
-        _ if left == right => left.clone(),
-        _ if left.accepts(right) => left.clone(),
-        _ if right.accepts(left) => right.clone(),
-        _ => Type::Top,
-    }
+    // Keep the same semantic lattice as the rest of WIR. In particular, SROA
+    // phis may preserve a bounded class set, typed list element or structural
+    // contract instead of immediately collapsing the scalar field to `any`.
+    left.flow_join(right)
 }
 
 fn for_each_edge_mut(kind: &mut Inst, mut f: impl FnMut(&mut Edge)) {

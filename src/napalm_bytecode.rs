@@ -2370,6 +2370,12 @@ impl BytecodeVerifier {
     fn verify_type(program: &BytecodeProgram, ty: &Type) -> Result<(), VerificationError> {
         match ty {
             Type::List(Some(element)) | Type::Cell(element) => Self::verify_type(program, element),
+            Type::Interface(fields) | Type::Record(fields) => {
+                for field in fields {
+                    Self::verify_type(program, &field.ty)?;
+                }
+                Ok(())
+            }
             Type::Class(classes) | Type::Instance(classes) => Self::verify_class_set(program, classes),
             Type::Closure(Some(function)) => {
                 if program.function(*function).is_none() {
@@ -2460,6 +2466,29 @@ impl BytecodeVerifier {
                         class.id, superclass
                     )));
                 }
+            }
+            if class.own_instance_field_types.len() != class.own_instance_field_count as usize {
+                return Err(VerificationError::function(format!(
+                    "class {:?} has {} instance field types for {} slots",
+                    class.id,
+                    class.own_instance_field_types.len(),
+                    class.own_instance_field_count
+                )));
+            }
+            if class.static_field_types.len() != class.static_field_count as usize {
+                return Err(VerificationError::function(format!(
+                    "class {:?} has {} static field types for {} slots",
+                    class.id,
+                    class.static_field_types.len(),
+                    class.static_field_count
+                )));
+            }
+            for ty in class
+                .own_instance_field_types
+                .iter()
+                .chain(class.static_field_types.iter())
+            {
+                Self::verify_type(program, ty)?;
             }
         }
 

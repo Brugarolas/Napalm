@@ -7,7 +7,7 @@
 
 use hashbrown::{HashMap, HashSet};
 use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_NAPALM_ARITY};
-use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId};
+use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId, Type};
 
 macro_rules! id {
     ($($name:ident),*) => {$(
@@ -491,6 +491,9 @@ impl Trace {
 #[derive(Clone)]
 pub struct TraceBuilder {
     trace: Trace, source: TraceLocation, slots: HashMap<FrameSlot, TraceValueId>,
+    /// Recorder-only semantic proofs. They intentionally stay out of TraceValue
+    /// so optimizer submodules do not need to know about source-level typing.
+    proven_types: HashMap<TraceValueId, Type>,
     /// Ordered dirty slots for deterministic snapshots plus O(1) membership for
     /// the recorder's very hot write/reload paths.
     dirty: Vec<FrameSlot>, dirty_set: HashSet<FrameSlot>, memory_epoch: bool,
@@ -499,7 +502,7 @@ impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
-            slots: HashMap::new(), dirty: vec![], dirty_set: HashSet::new(), memory_epoch: false }
+            slots: HashMap::new(), proven_types: HashMap::new(), dirty: vec![], dirty_set: HashSet::new(), memory_epoch: false }
     }
     /// Reserve the arenas used by one bounded recording up front. Tracing is hot
     /// enough that repeated Vec/HashMap growth is measurable, while the reservation
@@ -511,6 +514,7 @@ impl TraceBuilder {
         self.trace.exits.reserve((steps / 8).max(8));
         self.trace.preheader.reserve((steps / 16).max(8));
         self.slots.reserve(64);
+        self.proven_types.reserve(64);
         self.dirty.reserve(64);
         self.dirty_set.reserve(64);
     }
@@ -520,8 +524,28 @@ impl TraceBuilder {
     pub fn slot_value(&self, slot: FrameSlot) -> Option<TraceValueId> { self.slots.get(&slot).copied() }
     fn value(&mut self, ty: TraceType, rep: TraceRep, origin: TraceValueOrigin) -> TraceValueId {
         let id = TraceValueId(self.trace.values.len() as u32);
-        self.trace.values.push(TraceValue { id, ty, rep, origin }); id
+        self.trace.values.push(TraceValue { id, ty, rep, origin });
+        let proven = match ty {
+            TraceType::Null => Some(Type::Null),
+            TraceType::Bool => Some(Type::Bool),
+            TraceType::Num => Some(Type::Num),
+            _ => None,
+        };
+        if let Some(proven) = proven {
+            self.proven_types.insert(id, proven);
+        }
+        id
     }
+    pub fn set_proven_type(&mut self, value: TraceValueId, ty: Type) {
+        let value = self.trace.canonical_value(value);
+        self.proven_types.insert(value, ty);
+    }
+
+    pub fn proven_type(&self, value: TraceValueId) -> Option<&Type> {
+        let value = self.trace.canonical_value(value);
+        self.proven_types.get(&value)
+    }
+
     pub fn constant(&mut self, c: TraceConstant) -> TraceValueId {
         let (ty, rep) = c.layout(); self.value(ty, rep, TraceValueOrigin::Constant(c))
     }

@@ -1270,6 +1270,7 @@ fn type_may_reference(ty: &Type) -> bool {
         | Type::List(_)
         | Type::Map
         | Type::Interface(_)
+        | Type::Record(_)
         | Type::Range
         | Type::Class(_)
         | Type::Instance(_)

@@ -964,10 +964,17 @@ fn scan_interpolation_tail(bytes: &[u8], depth: usize) -> Result<usize, LexError
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleAst {
     pub interfaces: Vec<InterfaceDecl>,
+    pub type_aliases: Vec<TypeAliasDecl>,
     /// None for legacy fixtures; Napalm exports are explicit (local, public).
     pub exports: Option<Vec<(Ident, Ident)>>,
     pub statements: Vec<Stmt>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeAliasDecl {
+    pub name: Ident,
+    pub annotation: TypeAnnotation,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1101,7 +1108,18 @@ pub struct ClassDecl {
     pub superclass: Option<Expr>,
     pub is_foreign: bool,
     pub attributes: Vec<Attribute>,
+    /// Source-declared fixed-layout fields retained for runtime type invariants.
+    pub fields: Vec<ClassFieldDecl>,
     pub methods: Vec<MethodDecl>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassFieldDecl {
+    /// Internal storage name (`_x` for instance fields, `__x` for static fields).
+    pub storage: Ident,
+    pub annotation: Option<TypeAnnotation>,
+    pub initializer: Option<Expr>,
+    pub is_static: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1724,6 +1742,7 @@ impl<'a> Parser<'a> {
 
         ModuleAst {
             interfaces: Vec::new(),
+            type_aliases: Vec::new(),
             exports: None,
             statements,
             span: Span::new(start, self.peek().span.end),
@@ -1908,6 +1927,7 @@ impl<'a> Parser<'a> {
                 superclass,
                 is_foreign,
                 attributes,
+                fields: Vec::new(),
                 methods,
             }),
             span: Span::new(start, close.span.end),

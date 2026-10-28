@@ -53,7 +53,7 @@ impl Heap {
                 }
                 true
             }
-            Type::Interface(fields) => {
+            Type::Interface(fields) | Type::Record(fields) => {
                 let Some(HeapObject::Map(map)) = self.get(value) else {
                     return Err(mismatch(path, expected));
                 };
@@ -75,6 +75,32 @@ impl Heap {
                         }
                     }
                 }
+
+                if matches!(expected, Type::Record(_)) {
+                    for index in 0..map.len() {
+                        let Some(key) = map.nth_key(&self.map_shapes, index) else {
+                            continue;
+                        };
+                        let declared = match &key {
+                            MapKey::String(key) => fields
+                                .iter()
+                                .any(|field| field.name.as_bytes() == key.as_ref()),
+                            _ => false,
+                        };
+                        if !declared {
+                            let property = match key {
+                                MapKey::String(key) => {
+                                    String::from_utf8_lossy(key.as_ref()).into_owned()
+                                }
+                                _ => "<non-string key>".to_owned(),
+                            };
+                            return Err(RuntimeError::new(format!(
+                                "{TYPE_ERROR}property '{property}' is not declared by the closed type"
+                            )));
+                        }
+                    }
+                }
+
                 plan.push((value, expected.clone()));
                 true
             }
@@ -99,20 +125,55 @@ impl Heap {
 
     fn install_contracts(&mut self, plan: Vec<(Value, Type)>) {
         for (value, ty) in plan {
+            let Some(object) = self.object(value) else {
+                continue;
+            };
+            let (handle, shape, already_installed) = {
+                let managed = unsafe { managed_object(object) };
+                let installed = managed
+                    .contracts
+                    .as_ref()
+                    .is_some_and(|contracts| contracts.contains(&ty));
+                let shape = match &managed.object {
+                    HeapObject::Map(map) => map.shaped().map(|(shape, _)| shape),
+                    _ => None,
+                };
+                (managed.handle, shape, installed)
+            };
+            if already_installed {
+                continue;
+            }
+
+            // Keep the distinction between "not a shaped map" and "typed shape
+            // allocation failed". The latter must invalidate already-compiled
+            // shaped traces, so it falls back to dictionary representation.
+            let typed_shape = shape.map(|shape| self.map_shapes.apply_contract(shape, &ty));
             let object = self.object(value).expect("validated contract owner");
             let managed = unsafe { managed_object_mut(object) };
-            let contracts = managed
+            managed
                 .contracts
-                .get_or_insert_with(|| Box::new(Vec::new()));
-            if !contracts.contains(&ty) {
-                contracts.push(ty);
-                // This stable sidecar invalidates stores in traces compiled
-                // before an alias acquired its first contract. Reads stay native.
-                handles()
-                    .entry(managed.handle)
-                    .has_contract
-                    .store(1, Ordering::Relaxed);
+                .get_or_insert_with(|| Box::new(Vec::new()))
+                .push(ty);
+            if let HeapObject::Map(map) = &mut managed.object {
+                match typed_shape {
+                    Some(Some(typed_shape)) => {
+                        if let NapalmMapStorage::Shaped { shape, .. } = &mut map.storage {
+                            *shape = typed_shape;
+                        }
+                    }
+                    Some(None) => map.promote_to_dictionary(&self.map_shapes),
+                    None => {}
+                }
             }
+
+            // Contract installation changes both write validity and, for maps,
+            // the shape id carrying immutable slot type facts. Publish both to
+            // already-compiled/native tracing code before returning.
+            handles()
+                .entry(handle)
+                .has_contract
+                .store(1, Ordering::Relaxed);
+            self.handle_table.refresh(handle, &managed.object);
         }
     }
 
@@ -127,6 +188,37 @@ impl Heap {
         Ok(())
     }
 
+    pub(super) fn check_shaped_map_write(
+        &mut self,
+        shape: u32,
+        slot: u16,
+        key: &MapStringKey,
+        item: Value,
+    ) -> Result<bool, RuntimeError> {
+        let contract = self.map_shapes.slot_contract(shape, slot).clone();
+        if contract.write_runtime_checked {
+            return Ok(false);
+        }
+        if contract.readonly {
+            let property = String::from_utf8_lossy(key.as_ref());
+            return Err(RuntimeError::new(format!(
+                "{TYPE_ERROR}field '{property}' is readonly"
+            )));
+        }
+        let Some(expected) = contract.write_type else {
+            // No write type means this is either an untyped/open property or a
+            // declared `any` slot. The shape itself is enough proof that this is
+            // an update rather than a closed-record property addition.
+            return Ok(true);
+        };
+
+        let property = String::from_utf8_lossy(key.as_ref());
+        let mut plan = Vec::new();
+        self.plan_contract(item, &expected, &property, &mut plan)?;
+        self.install_contracts(plan);
+        Ok(true)
+    }
+
     pub(super) fn check_map_write(
         &mut self,
         owner: Value,
@@ -136,23 +228,39 @@ impl Heap {
         let Some(object) = self.object(owner) else {
             return Ok(());
         };
-        let mut plan = Vec::new();
-        let Some(contracts) = &unsafe { managed_object(object) }.contracts else {
+        let existing = key.and_then(|key| {
+            match &unsafe { managed_object(object) }.object {
+                HeapObject::Map(map) => map.get(&self.map_shapes, key),
+                _ => None,
+            }
+        });
+        let contracts = unsafe { managed_object(object) }
+            .contracts
+            .as_ref()
+            .map(|contracts| contracts.as_ref().clone())
+            .unwrap_or_default();
+        if contracts.is_empty() {
             return Ok(());
-        };
-        for contract in contracts.iter() {
-            let Type::Interface(fields) = contract else {
-                continue;
+        }
+
+        let mut plan = Vec::new();
+        for contract in &contracts {
+            let (fields, closed) = match contract {
+                Type::Interface(fields) => (fields, false),
+                Type::Record(fields) => (fields, true),
+                _ => continue,
             };
+            let mut matched = false;
             for field in fields {
                 let applies = match key {
-                    None => true, // clear
+                    None => true,
                     Some(MapKey::String(k)) => k.as_ref() == field.name.as_bytes(),
                     _ => false,
                 };
                 if !applies {
                     continue;
                 }
+                matched = true;
                 if field.readonly {
                     return Err(RuntimeError::new(format!(
                         "{TYPE_ERROR}field '{}' is readonly",
@@ -167,6 +275,16 @@ impl Heap {
                         field.name
                     )));
                 }
+            }
+
+            if closed && key.is_some() && !matched && existing.is_none() && item.is_some() {
+                let property = match key {
+                    Some(MapKey::String(key)) => String::from_utf8_lossy(key.as_ref()).into_owned(),
+                    _ => "<non-string key>".to_owned(),
+                };
+                return Err(RuntimeError::new(format!(
+                    "{TYPE_ERROR}cannot add property '{property}' to a closed type"
+                )));
             }
         }
         self.install_contracts(plan);

@@ -126,7 +126,12 @@ pub enum Type {
     // Napalm-visible heap/runtime types.
     List(Option<Box<Type>>),
     Map,
+    /// Open structural object contract declared with `interface`.
     Interface(Vec<InterfaceFieldType>),
+    /// Closed structural object contract declared with `type X = { ... }`.
+    /// Existing fields remain mutable subject to their declared types, but new
+    /// properties may not be added after the contract is installed.
+    Record(Vec<InterfaceFieldType>),
     Range,
     Class(ClassSet),
     Instance(ClassSet),
@@ -167,6 +172,7 @@ impl Type {
                 | Type::List(_)
                 | Type::Map
                 | Type::Interface(_)
+                | Type::Record(_)
                 | Type::Range
                 | Type::Class(_)
                 | Type::Instance(_)
@@ -197,13 +203,116 @@ impl Type {
                             .all(|class| expected.contains(*class)))
             }
             (Num, Int32 | F64) => true,
-            (Map, Interface(_)) => true,
+            (Map, Interface(_) | Record(_)) => true,
             (Foreign(None), Foreign(_)) => true,
             (Closure(None), Closure(_)) => true,
             (List(None), List(_)) => true,
             (List(Some(expected)), List(Some(actual))) => expected.accepts(actual),
             _ => false,
         }
+    }
+
+    /// Least common semantic supertype used when SSA control-flow merges values.
+    ///
+    /// This deliberately preserves exact structural contracts only when both
+    /// incoming values carry the same contract. Different `interface`/`type`
+    /// contracts remain a union rather than being collapsed to a fabricated
+    /// structural contract, because runtime structural guards validate installed
+    /// contracts, not merely a coincidentally matching object shape.
+    pub fn flow_join(&self, other: &Type) -> Type {
+        use Type::*;
+
+        if self == other {
+            return self.clone();
+        }
+        if matches!(self, Bottom) {
+            return other.clone();
+        }
+        if matches!(other, Bottom) {
+            return self.clone();
+        }
+        if matches!(self, Top) || matches!(other, Top) {
+            return Top;
+        }
+        // Lists are mutable and each concrete list may carry a persistent element
+        // contract. Joining two different element contracts into a wider typed
+        // List would incorrectly authorize stores that are valid for only one
+        // predecessor. Keep element typing only when the contracts are identical.
+        if matches!((self, other), (List(_), List(_))) {
+            return List(None);
+        }
+        if self.accepts(other) {
+            return self.clone();
+        }
+        if other.accepts(self) {
+            return other.clone();
+        }
+
+        match (self, other) {
+            (Int32, F64) | (F64, Int32) => Num,
+            (Instance(lhs), Instance(rhs)) => Instance(ClassSet::from_iter(
+                lhs.as_slice().iter().chain(rhs.as_slice()).copied(),
+            )),
+            (Class(lhs), Class(rhs)) => Class(ClassSet::from_iter(
+                lhs.as_slice().iter().chain(rhs.as_slice()).copied(),
+            )),
+            (Closure(_), Closure(_)) => Closure(None),
+            (Foreign(_), Foreign(_)) => Foreign(None),
+            _ => normalize_flow_union([self.clone(), other.clone()]),
+        }
+    }
+
+    /// Join a sequence of control-flow values without growing unions without
+    /// bound. Eight alternatives are enough to preserve useful polymorphism for
+    /// PIC/class specialization while keeping verifier and optimizer costs tiny.
+    pub fn flow_join_many(types: impl IntoIterator<Item = Type>) -> Type {
+        let mut iter = types.into_iter();
+        let Some(first) = iter.next() else {
+            return Type::Bottom;
+        };
+        iter.fold(first, |joined, ty| joined.flow_join(&ty))
+    }
+}
+
+fn normalize_flow_union(types: impl IntoIterator<Item = Type>) -> Type {
+    const MAX_FLOW_UNION: usize = 8;
+
+    fn push(out: &mut Vec<Type>, ty: Type) -> bool {
+        match ty {
+            Type::Bottom => true,
+            Type::Top => false,
+            Type::Union(types) => {
+                for ty in types {
+                    if !push(out, ty) {
+                        return false;
+                    }
+                }
+                true
+            }
+            ty => {
+                // If an existing alternative already accepts this one, the new
+                // alternative adds no information. Conversely, a broader new
+                // alternative subsumes narrower entries already accumulated.
+                if out.iter().any(|existing| existing.accepts(&ty)) {
+                    return true;
+                }
+                out.retain(|existing| !ty.accepts(existing));
+                out.push(ty);
+                out.len() <= MAX_FLOW_UNION
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for ty in types {
+        if !push(&mut out, ty) {
+            return Type::Top;
+        }
+    }
+    match out.len() {
+        0 => Type::Bottom,
+        1 => out.pop().unwrap(),
+        _ => Type::Union(out),
     }
 }
 
@@ -221,6 +330,7 @@ impl fmt::Debug for Type {
             List(Some(ty)) => write!(f, "List<{ty:?}>") ,
             Map => write!(f, "Map"),
             Interface(fields) => write!(f, "Interface{fields:?}"),
+            Record(fields) => write!(f, "Record{fields:?}"),
             Range => write!(f, "Range"),
             Class(classes) => write!(f, "Class<{classes:?}>") ,
             Instance(classes) => write!(f, "Instance<{classes:?}>") ,
@@ -389,9 +499,14 @@ pub struct ClassInfo {
     /// by the inherited field count exactly once, after the actual superclass is
     /// known. Hot execution therefore sees absolute fixed-layout field offsets.
     pub own_instance_field_count: u16,
+    /// Source-visible type guarantees for fields declared directly by this class.
+    /// `Type::Top` represents `any`/untyped fields and intentionally contributes
+    /// no specialization fact to the interpreter or JIT.
+    pub own_instance_field_types: Vec<Type>,
     /// Static storage slots owned by this class. Static fields are not folded
     /// into the inherited instance layout.
     pub static_field_count: u16,
+    pub static_field_types: Vec<Type>,
     pub is_foreign: bool,
 }
 
@@ -2027,7 +2142,9 @@ impl Program {
             name: self.intern_string(name),
             superclass,
             own_instance_field_count,
+            own_instance_field_types: vec![Type::Top; own_instance_field_count as usize],
             static_field_count,
+            static_field_types: vec![Type::Top; static_field_count as usize],
             is_foreign,
         };
         let index = self.classes.len();

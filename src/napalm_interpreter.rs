@@ -1070,13 +1070,53 @@ const MAX_SHAPED_MAP_SLOTS: usize = 16;
 const MAX_SHAPED_MAP_KEY_BYTES: usize = 64;
 const MAX_MAP_SHAPES: usize = 1 << 15;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ShapeSlotContract {
+    /// A type guaranteed by every contract currently represented by this shape.
+    /// `None` deliberately includes source-level `any`.
+    read_type: Option<Type>,
+    /// Type sufficient for a native write when `write_runtime_checked` is false.
+    write_type: Option<Type>,
+    readonly: bool,
+    /// Multiple incompatible structural contracts require the ordinary runtime
+    /// checker for writes, although reads may still use `read_type`.
+    write_runtime_checked: bool,
+}
+
+impl ShapeSlotContract {
+    fn merge_type(&mut self, ty: &Type, readonly: bool) {
+        self.readonly |= readonly;
+        if matches!(ty, Type::Top) {
+            return;
+        }
+        self.read_type = match self.read_type.take() {
+            None => Some(ty.clone()),
+            Some(old) if old.accepts(ty) => Some(ty.clone()),
+            Some(old) if ty.accepts(&old) => Some(old),
+            Some(old) => Some(old),
+        };
+        self.write_type = match self.write_type.take() {
+            None => Some(ty.clone()),
+            Some(old) if old.accepts(ty) => Some(ty.clone()),
+            Some(old) if ty.accepts(&old) => Some(old),
+            Some(old) => {
+                self.write_runtime_checked = true;
+                Some(old)
+            }
+        };
+    }
+}
+
 #[derive(Debug)]
 struct MapShape {
     /// Property order is also the physical value-slot order. Keep the prehashed
     /// key so PIC probes can reject unequal strings before comparing bytes.
     keys: Box<[MapStringKey]>,
+    /// Slot contracts are immutable after shape publication and therefore safe
+    /// facts for interpreter PICs and compiled traces.
+    slots: Box<[ShapeSlotContract]>,
     /// Shared hidden-class transitions. Only string keys participate.
-    transitions: FastMap<MapStringKey, u32>,
+    transitions: FastMap<(MapStringKey, ShapeSlotContract), u32>,
 }
 
 impl MapShape {
@@ -1100,6 +1140,7 @@ impl MapShape {
 #[derive(Debug)]
 struct MapShapeTable {
     shapes: Vec<MapShape>,
+    typed_variants: FastMap<(u32, Type), u32>,
 }
 
 impl Default for MapShapeTable {
@@ -1107,8 +1148,10 @@ impl Default for MapShapeTable {
         Self {
             shapes: vec![MapShape {
                 keys: Vec::<MapStringKey>::new().into_boxed_slice(),
+                slots: Vec::<ShapeSlotContract>::new().into_boxed_slice(),
                 transitions: FastMap::default(),
             }],
+            typed_variants: FastMap::default(),
         }
     }
 }
@@ -1129,6 +1172,14 @@ impl MapShapeTable {
     }
 
     #[inline(always)]
+    fn slot_contract(&self, shape: u32, slot: u16) -> &ShapeSlotContract {
+        debug_assert!((shape as usize) < self.shapes.len());
+        let slots = &unsafe { self.shapes.get_unchecked(shape as usize) }.slots;
+        debug_assert!((slot as usize) < slots.len());
+        unsafe { slots.get_unchecked(slot as usize) }
+    }
+
+    #[inline(always)]
     fn keys(&self, shape: u32) -> &[MapStringKey] {
         debug_assert!((shape as usize) < self.shapes.len());
         &unsafe { self.shapes.get_unchecked(shape as usize) }.keys
@@ -1136,6 +1187,15 @@ impl MapShapeTable {
 
     /// Return the shared child shape and the slot introduced by `key`.
     fn transition(&mut self, shape: u32, key: MapStringKey) -> Option<(u32, u16)> {
+        self.transition_with_contract(shape, key, ShapeSlotContract::default())
+    }
+
+    fn transition_with_contract(
+        &mut self,
+        shape: u32,
+        key: MapStringKey,
+        contract: ShapeSlotContract,
+    ) -> Option<(u32, u16)> {
         let parent_index = shape as usize;
         debug_assert!(parent_index < self.shapes.len());
         if let Some(slot) = unsafe { self.shapes.get_unchecked(parent_index) }
@@ -1150,21 +1210,70 @@ impl MapShapeTable {
         {
             return None;
         }
-        if let Some(&child) = unsafe { self.shapes.get_unchecked(parent_index) }.transitions.get(&key) {
+
+        // The parent shape already captures every fact about existing slots. The
+        // new slot contract is therefore the only additional transition identity.
+        // Caching `(key, contract)` keeps typed optional-field growth shared across
+        // objects while never aliasing it with an untyped/open-property child.
+        let transition_key = (key.clone(), contract.clone());
+        if let Some(&child) = unsafe { self.shapes.get_unchecked(parent_index) }
+            .transitions
+            .get(&transition_key)
+        {
             return Some((child, slot as u16));
         }
 
-        let mut keys = unsafe { self.shapes.get_unchecked(parent_index) }.keys.to_vec();
-        keys.push(key.clone());
+        let parent = unsafe { self.shapes.get_unchecked(parent_index) };
+        let mut keys = parent.keys.to_vec();
+        let mut slots = parent.slots.to_vec();
+        keys.push(key);
+        slots.push(contract);
         let child = self.shapes.len() as u32;
         self.shapes.push(MapShape {
             keys: keys.into_boxed_slice(),
+            slots: slots.into_boxed_slice(),
             transitions: FastMap::default(),
         });
-        self.shapes[parent_index].transitions.insert(key, child);
+        self.shapes[parent_index]
+            .transitions
+            .insert(transition_key, child);
         Some((child, slot as u16))
     }
+
+    fn apply_contract(&mut self, shape: u32, contract: &Type) -> Option<u32> {
+        let fields = match contract {
+            Type::Interface(fields) | Type::Record(fields) => fields,
+            _ => return Some(shape),
+        };
+        if fields.iter().all(|field| matches!(field.ty, Type::Top) && !field.readonly) {
+            return Some(shape);
+        }
+        let cache_key = (shape, contract.clone());
+        if let Some(&typed) = self.typed_variants.get(&cache_key) {
+            return Some(typed);
+        }
+        if self.shapes.len() >= MAX_MAP_SHAPES {
+            return None;
+        }
+        let parent = self.shapes.get(shape as usize)?;
+        let keys = parent.keys.clone();
+        let mut slots = parent.slots.to_vec();
+        for (slot, key) in keys.iter().enumerate() {
+            if let Some(field) = fields.iter().find(|field| field.name.as_bytes() == key.as_ref()) {
+                slots[slot].merge_type(&field.ty, field.readonly);
+            }
+        }
+        let typed = self.shapes.len() as u32;
+        self.shapes.push(MapShape {
+            keys,
+            slots: slots.into_boxed_slice(),
+            transitions: FastMap::default(),
+        });
+        self.typed_variants.insert(cache_key, typed);
+        Some(typed)
+    }
 }
+
 
 #[derive(Debug)]
 enum NapalmMapStorage {
@@ -2401,6 +2510,26 @@ impl Heap {
         Ok(map.get(&self.map_shapes, &key).unwrap_or(Value::NULL))
     }
 
+    fn map_slot_contract(&self, owner: Value, key: &[u8]) -> ShapeSlotContract {
+        let Some(object) = self.object(owner) else {
+            return ShapeSlotContract::default();
+        };
+        let Some(contracts) = &unsafe { managed_object(object) }.contracts else {
+            return ShapeSlotContract::default();
+        };
+        let mut result = ShapeSlotContract::default();
+        for contract in contracts.iter() {
+            let fields = match contract {
+                Type::Interface(fields) | Type::Record(fields) => fields,
+                _ => continue,
+            };
+            if let Some(field) = fields.iter().find(|field| field.name.as_bytes() == key) {
+                result.merge_type(&field.ty, field.readonly);
+            }
+        }
+        result
+    }
+
     /// Insert/update a map entry. The boolean reports a structural mutation
     /// (shape/length/backing representation change) requiring sidecar refresh.
     fn map_set_encoded(
@@ -2410,7 +2539,30 @@ impl Heap {
         item: Value,
         mut cache: Option<&mut MapInlineCacheState>,
     ) -> Result<bool, RuntimeError> {
-        self.check_map_write(map_value, Some(&key), Some(item))?;
+        let existing_shaped_slot = match &key {
+            MapKey::String(bytes) => self.object(map_value).and_then(|object| {
+                let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
+                    return None;
+                };
+                let (shape, _) = map.shaped()?;
+                self.map_shapes
+                    .slot_hashed(shape, bytes.hash, bytes.as_ref())
+                    .map(|slot| (shape, slot, bytes.clone()))
+            }),
+            _ => None,
+        };
+        let shaped_write_checked = if let Some((shape, slot, key)) = existing_shaped_slot {
+            self.check_shaped_map_write(shape, slot, &key, item)?
+        } else {
+            false
+        };
+        if !shaped_write_checked && self.has_contract(map_value) {
+            self.check_map_write(map_value, Some(&key), Some(item))?;
+        }
+        let new_slot_contract = match &key {
+            MapKey::String(bytes) => self.map_slot_contract(map_value, bytes.as_ref()),
+            _ => ShapeSlotContract::default(),
+        };
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -2438,7 +2590,11 @@ impl Heap {
                     return Ok(false);
                 }
 
-                if let Some((next_shape, slot)) = self.map_shapes.transition(*shape, bytes.clone()) {
+                if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
+                    *shape,
+                    bytes.clone(),
+                    new_slot_contract.clone(),
+                ) {
                     debug_assert_eq!(slot as usize, values.len());
                     values.push(item);
                     *shape = next_shape;
@@ -2467,10 +2623,6 @@ impl Heap {
         item: Value,
         cache: &mut MapInlineCacheState,
     ) -> Result<bool, RuntimeError> {
-        if self.has_contract(map_value) {
-            let contract_key = self.map_key(key_value)?;
-            self.check_map_write(map_value, Some(&contract_key), Some(item))?;
-        }
         // Classify the key before taking a mutable view of the map. For shaped
         // string properties keep only a raw pointer to the immutable string so a
         // PIC hit does not clone Arc<[u8]> or build/hash a temporary MapKey.
@@ -2504,6 +2656,39 @@ impl Heap {
             return Err(RuntimeError::new("value cannot be used as a map key"));
         };
 
+        let existing_shaped_slot = string_key.and_then(|string_key| {
+            let bytes = unsafe { &*string_key };
+            self.object(map_value).and_then(|object| {
+                let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
+                    return None;
+                };
+                let (shape, _) = map.shaped()?;
+                self.map_shapes
+                    .slot_hashed(shape, bytes.hash, bytes.as_ref())
+                    .map(|slot| (shape, slot, MapStringKey::from_napalm(bytes)))
+            })
+        });
+        let shaped_write_checked = if let Some((shape, slot, key)) = existing_shaped_slot {
+            self.check_shaped_map_write(shape, slot, &key, item)?
+        } else {
+            false
+        };
+        if !shaped_write_checked && self.has_contract(map_value) {
+            let contract_key = if let Some(string_key) = string_key {
+                MapKey::String(MapStringKey::from_napalm(unsafe { &*string_key }))
+            } else {
+                encoded_key
+                    .clone()
+                    .expect("non-string Map key must already be encoded")
+            };
+            self.check_map_write(map_value, Some(&contract_key), Some(item))?;
+        }
+
+        let new_string_slot_contract = string_key.map(|string_key| {
+            let bytes = unsafe { &*string_key };
+            self.map_slot_contract(map_value, bytes.as_ref())
+        });
+
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -2529,7 +2714,11 @@ impl Heap {
                 }
 
                 let key = MapStringKey::from_napalm(bytes);
-                if let Some((next_shape, slot)) = self.map_shapes.transition(*shape, key) {
+                if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
+                    *shape,
+                    key,
+                    new_string_slot_contract.clone().unwrap_or_default(),
+                ) {
                     debug_assert_eq!(slot as usize, values.len());
                     values.push(item);
                     *shape = next_shape;
@@ -4460,10 +4649,12 @@ struct RuntimeClass {
     superclass: Option<u32>,
     /// Fields declared directly by this class.
     own_instance_field_count: u16,
+    own_instance_field_types: Vec<Type>,
     /// First absolute field slot owned by this class.
     field_base: u16,
     /// Complete fixed instance layout after superclass fields are copied down.
     total_instance_field_count: u16,
+    instance_field_types: Vec<Type>,
     layout_finalized: bool,
     is_foreign: bool,
     /// Dense MethodSymbol-indexed tables. MethodSymbol is interned densely,
@@ -4471,6 +4662,7 @@ struct RuntimeClass {
     instance_methods: Vec<Option<CallTarget>>,
     static_methods: Vec<Option<CallTarget>>,
     static_fields: Vec<Value>,
+    static_field_types: Vec<Type>,
     class_value: Value,
 }
 
@@ -4882,13 +5074,16 @@ impl<'p> Interpreter<'p> {
                 // only after the superclass object has actually been created.
                 superclass: None,
                 own_instance_field_count: info.own_instance_field_count,
+                own_instance_field_types: info.own_instance_field_types.clone(),
                 field_base: 0,
                 total_instance_field_count: info.own_instance_field_count,
+                instance_field_types: info.own_instance_field_types.clone(),
                 layout_finalized: false,
                 is_foreign: info.is_foreign,
                 instance_methods: vec![None; program.metadata.methods.len()],
                 static_methods: vec![None; program.metadata.methods.len()],
                 static_fields: vec![Value::NULL; info.static_field_count as usize],
+                static_field_types: info.static_field_types.clone(),
                 class_value,
             });
         }
@@ -7354,7 +7549,7 @@ impl Interpreter<'_> {
             return Ok(());
         }
 
-        let (field_base, inherited_instance_methods) =
+        let (field_base, inherited_instance_methods, inherited_field_types) =
             if let Some(super_slot) = superclass {
                 let super_class = self
                     .classes
@@ -7375,9 +7570,10 @@ impl Interpreter<'_> {
                 (
                     super_class.total_instance_field_count,
                     Some(super_class.instance_methods.clone()),
+                    super_class.instance_field_types.clone(),
                 )
             } else {
-                (0, None)
+                (0, None, Vec::new())
             };
 
         let own = self.classes[class_index].own_instance_field_count;
@@ -7390,6 +7586,9 @@ impl Interpreter<'_> {
             class.superclass = superclass;
             class.field_base = field_base;
             class.total_instance_field_count = total;
+            let mut field_types = inherited_field_types;
+            field_types.extend(class.own_instance_field_types.iter().cloned());
+            class.instance_field_types = field_types;
             if let Some(methods) = inherited_instance_methods {
                 class.instance_methods = methods;
             }
@@ -8567,7 +8766,7 @@ impl Interpreter<'_> {
             Type::Num => Value::from_word(word).is_num(),
             Type::String => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::String(_))),
             Type::List(_) => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::List(_))),
-            Type::Interface(_) => self.heap.interface_matches(Value::from_word(word), expected),
+            Type::Interface(_) | Type::Record(_) => self.heap.interface_matches(Value::from_word(word), expected),
             Type::Map => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Map(_))),
             Type::Range => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Range { .. })),
             Type::Closure(function) => match self.heap.get(Value::from_word(word)) {
@@ -8584,6 +8783,38 @@ impl Interpreter<'_> {
                 _ => false,
             },
             Type::Union(types) => types.iter().any(|ty| self.type_matches(word, ty)),
+        }
+    }
+
+    fn enforce_runtime_type(
+        &mut self,
+        value: Value,
+        expected: &Type,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        fn needs_contract(ty: &Type) -> bool {
+            match ty {
+                Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => true,
+                Type::Union(types) => types.iter().any(needs_contract),
+                _ => false,
+            }
+        }
+
+        if matches!(expected, Type::Top) {
+            return Ok(());
+        }
+        if needs_contract(expected) {
+            self.heap.bind_contract(value, expected).map_err(|error| {
+                RuntimeError::new(format!("{context}: {}", error.message))
+            })?;
+            return Ok(());
+        }
+        if self.type_matches(value.word(), expected) {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(format!(
+                "{context}: expected {expected:?}"
+            )))
         }
     }
 
@@ -9822,15 +10053,23 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
 }
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
+    let (class_slot,index)=match vm.heap.get(obj){
+        Some(HeapObject::Instance{class_slot,fields})=>{
+            let index=op.x as usize;
+            debug_assert!(index < fields.len(), "verified StoreField slot is out of range");
+            (*class_slot,index)
+        }
+        _=>{vm.fail_at(op,"StoreField object is not an instance");return;}
+    };
+    let expected=vm.classes[class_slot as usize].instance_field_types.get(index).cloned().unwrap_or(Type::Top);
+    if let Err(error)=vm.enforce_runtime_type(value,&expected,"Class field type error"){vm.fail_at(op,error.message);return;}
     vm.heap.remember_if_reference(obj, value);
-    let Some(HeapObject::Instance{fields,..})=vm.heap.get_mut(obj) else {vm.fail_at(op,"StoreField object is not an instance");return;};
-    let index=op.x as usize;
-    debug_assert!(index < fields.len(), "verified StoreField slot is out of range");
+    let Some(HeapObject::Instance{fields,..})=vm.heap.get_mut(obj) else {std::hint::unreachable_unchecked()};
     *fields.get_unchecked_mut(index)=value;vm.advance(op)
 }
 unsafe fn h_load_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"LoadStaticField target is not class");return;}};match vm.classes[slot as usize].static_fields.get(op.x as usize).copied(){Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"static field slot out of range")}}
 unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"LoadStaticField target is not class");return;}};match vm.classes[slot as usize].static_fields.get(op.x as usize).copied(){Some(v)=>vm.return_from_frame(v.word(),None),None=>vm.fail_at(op,"static field slot out of range")}}
-unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"StoreStaticField target is not class");return;}};if let Some(field)=vm.classes[slot as usize].static_fields.get_mut(op.x as usize){*field=value;vm.advance(op)}else{vm.fail_at(op,"static field slot out of range")}}
+unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"StoreStaticField target is not class");return;}};let index=op.x as usize;let expected=vm.classes[slot as usize].static_field_types.get(index).cloned().unwrap_or(Type::Top);if let Err(error)=vm.enforce_runtime_type(value,&expected,"Class static field type error"){vm.fail_at(op,error.message);return;}if let Some(field)=vm.classes[slot as usize].static_fields.get_mut(index){*field=value;vm.advance(op)}else{vm.fail_at(op,"static field slot out of range")}}
 unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
 
 unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -10476,6 +10715,19 @@ impl TraceRuntime for Interpreter<'_> {
             .map_or(local_slot, |op| op.x)
     }
 
+    fn trace_field_type(&self, object: RegisterWord, slot: u32) -> Option<Type> {
+        let value = Value::from_word(object);
+        let class_slot = match self.heap.get(value)? {
+            HeapObject::Instance { class_slot, .. } => *class_slot,
+            _ => return None,
+        };
+        self.classes
+            .get(class_slot as usize)?
+            .instance_field_types
+            .get(slot as usize)
+            .cloned()
+    }
+
     fn trace_module_slot_address(&self, location: TraceLocation) -> Option<usize> {
         let prepared = self.current_prepared();
         if prepared.id != location.function {
@@ -10520,6 +10772,19 @@ impl TraceRuntime for Interpreter<'_> {
         let field = runtime_class.static_fields.get(slot as usize)?;
         let address = field as *const Value as usize;
         Some((CLASS_KIND_STATIC | class_slot as u64, address))
+    }
+
+    fn trace_static_field_type(&self, class: RegisterWord, slot: u32) -> Option<Type> {
+        let class = Value::from_word(class);
+        let class_slot = match self.heap.get(class)? {
+            HeapObject::ClassObject { class_slot } => *class_slot,
+            _ => return None,
+        };
+        self.classes
+            .get(class_slot as usize)?
+            .static_field_types
+            .get(slot as usize)
+            .cloned()
     }
 
     fn trace_is_instance_observation(
@@ -10771,7 +11036,16 @@ impl TraceRuntime for Interpreter<'_> {
     ) -> Option<crate::napalm_tracing_jit::ShapedMapAccess> {
         let (shape, slot, key_bytes) =
             self.heap.shaped_map_access(Value::from_word(map), Value::from_word(key))?;
-        Some(crate::napalm_tracing_jit::ShapedMapAccess { shape, slot, key_bytes })
+        let contract = self.heap.map_shapes.slot_contract(shape, slot);
+        Some(crate::napalm_tracing_jit::ShapedMapAccess {
+            shape,
+            slot,
+            key_bytes,
+            read_type: contract.read_type.clone(),
+            write_type: contract.write_type.clone(),
+            readonly: contract.readonly,
+            write_runtime_checked: contract.write_runtime_checked,
+        })
     }
 
     fn trace_materialize_constant(&self, constant: TraceConstant) -> Result<RegisterWord, RuntimeError> {
@@ -11913,6 +12187,114 @@ var result = Runner.run()
         vm.release_root(root_missing);
         vm.release_root(root_key);
         vm.release_root(root_map);
+    }
+
+    #[test]
+    fn structural_contracts_publish_shared_typed_shapes_and_enforce_open_closed_writes() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+
+        let key_x = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"x".as_slice()))));
+        let root_x = vm.add_root(key_x);
+        let key_payload = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"payload".as_slice()))));
+        let root_payload = vm.add_root(key_payload);
+        let key_extra = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"extra".as_slice()))));
+        let root_extra = vm.add_root(key_extra);
+
+        let open_a = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
+        let root_open_a = vm.add_root(open_a);
+        let open_b = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
+        let root_open_b = vm.add_root(open_b);
+        let closed = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
+        let root_closed = vm.add_root(closed);
+
+        for map in [open_a, open_b, closed] {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map, key_x, Value::from_num(1.0)).unwrap();
+            context.map_set(map, key_payload, Value::NULL).unwrap();
+        }
+
+        let untyped_shape = vm.heap.shaped_map_access(open_a, key_x).unwrap().0;
+        let fields = vec![
+            crate::napalm_ir::InterfaceFieldType {
+                name: "x".to_owned(),
+                ty: Type::Num,
+                optional: false,
+                readonly: false,
+            },
+            crate::napalm_ir::InterfaceFieldType {
+                name: "payload".to_owned(),
+                ty: Type::Top,
+                optional: false,
+                readonly: false,
+            },
+        ];
+        let open_contract = Type::Interface(fields.clone());
+        vm.heap.bind_contract(open_a, &open_contract).unwrap();
+        vm.heap.bind_contract(open_b, &open_contract).unwrap();
+
+        let (open_shape_a, x_slot, _) = vm.heap.shaped_map_access(open_a, key_x).unwrap();
+        let (open_shape_b, _, _) = vm.heap.shaped_map_access(open_b, key_x).unwrap();
+        assert_ne!(open_shape_a, untyped_shape, "installing Number metadata should publish a typed shape");
+        assert_eq!(open_shape_a, open_shape_b, "equal contracts over equal shapes must share typed shapes");
+        let x_contract = vm.heap.map_shapes.slot_contract(open_shape_a, x_slot);
+        assert_eq!(x_contract.read_type.as_ref(), Some(&Type::Num));
+        assert_eq!(x_contract.write_type.as_ref(), Some(&Type::Num));
+
+        let (_, payload_slot, _) = vm.heap.shaped_map_access(open_a, key_payload).unwrap();
+        let payload_contract = vm.heap.map_shapes.slot_contract(open_shape_a, payload_slot);
+        assert!(payload_contract.read_type.is_none(), "source any must not become a read proof");
+        assert!(payload_contract.write_type.is_none(), "source any must not constrain native stores");
+
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            assert!(context.map_set(open_a, key_x, Value::FALSE).is_err());
+            context.map_set(open_a, key_payload, Value::FALSE).unwrap();
+            context.map_set(open_a, key_extra, Value::from_num(7.0)).unwrap();
+        }
+        let (_, extra_slot_a, _) = vm.heap.shaped_map_access(open_a, key_extra).unwrap();
+        let extra_contract = vm.heap.map_shapes.slot_contract(
+            vm.heap.shaped_map_access(open_a, key_extra).unwrap().0,
+            extra_slot_a,
+        );
+        assert!(extra_contract.read_type.is_none(), "extra interface fields remain dynamically typed");
+
+        let closed_contract = Type::Record(fields);
+        vm.heap.bind_contract(closed, &closed_contract).unwrap();
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(closed, key_x, Value::from_num(2.0)).unwrap();
+            context.map_set(closed, key_payload, Value::TRUE).unwrap();
+            let error = context
+                .map_set(closed, key_extra, Value::from_num(3.0))
+                .expect_err("closed structural type must reject a new property");
+            assert!(error.message.contains("closed type"));
+        }
+
+        let preexpanded = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
+        let root_preexpanded = vm.add_root(preexpanded);
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(preexpanded, key_x, Value::from_num(1.0)).unwrap();
+            context.map_set(preexpanded, key_payload, Value::NULL).unwrap();
+            context.map_set(preexpanded, key_extra, Value::from_num(9.0)).unwrap();
+        }
+        let error = vm
+            .heap
+            .bind_contract(preexpanded, &closed_contract)
+            .expect_err("closed structural type must reject pre-existing undeclared properties");
+        assert!(error.message.contains("not declared by the closed type"));
+
+        vm.release_root(root_preexpanded);
+        vm.release_root(root_closed);
+        vm.release_root(root_open_b);
+        vm.release_root(root_open_a);
+        vm.release_root(root_extra);
+        vm.release_root(root_payload);
+        vm.release_root(root_x);
     }
 
     #[test]

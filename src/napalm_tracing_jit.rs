@@ -490,6 +490,12 @@ pub struct ShapedMapAccess {
     /// Canonical shape-key bytes. Recording copies them into Trace IR; generated
     /// code never embeds the recyclable heap handle of the observed String.
     pub key_bytes: Vec<u8>,
+    /// Guaranteed value type for this slot. `None` means source-level `any` or
+    /// an untyped/open property and deliberately provides no guard-elision fact.
+    pub read_type: Option<Type>,
+    pub write_type: Option<Type>,
+    pub readonly: bool,
+    pub write_runtime_checked: bool,
 }
 
 /// Thin interface implemented by `napalm_interpreter::Interpreter`.
@@ -566,6 +572,9 @@ pub trait TraceRuntime {
     /// Field slots are relocated when a class is linked to its superclass.
     fn trace_field_slot(&self, _location: TraceLocation, local_slot: u32) -> u32 { local_slot }
 
+    /// Guaranteed source type of one fixed instance slot for the observed object.
+    fn trace_field_type(&self, _object: RegisterWord, _slot: u32) -> Option<Type> { None }
+
     /// Stable address of the module-global slot referenced by this bytecode.
     /// Module variable arrays are fixed-size for the lifetime of an interpreter.
     fn trace_module_slot_address(&self, _location: TraceLocation) -> Option<usize> { None }
@@ -601,6 +610,8 @@ pub trait TraceRuntime {
     ) -> Option<(u64, usize)> {
         None
     }
+
+    fn trace_static_field_type(&self, _class: RegisterWord, _slot: u32) -> Option<Type> { None }
 
     /// Observe the class operand of IsInstance. The first element is the exact
     /// receiver-class key of the class object; the second contains every finalized
@@ -1214,6 +1225,184 @@ impl<'a> TraceRecorder<'a> {
         builder.write_slot(FrameSlot::General(Reg(reg)), value);
     }
 
+    fn semantic_trace_layout(ty: &Type) -> (TraceType, TraceRep) {
+        match ty {
+            Type::Null => (TraceType::Null, TraceRep::Tagged),
+            Type::Bool => (TraceType::Bool, TraceRep::Tagged),
+            Type::Num => (TraceType::Num, TraceRep::Tagged),
+            Type::Int32 => (TraceType::Int32, TraceRep::Int32),
+            Type::F64 => (TraceType::F64, TraceRep::F64),
+            _ => (TraceType::Any, TraceRep::Tagged),
+        }
+    }
+
+    fn semantic_heap_kind(ty: &Type) -> Option<TraceHeapObjectKind> {
+        match ty {
+            Type::String => Some(TraceHeapObjectKind::String),
+            Type::List(_) => Some(TraceHeapObjectKind::List),
+            Type::Map | Type::Interface(_) | Type::Record(_) => Some(TraceHeapObjectKind::Map),
+            Type::Cell(_) => Some(TraceHeapObjectKind::Cell),
+            Type::Range => Some(TraceHeapObjectKind::Range),
+            Type::Closure(_) => Some(TraceHeapObjectKind::Closure),
+            Type::Fiber => Some(TraceHeapObjectKind::Fiber),
+            Type::Module => Some(TraceHeapObjectKind::Module),
+            Type::Class(_) => Some(TraceHeapObjectKind::Class),
+            Type::Instance(_) => Some(TraceHeapObjectKind::Instance),
+            Type::Foreign(_) => Some(TraceHeapObjectKind::Foreign),
+            _ => None,
+        }
+    }
+
+    fn trace_value_proves_type(
+        &self,
+        builder: &crate::napalm_trace_ir::TraceBuilder,
+        value: TraceValueId,
+        expected: &Type,
+    ) -> bool {
+        if matches!(expected, Type::Top) {
+            return true;
+        }
+        let Some(proven) = builder.proven_type(value) else {
+            return false;
+        };
+        expected.accepts(proven) || expected == proven
+    }
+
+    #[inline]
+    fn semantic_type_definitely_non_null(ty: &Type) -> bool {
+        match ty {
+            Type::Top | Type::Null | Type::RawPtr => false,
+            Type::Union(types) => !types.is_empty()
+                && types.iter().all(Self::semantic_type_definitely_non_null),
+            Type::Bottom => true,
+            _ => true,
+        }
+    }
+
+    #[inline]
+    fn class_set_is_subset(actual: &crate::napalm_ir::ClassSet, expected: &crate::napalm_ir::ClassSet) -> bool {
+        expected.is_unknown()
+            || (!actual.is_unknown()
+                && actual.as_slice().iter().all(|class| expected.contains(*class)))
+    }
+
+    fn intersect_class_sets(
+        left: &crate::napalm_ir::ClassSet,
+        right: &crate::napalm_ir::ClassSet,
+    ) -> crate::napalm_ir::ClassSet {
+        if left.is_unknown() {
+            return right.clone();
+        }
+        if right.is_unknown() {
+            return left.clone();
+        }
+        crate::napalm_ir::ClassSet::from_iter(
+            left.as_slice().iter().copied().filter(|class| right.contains(*class)),
+        )
+    }
+
+    fn semantic_type_proves_class(
+        ty: &Type,
+        expected: &crate::napalm_ir::ClassSet,
+    ) -> bool {
+        match ty {
+            Type::Instance(actual) | Type::Class(actual) => {
+                Self::class_set_is_subset(actual, expected)
+            }
+            Type::Foreign(Some(class)) => expected.is_unknown() || expected.contains(*class),
+            Type::Union(types) => !types.is_empty()
+                && types.iter().all(|ty| Self::semantic_type_proves_class(ty, expected)),
+            _ => false,
+        }
+    }
+
+    fn refined_class_type(
+        prior: Option<&Type>,
+        expected: &crate::napalm_ir::ClassSet,
+        kind: Option<TraceHeapObjectKind>,
+    ) -> Option<Type> {
+        let refined_set = |actual: &crate::napalm_ir::ClassSet| {
+            let intersection = Self::intersect_class_sets(actual, expected);
+            if !actual.is_unknown() && !expected.is_unknown() && intersection.is_unknown() {
+                // A disjoint prior proof and a successful physical class guard
+                // cannot both be reachable. Keep the guard's conservative fact
+                // instead of encoding the empty intersection as ClassSet::unknown.
+                expected.clone()
+            } else {
+                intersection
+            }
+        };
+
+        match prior {
+            Some(Type::Instance(actual)) => Some(Type::Instance(refined_set(actual))),
+            Some(Type::Class(actual)) => Some(Type::Class(refined_set(actual))),
+            Some(Type::Foreign(Some(class))) if expected.is_unknown() || expected.contains(*class) => {
+                Some(Type::Foreign(Some(*class)))
+            }
+            _ => match kind {
+                Some(TraceHeapObjectKind::Instance) => Some(Type::Instance(expected.clone())),
+                Some(TraceHeapObjectKind::Class) => Some(Type::Class(expected.clone())),
+                Some(TraceHeapObjectKind::Foreign) if expected.as_slice().len() == 1 => {
+                    Some(Type::Foreign(Some(expected.as_slice()[0])))
+                }
+                Some(TraceHeapObjectKind::Foreign) => Some(Type::Foreign(None)),
+                _ => None,
+            },
+        }
+    }
+
+    fn guard_store_value(
+        &self,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        value: TraceValueId,
+        expected: &Type,
+        pc: BytecodePc,
+    ) -> Option<TraceValueId> {
+        if self.trace_value_proves_type(builder, value, expected) {
+            return Some(value);
+        }
+        let exit = builder.add_side_exit(ExitReason::GuardValue, pc);
+        match expected {
+            Type::Null | Type::Bool | Type::Num => {
+                let (trace_ty, _) = Self::semantic_trace_layout(expected);
+                let guarded = builder.emit1(
+                    TraceInst::GuardType { value, expected: trace_ty, exit },
+                    trace_ty,
+                    TraceRep::Tagged,
+                );
+                builder.set_proven_type(guarded, expected.clone());
+                Some(guarded)
+            }
+            Type::String
+            | Type::List(None)
+            | Type::Map
+            | Type::Range
+            | Type::Closure(None)
+            | Type::Fiber
+            | Type::Module
+            | Type::Foreign(None) => {
+                let kind = Self::semantic_heap_kind(expected)?;
+                let _ = self.guard_heap_object(builder, value, kind, exit);
+                builder.set_proven_type(value, expected.clone());
+                Some(value)
+            }
+            Type::Class(classes) if classes.is_unknown() => {
+                let _ = self.guard_heap_object(builder, value, TraceHeapObjectKind::Class, exit);
+                builder.set_proven_type(value, expected.clone());
+                Some(value)
+            }
+            Type::Instance(classes) if classes.is_unknown() => {
+                let _ = self.guard_heap_object(builder, value, TraceHeapObjectKind::Instance, exit);
+                builder.set_proven_type(value, expected.clone());
+                Some(value)
+            }
+            // Structural contracts, typed containers, exact class/closure/foreign
+            // identities and unions need the baseline checker unless already
+            // proven by a typed slot or a previous guard.
+            _ => None,
+        }
+    }
+
     #[inline]
     fn guard_heap_object(
         &self,
@@ -1222,11 +1411,38 @@ impl<'a> TraceRecorder<'a> {
         kind: TraceHeapObjectKind,
         exit: SideExitId,
     ) -> TraceValueId {
-        builder.emit1(
+        let pointer = builder.emit1(
             TraceInst::GuardHeapObject { value, kind, exit },
             TraceType::Any,
             TraceRep::RawPtr,
-        )
+        );
+        let proven = match kind {
+            TraceHeapObjectKind::String => Some(Type::String),
+            TraceHeapObjectKind::List => Some(Type::List(None)),
+            TraceHeapObjectKind::Map => Some(Type::Map),
+            TraceHeapObjectKind::Cell => Some(Type::Cell(Box::new(Type::Top))),
+            TraceHeapObjectKind::Instance => Some(Type::Instance(crate::napalm_ir::ClassSet::new())),
+            TraceHeapObjectKind::Range => Some(Type::Range),
+            TraceHeapObjectKind::Closure => Some(Type::Closure(None)),
+            TraceHeapObjectKind::Fiber => Some(Type::Fiber),
+            TraceHeapObjectKind::Module => Some(Type::Module),
+            TraceHeapObjectKind::Class => Some(Type::Class(crate::napalm_ir::ClassSet::new())),
+            TraceHeapObjectKind::Foreign => Some(Type::Foreign(None)),
+            TraceHeapObjectKind::Promise => None,
+        };
+        if let Some(proven) = proven {
+            // A physical heap-kind guard is usually broader than the semantic
+            // fact already attached to a typed slot (Record/Interface, List<T>,
+            // exact class, ...). Never erase that stronger proof merely because
+            // an access also validated the underlying heap representation.
+            let preserve_existing = builder
+                .proven_type(value)
+                .is_some_and(|existing| proven.accepts(existing));
+            if !preserve_existing {
+                builder.set_proven_type(value, proven);
+            }
+        }
+        pointer
     }
 
     fn tagged_bool(
@@ -3036,6 +3252,14 @@ impl<'a> TraceRecorder<'a> {
                     TraceType::Any,
                     TraceRep::Tagged,
                 )?;
+                if builder
+                    .proven_type(source)
+                    .is_some_and(Self::semantic_type_definitely_non_null)
+                {
+                    self.write_gpr(builder, op.a, source);
+                    return Ok(ExpectedStep::Exact(next));
+                }
+
                 let physical = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -3052,6 +3276,9 @@ impl<'a> TraceRecorder<'a> {
                     TraceType::Any,
                     TraceRep::Tagged,
                 );
+                if let Some(proven) = builder.proven_type(source).cloned() {
+                    builder.set_proven_type(result, proven);
+                }
                 self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
@@ -3159,6 +3386,13 @@ impl<'a> TraceRecorder<'a> {
                     return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
                 };
 
+                if let Some(source) = builder.slot_value(FrameSlot::General(Reg(op.b))) {
+                    if self.trace_value_proves_type(builder, source, &descriptor.expected) {
+                        self.write_gpr(builder, op.a, source);
+                        return Ok(ExpectedStep::Exact(next));
+                    }
+                }
+
                 // Generic Instance accepts both managed Instance and Foreign
                 // objects. Specialize to the concrete kind observed at this site;
                 // the alternate valid kind simply side-exits and can form its own
@@ -3177,6 +3411,12 @@ impl<'a> TraceRecorder<'a> {
                     let resume = deopt_resume(function, op.y).unwrap_or(op.location.pc);
                     let exit = builder.add_side_exit(ExitReason::GuardValue, resume);
                     let _ = self.guard_heap_object(builder, source, kind, exit);
+                    let proven = match kind {
+                        TraceHeapObjectKind::Instance => descriptor.expected.clone(),
+                        TraceHeapObjectKind::Foreign => Type::Foreign(None),
+                        _ => unreachable!(),
+                    };
+                    builder.set_proven_type(source, proven);
                     self.write_gpr(builder, op.a, source);
                     return Ok(ExpectedStep::Exact(next));
                 }
@@ -3187,9 +3427,11 @@ impl<'a> TraceRecorder<'a> {
                 // remains the original tagged value, exactly like h_guard_type.
                 let heap_kind = match &descriptor.expected {
                     Type::String => Some(TraceHeapObjectKind::String),
-                    Type::List(_) => Some(TraceHeapObjectKind::List),
+                    // A heap-kind check proves only an unparameterized List.
+                    // `List<T>` additionally requires its persistent element
+                    // contract, just like Interface/Record below.
+                    Type::List(None) => Some(TraceHeapObjectKind::List),
                     Type::Map => Some(TraceHeapObjectKind::Map),
-                    Type::Cell(_) => Some(TraceHeapObjectKind::Cell),
                     Type::Range => Some(TraceHeapObjectKind::Range),
                     Type::Closure(None) => Some(TraceHeapObjectKind::Closure),
                     Type::Fiber => Some(TraceHeapObjectKind::Fiber),
@@ -3209,6 +3451,7 @@ impl<'a> TraceRecorder<'a> {
                     let resume = deopt_resume(function, op.y).unwrap_or(op.location.pc);
                     let exit = builder.add_side_exit(ExitReason::GuardValue, resume);
                     let _ = self.guard_heap_object(builder, source, kind, exit);
+                    builder.set_proven_type(source, descriptor.expected.clone());
                     self.write_gpr(builder, op.a, source);
                     return Ok(ExpectedStep::Exact(next));
                 }
@@ -3223,11 +3466,15 @@ impl<'a> TraceRecorder<'a> {
                     // through the synchronized leaf boundary and preserve the
                     // rest of the native SSA state on the successful path.
                     _ => {
-                        return self.runtime_leaf(
+                        let step = self.runtime_leaf(
                             op,
                             builder,
                             &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-                        );
+                        )?;
+                        if let Some(result) = builder.slot_value(FrameSlot::General(Reg(op.a))) {
+                            builder.set_proven_type(result, descriptor.expected.clone());
+                        }
+                        return Ok(step);
                     }
                 };
 
@@ -3262,23 +3509,58 @@ impl<'a> TraceRecorder<'a> {
                         TraceRep::Tagged,
                     )
                 };
+                builder.set_proven_type(result, descriptor.expected.clone());
                 self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
 
             GuardClass => {
-                let classes = runtime.trace_class_guard(op.location.function, op.x)
+                let semantic_classes = function
+                    .chunk
+                    .class_guards
+                    .get(op.x as usize)
+                    .map(|guard| guard.expected.clone())
                     .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
-                let physical = runtime.trace_read_slot(FrameSlot::General(Reg(op.b)))
+
+                if let Some(source) = builder.slot_value(FrameSlot::General(Reg(op.b))) {
+                    if builder
+                        .proven_type(source)
+                        .is_some_and(|ty| Self::semantic_type_proves_class(ty, &semantic_classes))
+                    {
+                        self.write_gpr(builder, op.a, source);
+                        return Ok(ExpectedStep::Exact(next));
+                    }
+                }
+
+                let classes = runtime
+                    .trace_class_guard(op.location.function, op.x)
+                    .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let physical = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
-                if !runtime.trace_receiver_class(physical).is_some_and(|class| classes.contains(&class)) {
+                if !runtime
+                    .trace_receiver_class(physical)
+                    .is_some_and(|class| classes.contains(&class))
+                {
                     return Err(RecordingAbort::GuardFailedWhileRecording);
                 }
+                let observed_kind = runtime.trace_heap_object_kind(physical);
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let prior = builder.proven_type(value).cloned();
                 // Replay the guard on failure so the VM owns deoptimization.
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
-                let result = builder.emit1(TraceInst::GuardClass { value, classes, exit },
-                    TraceType::Any, TraceRep::Tagged);
+                let result = builder.emit1(
+                    TraceInst::GuardClass { value, classes, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                if let Some(refined) = Self::refined_class_type(
+                    prior.as_ref(),
+                    &semantic_classes,
+                    observed_kind,
+                ) {
+                    builder.set_proven_type(result, refined);
+                }
                 self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
@@ -3596,25 +3878,45 @@ impl<'a> TraceRecorder<'a> {
             }
 
             LoadField => {
+                let object_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let slot = runtime.trace_field_slot(op.location, op.x);
+                let field_type = runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top);
                 let object = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let object = self.guard_heap_object(builder, object, TraceHeapObjectKind::Instance, exit);
+                let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
                 let result = builder.emit1(
-                    TraceInst::HeapLoadField { object, slot: runtime.trace_field_slot(op.location, op.x), exit },
-                    TraceType::Any,
-                    TraceRep::Tagged,
+                    TraceInst::HeapLoadField { object, slot, exit },
+                    trace_ty,
+                    trace_rep,
                 );
+                if !matches!(field_type, Type::Top) {
+                    builder.set_proven_type(result, field_type);
+                }
                 self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
 
             StoreField => {
+                let object_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let slot = runtime.trace_field_slot(op.location, op.x);
+                let expected = runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top);
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let value = if matches!(expected, Type::Top) {
+                    value
+                } else if let Some(value) = self.guard_store_value(builder, value, &expected, op.location.pc) {
+                    value
+                } else {
+                    return self.runtime_leaf(op, builder, &[]);
+                };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let object = self.guard_heap_object(builder, object, TraceHeapObjectKind::Instance, exit);
-                builder.emit0(TraceInst::HeapStoreField {
-                    object, value, slot: runtime.trace_field_slot(op.location, op.x), exit });
+                builder.emit0(TraceInst::HeapStoreField { object, value, slot, exit });
                 Ok(ExpectedStep::Exact(next))
             }
 
@@ -3708,6 +4010,8 @@ impl<'a> TraceRecorder<'a> {
                 if let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) {
                     let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                     let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+                    let field_type = access.read_type.clone().unwrap_or(Type::Top);
+                    let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
                     let result = builder.emit1(
                         TraceInst::HeapMapGetShaped {
                             map,
@@ -3717,9 +4021,12 @@ impl<'a> TraceRecorder<'a> {
                             slot: access.slot as u32,
                             exit,
                         },
-                        TraceType::Any,
-                        TraceRep::Tagged,
+                        trace_ty,
+                        trace_rep,
                     );
+                    if !matches!(field_type, Type::Top) {
+                        builder.set_proven_type(result, field_type);
+                    }
                     self.write_gpr(builder, op.a, result);
                     Ok(ExpectedStep::Exact(next))
                 } else if runtime.trace_heap_object_kind(map_word) == Some(TraceHeapObjectKind::Map) {
@@ -3750,26 +4057,32 @@ impl<'a> TraceRecorder<'a> {
                 let key_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
-                let Some(access) = (!runtime.trace_has_contract(map_word)).then(|| runtime.trace_shaped_map_access(map_word, key_word)).flatten() else {
+                let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
                     // Inserts, dictionary Maps and non-string keys can allocate or
                     // change representation, but they stay in the current frame.
-                    // Skip baseline redispatch when the receiver is already proven
-                    // to be a Map and call the extracted mutation body directly.
                     if runtime.trace_heap_object_kind(map_word) == Some(TraceHeapObjectKind::Map) {
                         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                         let _ = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
-                        return self.runtime_gc_specialized(
-                            op,
-                            builder,
-                            TRACE_RUNTIME_MODE_MAP_SET,
-                            &[],
-                        );
+                        return self.runtime_gc_specialized(op, builder, TRACE_RUNTIME_MODE_MAP_SET, &[]);
                     }
                     return self.runtime_gc_leaf(op, builder, &[]);
                 };
+                if access.readonly || access.write_runtime_checked {
+                    return self.runtime_leaf(op, builder, &[]);
+                }
+                let value = if let Some(expected) = &access.write_type {
+                    let Some(value) = self.guard_store_value(builder, value, expected, op.location.pc) else {
+                        return self.runtime_leaf(op, builder, &[]);
+                    };
+                    value
+                } else {
+                    value
+                };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
-                builder.emit0(TraceInst::GuardNoContract { value: map, kind: TraceHeapObjectKind::Map, exit });
+                // The shape id is itself the contract epoch for this slot. Installing
+                // a stricter contract creates a new typed shape, so no separate
+                // GuardNoContract is needed for existing-slot native stores.
                 builder.emit0(TraceInst::HeapMapSetShaped {
                     map,
                     key,
@@ -3855,11 +4168,16 @@ impl<'a> TraceRecorder<'a> {
                     TraceType::Any,
                     TraceRep::Tagged,
                 );
+                let field_type = runtime.trace_static_field_type(class_word, op.x).unwrap_or(Type::Top);
+                let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
                 let value = builder.emit1(
                     TraceInst::LoadAbsoluteValue { address: address as u64 },
-                    TraceType::Any,
-                    TraceRep::Tagged,
+                    trace_ty,
+                    trace_rep,
                 );
+                if !matches!(field_type, Type::Top) {
+                    builder.set_proven_type(value, field_type);
+                }
                 self.write_gpr(builder, op.a, value);
                 Ok(ExpectedStep::Exact(next))
             }
@@ -3875,6 +4193,14 @@ impl<'a> TraceRecorder<'a> {
                 };
                 let class = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let expected = runtime.trace_static_field_type(class_word, op.x).unwrap_or(Type::Top);
+                let value = if matches!(expected, Type::Top) {
+                    value
+                } else if let Some(value) = self.guard_store_value(builder, value, &expected, op.location.pc) {
+                    value
+                } else {
+                    return self.runtime_leaf(op, builder, &[]);
+                };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let _guarded = builder.emit1(
                     TraceInst::GuardClass {
@@ -3995,6 +4321,8 @@ impl<'a> TraceRecorder<'a> {
                                 TraceHeapObjectKind::Map,
                                 exit,
                             );
+                            let field_type = access.read_type.clone().unwrap_or(Type::Top);
+                            let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
                             let result = builder.emit1(
                                 TraceInst::HeapMapGetShaped {
                                     map,
@@ -4004,9 +4332,12 @@ impl<'a> TraceRecorder<'a> {
                                     slot: access.slot as u32,
                                     exit,
                                 },
-                                TraceType::Any,
-                                TraceRep::Tagged,
+                                trace_ty,
+                                trace_rep,
                             );
+                            if !matches!(field_type, Type::Top) {
+                                builder.set_proven_type(result, field_type);
+                            }
                             self.write_gpr(builder, op.a, result);
                             Ok(ExpectedStep::Exact(next))
                         } else {
@@ -4411,9 +4742,24 @@ impl<'a> TraceRecorder<'a> {
                 Ok(step)
             }
 
+            BindInterface => {
+                let Some(descriptor) = function.chunk.type_guards.get(op.x as usize) else {
+                    return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                };
+                let step = self.runtime_leaf(
+                    op,
+                    builder,
+                    &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                )?;
+                if let Some(result) = builder.slot_value(FrameSlot::General(Reg(op.a))) {
+                    builder.set_proven_type(result, descriptor.expected.clone());
+                }
+                Ok(step)
+            }
+
             // Class creation/binding changes global layout or method-table epochs.
             // Keep those rare structural operations as full runtime boundaries.
-            CreateClass | BindMethod | BindForeignMethod | BindInterface => {
+            CreateClass | BindMethod | BindForeignMethod => {
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
@@ -4470,7 +4816,15 @@ impl<'a> TraceRecorder<'a> {
                 return Err(RecordingAbort::RepresentationConflict);
             }
 
+            let initial_semantic = builder.proven_type(initial).cloned();
+            let backedge_semantic = builder.proven_type(final_value).cloned();
             let phi = builder.add_loop_phi(slot, initial, ty, rep);
+            if let (Some(initial), Some(backedge)) = (initial_semantic, backedge_semantic) {
+                let joined = initial.flow_join(&backedge);
+                if !matches!(joined, Type::Top) {
+                    builder.set_proven_type(phi, joined);
+                }
+            }
 
             // Rewrite uses *inside the iteration* from the original entry value to
             // the loop-carried value. Do not rewrite LoopPhi.initial itself.
@@ -5350,6 +5704,12 @@ struct CraneliftLoweringState<'a, 'p> {
     /// Constant-index bounds facts over one epoch-local length SSA value.
     /// Repeated fixed field/shape slot accesses therefore pay the guard once.
     constant_index_proofs: HashSet<(Value, u32)>,
+    /// Typed shape proofs are valid until a runtime/GC epoch boundary. Native
+    /// shaped stores update existing slots only, so they preserve the shape.
+    map_shape_proofs: HashSet<(TraceValueId, u32)>,
+    /// Canonical property-key content proofs. This is intentionally keyed by SSA
+    /// value plus bytes, not by the recyclable heap handle.
+    string_key_proofs: HashSet<(TraceValueId, Vec<u8>)>,
     /// Shared cold stubs for exits whose snapshots contain no dynamic SSA values.
     /// The current watchdog SSA value is part of the key so preheader and loop-body
     /// exits never accidentally share different native-iteration accounting.
@@ -5547,6 +5907,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 list_lengths: HashMap::new(),
                 bounds_proofs: HashSet::new(),
                 constant_index_proofs: HashSet::new(),
+                map_shape_proofs: HashSet::new(),
+                string_key_proofs: HashSet::new(),
                 shared_constant_exit_blocks: HashMap::new(),
                 forwarded_heap_loads: HashMap::new(),
                 forwarded_absolute_loads: HashMap::new(),
@@ -6858,6 +7220,52 @@ impl CraneliftLoweringState<'_, '_> {
         self.emit_side_exit(exit, fail)
     }
 
+    fn guard_map_shape_once(
+        &mut self,
+        map: TraceValueId,
+        metadata: Value,
+        expected: u32,
+        exit: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        let key = (self.trace.canonical_value(map), expected);
+        if self.map_shape_proofs.contains(&key) {
+            return Ok(());
+        }
+        self.guard_map_shape_metadata(metadata, expected, exit)?;
+        self.map_shape_proofs.insert(key);
+        Ok(())
+    }
+
+    fn guard_string_bytes_once(
+        &mut self,
+        key_value: TraceValueId,
+        tagged: Value,
+        expected: &[u8],
+        exit: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        let key_value = self.trace.canonical_value(key_value);
+        // LoadConst strings are materialized by the recorder as StableTagged VM
+        // roots. `expected` was obtained from this exact key on the recorded path,
+        // so replaying a byte-by-byte equality guard would prove a compile-time
+        // identity again on every native iteration.
+        if self.trace.value(key_value).is_some_and(|value| {
+            matches!(
+                &value.origin,
+                TraceValueOrigin::Constant(TraceConstant::StableTagged(_))
+            )
+        }) {
+            return Ok(());
+        }
+
+        let proof = (key_value, expected.to_vec());
+        if self.string_key_proofs.contains(&proof) {
+            return Ok(());
+        }
+        self.guard_string_bytes(tagged, expected, exit)?;
+        self.string_key_proofs.insert(proof);
+        Ok(())
+    }
+
     /// Guard a dynamic Napalm String against canonical shape-key bytes. The heap
     /// handle itself is deliberately not compared: handles are recyclable. The
     /// String sidecar packs UTF-8 byte length in the metadata high bits and keeps
@@ -7107,6 +7515,8 @@ impl CraneliftLoweringState<'_, '_> {
         self.heap_receiver_class.clear();
         self.list_indices.clear();
         self.list_lengths.clear();
+        self.map_shape_proofs.clear();
+        self.string_key_proofs.clear();
         self.forwarded_heap_loads.clear();
         self.forwarded_absolute_loads.clear();
         self.heap_chunks_base = None;
@@ -8274,10 +8684,13 @@ impl CraneliftLoweringState<'_, '_> {
                 let tagged_key = self.lower_value(*key)?;
                 let (entry, _, metadata) =
                     self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
-                self.guard_map_shape_metadata(metadata, *shape, *exit)?;
-                self.guard_string_bytes(tagged_key, expected_key, *exit)?;
-                let len = self.heap_entry_len(entry);
-                self.guard_constant_index(len, *slot, *exit)?;
+                self.guard_map_shape_once(*map, metadata, *shape, *exit)?;
+                self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
+                // `slot` was resolved from this exact immutable shape while
+                // recording. A successful shape guard therefore proves the dense
+                // value array contains that slot; a second length/bounds guard is
+                // redundant. Shape-changing operations are runtime boundaries and
+                // invalidate `map_shape_proofs` before control can continue.
                 let location = ForwardedHeapLocation::ShapedMap { entry, slot: *slot };
                 let result = if let Some(value) = self.forwarded_heap_load(location) {
                     value
@@ -8302,11 +8715,13 @@ impl CraneliftLoweringState<'_, '_> {
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address, metadata) =
                     self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
-                self.guard_uncontracted_store(entry, *exit)?;
-                self.guard_map_shape_metadata(metadata, *shape, *exit)?;
-                self.guard_string_bytes(tagged_key, expected_key, *exit)?;
-                let len = self.heap_entry_len(entry);
-                self.guard_constant_index(len, *slot, *exit)?;
+                // A shaped store is contract-safe: installing any contract that
+                // changes existing-slot semantics moves the map to a typed shape
+                // (or dictionary fallback), so the shape guard is the epoch check.
+                self.guard_map_shape_once(*map, metadata, *shape, *exit)?;
+                self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
+                // Exact shape identity also proves this existing dense slot is in
+                // range. Shaped native stores never append/remove properties.
                 let data = self.heap_entry_data(entry);
                 let index = self.builder.ins().iconst(types::I64, *slot as i64);
                 let address = self.heap_element_address(data, index);

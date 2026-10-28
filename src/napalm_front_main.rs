@@ -139,6 +139,7 @@ type Result<T> = std::result::Result<T, ()>;
 
 struct Parser<'a> {
     interfaces: Vec<InterfaceDecl>,
+    type_aliases: Vec<TypeAliasDecl>,
     source: &'a str,
     tokens: Vec<Tok>,
     pos: usize,
@@ -352,6 +353,7 @@ pub fn parse(_name: &str, source: &str) -> ParseOutput {
     let statements = p.statements(None);
     let module = ModuleAst {
         interfaces: p.interfaces,
+        type_aliases: p.type_aliases,
         statements,
         span: Span::new(0, source.len()),
         exports: Some(p.exports),
@@ -401,6 +403,7 @@ impl<'a> Parser<'a> {
         });
         Self {
             interfaces: Vec::new(),
+            type_aliases: Vec::new(),
             source,
             tokens,
             pos: 0,
@@ -540,11 +543,25 @@ impl<'a> Parser<'a> {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            self.ident()?;
+            let name = self.ident()?;
             self.type_parameters()?;
             self.expect("=")?;
+            self.lines();
+            let type_start = self.peek().span.start;
             self.ty()?;
+            let type_end = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map_or(type_start, |token| token.span.end);
+            let span = Span::new(type_start, type_end);
+            let annotation = classify_variable_type(&self.source[span.as_range()], span);
             self.boundary()?;
+            if self.interfaces.iter().any(|i| i.name.value == name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            {
+                return self.error("duplicate interface/type declaration");
+            }
+            self.type_aliases.push(TypeAliasDecl { name, annotation });
             return Ok(Vec::new());
         }
 
@@ -619,11 +636,28 @@ impl<'a> Parser<'a> {
         }
 
         if self.eat("type") {
-            self.ident()?;
+            if !module {
+                return self.error("type aliases must be declared at module scope");
+            }
+            let name = self.ident()?;
             self.type_parameters()?;
             self.expect("=")?;
+            self.lines();
+            let type_start = self.peek().span.start;
             self.ty()?;
+            let type_end = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map_or(type_start, |token| token.span.end);
+            let span = Span::new(type_start, type_end);
+            let annotation = classify_variable_type(&self.source[span.as_range()], span);
             self.boundary()?;
+            if self.interfaces.iter().any(|i| i.name.value == name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            {
+                return self.error("duplicate interface/type declaration");
+            }
+            self.type_aliases.push(TypeAliasDecl { name, annotation });
             return Ok(Vec::new());
         }
         if self.eat("interface") {
@@ -640,8 +674,10 @@ impl<'a> Parser<'a> {
                 }
             }
             let fields = self.interface_fields()?;
-            if self.interfaces.iter().any(|i| i.name.value == name.value) {
-                return self.error("duplicate interface declaration");
+            if self.interfaces.iter().any(|i| i.name.value == name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            {
+                return self.error("duplicate interface/type declaration");
             }
             self.interfaces.push(InterfaceDecl { name, parents, fields });
             return Ok(Vec::new());
@@ -1457,7 +1493,7 @@ impl<'a> Parser<'a> {
     /// Parse TypeScript parameters. Constructor parameter-properties are returned
     /// separately so class lowering can synthesize the same fixed-slot storage as
     /// an explicit `x: T` class field while preserving the existing backend AST.
-    fn params_with_properties(&mut self, constructor: bool) -> Result<(Vec<Ident>, Vec<Ident>)> {
+    fn params_with_properties(&mut self, constructor: bool) -> Result<(Vec<Ident>, Vec<(Ident, Option<TypeAnnotation>)>)> {
         self.expect("(")?;
         self.lines();
         let mut params = Vec::new();
@@ -1501,12 +1537,12 @@ impl<'a> Parser<'a> {
             // arity, so callers must supply the argument until default/optional
             // argument lowering is added deliberately.
             self.eat("?");
-            self.annotation()?;
+            let annotation = self.variable_annotation()?;
             if self.eat("=") {
                 return self.error("default parameters are not implemented yet");
             }
             if property {
-                properties.push(param.clone());
+                properties.push((param.clone(), annotation));
             }
             params.push(param);
             self.lines();
@@ -2683,6 +2719,7 @@ impl<'a> Parser<'a> {
         self.expect("{")?;
         self.separators();
         let mut methods = Vec::new();
+        let mut fields = Vec::new();
         let mut initializers = Vec::new();
         let mut parameter_initializers = Vec::new();
         let mut static_initializers = Vec::new();
@@ -2776,10 +2813,16 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if is_constructor {
-                    for property in &parameter_properties {
+                    for (property, annotation) in &parameter_properties {
                         let value = Expr::new(ExprKind::Name(property.clone()), property.span);
                         let (getter, setter, assignment) =
                             synthesize_class_property(property, false, value);
+                        fields.push(ClassFieldDecl {
+                            storage: class_storage_ident(property, false),
+                            annotation: annotation.clone(),
+                            initializer: None,
+                            is_static: false,
+                        });
                         methods.push(getter);
                         methods.push(setter);
                         parameter_initializers.push(assignment);
@@ -2808,7 +2851,7 @@ impl<'a> Parser<'a> {
                 if access.is_some() || async_ || foreign || is_constructor {
                     return self.error("expected a method parameter list");
                 }
-                self.annotation()?;
+                let annotation = self.variable_annotation()?;
                 let initializer = if self.eat("=") {
                     self.lines();
                     Some(self.expr(0)?)
@@ -2820,6 +2863,12 @@ impl<'a> Parser<'a> {
                     self.separators();
                     continue;
                 }
+                fields.push(ClassFieldDecl {
+                    storage: class_storage_ident(&member, is_static),
+                    annotation,
+                    initializer: initializer.clone(),
+                    is_static,
+                });
                 let initializer = initializer.unwrap_or_else(|| Expr::new(ExprKind::Null, member.span));
                 let (getter, setter, assignment) =
                     synthesize_class_property(&member, is_static, initializer);
@@ -2917,6 +2966,7 @@ impl<'a> Parser<'a> {
             superclass,
             is_foreign,
             attributes: Vec::new(),
+            fields,
             methods,
         };
         let mut out = vec![Stmt {
@@ -2943,6 +2993,17 @@ impl<'a> Parser<'a> {
 /// AST representation: fixed storage plus ordinary getter/setter methods. This
 /// keeps all field layout, GC and JIT machinery unchanged while the surface
 /// syntax becomes Napalm/TypeScript-like.
+fn class_storage_ident(property: &Ident, is_static: bool) -> Ident {
+    Spanned::new(
+        if is_static {
+            format!("__{}", property.value)
+        } else {
+            format!("_{}", property.value)
+        },
+        property.span,
+    )
+}
+
 fn synthesize_class_property(
     member: &Ident,
     is_static: bool,
@@ -3497,6 +3558,62 @@ mod napalm_syntax_tests {
             panic!("expected inferred variable declaration");
         };
         assert!(annotation.is_none(), "inferred types are intentionally computed by lowering");
+    }
+
+    #[test]
+    fn retains_interfaces_closed_type_aliases_and_class_field_types() {
+        let module = assert_parses(r#"
+            interface OpenPoint {
+                x: number;
+                payload: any;
+            }
+
+            type ClosedPoint = {
+                x: number;
+                payload: any;
+            };
+
+            class Point {
+                x: number = 1;
+                payload: any = null;
+                static count: number = 0;
+            }
+        "#);
+
+        assert_eq!(module.interfaces.len(), 1);
+        assert_eq!(module.interfaces[0].name.value, "OpenPoint");
+        assert!(matches!(
+            &module.interfaces[0].fields[1].annotation.kind,
+            TypeAnnotationKind::Any
+        ));
+
+        assert_eq!(module.type_aliases.len(), 1);
+        assert_eq!(module.type_aliases[0].name.value, "ClosedPoint");
+        let TypeAnnotationKind::Object(fields) = &module.type_aliases[0].annotation.kind else {
+            panic!("closed object type alias should retain its structural fields");
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(&fields[0].annotation.kind, TypeAnnotationKind::Num));
+        assert!(matches!(&fields[1].annotation.kind, TypeAnnotationKind::Any));
+
+        let class = module
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                StmtKind::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("Point class");
+        assert_eq!(class.fields.len(), 3);
+        assert!(matches!(
+            class.fields[0].annotation.as_ref().map(|annotation| &annotation.kind),
+            Some(TypeAnnotationKind::Num)
+        ));
+        assert!(matches!(
+            class.fields[1].annotation.as_ref().map(|annotation| &annotation.kind),
+            Some(TypeAnnotationKind::Any)
+        ));
+        assert!(class.fields[2].is_static);
     }
 
     #[test]

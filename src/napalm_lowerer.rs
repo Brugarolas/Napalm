@@ -437,6 +437,20 @@ fn resolve_type_annotation(
     }
 }
 
+fn seal_structural_type(ty: Type) -> Type {
+    match ty {
+        // `type X = InterfaceName` closes the object bound as X, but does not
+        // recursively change the declared semantics of nested interface-valued
+        // fields. A child explicitly typed as an interface remains open.
+        Type::Interface(fields) => Type::Record(fields),
+        Type::Record(fields) => Type::Record(fields),
+        // Each object alternative of a top-level alias is a value of the alias and
+        // therefore inherits the alias's closed-object semantics.
+        Type::Union(types) => Type::Union(types.into_iter().map(seal_structural_type).collect()),
+        other => other,
+    }
+}
+
 fn semantic_source_type(ty: &Type) -> Type {
     match ty {
         Type::Int32 | Type::F64 => Type::Num,
@@ -482,7 +496,7 @@ fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
     }
     fn may_satisfy(expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
-            (Type::Interface(_), Type::Map | Type::Interface(_)) => true,
+            (Type::Interface(_) | Type::Record(_), Type::Map | Type::Interface(_) | Type::Record(_)) => true,
             (Type::List(Some(e)), Type::List(Some(a))) => may_satisfy(e, a),
             (e, Type::Union(ts)) => ts.iter().all(|a| may_satisfy(e, a)),
             (Type::Union(ts), a) => ts.iter().any(|e| may_satisfy(e, a)),
@@ -505,6 +519,7 @@ fn display_source_type(ty: &Type) -> String {
         Type::List(Some(element)) => format!("{}[]", display_source_type(element)),
         Type::Map => "Map".to_owned(),
         Type::Interface(_) => "interface".to_owned(),
+        Type::Record(_) => "type".to_owned(),
         Type::Range => "Range".to_owned(),
         Type::Class(_) => "class".to_owned(),
         Type::Instance(_) => "instance".to_owned(),
@@ -1155,7 +1170,9 @@ struct ClassPlan {
     /// Instance fields declared directly by this class. Slots always start at
     /// zero; runtime class linking adds the inherited field base once.
     fields: HashMap<String, FieldSlot>,
+    field_types: HashMap<String, Type>,
     static_fields: HashMap<String, StaticFieldSlot>,
+    static_field_types: HashMap<String, Type>,
     methods: Vec<MethodPlan>,
 }
 
@@ -1353,46 +1370,110 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     }
 
     fn plan_interfaces(&mut self) {
-        let mut pending: Vec<_> = self.ast.interfaces.iter().collect();
-        while !pending.is_empty() {
-            let before = pending.len();
-            pending.retain(|decl| {
-                if !decl.parents.iter().all(|p| self.interface_types.contains_key(&p.value))
-                    || !decl.fields.iter().all(|f| supported_interface_annotation(&f.annotation, &self.interface_types)) {
+        let mut pending_interfaces: Vec<_> = self.ast.interfaces.iter().collect();
+        let mut pending_aliases: Vec<_> = self.ast.type_aliases.iter().collect();
+
+        while !pending_interfaces.is_empty() || !pending_aliases.is_empty() {
+            let before = pending_interfaces.len() + pending_aliases.len();
+
+            pending_interfaces.retain(|decl| {
+                if !decl
+                    .parents
+                    .iter()
+                    .all(|parent| self.interface_types.contains_key(&parent.value))
+                    || !decl.fields.iter().all(|field| {
+                        supported_interface_annotation(&field.annotation, &self.interface_types)
+                    })
+                {
                     return true;
                 }
+
                 let mut fields: Vec<ir::InterfaceFieldType> = Vec::new();
                 for parent in &decl.parents {
-                    if let Type::Interface(inherited) = &self.interface_types[&parent.value] {
-                        for field in inherited {
-                            if let Some(old) = fields.iter().find(|f| f.name == field.name) {
-                                if old != field {
-                                    self.diagnostics.push(Diagnostic::error("NAPALM-T002", "conflicting inherited interface fields", parent.span));
-                                }
-                            } else { fields.push(field.clone()); }
+                    let inherited = match &self.interface_types[&parent.value] {
+                        Type::Interface(fields) | Type::Record(fields) => fields,
+                        _ => {
+                            self.diagnostics.push(Diagnostic::error(
+                                "NAPALM-T002",
+                                "an interface can only extend a structural interface/type",
+                                parent.span,
+                            ));
+                            continue;
+                        }
+                    };
+                    for field in inherited {
+                        if let Some(old) = fields.iter().find(|candidate| candidate.name == field.name) {
+                            if old != field {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "NAPALM-T002",
+                                    "conflicting inherited interface fields",
+                                    parent.span,
+                                ));
+                            }
+                        } else {
+                            fields.push(field.clone());
                         }
                     }
                 }
+
                 for field in &decl.fields {
                     let field_ty = ir::InterfaceFieldType {
                         name: field.name.value.clone(),
-                        ty: resolve_type_annotation(&field.annotation, &self.top_level_classes, &self.interface_types),
+                        ty: resolve_type_annotation(
+                            &field.annotation,
+                            &self.top_level_classes,
+                            &self.interface_types,
+                        ),
                         optional: field.optional,
                         readonly: field.readonly,
                     };
-                    if let Some(old) = fields.iter().find(|f| f.name == field_ty.name) {
+                    if let Some(old) = fields.iter().find(|candidate| candidate.name == field_ty.name) {
                         if old != &field_ty {
-                            self.diagnostics.push(Diagnostic::error("NAPALM-T002", "incompatible interface field override", field.name.span));
+                            self.diagnostics.push(Diagnostic::error(
+                                "NAPALM-T002",
+                                "incompatible interface field override",
+                                field.name.span,
+                            ));
                         }
-                    } else { fields.push(field_ty); }
+                    } else {
+                        fields.push(field_ty);
+                    }
                 }
-                self.interface_types.insert(decl.name.value.clone(), Type::Interface(fields));
+
+                self.interface_types
+                    .insert(decl.name.value.clone(), Type::Interface(fields));
                 false
             });
-            if pending.len() == before {
-                for decl in pending {
-                    self.diagnostics.push(Diagnostic::error("NAPALM-T002",
-                        "unresolved, recursive or unsupported interface field type or parent", decl.name.span));
+
+            pending_aliases.retain(|decl| {
+                if !supported_interface_annotation(&decl.annotation, &self.interface_types) {
+                    return true;
+                }
+                let resolved = resolve_type_annotation(
+                    &decl.annotation,
+                    &self.top_level_classes,
+                    &self.interface_types,
+                );
+                self.interface_types
+                    .insert(decl.name.value.clone(), seal_structural_type(resolved));
+                false
+            });
+
+            let after = pending_interfaces.len() + pending_aliases.len();
+            if after == before {
+                for decl in pending_interfaces.drain(..) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "NAPALM-T002",
+                        "unresolved, recursive or unsupported interface field type or parent",
+                        decl.name.span,
+                    ));
+                }
+                for decl in pending_aliases.drain(..) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "NAPALM-T002",
+                        "unresolved, recursive or unsupported type alias",
+                        decl.name.span,
+                    ));
                 }
                 break;
             }
@@ -1538,7 +1619,9 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     declaration_span: class.name.span,
                     superclass: None,
                     fields: HashMap::new(),
+                    field_types: HashMap::new(),
                     static_fields: HashMap::new(),
+                    static_field_types: HashMap::new(),
                     methods: Vec::new(),
                 },
             );
@@ -1659,17 +1742,61 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             static_fields.insert(name.to_owned(), StaticFieldSlot(index as u16));
         }
 
+        let mut field_types = HashMap::new();
+        let mut static_field_types = HashMap::new();
+        for field in &class.fields {
+            let expected = field
+                .annotation
+                .as_ref()
+                .map(|annotation| {
+                    resolve_type_annotation(
+                        annotation,
+                        &self.top_level_classes,
+                        &self.interface_types,
+                    )
+                })
+                .or_else(|| {
+                    field.initializer.as_ref().and_then(infer_surface_type_annotation).map(
+                        |annotation| {
+                            resolve_type_annotation(
+                                &annotation,
+                                &self.top_level_classes,
+                                &self.interface_types,
+                            )
+                        },
+                    )
+                })
+                .unwrap_or(Type::Top);
+            if field.is_static {
+                static_field_types.insert(field.storage.value.clone(), expected);
+            } else {
+                field_types.insert(field.storage.value.clone(), expected);
+            }
+        }
+
         let id = self.class_plans[&key].id;
         if let Some(info) = self.program.classes.iter_mut().find(|info| info.id == id) {
             info.superclass = static_super;
             info.own_instance_field_count = fields.len() as u16;
+            info.own_instance_field_types = vec![Type::Top; fields.len()];
+            for (name, slot) in &fields {
+                info.own_instance_field_types[slot.0 as usize] =
+                    field_types.get(name).cloned().unwrap_or(Type::Top);
+            }
             info.static_field_count = static_fields.len() as u16;
+            info.static_field_types = vec![Type::Top; static_fields.len()];
+            for (name, slot) in &static_fields {
+                info.static_field_types[slot.0 as usize] =
+                    static_field_types.get(name).cloned().unwrap_or(Type::Top);
+            }
         }
 
         let plan = self.class_plans.get_mut(&key).unwrap();
         plan.superclass = static_super;
         plan.fields = fields;
+        plan.field_types = field_types;
         plan.static_fields = static_fields;
+        plan.static_field_types = static_field_types;
 
         resolving.remove(&key);
         resolved.insert(key);
@@ -1817,7 +1944,9 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         constructor: method.is_constructor,
                         static_method: method.is_static,
                         fields: class_plan.fields.clone(),
+                        field_types: class_plan.field_types.clone(),
                         static_fields: class_plan.static_fields.clone(),
+                        static_field_types: class_plan.static_field_types.clone(),
                     }),
                 );
 
@@ -2013,7 +2142,9 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 constructor: spec.constructor,
                 static_method: spec.static_method,
                 fields: plan.fields,
+                field_types: plan.field_types,
                 static_fields: plan.static_fields,
+                static_field_types: plan.static_field_types,
             }
         });
 
@@ -2098,7 +2229,9 @@ struct MethodContextSpec {
     constructor: bool,
     static_method: bool,
     fields: HashMap<String, FieldSlot>,
+    field_types: HashMap<String, Type>,
     static_fields: HashMap<String, StaticFieldSlot>,
+    static_field_types: HashMap<String, Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -2108,7 +2241,9 @@ struct MethodContext {
     constructor: bool,
     static_method: bool,
     fields: HashMap<String, FieldSlot>,
+    field_types: HashMap<String, Type>,
     static_fields: HashMap<String, StaticFieldSlot>,
+    static_field_types: HashMap<String, Type>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2272,18 +2407,56 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn common_value_type(&self, values: &[ValueId]) -> Type {
-        let Some((&first, rest)) = values.split_first() else {
+        if values.is_empty() {
             return Type::Top;
-        };
-        let first_type = self.builder.value_type(first);
-        if rest
-            .iter()
-            .all(|value| self.builder.value_type(*value) == first_type)
-        {
-            first_type.clone()
-        } else {
-            Type::Top
         }
+        Type::flow_join_many(
+            values
+                .iter()
+                .map(|value| self.builder.value_type(*value).clone()),
+        )
+    }
+
+    /// Preserve a binding's semantic contract across SSA merge parameters. The
+    /// binding checker already guarantees every assignment satisfies this type,
+    /// so carrying `Record`/`Interface`/exact-class information through loops is
+    /// strictly stronger than degrading the parameter to `any`.
+    fn binding_flow_type(
+        &self,
+        binding: BindingId,
+        env: &HashMap<BindingId, Storage>,
+    ) -> Type {
+        match env.get(&binding).copied() {
+            // Captured mutable bindings carry the Cell itself through CFG edges;
+            // their source-level annotation describes the cell payload instead.
+            Some(Storage::Cell(cell)) => return self.builder.value_type(cell).clone(),
+            Some(Storage::Value(_)) | None => {}
+        }
+        if let Some(binding_type) = self.binding_types.get(&binding) {
+            if !matches!(binding_type.expected, Type::Top) {
+                return binding_type.expected.clone();
+            }
+        }
+        match env.get(&binding).copied() {
+            Some(Storage::Value(value)) => self.builder.value_type(value).clone(),
+            Some(Storage::Cell(cell)) => self.builder.value_type(cell).clone(),
+            None => Type::Top,
+        }
+    }
+
+    fn merged_binding_type(&self, binding: BindingId, values: &[ValueId]) -> Type {
+        if let Some(binding_type) = self.binding_types.get(&binding) {
+            if !matches!(binding_type.expected, Type::Top)
+                && values.iter().all(|value| {
+                    binding_type
+                        .expected
+                        .accepts(self.builder.value_type(*value))
+                })
+            {
+                return binding_type.expected.clone();
+            }
+        }
+        self.common_value_type(values)
     }
 
     fn register_binding_type(
@@ -2336,15 +2509,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn bind_interface(&mut self, value: ValueId, expected: &Type) -> ValueId {
-        fn contains_interface(ty: &Type) -> bool {
+        fn contains_structural_contract(ty: &Type) -> bool {
             match ty {
-                Type::Interface(_) => true,
-                Type::List(Some(t)) => contains_interface(t),
-                Type::Union(ts) => ts.iter().any(contains_interface),
+                Type::Interface(_) | Type::Record(_) => true,
+                Type::List(Some(t)) => contains_structural_contract(t),
+                Type::Union(ts) => ts.iter().any(contains_structural_contract),
                 _ => false,
             }
         }
-        if contains_interface(expected) {
+        if contains_structural_contract(expected) {
             self.builder.emit1(Inst::BindInterface { value, expected: expected.clone() }, expected.clone())
         } else { value }
     }
@@ -3037,7 +3210,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                                 Storage::Cell(_) => unreachable!(),
                             })
                             .collect::<Vec<_>>();
-                        let param_type = self.common_value_type(&ids);
+                        let param_type = self.merged_binding_type(binding, &ids);
                         let param = self.builder.add_block_param(join, param_type);
                         merged.insert(binding, Storage::Value(param));
                         params.push(binding);
@@ -3073,18 +3246,26 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let header = self.new_block(&[]);
         let mut header_params = HashMap::new();
         for binding in &carried {
-            let param = self.builder.add_block_param(header, Type::Top);
+            let ty = self.binding_flow_type(*binding, &preheader_env);
+            let param = self.builder.add_block_param(header, ty);
             header_params.insert(*binding, param);
         }
         let body_block = self.new_block(&[]);
         let step = increment.map(|_| self.new_block(&[]));
-        let step_params: Vec<_> = carried.iter().filter_map(|binding| {
-            step.map(|block| (*binding, self.builder.add_block_param(block, Type::Top)))
-        }).collect();
+        let step_params: Vec<_> = carried
+            .iter()
+            .filter_map(|binding| {
+                step.map(|block| {
+                    let ty = self.binding_flow_type(*binding, &preheader_env);
+                    (*binding, self.builder.add_block_param(block, ty))
+                })
+            })
+            .collect();
         let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
-            let param = self.builder.add_block_param(exit, Type::Top);
+            let ty = self.binding_flow_type(*binding, &preheader_env);
+            let param = self.builder.add_block_param(exit, ty);
             exit_params.insert(*binding, param);
         }
 
@@ -3143,22 +3324,25 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let body_block = self.new_block(&[]);
         let mut body_params = HashMap::new();
         for binding in &carried {
-            body_params.insert(*binding, self.builder.add_block_param(body_block, Type::Top));
+            let ty = self.binding_flow_type(*binding, &preheader_env);
+            body_params.insert(*binding, self.builder.add_block_param(body_block, ty));
         }
 
         let condition_block = self.new_block(&[]);
         let mut condition_params = HashMap::new();
         for binding in &carried {
+            let ty = self.binding_flow_type(*binding, &preheader_env);
             condition_params.insert(
                 *binding,
-                self.builder.add_block_param(condition_block, Type::Top),
+                self.builder.add_block_param(condition_block, ty),
             );
         }
 
         let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
-            exit_params.insert(*binding, self.builder.add_block_param(exit, Type::Top));
+            let ty = self.binding_flow_type(*binding, &preheader_env);
+            exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
         }
 
         let entry_args = self.values_for_bindings(&carried, &preheader_env);
@@ -3224,13 +3408,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let iterator_param = self.builder.add_block_param(header, Type::Top);
         let mut header_params = HashMap::new();
         for binding in &carried {
-            header_params.insert(*binding, self.builder.add_block_param(header, Type::Top));
+            let ty = self.binding_flow_type(*binding, &base_env);
+            header_params.insert(*binding, self.builder.add_block_param(header, ty));
         }
         let body_block = self.new_block(&[]);
         let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
-            exit_params.insert(*binding, self.builder.add_block_param(exit, Type::Top));
+            let ty = self.binding_flow_type(*binding, &base_env);
+            exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
         }
 
         let mut entry_args = vec![iterator_initial];
@@ -3561,8 +3747,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
             return self.builder.const_null();
         };
+        let ty = method.field_types.get(&name.value).cloned().unwrap_or(Type::Top);
         let this = self.lower_this(name.span);
-        self.builder.load_field(this, slot, Type::Top)
+        self.builder.load_field(this, slot, ty)
     }
 
     fn lower_static_field(&mut self, name: &Ident) -> ValueId {
@@ -3578,9 +3765,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
             return self.builder.const_null();
         };
+        let ty = method.static_field_types.get(&name.value).cloned().unwrap_or(Type::Top);
         let class = self.lower_lexical_class(method.class);
         self.builder
-            .emit1(Inst::LoadStaticField { class, slot }, Type::Top)
+            .emit1(Inst::LoadStaticField { class, slot }, ty)
     }
 
     fn lower_lexical_class(&mut self, class: ClassId) -> ValueId {
@@ -3883,7 +4071,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (short_env.get(&binding).copied(), rhs_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param_type = self.common_value_type(&[a, b]);
+                    let param_type = self.merged_binding_type(binding, &[a, b]);
                     let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
@@ -3946,7 +4134,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (then_env.get(&binding).copied(), else_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param_type = self.common_value_type(&[a, b]);
+                    let param_type = self.merged_binding_type(binding, &[a, b]);
                     let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
@@ -4050,6 +4238,79 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
     }
 
+    fn structural_field(&self, receiver: ValueId, name: &str) -> Option<ir::InterfaceFieldType> {
+        let fields = match self.builder.value_type(receiver) {
+            Type::Interface(fields) | Type::Record(fields) => fields,
+            _ => return None,
+        };
+        fields.iter().find(|field| field.name == name).cloned()
+    }
+
+    fn structural_object_is_closed(&self, receiver: ValueId) -> bool {
+        matches!(self.builder.value_type(receiver), Type::Record(_))
+    }
+
+    fn prepared_structural_read(
+        &mut self,
+        target: &Expr,
+        location: &Option<(ValueId, Vec<ValueId>)>,
+    ) -> Option<ValueId> {
+        let (receiver, _) = location.as_ref()?;
+        let name = match &target.kind {
+            ExprKind::Invoke(invoke) if invoke.syntax == InvokeSyntax::Getter => {
+                invoke.name.value.as_str()
+            }
+            ExprKind::Subscript { args, .. } => match args.as_slice() {
+                [Expr { kind: ExprKind::String(name), .. }] => std::str::from_utf8(name).ok()?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let field = self.structural_field(*receiver, name)?;
+        let ty = if field.optional && !field.ty.accepts(&Type::Null) {
+            Type::Union(vec![field.ty.clone(), Type::Null])
+        } else {
+            field.ty.clone()
+        };
+        let key = self.builder.const_string(name);
+        Some(self.builder.emit1(Inst::MapGet { map: *receiver, key }, ty))
+    }
+
+    fn store_structural_field(
+        &mut self,
+        receiver: ValueId,
+        name: &str,
+        value: ValueId,
+        span: Span,
+    ) -> bool {
+        let Some(field) = self.structural_field(receiver, name) else {
+            return false;
+        };
+        if field.readonly {
+            self.diagnostics.push(Diagnostic::error(
+                "NAPALM-T003",
+                format!("field '{name}' is readonly"),
+                span,
+            ));
+        }
+        let actual = self.builder.value_type(value).clone();
+        if assignment_is_known_incompatible(&field.ty, &actual) {
+            self.diagnostics.push(Diagnostic::error(
+                "NAPALM-T001",
+                format!(
+                    "field '{name}' expects {}, got {}",
+                    display_source_type(&field.ty),
+                    display_source_type(&semantic_source_type(&actual)),
+                ),
+                span,
+            ));
+        }
+        let value = self.bind_interface(value, &field.ty);
+        let key = self.builder.const_string(name);
+        self.builder.emit0(Inst::MapSet { map: receiver, key, value });
+        true
+    }
+
     fn lower_logical_assignment(
         &mut self,
         target: &Expr,
@@ -4058,22 +4319,26 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         _span: Span,
     ) -> ValueId {
         let location = self.prepare_assignment(target);
-        let old = match (&target.kind, &location) {
-            (ExprKind::Invoke(invoke), Some((receiver, _))) => {
-                let getter = self
-                    .context
-                    .symbols
-                    .expect(&invoke.name.value, MethodKind::Getter, 0);
-                self.builder.invoke(*receiver, getter, Vec::new())
+        let old = if let Some(value) = self.prepared_structural_read(target, &location) {
+            value
+        } else {
+            match (&target.kind, &location) {
+                (ExprKind::Invoke(invoke), Some((receiver, _))) => {
+                    let getter = self
+                        .context
+                        .symbols
+                        .expect(&invoke.name.value, MethodKind::Getter, 0);
+                    self.builder.invoke(*receiver, getter, Vec::new())
+                }
+                (ExprKind::Subscript { .. }, Some((receiver, args))) => {
+                    let getter = self
+                        .context
+                        .symbols
+                        .expect("[]", MethodKind::SubscriptGetter, args.len());
+                    self.builder.invoke(*receiver, getter, args.clone())
+                }
+                _ => self.lower_expr(target),
             }
-            (ExprKind::Subscript { .. }, Some((receiver, args))) => {
-                let getter = self
-                    .context
-                    .symbols
-                    .expect("[]", MethodKind::SubscriptGetter, args.len());
-                self.builder.invoke(*receiver, getter, args.clone())
-            }
-            _ => self.lower_expr(target),
         };
 
         let rhs_block = self.new_block(&[]);
@@ -4126,7 +4391,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         for binding in incoming.keys().copied().collect::<Vec<_>>() {
             match (short_env.get(&binding).copied(), rhs_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
-                    let param_type = self.common_value_type(&[a, b]);
+                    let param_type = self.merged_binding_type(binding, &[a, b]);
                     let param = self.builder.add_block_param(join, param_type);
                     merged_env.insert(binding, Storage::Value(param));
                     env_params.push(binding);
@@ -4162,16 +4427,20 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_update(&mut self, target: &Expr, operator: BinaryOp, rhs: &Expr, postfix: bool) -> ValueId {
         let location = self.prepare_assignment(target);
-        let old = match (&target.kind, &location) {
-            (ExprKind::Invoke(i), Some((receiver, _))) => {
-                let symbol = self.context.symbols.expect(&i.name.value, MethodKind::Getter, 0);
-                self.builder.invoke(*receiver, symbol, Vec::new())
+        let old = if let Some(value) = self.prepared_structural_read(target, &location) {
+            value
+        } else {
+            match (&target.kind, &location) {
+                (ExprKind::Invoke(i), Some((receiver, _))) => {
+                    let symbol = self.context.symbols.expect(&i.name.value, MethodKind::Getter, 0);
+                    self.builder.invoke(*receiver, symbol, Vec::new())
+                }
+                (ExprKind::Subscript { .. }, Some((receiver, args))) => {
+                    let symbol = self.context.symbols.expect("[]", MethodKind::SubscriptGetter, args.len());
+                    self.builder.invoke(*receiver, symbol, args.clone())
+                }
+                _ => self.lower_expr(target),
             }
-            (ExprKind::Subscript { .. }, Some((receiver, args))) => {
-                let symbol = self.context.symbols.expect("[]", MethodKind::SubscriptGetter, args.len());
-                self.builder.invoke(*receiver, symbol, args.clone())
-            }
-            _ => self.lower_expr(target),
         };
         let rhs = self.lower_expr(rhs);
         let symbol = self.context.symbols.expect(binary_operator_name(operator), MethodKind::Method, 1);
@@ -4222,6 +4491,25 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     return value;
                 }
                 if let Some(slot) = method.fields.get(&name.value).copied() {
+                    let expected = method
+                        .field_types
+                        .get(&name.value)
+                        .cloned()
+                        .unwrap_or(Type::Top);
+                    let actual = self.builder.value_type(value).clone();
+                    if assignment_is_known_incompatible(&expected, &actual) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T001",
+                            format!(
+                                "field '{}' expects {}, got {}",
+                                name.value,
+                                display_source_type(&expected),
+                                display_source_type(&semantic_source_type(&actual))
+                            ),
+                            name.span,
+                        ));
+                    }
+                    let value = self.bind_interface(value, &expected);
                     let this = self.lower_this(name.span);
                     self.builder.store_field(this, slot, value);
                 } else {
@@ -4234,6 +4522,25 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     return value;
                 };
                 if let Some(slot) = method.static_fields.get(&name.value).copied() {
+                    let expected = method
+                        .static_field_types
+                        .get(&name.value)
+                        .cloned()
+                        .unwrap_or(Type::Top);
+                    let actual = self.builder.value_type(value).clone();
+                    if assignment_is_known_incompatible(&expected, &actual) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T001",
+                            format!(
+                                "static field '{}' expects {}, got {}",
+                                name.value,
+                                display_source_type(&expected),
+                                display_source_type(&semantic_source_type(&actual))
+                            ),
+                            name.span,
+                        ));
+                    }
+                    let value = self.bind_interface(value, &expected);
                     let class = self.lower_lexical_class(method.class);
                     self.builder.emit0(Inst::StoreStaticField { class, slot, value });
                 } else {
@@ -4242,14 +4549,41 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             ExprKind::Invoke(invoke) => {
                 let (receiver, _) = location.expect("prepared property assignment");
-                let setter = self
-                    .context
-                    .symbols
-                    .expect(&invoke.name.value, MethodKind::Setter, 1);
-                let _ = self.builder.invoke(receiver, setter, vec![value]);
+                if !self.store_structural_field(receiver, &invoke.name.value, value, invoke.name.span) {
+                    if self.structural_object_is_closed(receiver) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T004",
+                            format!("cannot add property '{}' to a closed type", invoke.name.value),
+                            invoke.name.span,
+                        ));
+                    }
+                    let setter = self
+                        .context
+                        .symbols
+                        .expect(&invoke.name.value, MethodKind::Setter, 1);
+                    let _ = self.builder.invoke(receiver, setter, vec![value]);
+                }
             }
-            ExprKind::Subscript { receiver, args } => {
+            ExprKind::Subscript { receiver: _, args } => {
                 let (receiver, mut lowered) = location.expect("prepared subscript assignment");
+                let literal_name = match args.as_slice() {
+                    [Expr { kind: ExprKind::String(name), span }] => {
+                        std::str::from_utf8(name).ok().map(|name| (name.to_owned(), *span))
+                    }
+                    _ => None,
+                };
+                if let Some((name, span)) = literal_name {
+                    if self.store_structural_field(receiver, &name, value, span) {
+                        return value;
+                    }
+                    if self.structural_object_is_closed(receiver) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T004",
+                            format!("cannot add property '{name}' to a closed type"),
+                            span,
+                        ));
+                    }
+                }
                 lowered.push(value);
                 let method = self.context.symbols.expect(
                     "[]=",
@@ -4300,7 +4634,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn interface_field_type(&self, receiver: ValueId, name: &str) -> Option<Type> {
-        let Type::Interface(fields) = self.builder.value_type(receiver) else { return None; };
+        let fields = match self.builder.value_type(receiver) {
+            Type::Interface(fields) | Type::Record(fields) => fields,
+            _ => return None,
+        };
         let field = fields.iter().find(|f| f.name == name)?;
         Some(if field.optional && !field.ty.accepts(&Type::Null) {
             Type::Union(vec![field.ty.clone(), Type::Null])
@@ -4347,6 +4684,13 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.builder.const_null();
         }
 
+        let result_type = Type::flow_join_many(
+            exits
+                .iter()
+                .map(|(_, value, _)| self.builder.value_type(*value).clone()),
+        );
+        self.builder.refine_value_type(result_param, result_type);
+
         // Merge SSA locals from every possible short-circuit point exactly like
         // conditional expressions do. Captured mutable locals are cells and keep
         // the same storage identity across every path.
@@ -4373,7 +4717,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 continue;
             }
             if values.iter().all(|value| matches!(value, Storage::Value(_))) {
-                let param = self.builder.add_block_param(join, Type::Top);
+                let ids = values
+                    .iter()
+                    .map(|value| match value {
+                        Storage::Value(value) => *value,
+                        Storage::Cell(_) => unreachable!(),
+                    })
+                    .collect::<Vec<_>>();
+                let ty = self.merged_binding_type(binding, &ids);
+                let param = self.builder.add_block_param(join, ty);
                 merged_env.insert(binding, Storage::Value(param));
                 env_params.push(binding);
             }
@@ -5717,6 +6069,253 @@ class Child is Parent {
             "unexpected type diagnostics: {:#?}",
             output.diagnostics
         );
+    }
+
+    #[test]
+    fn structural_interfaces_and_types_lower_to_typed_map_accesses() {
+        let source = r#"
+            interface OpenPoint {
+                x: number;
+                payload: any;
+            }
+
+            type ClosedPoint = {
+                x: number;
+                payload: any;
+            };
+
+            let open: OpenPoint = {x: 1, payload: null};
+            let closed: ClosedPoint = {x: 1, payload: null};
+
+            open.x = open.x + 1;
+            open.payload = "dynamic";
+            open.extra = 7;
+
+            closed.x = closed.x + 1;
+            closed.payload = true;
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            !output.has_errors(),
+            "typed structural lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let mut saw_open_contract = false;
+        let mut saw_closed_contract = false;
+        let mut typed_num_gets = 0usize;
+        let mut direct_map_sets = 0usize;
+        for function in &output.program.functions {
+            for node in &function.nodes {
+                match &node.kind {
+                    Inst::BindInterface { expected, .. } => match expected {
+                        Type::Interface(_) => saw_open_contract = true,
+                        Type::Record(_) => saw_closed_contract = true,
+                        _ => {}
+                    },
+                    Inst::MapGet { .. } => {
+                        if node.results.iter().any(|result| {
+                            function
+                                .value(*result)
+                                .is_some_and(|value| value.ty == Type::Num)
+                        }) {
+                            typed_num_gets += 1;
+                        }
+                    }
+                    Inst::MapSet { .. } => direct_map_sets += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_open_contract, "interface binding must stay open");
+        assert!(saw_closed_contract, "type alias binding must become a closed record");
+        assert!(typed_num_gets >= 2, "typed property reads should expose Number in WIR");
+        assert!(direct_map_sets >= 4, "known structural writes should lower directly to MapSet");
+    }
+
+    #[test]
+    fn structural_contract_survives_loop_carried_ssa_merges() {
+        let source = r#"
+            type Point = { x: number; y: number };
+
+            function accumulate(limit: number): number {
+                let point: Point = {x: 1, y: 2};
+                let sum: number = 0;
+                let i: number = 0;
+                while (i < limit) {
+                    if ((i % 8) == 0) {
+                        point = {x: point.x, y: point.y};
+                    }
+                    sum = sum + point.x + point.y;
+                    i = i + 1;
+                }
+                return sum;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            !output.has_errors(),
+            "loop-carried typed lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let mut saw_record_param = false;
+        let mut typed_number_gets = 0usize;
+        for function in &output.program.functions {
+            for block in &function.blocks {
+                saw_record_param |= block.params.iter().any(|param| {
+                    function
+                        .value(*param)
+                        .is_some_and(|value| matches!(&value.ty, Type::Record(_)))
+                });
+            }
+            for node in &function.nodes {
+                if matches!(node.kind, Inst::MapGet { .. })
+                    && node.results.iter().any(|result| {
+                        function
+                            .value(*result)
+                            .is_some_and(|value| value.ty == Type::Num)
+                    })
+                {
+                    typed_number_gets += 1;
+                }
+            }
+        }
+        assert!(saw_record_param, "loop-carried Point must keep its closed record contract");
+        assert!(
+            typed_number_gets >= 4,
+            "Point property reads after loop merges must stay direct typed MapGet operations"
+        );
+    }
+
+    #[test]
+    fn exact_class_survives_loop_carried_ssa_merges() {
+        let source = r#"
+            class Point {
+                x: number = 1;
+                y: number = 2;
+            }
+
+            function accumulate(limit: number): number {
+                let point = new Point();
+                let sum: number = 0;
+                let i: number = 0;
+                while (i < limit) {
+                    if ((i % 8) == 0) {
+                        point = new Point();
+                    }
+                    sum = sum + point.x + point.y;
+                    i = i + 1;
+                }
+                return sum;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("classes.nap", source, "classes", &module);
+        assert!(
+            !output.has_errors(),
+            "loop-carried class lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let mut saw_exact_class_param = false;
+        let mut typed_field_loads = 0usize;
+        for function in &output.program.functions {
+            for block in &function.blocks {
+                saw_exact_class_param |= block.params.iter().any(|param| {
+                    function.value(*param).is_some_and(|value| {
+                        matches!(&value.ty, Type::Instance(classes) if !classes.is_unknown())
+                    })
+                });
+            }
+            for node in &function.nodes {
+                if matches!(node.kind, Inst::LoadField { .. })
+                    && node.results.iter().any(|result| {
+                        function
+                            .value(*result)
+                            .is_some_and(|value| value.ty == Type::Num)
+                    })
+                {
+                    typed_field_loads += 1;
+                }
+            }
+        }
+        assert!(
+            saw_exact_class_param,
+            "loop-carried Point must keep its exact class set"
+        );
+        assert!(
+            typed_field_loads >= 4,
+            "Point field reads after loop merges must remain typed fixed-slot loads"
+        );
+    }
+
+    #[test]
+    fn closed_type_rejects_a_new_property_during_lowering() {
+        let source = r#"
+            type Closed = { x: number };
+            let value: Closed = {x: 1};
+            value.extra = 2;
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "NAPALM-T004"
+                && diagnostic.message.contains("extra")
+                && diagnostic.message.contains("closed type")
+        }));
+    }
+
+    #[test]
+    fn class_field_annotations_become_fixed_slot_type_metadata() {
+        let source = r#"
+            class Point {
+                x: number = 1;
+                payload: any = null;
+                static count: number = 0;
+
+                bump(): number {
+                    this.x = this.x + 1;
+                    return this.x;
+                }
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            !output.has_errors(),
+            "typed class lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+        let class = output
+            .program
+            .classes
+            .iter()
+            .find(|class| output.program.string(class.name) == Some("Point"))
+            .expect("Point class metadata");
+        assert!(class.own_instance_field_types.contains(&Type::Num));
+        assert!(class.own_instance_field_types.contains(&Type::Top));
+        assert_eq!(class.static_field_types, vec![Type::Num]);
+
+        let mut saw_typed_load = false;
+        for function in &output.program.functions {
+            if function.field_owner != Some(class.id) {
+                continue;
+            }
+            for node in &function.nodes {
+                if !matches!(&node.kind, Inst::LoadField { .. }) {
+                    continue;
+                }
+                saw_typed_load |= node.results.iter().any(|result| {
+                    function
+                        .value(*result)
+                        .is_some_and(|value| value.ty == Type::Num)
+                });
+            }
+        }
+        assert!(saw_typed_load, "class Number field loads should be typed in WIR");
     }
 
     #[test]

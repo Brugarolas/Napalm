@@ -10,6 +10,10 @@ use crate::napalm_ir::{
 use crate::napalm_ir_escape::ScalarReplacement;
 use crate::napalm_ir_optimizer::{repair_effect_chain, FunctionOptimization, Optimize};
 
+#[path = "typed_object_specialization.rs"]
+mod typed_object_specialization;
+pub use typed_object_specialization::TypedObjectSpecialization;
+
 /// Interpreter-oriented WIR optimization pipeline.
 ///
 /// The default stage combines bounded scalar folding, local value numbering,
@@ -114,6 +118,7 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         let mut changed_any = false;
 
         let mut cse = DominatorCSE::default();
+        let mut typed_objects = TypedObjectSpecialization::default();
         let mut simplify = FastLocalSimplify::default();
         let mut copies = CopyPropagation::default();
         let mut dce = DeadCodeElimination::default();
@@ -137,6 +142,10 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
                 break;
             }
         }
+
+        // Recover exact structural/class facts across the SSA merges produced by
+        // the frontend before guard cleanup and escape analysis consume them.
+        changed_any |= typed_objects.optimize_function(function);
 
         // Remove dead values before touching the CFG.
         changed_any |= dce.optimize_function(function);
@@ -168,6 +177,7 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
             // behind, so clean them immediately.
             simplify.optimize_function(function);
             copies.optimize_function(function);
+            typed_objects.optimize_function(function);
             dce.optimize_function(function);
         }
 
@@ -184,8 +194,12 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
             // and simpler operands to all subsequent local passes.
             round |= cse.optimize_function(function);
 
-            // Canonicalize SSA identities before algebraic simplification.
+            // Canonicalize SSA identities before semantic type propagation.
             round |= copies.optimize_function(function);
+
+            // Moves, guards and loop block parameters may now expose exact closed
+            // object/class facts which make the following guard sweep much cheaper.
+            round |= typed_objects.optimize_function(function);
 
             // Constant folding, peepholes, local CSE, guard simplification, memory
             // forwarding and the other bounded transformations contained here.
@@ -205,10 +219,11 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
                 // SROA and CFG cleanup frequently expose another short scalar chain.
                 // Do a cleanup here rather than waiting for the next global round.
                 let propagated = copies.optimize_function(function);
+                let specialized = typed_objects.optimize_function(function);
                 let simplified = simplify.optimize_function(function);
                 let eliminated = dce.optimize_function(function);
 
-                round |= propagated | simplified | eliminated;
+                round |= propagated | specialized | simplified | eliminated;
             }
 
             changed_any |= round;
@@ -225,9 +240,10 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         // change, the fixed-point loop above would not have terminated.
         // ---------------------------------------------------------------------
         let final_copies = copies.optimize_function(function);
+        let final_typed = typed_objects.optimize_function(function);
         let final_simplify = simplify.optimize_function(function);
 
-        let mut final_changed = final_copies | final_simplify;
+        let mut final_changed = final_copies | final_typed | final_simplify;
 
         if final_changed {
             final_changed |= dce.optimize_function(function);
@@ -565,6 +581,19 @@ fn fold_instruction(function: &Function, id: InstId) -> Option<Inst> {
             let right = resolve_constant(function, right, 0)?;
             fold_ref_eq_constants(&left, &right).map(|value| Const(Constant::Bool(value)))
         }
+
+        MapLen { map } => match function.value(map).map(|value| &value.ty) {
+            // A closed record has no undeclared properties. When every declared
+            // field is required, successful contract installation also proves
+            // the exact property count for the rest of the object's lifetime.
+            Some(Type::Record(fields))
+                if fields.iter().all(|field| !field.optional)
+                    && fields.len() <= i32::MAX as usize =>
+            {
+                Some(Const(Constant::Int32(fields.len() as i32)))
+            }
+            _ => None,
+        },
 
         Branch {
             cond,
@@ -941,6 +970,73 @@ fn fold_ref_eq_constants(left: &Constant, right: &Constant) -> Option<bool> {
 }
 
 
+/// Follow operations that preserve the exact runtime object identity. This is
+/// intentionally narrower than general copy propagation: representation-changing
+/// guards/conversions are not aliases even if they originate from the same SSA value.
+fn object_alias_root(function: &Function, mut value: ValueId) -> ValueId {
+    for _ in 0..=function.values.len() {
+        let Some(info) = function.value(value) else { break };
+        let ValueDef::InstResult(inst, _) = info.def else { break };
+        let Some(node) = function.node(inst) else { break };
+        let source = match &node.kind {
+            Inst::Move(source)
+            | Inst::BindInterface { value: source, .. }
+            | Inst::GuardType { value: source, .. }
+            | Inst::GuardClass { value: source, .. }
+            | Inst::GuardNotNull { value: source, .. } => Some(*source),
+            _ => None,
+        };
+        let Some(source) = source else { break };
+        if source == value { break; }
+        value = source;
+    }
+    value
+}
+
+fn fresh_object_allocation(function: &Function, value: ValueId) -> Option<InstId> {
+    let value = object_alias_root(function, value);
+    let ValueDef::InstResult(inst, _) = function.value(value)?.def else { return None };
+    matches!(
+        &function.node(inst)?.kind,
+        Inst::AllocInstance { .. }
+            | Inst::AllocForeign { .. }
+            | Inst::AllocCell { .. }
+            | Inst::MakeClosure { .. }
+            | Inst::AllocList { .. }
+            | Inst::AllocMap
+            | Inst::MakeRange { .. }
+            | Inst::MakeFiber { .. }
+    )
+    .then_some(inst)
+}
+
+#[inline]
+fn objects_definitely_distinct(function: &Function, lhs: ValueId, rhs: ValueId) -> bool {
+    let lhs = object_alias_root(function, lhs);
+    let rhs = object_alias_root(function, rhs);
+    lhs != rhs
+        && fresh_object_allocation(function, lhs)
+            .zip(fresh_object_allocation(function, rhs))
+            .is_some_and(|(lhs, rhs)| lhs != rhs)
+}
+
+fn string_constant(function: &Function, value: ValueId) -> Option<StringId> {
+    let value = object_alias_root(function, value);
+    let ValueDef::InstResult(inst, _) = function.value(value)?.def else { return None };
+    match &function.node(inst)?.kind {
+        Inst::Const(Constant::String(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+#[inline]
+fn map_keys_definitely_distinct(function: &Function, lhs: ValueId, rhs: ValueId) -> bool {
+    match (string_constant(function, lhs), string_constant(function, rhs)) {
+        (Some(lhs), Some(rhs)) => lhs != rhs,
+        _ => false,
+    }
+}
+
 /// One bounded block-local sweep that combines scalar folding, guard cleanup,
 /// local value numbering, load forwarding and conservative dead-store removal.
 #[derive(Default)]
@@ -1080,8 +1176,18 @@ impl FunctionOptimization for FastLocalSimplify {
                 let effect_kind = kind.effect_kind();
                 match kind {
                     Inst::LoadField { object, slot } => {
-                        // Any field load can observe a prior store through an alias.
-                        last_field_store.clear();
+                        let object = object_alias_root(function, object);
+                        // A read only makes stores to the same physical slot
+                        // observable. Stores to another fixed slot are disjoint;
+                        // distinct fresh allocations are also a no-alias proof.
+                        last_field_store.retain(|(stored_object, stored_slot), _| {
+                            *stored_slot != slot
+                                || objects_definitely_distinct(
+                                    function,
+                                    *stored_object,
+                                    object,
+                                )
+                        });
                         let key = (object, slot);
                         if let Some(value) = field_values.get(&key).copied() {
                             function.nodes[id.0 as usize].kind = Inst::Move(value);
@@ -1092,18 +1198,28 @@ impl FunctionOptimization for FastLocalSimplify {
                         }
                     }
                     Inst::StoreField { object, slot, value } => {
+                        let object = object_alias_root(function, object);
                         let key = (object, slot);
                         if let Some(previous) = last_field_store.insert(key, id) {
                             removed[previous.0 as usize] = true;
                             changed = true;
                             effect_shape_changed = true;
                         }
-                        // Different SSA values may still alias the same object.
-                        field_values.clear();
+                        field_values.retain(|(known_object, known_slot), _| {
+                            if *known_object == object {
+                                *known_slot != slot
+                            } else {
+                                objects_definitely_distinct(function, *known_object, object)
+                            }
+                        });
                         field_values.insert(key, value);
                     }
                     Inst::LoadStaticField { class, slot } => {
-                        last_static_store.clear();
+                        let class = object_alias_root(function, class);
+                        last_static_store.retain(|(stored_class, stored_slot), _| {
+                            *stored_slot != slot
+                                || objects_definitely_distinct(function, *stored_class, class)
+                        });
                         let key = (class, slot);
                         if let Some(value) = static_values.get(&key).copied() {
                             function.nodes[id.0 as usize].kind = Inst::Move(value);
@@ -1114,17 +1230,27 @@ impl FunctionOptimization for FastLocalSimplify {
                         }
                     }
                     Inst::StoreStaticField { class, slot, value } => {
+                        let class = object_alias_root(function, class);
                         let key = (class, slot);
                         if let Some(previous) = last_static_store.insert(key, id) {
                             removed[previous.0 as usize] = true;
                             changed = true;
                             effect_shape_changed = true;
                         }
-                        static_values.clear();
+                        static_values.retain(|(known_class, known_slot), _| {
+                            if *known_class == class {
+                                *known_slot != slot
+                            } else {
+                                objects_definitely_distinct(function, *known_class, class)
+                            }
+                        });
                         static_values.insert(key, value);
                     }
                     Inst::LoadCell { cell } => {
-                        last_cell_store.clear();
+                        let cell = object_alias_root(function, cell);
+                        last_cell_store.retain(|stored_cell, _| {
+                            objects_definitely_distinct(function, *stored_cell, cell)
+                        });
                         if let Some(value) = cell_values.get(&cell).copied() {
                             function.nodes[id.0 as usize].kind = Inst::Move(value);
                             changed = true;
@@ -1134,12 +1260,15 @@ impl FunctionOptimization for FastLocalSimplify {
                         }
                     }
                     Inst::StoreCell { cell, value } => {
+                        let cell = object_alias_root(function, cell);
                         if let Some(previous) = last_cell_store.insert(cell, id) {
                             removed[previous.0 as usize] = true;
                             changed = true;
                             effect_shape_changed = true;
                         }
-                        cell_values.clear();
+                        cell_values.retain(|known_cell, _| {
+                            objects_definitely_distinct(function, *known_cell, cell)
+                        });
                         cell_values.insert(cell, value);
                     }
                     Inst::LoadModuleVar { module, slot } => {
@@ -1193,6 +1322,7 @@ impl FunctionOptimization for FastLocalSimplify {
                         list_values.clear();
                     }
                     Inst::MapLen { map } => {
+                        let map = object_alias_root(function, map);
                         cse_read(
                             function,
                             id,
@@ -1203,6 +1333,8 @@ impl FunctionOptimization for FastLocalSimplify {
                         );
                     }
                     Inst::MapGet { map, key } => {
+                        let map = object_alias_root(function, map);
+                        let key = object_alias_root(function, key);
                         cse_read(
                             function,
                             id,
@@ -1213,7 +1345,21 @@ impl FunctionOptimization for FastLocalSimplify {
                         );
                     }
                     Inst::MapSet { map, key, value } => {
-                        map_values.clear();
+                        let map = object_alias_root(function, map);
+                        let key = object_alias_root(function, key);
+                        map_values.retain(|cached, _| match cached {
+                            SeqReadKey::MapGet(known_map, known_key) => {
+                                if *known_map == map {
+                                    map_keys_definitely_distinct(function, *known_key, key)
+                                } else {
+                                    objects_definitely_distinct(function, *known_map, map)
+                                }
+                            }
+                            SeqReadKey::MapLen(known_map) => {
+                                objects_definitely_distinct(function, *known_map, map)
+                            }
+                            _ => true,
+                        });
                         map_values.insert(SeqReadKey::MapGet(map, key), value);
                     }
                     Inst::MapRemove { .. } | Inst::MapSpread { .. } => {
@@ -1401,6 +1547,7 @@ fn class_guard_known(actual: &Type, expected: &ClassSet) -> bool {
             .as_slice()
             .iter()
             .all(|class| expected.contains(*class)),
+        Type::Foreign(Some(class)) => expected.contains(*class),
         Type::Union(types) => types.iter().all(|ty| class_guard_known(ty, expected)),
         Type::Bottom => true,
         _ => false,
@@ -2161,4 +2308,86 @@ fn live_instruction_ids(function: &Function) -> Vec<InstId> {
     }
 
     ids
+}
+
+#[cfg(test)]
+mod typed_object_tests {
+    use super::*;
+    use crate::napalm_ir::{Builder, FunctionKind, InterfaceFieldType, Program};
+
+    #[test]
+    fn closed_required_record_has_constant_map_length() {
+        let mut program = Program::new();
+        let module = program.add_module("typed", 0);
+        let record = Type::Record(vec![
+            InterfaceFieldType {
+                name: "x".into(),
+                ty: Type::Num,
+                optional: false,
+                readonly: false,
+            },
+            InterfaceFieldType {
+                name: "payload".into(),
+                ty: Type::Top,
+                optional: false,
+                readonly: false,
+            },
+        ]);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "len",
+            FunctionKind::Closure,
+            vec![record],
+            Type::Int32,
+        );
+        let map = builder.param(0);
+        let len = builder.emit1(Inst::MapLen { map }, Type::Int32);
+        builder.ret(len);
+        let function_id = builder.finish();
+        let function = &mut program.functions[function_id.0 as usize];
+
+        assert!(FastLocalSimplify.optimize_function(function));
+        let ValueDef::InstResult(inst, _) = function.value(len).unwrap().def else {
+            panic!("MapLen result must stay instruction-backed");
+        };
+        assert!(matches!(
+            function.node(inst).map(|node| &node.kind),
+            Some(Inst::Const(Constant::Int32(2)))
+        ));
+    }
+
+    #[test]
+    fn optional_record_field_prevents_constant_map_length() {
+        let mut program = Program::new();
+        let module = program.add_module("typed", 0);
+        let record = Type::Record(vec![InterfaceFieldType {
+            name: "x".into(),
+            ty: Type::Num,
+            optional: true,
+            readonly: false,
+        }]);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "len",
+            FunctionKind::Closure,
+            vec![record],
+            Type::Int32,
+        );
+        let map = builder.param(0);
+        let len = builder.emit1(Inst::MapLen { map }, Type::Int32);
+        builder.ret(len);
+        let function_id = builder.finish();
+        let function = &mut program.functions[function_id.0 as usize];
+
+        FastLocalSimplify.optimize_function(function);
+        let ValueDef::InstResult(inst, _) = function.value(len).unwrap().def else {
+            panic!("MapLen result must stay instruction-backed");
+        };
+        assert!(matches!(
+            function.node(inst).map(|node| &node.kind),
+            Some(Inst::MapLen { .. })
+        ));
+    }
 }

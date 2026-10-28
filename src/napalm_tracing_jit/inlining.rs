@@ -31,7 +31,16 @@ impl TraceRecorder<'_> {
         if arguments.len() != callee.arity as usize { return Err(RecordingAbort::UnsupportedCall); }
         let mut args = Vec::new();
         for reg in arguments { args.push(self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)?); }
-        let receiver = receiver_reg.map(|reg| self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)).transpose()?;
+        let receiver = receiver_reg
+            .map(|reg| self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged))
+            .transpose()?;
+        let receiver_word = receiver_reg
+            .map(|reg| {
+                runtime
+                    .trace_read_slot(FrameSlot::General(reg))
+                    .map_err(|_| RecordingAbort::UnsupportedCall)
+            })
+            .transpose()?;
         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
         builder.emit0(TraceInst::GuardMethodEpoch { expected: runtime.trace_method_epoch(), exit });
         if let Some(classes) = &class {
@@ -76,7 +85,23 @@ impl TraceRecorder<'_> {
                 LoadField => {
                     let object = scalar(inst.b, TraceRep::Tagged)?;
                     let slot = runtime.trace_field_slot(inst.location, inst.x);
-                    builder.emit1(TraceInst::HeapLoadField { object, slot, exit }, TraceType::Any, TraceRep::Tagged)
+                    let field_type = if Some(object) == receiver {
+                        receiver_word
+                            .and_then(|word| runtime.trace_field_type(word, slot))
+                            .unwrap_or(Type::Top)
+                    } else {
+                        Type::Top
+                    };
+                    let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+                    let result = builder.emit1(
+                        TraceInst::HeapLoadField { object, slot, exit },
+                        trace_ty,
+                        trace_rep,
+                    );
+                    if !matches!(&field_type, Type::Top) {
+                        builder.set_proven_type(result, field_type);
+                    }
+                    result
                 }
                 LoadCell => {
                     let cell = scalar(inst.b, TraceRep::Tagged)?;
@@ -94,7 +119,20 @@ impl TraceRecorder<'_> {
                 ListGet => {
                     let list = scalar(inst.b, TraceRep::Tagged)?;
                     let index = scalar(inst.c, TraceRep::Int32)?;
-                    builder.emit1(TraceInst::HeapListGet { list, index, exit }, TraceType::Any, TraceRep::Tagged)
+                    let element_type = match builder.proven_type(list) {
+                        Some(Type::List(Some(element))) => (**element).clone(),
+                        _ => Type::Top,
+                    };
+                    let (trace_ty, trace_rep) = Self::semantic_trace_layout(&element_type);
+                    let result = builder.emit1(
+                        TraceInst::HeapListGet { list, index, exit },
+                        trace_ty,
+                        trace_rep,
+                    );
+                    if !matches!(&element_type, Type::Top) {
+                        builder.set_proven_type(result, element_type);
+                    }
+                    result
                 }
                 GuardBounds => {
                     let index = scalar(inst.a, TraceRep::Int32)?;
