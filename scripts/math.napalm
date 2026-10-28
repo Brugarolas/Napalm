@@ -1,0 +1,7 @@
+// math — exporta constantes, funciones y una clase
+
+export const ANSWER = 42;
+
+export function add(a, b) {
+  return a + b;
+}

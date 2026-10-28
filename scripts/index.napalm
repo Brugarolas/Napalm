@@ -1,0 +1,597 @@
+// src/index.napalm
+
+print("===== Hello World =====");
+print("Hello, World!"); // expect Hello, World!
+
+print("===== Simple function =====");
+fn add2(a, b) {
+    return a + b;
+}
+
+print(add2(2, 3)); // expect 5
+
+print("===== Recursive function =====");
+fn fibonacci(n) {
+    if (n <= 1) {
+        return n;
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2);
+}
+print(fibonacci(5)); // expect 5
+
+print("===== Levenshtein distance =====");
+
+fn levenshtein(a, b) {
+    if (a == b) { return 0; }
+
+    var m = a.length;
+    var n = b.length;
+
+    if (m == 0) { return n; }
+    if (n == 0) { return m; }
+
+    // Two-row dynamic programming: O(min(m, n)) space
+    // Ensure we iterate over the shorter string horizontally for cache-friendliness
+    if (n > m) {
+        // swap a <-> b and m <-> n so that n <= m
+        var tmpS = a; a = b; b = tmpS;
+        var tmpL = m; m = n; n = tmpL;
+    }
+
+    var prev = Array(n + 1);
+    var curr = Array(n + 1);
+
+    // Initialize prev row: [0..n]
+    var j = 0;
+    while (j <= n) {
+        prev[j] = j;
+        j += 1;
+    }
+
+    var i = 1;
+    while (i <= m) {
+        curr[0] = i;
+
+        var ai = a[i - 1];   // assume string indexing returns 1-char string
+
+        j = 1;
+        while (j <= n) {
+            var cost = (ai == b[j - 1]) ? 0 : 1;
+
+            var del = prev[j] + 1;       // deletion
+            var ins = curr[j - 1] + 1;   // insertion
+            var sub = prev[j - 1] + cost; // substitution
+
+            // min of three
+            var t = (del < ins) ? del : ins;
+            curr[j] = (sub < t) ? sub : t;
+
+            j += 1;
+        }
+
+        // swap rows (no copy)
+        var trow = prev; prev = curr; curr = trow;
+
+        i += 1;
+    }
+
+    return prev[n];
+}
+
+var A = "kitten";
+var B = "sitting";
+var d = levenshtein(A, B);
+print(d); // expect 3
+
+print("===== While loop =====");
+var x = 0;
+while (x < 10) {
+    x += 1;
+}
+print(x); // expect 10
+
+print("===== For loop =====");
+var y = 0;
+for (var i = 0; i < 5; i += 1) {
+    y += i;
+}
+print(y); // expect 10
+
+print("===== If-else with else unless =====");
+var x = 3;
+if (x == 0) {
+    x = x + 0;
+} else unless (x < 0) {
+    x = x + 1;
+} else {
+    x = x - 1;
+}
+print(x); // expect 4
+
+print("===== Boolean basics =====");
+let t = true;
+let f = false;
+print(t);           // expect true
+print(f);           // expect false
+print(!t);          // expect false
+print(!f);          // expect true
+
+print("===== Boolean control flow =====");
+if (t) {
+    print("true branch");   // expect "true branch"
+}
+
+if (f) {
+    print("unreachable");
+} else {
+    print("false branch");  // expect "false branch"
+}
+
+print("===== Boolean equality =====");
+print(t == f);      // expect false
+print(t != f);      // expect true
+
+print("===== Lambda functions =====");
+print((fn (a, b) { return a + b; })(2, 3));      // 5
+print((|x| x + 1)(41));                  // 42
+print((|a, b| { return a*b; })(6, 7));   // 42
+
+print("===== Objects =====");
+var o = { a: 10, "b": 20 };
+print(o.a);          // 10
+o.a = o.a + 1;
+print(o["a"]);       // 11
+print(o["b"]);       // 20
+print("a" in o);     // expect true
+delete o.a;
+print("a" in o);     // expect false
+var key_b = "b";
+print(o[key_b]);     // 20
+
+print("===== Object destructuring =====");
+var user = { name: "Ada", age: 32, country: "UK" };
+var { name, age } = user;
+print(name);          // expect Ada
+print(age);           // expect 32
+
+print("===== Object rest =====");
+var { name: displayName, ...others } = user;
+print(displayName);   // expect Ada
+print(others.country); // expect UK
+
+print("===== Object spread =====");
+var base = { a: 1, b: 2 };
+var extra = { b: 5, c: 9 };
+var merged = { greeting: "hi", ...base, ...extra, d: 10 };
+print(merged.a + merged.b + merged.c + merged.d); // expect 1 + 5 + 9 + 10 = 25
+print(merged);
+
+print("===== Object iteration helpers =====");
+print(merged.keys());              // expect keys of merged in insertion order
+print(merged.values());            // expect values [1, 5, 9, 10, "hi"]
+print(merged.entries());           // expect entry pairs [["a",1], ...]
+print(merged.size);                // expect 5
+
+print("===== Class instance iteration helpers =====");
+class Box {
+  constructor(v) {
+    this.value = v;
+    this.tag = "box";
+  }
+}
+var box = new Box(42);
+print(box.keys());                 // expect ["value", "tag"]
+print(box.values());               // expect [42, "box"]
+print(box.entries());              // expect [["value",42],["tag","box"]]
+print(box.size);                   // expect 2
+
+print("===== Map iteration helpers =====");
+var map2 = new Map();
+map2.set("x", 1);
+map2.set("y", 2);
+print(map2.keys());                // expect ["x", "y"]
+print(map2.values());              // expect [1, 2]
+print(map2.entries());             // expect [["x",1],["y",2]]
+print(map2.size);                  // expect 2
+
+print("===== Set iteration helpers =====");
+var set2 = new Set();
+set2.add("alpha");
+set2.add("beta");
+print(set2.values());              // expect ["alpha", "beta"]
+print(set2.size);                  // expect 2
+
+print("===== Proxy basic traps =====");
+var proxyTarget = { foo: 10 };
+var proxyLog = Array(0);
+proxyLog.setLength(0);
+var proxyHandler = {
+    "get": fn (t, key, recv) {
+        proxyLog.push("get:" + key);
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        proxyLog.push("set:" + key);
+        t[key] = value;
+        return true;
+    },
+    "has": fn (t, key) {
+        proxyLog.push("has:" + key);
+        return key in t;
+    },
+    "deleteProperty": fn (t, key) {
+        proxyLog.push("del:" + key);
+        delete t[key];
+        return true;
+    },
+    "ownKeys": fn (t) {
+        proxyLog.push("ownKeys");
+        return t.keys();
+    }
+};
+var proxied = new Proxy(proxyTarget, proxyHandler);
+print(proxied.foo);                // expect 10, triggers get
+proxied.bar = 42;                  // expect set trap, writes through
+print(proxyTarget.bar);            // expect 42
+print("foo" in proxied);           // expect true, has trap
+delete proxied.foo;                // expect delete trap
+print("foo" in proxied);           // expect false
+print(proxied.keys());             // expect ["bar"], uses ownKeys trap
+print(proxyLog);
+
+print("===== Proxy iteration & spread =====");
+var proxiedIter = new Proxy({ a: 1, c: 3 }, {
+    "ownKeys": fn (t) {
+        return ["c", "a"]; // custom key order
+    },
+    "get": fn (t, key, recv) {
+        return t[key];
+    },
+    "set": fn (t, key, value, recv) {
+        t[key] = value;
+        return true;
+    }
+});
+print(proxiedIter.keys());         // expect ["c", "a"]
+print(proxiedIter.values());       // expect [3, 1]
+print(proxiedIter.entries());      // expect [["c",3],["a",1]]
+var spreadProxy = { ...proxiedIter, b: 2 };
+print(spreadProxy.keys());         // expect sorted ["a","b","c"] (object keys sorted alpha)
+print(spreadProxy.values());       // expect [1,2,3]
+
+// ===========================
+// Arrays
+// ===========================
+
+print("===== Arrays: create & index =====");
+var array = [10, 20, 30];
+print(array[0] + array[1] + array[2]); // expect 60
+print(array);
+
+var a = Array(3);        // [0,0,0]
+a[0] = 10;
+a[1] = 20;
+a[2] = 30;
+print(a[0] + a[1] + a[2]); // expect 60
+
+print("===== Arrays: length & setLength =====");
+print(a.length());      // expect 3
+a.setLength(5);         // grow to 5
+a[3] = 40;
+a[4] = 50;
+print(a.length());      // expect 5
+print(a[3] + a[4]);     // expect 90
+
+print("===== Arrays: length property =====");
+var arr = [1, 2, 3, 4, 5, 6, 7, 8];
+print(arr.length);      // expect 8
+arr.length = 5;
+print(arr.length);      // expect 5
+arr.setLength(2);       // legacy method still works
+print(arr.length);      // expect 2
+print(arr.length());    // method form still works → expect 2
+
+print("===== Arrays: push/pop/shift/unshift =====");
+var b = Array(0);        // start empty-length array (implementation may allow 0)
+b.setLength(0);
+b.push(1);
+b.push(2);
+b.push(3);              // b = [1,2,3]
+print(b.length());      // expect 3
+print(b.pop());         // expect 3, b = [1,2]
+print(b.shift());       // expect 1, b = [2]
+b.unshift(9);           // b = [9,2]
+print(b.length());      // expect 2
+print(b[0] + b[1]);     // expect 11
+
+print("===== Arrays: map/filter/forEach/reduce/find/findIndex =====");
+var n = 6;
+var c = Array(n);
+var i = 0;
+while (i < n) {
+    c[i] = i;   // c = [0,1,2,3,4,5]
+    i += 1;
+}
+
+// map: x -> x*2  => [0,2,4,6,8,10]
+var d = c.map(|x| x * 2);
+print(d[0] + d[1] + d[2]);       // expect 6
+
+// filter: keep >= 4  => [4,5]
+var e = c.filter(|x| x >= 4);
+print(e.length());               // expect 2
+print(e[0] + e[1]);              // expect 9
+
+// forEach: accumulate into outer var
+var acc = 0;
+c.forEach(|x| { acc = acc + x; });
+print(acc);                      // expect 15  (0+1+2+3+4+5)
+
+// reduce: sum with init 100 -> 115
+var sum = c.reduce(|s, x| s + x, 100);
+print(sum);                      // expect 115
+
+// find: first even >= 4 -> 4
+print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
+
+// findIndex: index of 4 -> 4
+var find_index = 4;
+print(c.findIndex(|x| x == 4));              // expect 4
+
+print("===== Classes =====");
+// --- Base class: ctor, instance methods, static, getter ---
+class Base {
+  constructor(a) { this.a = a; }
+
+  fn m(k) { return this.a + k; }
+
+  // mutate via instance method (used to confirm 'this' works)
+  fn inc(n) { this.a = this.a + n; return this.a; }
+
+  static fn S(v) { return v + 100; }
+
+  get double() { return this.a + this.a; }
+}
+
+// --- Derived: single inheritance + super(...) + super.m(...) override ---
+class Derived extends Base {
+  constructor(a) {
+    super(a + 1);           // exercise super(...) rewrite
+  }
+  fn m(k) {
+    return super.m(k + 1) + 1;  // exercise super.m(...) rewrite
+  }
+}
+
+// --- Class with literal field initializer (pure) ---
+class InitOnly {
+  var z = 7;                 // tested during allocation
+  async fn getZ() { return await this.z; }
+}
+
+var b = new Base(10);
+print(b.m(5));          // expect 15
+
+print(b);       // expect 10
+
+print(Base.S(1));       // expect 101
+
+var d = new Derived(10);             // Base.a receives 11
+print(d.m(5));          // super.m(6)=17; +1 => 18
+print(d);       // expect 18 (same caveat as T2)
+
+print(b.double);        // getter → 20
+
+var i = new InitOnly();
+print(await i.getZ());        // expect 7
+
+b.a = b.a + 5;                         // a: 10 -> 15
+print(b.a);             // expect 15
+
+print("===== Closures =====");
+fn make_adder(x) {
+    return |y| x + y;
+}
+
+var add42 = make_adder(42);
+print(add42(0));  // expect 42
+print(add42(100)); // expect 142
+
+print("===== Strings: length property =====");
+var s = "hello";
+print(s.length);       // expect 5
+var empty = "";
+print(empty.length);     // expect 0
+print("hello world".length); // expect 11
+
+print("===== Strings: concat =====");
+var s1 = "Hello, ";
+var s2 = "World!";
+var s3 = s1.concat(s2);
+print(s3);             // expect "Hello, World!"
+print("first".concat(" second")); // expect "first second"
+
+print("===== Strings: slice & substring =====");
+var longStr = "The quick brown fox jumps over the lazy dog.";
+print(longStr.slice(4, 19));        // expect "quick brown fox"
+print(longStr.substring(4, 19));    // expect "quick brown fox"
+print(longStr.slice(-9, -5));       // expect "lazy" (slice supports negative indices)
+print(longStr.substring(19, 4));    // expect "quick brown fox" (substring swaps args if start > end)
+print(longStr.slice(20));           // expect "jumps over the lazy dog." (to the end)
+
+print("===== Strings: case conversion =====");
+var mixed = "Napalm Is Awesome!";
+print(mixed.toUpperCase()); // expect "NAPALM IS AWESOME!"
+print(mixed.toLowerCase()); // expect "napalm is awesome!"
+
+print("===== Strings: searching (includes, startsWith, endsWith) =====");
+var sentence = "Be brave, be bold.";
+print(sentence.includes("brave"));    // expect true
+print(sentence.includes("calm"));     // expect false
+print(sentence.startsWith("Be"));       // expect true
+print(sentence.startsWith("brave"));    // expect false
+print(sentence.endsWith("."));        // expect true
+print(sentence.endsWith("bold"));     // expect false
+
+print("===== Strings: searching (indexOf, lastIndexOf) =====");
+var p = "The rain in Spain stays mainly in the plain.";
+print(p.indexOf("rain"));        // expect 4
+print(p.indexOf("zain"));        // expect -1
+print(p.indexOf("ain", 6));      // expect 14 (starts search from index 5)
+print(p.lastIndexOf("ain"));     // expect 40
+print(p.lastIndexOf("ain", 30)); // expect 25 (searches backwards from index 30)
+
+print("===== Strings: padding (padStart, padEnd) =====");
+var num = "5";
+print(num.padStart(4, "0"));    // expect "0005"
+print("abc".padEnd(5, "."));      // expect "abc.."
+print("long".padStart(2, "*"));   // expect "long" (no padding needed)
+
+print("===== Strings: repeat & split =====");
+print("*".repeat(5));             // expect "*****"
+var csv = "one,two,three";
+var parts = csv.split(",");
+print(parts[0]);                  // expect "one"
+print(parts[2]);                  // expect "three"
+print(parts.length);              // expect 3
+
+print("===== Strings: replace & replaceAll =====");
+var text = "I like cats. I think cats are great.";
+print(text.replace("cats", "dogs"));     // expect "I like dogs. I think cats are great."
+print(text.replaceAll("cats", "dogs")); // expect "I like dogs. I think dogs are great."
+
+print("===== Strings: trimming (trim, trimStart, trimEnd) =====");
+var padded = "   Hello, World!   ";
+print(padded.trim());       // expect "Hello, World!"
+print(padded.trimStart());  // expect "Hello, World!   "
+print(padded.trimEnd());    // expect "   Hello, World!"
+
+// ===========================
+// Map
+// ===========================
+
+print("===== Map: create, set, get, size =====");
+var m = new Map();
+m.set("name", "Napalm");
+m.set("year", 2024);
+m.set(123, "is a number key");
+
+print(m.get("name"));       // expect "Napalm"
+print(m.get("year"));       // expect 2024 (as SMI)
+print(m.get(123));          // expect "is a number key"
+print(m.size);              // expect 3
+print(m.get("missing"));    // expect null
+
+print("===== Map: has, delete, clear =====");
+print(m.has("year"));       // expect true
+print(m.delete("year"));    // expect true (entry existed)
+print(m.has("year"));       // expect false
+print(m.size);              // expect 2
+m.clear();
+print(m.size);              // expect 0
+
+// ===========================
+// Set
+// ===========================
+
+print("===== Set: create, add, has, size =====");
+var s = new Set();
+s.add("first");
+s.add(42);
+s.add("first"); // Duplicate, should be ignored
+
+print(s.size);              // expect 2
+print(s.has("first"));      // expect true
+print(s.has(42));           // expect true
+print(s.has("second"));     // expect false
+
+print("===== Set: delete, clear =====");
+print(s.delete(42));        // expect true (entry existed)
+print(s.has(42));           // expect false
+print(s.size);              // expect 1
+s.clear();
+print(s.size);              // expect 0
+
+print("===== Promises ====="); // (VALIDATED UNTIL HERE)
+print("(async)");
+
+// sync resolve
+var p = Promise(|resolve, reject| { resolve(42); });
+p.then(|v| print(v));        // expect: 42
+
+// rejection + catch
+var q = Promise(|resolve, reject| { reject(7); });
+q.catch(|e| print(e));       // expect: 7
+
+// chaining should keep returning the public object now:
+p.then(|v| print(v+1)).catch(|e| print(-1));    // expect: 43
+
+print("===== Deferreds =====");
+print("(async)");
+var d = Deferred();
+d.then(|x| { print(x); });
+
+setTimeout(| | { d.resolve(123); }, 0);
+
+// Rejection path
+var e = Deferred();
+e.catch(|r| { print(999 + r); });
+setTimeout(| | { e.reject(1); }, 0);
+
+print("===== Timers =====");
+print("(async)");
+setTimeout(fn () { print("Timer"); }, 10);
+
+// Timer (2)
+setTimeout(fn () { print("Timer (2)"); }, 20);
+
+print("===== Async/Await =====");
+print("(async)");
+async fn delay(ms, v) {
+    var d = Deferred();
+    setTimeout(| | { d.resolve(v); }, ms);
+    return await d;
+}
+
+// await inside top-level (top-level is async)
+var aa = await delay(0, 21);
+print(aa + 21);                // expect 42
+
+// await a plain Promise
+var bb = await Promise(|resolve, reject| {
+    setTimeout(| | { resolve(7); }, 0);
+});
+print(bb);                     // expect 7
+
+print("===== Conditional / Nullish =====");
+print((1 < 2) ? 10 : 20);              // expect 10
+print((1 > 2) ? 10 : 20);              // expect 20
+print(null ?? 99);                     // expect 99
+print(0 ?? 123);                       // expect 0 (0 is not nullish)
+
+print("===== Optional chaining =====");
+var maybe = null;
+print(maybe?.missing);                 // expect null
+var chain = { inner: { value: 7 } };
+print(chain?.inner?.value);            // expect 7
+class MulBox {
+  constructor(k) { this.k = k; }
+  fn mul(x) { return this.k * x; }
+}
+var optObj = new MulBox(3);
+print(optObj?.mul(4));                 // expect 12
+var none = null;
+print(none?.mul(4));                   // expect null
+var maybeFn = null;
+print(maybeFn?.(5));                   // expect null
+
+print("===== Pipeline operator =====");
+fn inc1(v) { return v + 1; }
+fn double(v) { return v * 2; }
+print(3 |> inc1);                      // expect 4
+print(3 |> inc1 |> double);           // expect 8
+
+// multiple awaits in sequence
+var a1 = await delay(0, 10);
+var a2 = await delay(0, 32);
+print(a1 + a2);                // expect 42
