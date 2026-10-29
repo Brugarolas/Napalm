@@ -5,12 +5,13 @@
 //! lowered to canonical StringId values and resolved by the VM's dense module map.
 //!
 //! Supported specifiers:
-//! - `./foo`, `../foo.nap`, `foo`  -> importer-relative source modules.
+//! - `./foo`, `../foo.napalm`, `foo`  -> importer-relative source modules.
 //! - `@lib/pkg[/subpath]`           -> package roots.
 //! - `@std/name[/subpath]`          -> standard-library roots.
 //!
-//! For every filesystem base we try the exact path, `<path>.nap`, and
-//! `<path>/index.nap`. Package/std specifiers may not contain `..` and symlink
+//! Extensionless specifiers try `<path>.napalm` and `<path>/index.napalm`; an
+//! explicit `.napalm` path is used as written. Package/std specifiers may not
+//! contain `..`, and symlink
 //! escapes outside their configured root are rejected.
 
 use crate::napalm_front::{self, Diagnostic, ModuleAst};
@@ -26,7 +27,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-const SOURCE_EXTENSION: &str = "nap";
+const SOURCE_EXTENSION: &str = "napalm";
 const PROJECT_MARKERS: &[&str] = &["napalm.toml", "Napalm.toml", ".napalm", ".git"];
 
 #[derive(Clone, Debug)]
@@ -137,6 +138,8 @@ impl ModuleResolver {
                 reason: "module specifier contains a NUL byte".to_owned(),
             });
         }
+
+        validate_source_extension(importer, specifier)?;
 
         let mut searched = Vec::new();
         let path = if let Some(tail) = specifier.strip_prefix("@lib/") {
@@ -598,6 +601,24 @@ fn dedupe_roots(roots: &mut Vec<PathBuf>) {
     });
 }
 
+fn validate_source_extension(importer: &Path, specifier: &str) -> Result<(), ModuleError> {
+    let path = Path::new(specifier);
+    let Some(extension) = path.extension() else {
+        return Ok(());
+    };
+    if extension.to_str() == Some(SOURCE_EXTENSION) {
+        return Ok(());
+    }
+    Err(ModuleError::InvalidSpecifier {
+        importer: importer.to_owned(),
+        specifier: specifier.to_owned(),
+        reason: format!(
+            "unsupported module extension '.{}'; Napalm source modules use '.{SOURCE_EXTENSION}'",
+            extension.to_string_lossy()
+        ),
+    })
+}
+
 fn validate_namespaced_tail(
     importer: &Path,
     specifier: &str,
@@ -646,17 +667,13 @@ fn resolve_candidate_set(base: &Path, searched: &mut Vec<PathBuf>) -> Option<Pat
 }
 
 fn candidate_paths(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(3);
-    candidates.push(base.to_owned());
-
-    if base.extension().is_none() {
-        candidates.push(base.with_extension(SOURCE_EXTENSION));
-        candidates.push(base.with_extension("ts"));
+    if base.extension().is_some() {
+        return vec![base.to_owned()];
     }
-
-    candidates.push(base.join(format!("index.{SOURCE_EXTENSION}")));
-    candidates.push(base.join("index.ts"));
-    candidates
+    vec![
+        base.with_extension(SOURCE_EXTENSION),
+        base.join(format!("index.{SOURCE_EXTENSION}")),
+    ]
 }
 
 fn slash_path(path: &Path) -> String {
@@ -703,9 +720,9 @@ mod tests {
     fn resolves_relative_extension_and_directory_index() {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("src/main.nap", "");
-        let direct = tree.write("src/util.nap", "");
-        let index = tree.write("src/widgets/index.nap", "");
+        let entry = tree.write("src/main.napalm", "");
+        let direct = tree.write("src/util.napalm", "");
+        let index = tree.write("src/widgets/index.napalm", "");
         let resolver = ModuleResolver::for_entry(&entry).unwrap();
 
         assert_eq!(resolver.resolve_import(&entry, "./util").unwrap().path, fs::canonicalize(direct).unwrap());
@@ -716,9 +733,9 @@ mod tests {
     fn relative_and_namespaced_package_import_share_identity() {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("main.nap", "");
-        let package = tree.write("packages/foo/index.nap", "");
-        let child = tree.write("packages/foo/child.nap", "");
+        let entry = tree.write("main.napalm", "");
+        let package = tree.write("packages/foo/index.napalm", "");
+        let child = tree.write("packages/foo/child.napalm", "");
 
         let mut config = ModuleResolverConfig::for_entry(&entry).unwrap();
         config.package_roots.insert(0, tree.root.join("packages"));
@@ -728,7 +745,7 @@ mod tests {
         let from_package = resolver.resolve_import(&package, "./child").unwrap();
         assert_eq!(by_namespace.path, fs::canonicalize(child).unwrap());
         assert_eq!(by_namespace.canonical_name, from_package.canonical_name);
-        assert_eq!(by_namespace.canonical_name, "@lib/foo/child.nap");
+        assert_eq!(by_namespace.canonical_name, "@lib/foo/child.napalm");
     }
 
     #[test]
@@ -736,13 +753,13 @@ mod tests {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
         let entry = tree.write(
-            "src/main.nap",
+            "src/main.napalm",
             r#"import { Answer } from "./dep"
 var Seen = Answer
 return Seen
 "#,
         );
-        tree.write("src/dep.nap", "export let Answer = 42\n");
+        tree.write("src/dep.napalm", "export let Answer = 42\n");
 
         let mut program = Program::new();
         let graph = compile_module_graph(&mut program, &entry).unwrap();
@@ -751,7 +768,7 @@ return Seen
         let dep = program
             .modules
             .iter()
-            .find(|module| program.string(module.name) == Some("file:src/dep.nap"))
+            .find(|module| program.string(module.name) == Some("file:src/dep.napalm"))
             .expect("dependency module metadata missing");
         assert!(dep
             .exports
@@ -780,14 +797,14 @@ return Seen
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
         let entry = tree.write(
-            "main.nap",
+            "main.napalm",
             r#"import { Answer as Result, Greeting, Calculator, Empty } from "./bridge"
 import { Answer as Other } from "./other"
 return `${Greeting}|${Result}|${Calculator.add(20, 22)}|${Empty}|${Other}`
 "#,
         );
         tree.write(
-            "dep.nap",
+            "dep.napalm",
             r#"export let Answer = 42
 export let Greeting = "hello"
 export let Empty = null
@@ -799,10 +816,10 @@ export class Calculator {
 "#,
         );
         tree.write(
-            "bridge.nap",
+            "bridge.napalm",
             "import { Answer, Greeting, Calculator, Empty } from \"./dep\"\nexport { Answer, Greeting, Calculator, Empty };\n",
         );
-        tree.write("other.nap", "export let Answer = 7\n");
+        tree.write("other.napalm", "export let Answer = 7\n");
 
         let mut program = Program::new();
         let manifest = napalm_builtin::install_hir_builtins(&mut program);
@@ -823,8 +840,8 @@ export class Calculator {
     fn importing_a_missing_export_still_fails() {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("main.nap", "import { Missing } from \"./dep\"\n");
-        tree.write("dep.nap", "export let Answer = 42\n");
+        let entry = tree.write("main.napalm", "import { Missing } from \"./dep\"\n");
+        tree.write("dep.napalm", "export let Answer = 42\n");
 
         let mut program = Program::new();
         let graph = compile_module_graph(&mut program, &entry).unwrap();
@@ -839,10 +856,10 @@ export class Calculator {
     fn cyclic_graph_is_discovered_once() {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("a.nap", r#"import "./b"
+        let entry = tree.write("a.napalm", r#"import "./b"
 var A = 1
 "#);
-        tree.write("b.nap", r#"import "./a"
+        tree.write("b.napalm", r#"import "./a"
 var B = 2
 "#);
 
@@ -864,7 +881,7 @@ var B = 2
     fn rejects_namespace_escape() {
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("main.nap", "");
+        let entry = tree.write("main.napalm", "");
         let mut config = ModuleResolverConfig::for_entry(&entry).unwrap();
         config.package_roots.insert(0, tree.root.join("packages"));
         let resolver = ModuleResolver::new(config);
@@ -875,22 +892,46 @@ var B = 2
     }
 
     #[test]
+    fn source_extension_is_napalm_only() {
+        let tree = TempTree::new();
+        tree.write("napalm.toml", "");
+        let entry = tree.write("main.napalm", "");
+        tree.write("dep.ts", "export const value = 21;\n");
+        let resolver = ModuleResolver::for_entry(&entry).unwrap();
+
+        let error = resolver.resolve_import(&entry, "./dep").unwrap_err();
+        let ModuleError::Resolve { searched, .. } = error else {
+            panic!("expected unresolved extensionless import");
+        };
+        assert_eq!(searched.len(), 2);
+        assert!(searched.iter().all(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some(SOURCE_EXTENSION)
+        }));
+
+        let error = resolver.resolve_import(&entry, "./dep.ts").unwrap_err();
+        let ModuleError::InvalidSpecifier { reason, .. } = error else {
+            panic!("expected explicit TypeScript extension to be rejected");
+        };
+        assert!(reason.contains(".napalm"));
+    }
+
+    #[test]
     fn napalm_named_default_reexports_and_private_bindings() {
         use crate::napalm_builtin::{self, BuiltinHost};
         use crate::napalm_interpreter::{ExecutionResult, Interpreter};
         let tree = TempTree::new();
         tree.write("napalm.toml", "");
-        let entry = tree.write("main.nap", r#"
+        let entry = tree.write("main.napalm", r#"
             import twice, { answer as value } from './bridge';
             return twice(value);
         "#);
-        tree.write("dep.ts", "const hidden = 99; export const value = 21; export default function(n: number) { return n * 2; }");
-        tree.write("bridge.nap", "export { default, value as answer } from './dep';");
+        tree.write("dep.napalm", "const hidden = 99; export const value = 21; export default function(n: number) { return n * 2; }");
+        tree.write("bridge.napalm", "export { default, value as answer } from './dep';");
         let mut program = Program::new();
         let manifest = napalm_builtin::install_hir_builtins(&mut program);
         let graph = compile_module_graph(&mut program, &entry).unwrap();
         assert_eq!(graph.module_count, 3);
-        let dep = program.modules.iter().find(|m| program.string(m.name).unwrap().ends_with("dep.ts")).unwrap();
+        let dep = program.modules.iter().find(|m| program.string(m.name).unwrap().ends_with("dep.napalm")).unwrap();
         assert_eq!(dep.exports.len(), 2);
         assert!(dep.exports.iter().all(|e| program.string(e.name) != Some("hidden")));
         let bytecode = crate::napalm_pipeline::compile_program(&mut program).unwrap();
