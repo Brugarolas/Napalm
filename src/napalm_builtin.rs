@@ -594,6 +594,17 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // Global fetch() is represented by the ordinary core-static callable object.
     // The VM-native implementation starts asynchronous HTTP work and immediately
     // returns a cancellable Napalm Promise<Response>.
+    // Reactive is a compiler/runtime service. Keep its entry points internal so
+    // reactivity can be detected before execution and the JIT never compiles a
+    // field trace under the wrong tracking policy.
+    let reactive = static_(BuiltinId::Reactive);
+    manifest.register_native(program, reactive, "__registerComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveComputed);
+    manifest.register_native(program, reactive, "__registerWatcher", MethodKind::Method, 1, NativeBuiltin::ReactiveWatch);
+    manifest.register_native(program, reactive, "__unwatch", MethodKind::Method, 1, NativeBuiltin::ReactiveUnwatch);
+    manifest.register_native(program, reactive, "__beginComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveBeginComputed);
+    manifest.register_native(program, reactive, "__finishComputed", MethodKind::Method, 2, NativeBuiltin::ReactiveFinishComputed);
+    manifest.register_native(program, reactive, "__abortComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveAbortComputed);
+
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 2, NativeBuiltin::FetchCall);
 

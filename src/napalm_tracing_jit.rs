@@ -536,6 +536,12 @@ pub trait TraceRuntime {
 
     fn trace_method_epoch(&self) -> u64 { 0 }
 
+    /// Reactive class-field tracking is an interpreter/runtime side effect. When
+    /// enabled, field bytecodes must remain runtime leaves so native traces cannot
+    /// bypass dependency collection or invalidation.
+    fn trace_reactive_enabled(&self) -> bool { false }
+    fn trace_reactive_tracking_active(&self) -> bool { false }
+
     /// Convert one recording-time VM binding into a semantic descriptor which can
     /// be reconstructed inside another isolated Interpreter. Returning `None`
     /// makes the containing trace worker-private rather than risking cross-VM state.
@@ -2521,6 +2527,9 @@ impl<'a> TraceRecorder<'a> {
         if op.opcode != Opcode::InvokeSpread {
             return Err(RecordingAbort::UnsupportedCall);
         }
+        if runtime.trace_reactive_tracking_active() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
 
         let argument_word = runtime
             .trace_read_slot(FrameSlot::General(Reg(op.c)))
@@ -3947,6 +3956,9 @@ impl<'a> TraceRecorder<'a> {
             }
 
             LoadField => {
+                // Reactive collectors never enter native traces (h_jit_entry
+                // falls back to baseline while tracking), so ordinary field
+                // reads can retain the native fast path even in a reactive VM.
                 let object_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -3969,6 +3981,9 @@ impl<'a> TraceRecorder<'a> {
             }
 
             StoreField => {
+                if runtime.trace_reactive_enabled() {
+                    return self.runtime_leaf(op, builder, &[]);
+                }
                 let object_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -4341,6 +4356,8 @@ impl<'a> TraceRecorder<'a> {
             }
 
             LoadStaticField => {
+                // See LoadField: tracking executions stay in baseline, while
+                // non-tracking executions keep this native absolute load.
                 let class_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -4379,6 +4396,9 @@ impl<'a> TraceRecorder<'a> {
             }
 
             StoreStaticField => {
+                if runtime.trace_reactive_enabled() {
+                    return self.runtime_leaf(op, builder, &[]);
+                }
                 let class_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;

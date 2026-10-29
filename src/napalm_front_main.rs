@@ -3046,6 +3046,11 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         let mut initializers = Vec::new();
         let mut parameter_initializers = Vec::new();
+        // Watchers are registered only after every ordinary instance field has
+        // been initialized, regardless of their textual position in the class.
+        // This prevents the watcher's first microtask from observing a partially
+        // initialized instance.
+        let mut watch_initializers = Vec::new();
         let mut static_initializers = Vec::new();
         let mut constructor = None;
         while !self.at("}") && self.peek().kind != Kind::Eof {
@@ -3086,6 +3091,116 @@ impl<'a> Parser<'a> {
                 self.separators();
                 continue;
             }
+            // Operator overloads deliberately reuse Napalm's existing method-symbol
+            // ABI. The operator token becomes the method name (for example `+`),
+            // so interpreter inline caches and the tracing JIT see an ordinary
+            // virtual call rather than a second dispatch mechanism.
+            if self.eat("operator") {
+                if is_static || foreign || async_ || type_only_member {
+                    return self.error("operator overloads must be concrete synchronous instance methods");
+                }
+                let spelling = self.text().to_owned();
+                let Some(operator) = typescript_operator_name(&spelling) else {
+                    return self.error(format!("unsupported overloadable operator '{spelling}'"));
+                };
+                self.bump();
+                let params = self.params()?;
+                let signature = match params.as_slice() {
+                    [] if matches!(operator, OperatorName::Bang | OperatorName::Tilde | OperatorName::Minus) => {
+                        MethodSignatureAst::PrefixOperator { operator }
+                    }
+                    [param] if !matches!(operator, OperatorName::Bang | OperatorName::Tilde) => {
+                        MethodSignatureAst::InfixOperator { operator, param: param.clone() }
+                    }
+                    [] => {
+                        return self.error(format!(
+                            "operator '{}' is binary and requires one parameter",
+                            operator.as_str()
+                        ));
+                    }
+                    _ => {
+                        return self.error(format!(
+                            "operator '{}' accepts exactly {} parameter{}",
+                            operator.as_str(),
+                            if matches!(operator, OperatorName::Bang | OperatorName::Tilde) { 0 } else { 1 },
+                            if matches!(operator, OperatorName::Bang | OperatorName::Tilde) { "s" } else { "" },
+                        ));
+                    }
+                };
+                self.annotation()?;
+                if !self.at("{") {
+                    return self.error("operator overloads require an implementation body");
+                }
+                let body = Some(self.function_body(params, member_start)?);
+                methods.push(MethodDecl {
+                    signature,
+                    is_async: false,
+                    is_static: false,
+                    is_foreign: false,
+                    is_constructor: false,
+                    attributes: Vec::new(),
+                    body,
+                    span: self.end(member_start),
+                });
+                self.separators();
+                continue;
+            }
+
+            // `computed name() { ... }` creates a lazy cached property. The
+            // implementation body is stored as a zero-argument closure in a hidden
+            // fixed-layout field. The public getter brackets closure execution with
+            // the internal reactive begin/finish hooks so field reads can be
+            // dependency-tracked without changing the ordinary getter ABI.
+            //
+            // `watch name() { ... }` similarly stores a closure, but the reactive runtime
+            // schedules it as a microtask and re-schedules it when any dependency
+            // written during the previous run changes.
+            let reactive_member = if self.eat("computed") {
+                Some(true)
+            } else if self.eat("watch") {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(is_computed) = reactive_member {
+                if is_static || foreign || async_ || type_only_member {
+                    return self.error("computed properties and watchers must be concrete synchronous instance members");
+                }
+                let member = self.ident()?;
+                self.type_parameters()?;
+                let params = self.params()?;
+                if !params.is_empty() {
+                    return self.error(if is_computed {
+                        "a computed property takes no parameters"
+                    } else {
+                        "a watcher takes no parameters"
+                    });
+                }
+                self.annotation()?;
+                if !self.at("{") {
+                    return self.error(if is_computed {
+                        "a computed property requires a function body"
+                    } else {
+                        "a watcher requires a function body"
+                    });
+                }
+                let body = self.function_body(Vec::new(), member_start)?;
+                if is_computed {
+                    let (callback_field, cache_field, getter, initializer) =
+                        synthesize_computed_property(&member, body);
+                    fields.push(callback_field);
+                    fields.push(cache_field);
+                    methods.push(getter);
+                    initializers.push(initializer);
+                } else {
+                    let (field, initializer) = synthesize_watcher(&member, body);
+                    fields.push(field);
+                    watch_initializers.push(initializer);
+                }
+                self.separators();
+                continue;
+            }
+
             let access = if (self.at("get") || self.at("set")) && self.next_text() != "(" {
                 let t = self.text();
                 self.bump();
@@ -3207,7 +3322,7 @@ impl<'a> Parser<'a> {
             self.separators();
         }
         self.expect("}")?;
-        if !initializers.is_empty() || !parameter_initializers.is_empty() {
+        if !initializers.is_empty() || !parameter_initializers.is_empty() || !watch_initializers.is_empty() {
             if constructor.is_none() {
                 constructor = Some(methods.len());
                 let statements = if superclass.is_some() {
@@ -3258,10 +3373,13 @@ impl<'a> Parser<'a> {
                     0
                 };
                 let mut constructor_initializers = Vec::with_capacity(
-                    parameter_initializers.len() + initializers.len(),
+                    parameter_initializers.len() + initializers.len() + watch_initializers.len(),
                 );
                 constructor_initializers.append(&mut parameter_initializers);
                 constructor_initializers.append(&mut initializers);
+                // Register effects last so their initial microtask observes the
+                // fully initialized object state.
+                constructor_initializers.append(&mut watch_initializers);
                 statements.splice(offset..offset, constructor_initializers);
             }
         }
@@ -3312,6 +3430,181 @@ impl<'a> Parser<'a> {
     }
 }
 
+
+fn typescript_operator_name(spelling: &str) -> Option<OperatorName> {
+    Some(match spelling {
+        "!" => OperatorName::Bang,
+        "~" => OperatorName::Tilde,
+        "-" => OperatorName::Minus,
+        "+" => OperatorName::Plus,
+        "*" => OperatorName::Star,
+        "**" => OperatorName::Power,
+        "/" => OperatorName::Slash,
+        "%" => OperatorName::Percent,
+        "<<" => OperatorName::ShiftLeft,
+        ">>" => OperatorName::ShiftRight,
+        "&" => OperatorName::Ampersand,
+        "^" => OperatorName::Caret,
+        "|" => OperatorName::Pipe,
+        "<" => OperatorName::Less,
+        "<=" => OperatorName::LessEqual,
+        ">" => OperatorName::Greater,
+        ">=" => OperatorName::GreaterEqual,
+        "==" | "===" => OperatorName::EqualEqual,
+        "!=" | "!==" => OperatorName::BangEqual,
+        _ => return None,
+    })
+}
+
+fn reactive_static_call(name: &str, args: Vec<Expr>, span: Span) -> Expr {
+    invoke(
+        Expr::new(
+            ExprKind::Name(Spanned::new("__Reactive".into(), span)),
+            span,
+        ),
+        name,
+        args,
+        span,
+    )
+}
+
+fn hidden_reactive_field(member: &Ident, kind: &str) -> Ident {
+    Spanned::new(format!("__reactive_{kind}${}", member.value), member.span)
+}
+
+fn instance_field_expr(storage: &Ident) -> Expr {
+    Expr::new(ExprKind::Field(storage.clone()), storage.span)
+}
+
+fn synthesize_computed_property(
+    member: &Ident,
+    body: FunctionBody,
+) -> (ClassFieldDecl, ClassFieldDecl, MethodDecl, Stmt) {
+    let callback_storage = hidden_reactive_field(member, "computed");
+    let cache_storage = hidden_reactive_field(member, "computed_cache");
+    let span = member.span;
+    let closure = Expr::new(ExprKind::Closure(body), span);
+    let callback = || instance_field_expr(&callback_storage);
+    let cache = || instance_field_expr(&cache_storage);
+
+    let begin = reactive_static_call("__beginComputed", vec![callback()], span);
+    let evaluate = invoke(callback(), "call", Vec::new(), span);
+    let finish = reactive_static_call(
+        "__finishComputed",
+        vec![callback(), evaluate],
+        span,
+    );
+    let cache_update = Expr::new(
+        ExprKind::Assign {
+            target: Box::new(cache()),
+            value: Box::new(finish),
+        },
+        span,
+    );
+    let abort = reactive_static_call("__abortComputed", vec![callback()], span);
+    let guarded_eval = Stmt {
+        kind: StmtKind::If {
+            condition: begin,
+            then_branch: Box::new(Stmt {
+                kind: StmtKind::Try {
+                    body: Box::new(Stmt {
+                        kind: StmtKind::Block(vec![Stmt {
+                            kind: StmtKind::Expression(cache_update),
+                            span,
+                        }]),
+                        span,
+                    }),
+                    catch: None,
+                    finally_branch: Some(Box::new(Stmt {
+                        kind: StmtKind::Block(vec![Stmt {
+                            kind: StmtKind::Expression(abort),
+                            span,
+                        }]),
+                        span,
+                    })),
+                },
+                span,
+            }),
+            else_branch: None,
+        },
+        span,
+    };
+    let getter = MethodDecl {
+        signature: MethodSignatureAst::Getter { name: member.clone() },
+        is_async: false,
+        is_static: false,
+        is_foreign: false,
+        is_constructor: false,
+        attributes: Vec::new(),
+        body: Some(FunctionBody {
+            params: Vec::new(),
+            kind: FunctionBodyKind::Statements(vec![
+                guarded_eval,
+                Stmt {
+                    kind: StmtKind::Return(Some(cache())),
+                    span,
+                },
+            ]),
+            span,
+        }),
+        span,
+    };
+    let initializer = Stmt {
+        kind: StmtKind::Expression(Expr::new(
+            ExprKind::Assign {
+                target: Box::new(callback()),
+                value: Box::new(reactive_static_call("__registerComputed", vec![closure], span)),
+            },
+            span,
+        )),
+        span,
+    };
+    (
+        ClassFieldDecl {
+            storage: callback_storage,
+            annotation: None,
+            initializer: None,
+            is_static: false,
+        },
+        ClassFieldDecl {
+            storage: cache_storage,
+            annotation: None,
+            initializer: None,
+            is_static: false,
+        },
+        getter,
+        initializer,
+    )
+}
+
+fn synthesize_watcher(
+    member: &Ident,
+    body: FunctionBody,
+) -> (ClassFieldDecl, Stmt) {
+    let storage = hidden_reactive_field(member, "watch");
+    let span = member.span;
+    let closure = Expr::new(ExprKind::Closure(body), span);
+    let target = instance_field_expr(&storage);
+    let initializer = Stmt {
+        kind: StmtKind::Expression(Expr::new(
+            ExprKind::Assign {
+                target: Box::new(target),
+                value: Box::new(reactive_static_call("__registerWatcher", vec![closure], span)),
+            },
+            span,
+        )),
+        span,
+    };
+    (
+        ClassFieldDecl {
+            storage,
+            annotation: None,
+            initializer: None,
+            is_static: false,
+        },
+        initializer,
+    )
+}
 
 /// Convert a TypeScript-style class property into the existing Napalm-compatible
 /// AST representation: fixed storage plus ordinary getter/setter methods. This
@@ -4281,6 +4574,63 @@ mod napalm_syntax_tests {
             &initializer.kind,
             ExprKind::Binary { operator: BinaryOp::Less, .. }
         ));
+    }
+
+    #[test]
+    fn parses_accessors_computed_watchers_and_operator_overloads() {
+        let module = assert_parses(r#"
+            class Vector {
+                x: number = 1;
+                y: number = 2;
+                _scale: number = 1;
+
+                get scale(): number { return this._scale; }
+                set scale(value: number) { this._scale = value; }
+
+                computed magnitude2(): number {
+                    return this.x * this.x + this.y * this.y;
+                }
+
+                watch traceMagnitude() {
+                    System.print(this.magnitude2);
+                }
+
+                operator +(other) {
+                    return this.x + other.x;
+                }
+
+                operator -() {
+                    return -this.x;
+                }
+            }
+        "#);
+
+        let StmtKind::Class(class) = &module.statements[0].kind else {
+            panic!("expected class declaration");
+        };
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::Getter { name } if name.value == "scale"
+        )));
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::Setter { name, .. } if name.value == "scale"
+        )));
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::Getter { name } if name.value == "magnitude2"
+        )));
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::InfixOperator { operator: OperatorName::Plus, .. }
+        )));
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::PrefixOperator { operator: OperatorName::Minus }
+        )));
+        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed$magnitude2")));
+        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
+        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
     }
 
 }

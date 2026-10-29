@@ -11,6 +11,15 @@ impl TraceRecorder<'_> {
         &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
+        // Reactive dependency tracking is intentionally implemented in the baseline
+        // field handlers. Bounded replayable inlining would otherwise turn a
+        // LoadField into a native HeapLoadField and make the dependency invisible.
+        // Ordinary execution, including reactive programs outside a collector,
+        // keeps the normal inlining path.
+        if runtime.trace_reactive_tracking_active() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+
         let (target, class) = if op.opcode == Opcode::Invoke {
             let receiver = runtime.trace_read_slot(FrameSlot::General(Reg(op.b)))
                 .map_err(|_| RecordingAbort::UnsupportedCall)?;

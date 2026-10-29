@@ -1,0 +1,35 @@
+class User {
+    _name: String = "";
+
+    get name(): String {
+        return this._name;
+    }
+
+    set name(value: String) {
+        this._name = value;
+    }
+}
+
+let user = new User();
+
+user.name = "Andrés";
+System.print(user.name); // Andrés
+
+class Vector {
+    x: number = 0;
+    y: number = 0;
+
+    computed magnitude2(): number {
+        return this.x * this.x + this.y * this.y;
+    }
+}
+
+let v = new Vector();
+
+System.print(v.magnitude2); // 0
+System.print(v.magnitude2); // cached
+
+v.x = 10;
+v.y = 5;
+
+System.print(v.magnitude2); // recomputed: 125

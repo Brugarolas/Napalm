@@ -1671,10 +1671,34 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             let mut instance = SmallVec::<[&str; 8]>::new();
             let mut statics = SmallVec::<[&str; 8]>::new();
             for method in &class.methods {
-                if let Some(body) = &method.body {
-                    collect_fields_in_body(body, &mut instance, &mut statics);
+                let Some(body) = &method.body else { continue };
+                let mut method_instance = SmallVec::<[&str; 8]>::new();
+                collect_fields_in_body(body, &mut method_instance, &mut statics);
+                // `this.name` inside a static method refers to the class object,
+                // never to an instance. Do not accidentally reserve instance slots
+                // for those writes.
+                if !method.is_static {
+                    instance.extend(method_instance);
                 }
             }
+
+            // Declared accessors (including the accessors synthesized for typed
+            // class fields) keep their method semantics. A `this.x = ...` write to
+            // such a property must call the setter instead of creating a second,
+            // shadow fixed slot named `x` beside the backing `_x` field.
+            let accessor_names = class
+                .methods
+                .iter()
+                .filter(|method| !method.is_static)
+                .filter_map(|method| match &method.signature {
+                    MethodSignatureAst::Getter { name } | MethodSignatureAst::Setter { name, .. } => {
+                        Some(name.value.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            instance.retain(|name| !accessor_names.contains(name));
+
             dedup_preserve_order(&mut instance);
             dedup_preserve_order(&mut statics);
             local_instance_fields.insert(class.name.span, instance);
@@ -4112,12 +4136,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let left_type = semantic_source_type(self.builder.value_type(left));
         let right_type = semantic_source_type(self.builder.value_type(right));
 
-        // TypeScript/JavaScript-compatible `+`: when either side is statically a
-        // String, concatenate and convert the other operand through the same
-        // virtual `toString()` protocol used by template interpolation. This is
-        // deliberately lowered to StringConcat instead of dynamic String.+ so the
-        // interpreter/JIT can optimize the common String+String case directly.
-        if operator == BinaryOp::Add && (left_type == Type::String || right_type == Type::String) {
+        // TypeScript/JavaScript-compatible `+` keeps the direct StringConcat fast
+        // path only when the left operand is known not to be a user instance (or
+        // an unknown value that may become one). User-defined `operator +` must
+        // get first refusal; the interpreter falls back to String coercion only
+        // when dynamic method lookup proves that no overload exists.
+        let left_may_overload = matches!(
+            left_type,
+            Type::Top | Type::Instance(_) | Type::Union(_) | Type::Interface(_) | Type::Record(_)
+        );
+        if operator == BinaryOp::Add
+            && (left_type == Type::String || (right_type == Type::String && !left_may_overload))
+        {
             let left = self.lower_to_string_value(left);
             let right = self.lower_to_string_value(right);
             return self.builder.emit1(
@@ -4805,6 +4835,42 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             ExprKind::Invoke(invoke) => {
                 let (receiver, _) = location.expect("prepared property assignment");
+
+                // Mirror lower_invoke's fixed-field fast path for JS/TS-style
+                // `this.name = value` properties inferred during class planning.
+                if invoke.syntax == InvokeSyntax::Getter
+                    && invoke.args.is_empty()
+                    && invoke.receiver.as_deref().is_some_and(|expr| matches!(expr.kind, ExprKind::This))
+                {
+                    if let Some(method) = self.context.method_context.as_ref() {
+                        if !method.static_method {
+                            if let Some(slot) = method.fields.get(&invoke.name.value).copied() {
+                                let expected = method
+                                    .field_types
+                                    .get(&invoke.name.value)
+                                    .cloned()
+                                    .unwrap_or(Type::Top);
+                                let actual = self.builder.value_type(value).clone();
+                                if assignment_is_known_incompatible(&expected, &actual) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        "NAPALM-T001",
+                                        format!(
+                                            "field '{}' expects {}, got {}",
+                                            invoke.name.value,
+                                            display_source_type(&expected),
+                                            display_source_type(&semantic_source_type(&actual))
+                                        ),
+                                        invoke.name.span,
+                                    ));
+                                }
+                                let value = self.bind_interface(value, &expected);
+                                self.builder.store_field(receiver, slot, value);
+                                return value;
+                            }
+                        }
+                    }
+                }
+
                 if !self.store_structural_field(receiver, &invoke.name.value, value, invoke.name.span) {
                     if self.structural_object_is_closed(receiver) {
                         self.diagnostics.push(Diagnostic::error(
@@ -4951,6 +5017,28 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             InvokeSyntax::Getter => MethodKind::Getter,
             InvokeSyntax::Method => MethodKind::Method,
         };
+
+        // Undeclared JS/TS-style properties first assigned through `this.name`
+        // are planned as fixed instance fields. Access them directly here rather
+        // than looking for a getter method that does not exist.
+        if kind == MethodKind::Getter
+            && invoke.args.is_empty()
+            && invoke.receiver.as_deref().is_some_and(|expr| matches!(expr.kind, ExprKind::This))
+        {
+            if let Some(method) = self.context.method_context.as_ref() {
+                if !method.static_method {
+                    if let Some(slot) = method.fields.get(&invoke.name.value).copied() {
+                        let ty = method
+                            .field_types
+                            .get(&invoke.name.value)
+                            .cloned()
+                            .unwrap_or(Type::Top);
+                        return self.builder.load_field(receiver, slot, ty);
+                    }
+                }
+            }
+        }
+
         // Dot syntax preserves builtin Map getter precedence. Brackets always
         // address the property, even for these reserved member names.
         if kind == MethodKind::Getter && !matches!(invoke.name.value.as_str(), "count" | "isEmpty" | "keys" | "toString") {
@@ -5544,6 +5632,19 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
         ExprKind::Assign { target, value }
         | ExprKind::Update { target, value, .. }
         | ExprKind::LogicalAssign { target, value, .. } => {
+            // TypeScript/JavaScript permits creating an instance property with
+            // `this.name = value` even when no class field declaration exists.
+            // Treat those direct writes as fixed-layout fields so subsequent
+            // `this.name` reads/writes compile to LoadField/StoreField instead of
+            // paying dynamic method dispatch. Plain reads do not create fields.
+            if let ExprKind::Invoke(invoke) = &target.kind {
+                if invoke.syntax == InvokeSyntax::Getter
+                    && invoke.args.is_empty()
+                    && invoke.receiver.as_deref().is_some_and(|receiver| matches!(receiver.kind, ExprKind::This))
+                {
+                    instance.push(invoke.name.value.as_str());
+                }
+            }
             collect_fields_expr(target, instance, statics);
             collect_fields_expr(value, instance, statics);
         }
@@ -6844,6 +6945,62 @@ class Child is Parent {
             }
         }
         assert!(saw_typed_load, "class Number field loads should be typed in WIR");
+    }
+
+    #[test]
+    fn undeclared_this_property_becomes_fixed_instance_field() {
+        let source = r#"
+            class Counter {
+                constructor() {
+                    this.value = 0;
+                }
+
+                inc() {
+                    this.value = this.value + 1;
+                }
+
+                getValue() {
+                    return this.value;
+                }
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("other.napalm", source, "other", &module);
+        assert!(
+            !output.has_errors(),
+            "JS-style instance property lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let class = output
+            .program
+            .classes
+            .iter()
+            .find(|class| output.program.string(class.name) == Some("Counter"))
+            .expect("Counter class metadata");
+
+        assert_eq!(
+            class.own_instance_field_count, 1,
+            "this.value assignment should reserve one fixed instance slot"
+        );
+
+        let mut loads = 0usize;
+        let mut stores = 0usize;
+        for function in &output.program.functions {
+            if function.field_owner != Some(class.id) {
+                continue;
+            }
+            for node in &function.nodes {
+                match &node.kind {
+                    Inst::LoadField { .. } => loads += 1,
+                    Inst::StoreField { .. } => stores += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(loads >= 2, "this.value reads should lower to LoadField");
+        assert!(stores >= 2, "this.value writes should lower to StoreField");
     }
 
     #[test]

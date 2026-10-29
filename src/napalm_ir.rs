@@ -462,14 +462,16 @@ pub enum BuiltinId {
     FFI = 16,
     /// Global JavaScript-compatible asynchronous HTTP function object.
     Fetch = 17,
+    /// Runtime support for lazy computed properties and dependency-tracked watchers.
+    Reactive = 18,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
-        Self::Timer, Self::FFI, Self::Fetch,
+        Self::Timer, Self::FFI, Self::Fetch, Self::Reactive,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -484,6 +486,7 @@ impl BuiltinId {
             Self::Timer => "Timer",
             Self::FFI => "FFI",
             Self::Fetch => "fetch",
+            Self::Reactive => "__Reactive",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
