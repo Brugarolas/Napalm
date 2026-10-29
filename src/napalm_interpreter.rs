@@ -7315,6 +7315,27 @@ impl<'p> Interpreter<'p> {
             }
             index += 1;
         }
+
+        // Napalm uses `null` as its missing-value sentinel. Frame storage is
+        // intentionally retained at a high-water mark, so omitted arguments must
+        // be written explicitly instead of inheriting stale words from an older
+        // invocation that reused the same register slots. This also gives optional
+        // TypeScript-style parameters deterministic JavaScript-like semantics.
+        let formal_arity = prepared.arity as usize;
+        let mut missing = args.len().min(formal_arity);
+        while missing < formal_arity {
+            let value = Value::NULL.word();
+            if prepared.needs_argument_bank {
+                banks.arguments[missing] = value;
+            }
+            let dst = unsafe { *prepared.entry_arg_dsts.get_unchecked(missing) };
+            if dst != u16::MAX {
+                unsafe {
+                    *fiber.registers.get_unchecked_mut(base + dst as usize) = value;
+                }
+            }
+            missing += 1;
+        }
         if let Some(receiver) = receiver {
             if prepared.entry_this_dst != u16::MAX {
                 unsafe {
@@ -13067,22 +13088,44 @@ unsafe fn h_alloc_foreign(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*p
 unsafe fn h_load_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
-    let value={
-        let Some(HeapObject::Instance{fields,..})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+    let (class_slot,value)={
+        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
-        *fields.get_unchecked(slot)
+        (*class_slot,*fields.get_unchecked(slot))
     };
+    // Non-nullable source fields are physically initialized to null so constructors
+    // and derived classes can populate them later. A successful typed load must still
+    // uphold the IR/JIT representation guarantee, so null is trapped as an
+    // uninitialized-field read instead of escaping as a fake Number/String/etc.
+    if value.is_null() {
+        let expected=vm.classes[class_slot as usize].instance_field_types.get(slot).cloned().unwrap_or(Type::Top);
+        if !expected.accepts(&Type::Null) {
+            vm.fail_at(op,"read of an uninitialized non-nullable class field");
+            return;
+        }
+    }
     if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x); }
     vm.set_reg(op.a,value.word());vm.advance(op)
 }
 unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
-    let value={
-        let Some(HeapObject::Instance{fields,..})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+    let (class_slot,value)={
+        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
-        *fields.get_unchecked(slot)
+        (*class_slot,*fields.get_unchecked(slot))
     };
+    // Non-nullable source fields are physically initialized to null so constructors
+    // and derived classes can populate them later. A successful typed load must still
+    // uphold the IR/JIT representation guarantee, so null is trapped as an
+    // uninitialized-field read instead of escaping as a fake Number/String/etc.
+    if value.is_null() {
+        let expected=vm.classes[class_slot as usize].instance_field_types.get(slot).cloned().unwrap_or(Type::Top);
+        if !expected.accepts(&Type::Null) {
+            vm.fail_at(op,"read of an uninitialized non-nullable class field");
+            return;
+        }
+    }
     if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x); }
     vm.return_from_frame(value.word(),None)
 }
@@ -13107,18 +13150,32 @@ unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_load_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let class=Value::from_word(vm.reg(op.b));
     let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"LoadStaticField target is not class");return;}};
-    match vm.classes[slot as usize].static_fields.get(op.x as usize).copied(){
-        Some(v)=>{if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}vm.set_reg(op.a,v.word());vm.advance(op)},
-        None=>vm.fail_at(op,"static field slot out of range")
+    let index=op.x as usize;
+    let Some(v)=vm.classes[slot as usize].static_fields.get(index).copied() else {vm.fail_at(op,"static field slot out of range");return;};
+    if v.is_null() {
+        let expected=vm.classes[slot as usize].static_field_types.get(index).cloned().unwrap_or(Type::Top);
+        if !expected.accepts(&Type::Null) {
+            vm.fail_at(op,"read of an uninitialized non-nullable static field");
+            return;
+        }
     }
+    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}
+    vm.set_reg(op.a,v.word());vm.advance(op)
 }
 unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let class=Value::from_word(vm.reg(op.b));
     let slot=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"LoadStaticField target is not class");return;}};
-    match vm.classes[slot as usize].static_fields.get(op.x as usize).copied(){
-        Some(v)=>{if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}vm.return_from_frame(v.word(),None)},
-        None=>vm.fail_at(op,"static field slot out of range")
+    let index=op.x as usize;
+    let Some(v)=vm.classes[slot as usize].static_fields.get(index).copied() else {vm.fail_at(op,"static field slot out of range");return;};
+    if v.is_null() {
+        let expected=vm.classes[slot as usize].static_field_types.get(index).cloned().unwrap_or(Type::Top);
+        if !expected.accepts(&Type::Null) {
+            vm.fail_at(op,"read of an uninitialized non-nullable static field");
+            return;
+        }
     }
+    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}
+    vm.return_from_frame(v.word(),None)
 }
 unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let class=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));

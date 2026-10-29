@@ -561,7 +561,7 @@ impl<'a> Parser<'a> {
                 return Ok(Vec::new());
             }
             let name = self.ident()?;
-            self.type_parameters()?;
+            let type_params = self.type_parameter_names()?;
             self.expect("=")?;
             self.lines();
             let type_start = self.peek().span.start;
@@ -578,7 +578,7 @@ impl<'a> Parser<'a> {
             {
                 return self.error("duplicate interface/type declaration");
             }
-            self.type_aliases.push(TypeAliasDecl { name, annotation });
+            self.type_aliases.push(TypeAliasDecl { name, type_params, annotation });
             return Ok(Vec::new());
         }
 
@@ -659,7 +659,7 @@ impl<'a> Parser<'a> {
                 return self.error("type aliases must be declared at module scope");
             }
             let name = self.ident()?;
-            self.type_parameters()?;
+            let type_params = self.type_parameter_names()?;
             self.expect("=")?;
             self.lines();
             let type_start = self.peek().span.start;
@@ -676,7 +676,7 @@ impl<'a> Parser<'a> {
             {
                 return self.error("duplicate interface/type declaration");
             }
-            self.type_aliases.push(TypeAliasDecl { name, annotation });
+            self.type_aliases.push(TypeAliasDecl { name, type_params, annotation });
             return Ok(Vec::new());
         }
         if self.eat("interface") {
@@ -1129,8 +1129,12 @@ impl<'a> Parser<'a> {
                 if immutable {
                     self.immutable.insert(name.span);
                 }
-                if immutable && initializer.is_none() {
-                    return self.error("a const declaration needs an initializer");
+                if initializer.is_none() {
+                    return self.error(if immutable {
+                        "a const declaration needs an initializer"
+                    } else {
+                        "a variable declaration needs an initializer; only class properties may start uninitialized"
+                    });
                 }
                 out.push(Stmt {
                     span: self.end(name.span.start),
@@ -1800,11 +1804,12 @@ impl<'a> Parser<'a> {
         let span = Span::new(start, end);
         Ok(Some(classify_variable_type(&self.source[span.as_range()], span)))
     }
-    fn type_parameters(&mut self) -> Result<()> {
+    fn type_parameter_names(&mut self) -> Result<Vec<Ident>> {
+        let mut params = Vec::new();
         if self.eat("<") {
             loop {
                 self.lines();
-                self.ident()?;
+                params.push(self.ident()?);
                 if self.eat("extends") {
                     self.ty()?;
                 }
@@ -1817,6 +1822,11 @@ impl<'a> Parser<'a> {
             }
             self.type_close()?;
         }
+        Ok(params)
+    }
+
+    fn type_parameters(&mut self) -> Result<()> {
+        let _ = self.type_parameter_names()?;
         Ok(())
     }
     fn restore_token_splits(&mut self, checkpoint: usize) {
@@ -3143,10 +3153,17 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Napalm historically allowed Wren-style class methods without a
+            // keyword, while the TypeScript-like surface also accepts the explicit
+            // `function name(...)` spelling used by ordinary declarations. Treat
+            // `function` as a compatibility marker only; it does not change the
+            // method ABI or AST representation.
+            let explicit_function = self.eat("function");
+
             // ES/TypeScript static initialization blocks map naturally to the
             // synthetic class initializer already used for static field values.
             if is_static && self.at("{") {
-                if foreign || async_ || type_only_member {
+                if explicit_function || foreign || async_ || type_only_member {
                     return self.error("a static block cannot be foreign, async, abstract or declare");
                 }
                 let block = self.block()?;
@@ -3160,6 +3177,9 @@ impl<'a> Parser<'a> {
             // so interpreter inline caches and the tracing JIT see an ordinary
             // virtual call rather than a second dispatch mechanism.
             if self.eat("operator") {
+                if explicit_function {
+                    return self.error("`function` cannot prefix an operator overload");
+                }
                 if is_static || foreign || async_ || type_only_member {
                     return self.error("operator overloads must be concrete synchronous instance methods");
                 }
@@ -3227,6 +3247,9 @@ impl<'a> Parser<'a> {
                 None
             };
             if let Some(is_computed) = reactive_member {
+                if explicit_function {
+                    return self.error("`function` cannot prefix a computed property or watcher");
+                }
                 if is_static || foreign || async_ || type_only_member {
                     return self.error("computed properties and watchers must be concrete synchronous instance members");
                 }
@@ -3319,7 +3342,7 @@ impl<'a> Parser<'a> {
                     for (property, annotation) in &parameter_properties {
                         let value = Expr::new(ExprKind::Name(property.clone()), property.span);
                         let (getter, setter, assignment) =
-                            synthesize_class_property(property, false, value);
+                            synthesize_class_property(property, false, Some(value));
                         fields.push(ClassFieldDecl {
                             storage: class_storage_ident(property, false),
                             annotation: annotation.clone(),
@@ -3328,7 +3351,9 @@ impl<'a> Parser<'a> {
                         });
                         methods.push(getter);
                         methods.push(setter);
-                        parameter_initializers.push(assignment);
+                        if let Some(assignment) = assignment {
+                            parameter_initializers.push(assignment);
+                        }
                     }
                 }
                 let body = if foreign {
@@ -3351,7 +3376,7 @@ impl<'a> Parser<'a> {
                     span: self.end(member_start),
                 });
             } else {
-                if access.is_some() || async_ || foreign || is_constructor {
+                if explicit_function || access.is_some() || async_ || foreign || is_constructor {
                     return self.error("expected a method parameter list");
                 }
                 let annotation = self.variable_annotation()?;
@@ -3372,15 +3397,21 @@ impl<'a> Parser<'a> {
                     initializer: initializer.clone(),
                     is_static,
                 });
-                let initializer = initializer.unwrap_or_else(|| Expr::new(ExprKind::Null, member.span));
+                // Runtime instance/static storage is already born as null. An absent
+                // source initializer therefore means "uninitialized", not an explicit
+                // assignment of null to the declared type. Keeping those states distinct
+                // lets `width: number;` be initialized by the constructor without weakening
+                // the type of later writes to `number | null`.
                 let (getter, setter, assignment) =
                     synthesize_class_property(&member, is_static, initializer);
                 methods.push(getter);
                 methods.push(setter);
-                if is_static {
-                    static_initializers.push(assignment);
-                } else {
-                    initializers.push(assignment);
+                if let Some(assignment) = assignment {
+                    if is_static {
+                        static_initializers.push(assignment);
+                    } else {
+                        initializers.push(assignment);
+                    }
                 }
             }
             self.separators();
@@ -3688,8 +3719,8 @@ fn class_storage_ident(property: &Ident, is_static: bool) -> Ident {
 fn synthesize_class_property(
     member: &Ident,
     is_static: bool,
-    initializer: Expr,
-) -> (MethodDecl, MethodDecl, Stmt) {
+    initializer: Option<Expr>,
+) -> (MethodDecl, MethodDecl, Option<Stmt>) {
     let storage = Spanned::new(
         format!("{}{}", if is_static { "__" } else { "_" }, member.value),
         member.span,
@@ -3744,7 +3775,7 @@ fn synthesize_class_property(
         attributes: Vec::new(),
         span: member.span,
     };
-    let assignment = Stmt {
+    let assignment = initializer.map(|initializer| Stmt {
         kind: StmtKind::Expression(Expr::new(
             ExprKind::Assign {
                 target: Box::new(field),
@@ -3753,7 +3784,7 @@ fn synthesize_class_property(
             member.span,
         )),
         span: member.span,
-    };
+    });
     (getter, setter, assignment)
 }
 
@@ -4311,6 +4342,55 @@ mod napalm_syntax_tests {
     }
 
     #[test]
+    fn accepts_explicit_function_keyword_for_class_methods() {
+        let module = assert_parses(r#"
+            interface Shape {
+                name: string;
+                area(): number;
+            }
+
+            class Rect implements Shape {
+                name: string;
+                width: number;
+                height: number;
+
+                constructor(width: number, height: number) {
+                    this.name = "rect";
+                    this.width = width;
+                    this.height = height;
+                }
+
+                function area(): number {
+                    return this.width * this.height;
+                }
+            }
+
+            class Box<T> {
+                value: T;
+                constructor(value: T) { this.value = value; }
+                function read(): T { return this.value; }
+                function swap(value: T): T {
+                    var old = this.value;
+                    this.value = value;
+                    return old;
+                }
+            }
+        "#);
+        assert_eq!(module.statements.len(), 2);
+    }
+
+    #[test]
+    fn generic_type_alias_retains_declared_parameter_names() {
+        let module = assert_parses(r#"
+            type Pair<A, B> = { first: A; second: B };
+            var pair: Pair<number, string> = { first: 1, second: "x" };
+        "#);
+        assert_eq!(module.type_aliases.len(), 1);
+        let alias = &module.type_aliases[0];
+        assert_eq!(alias.type_params.iter().map(|p| p.value.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+    }
+
+    #[test]
     fn parses_erased_types_generics_and_modern_class_syntax() {
         let module = assert_parses(r#"
             import type { ExternalType } from "types";
@@ -4695,6 +4775,33 @@ mod napalm_syntax_tests {
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed$magnitude2")));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
+    }
+
+    #[test]
+    fn class_properties_may_be_declared_without_initializers_but_variables_may_not() {
+        let module = assert_parses(r#"
+            class Rect {
+                name: string;
+                width: number;
+                height: number;
+                constructor(width: number, height: number) {
+                    this.name = "rect";
+                    this.width = width;
+                    this.height = height;
+                }
+            }
+        "#);
+        let StmtKind::Class(class) = &module.statements[0].kind else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.fields.len(), 3);
+        assert!(class.fields.iter().all(|field| field.initializer.is_none()));
+
+        let parsed = parse("variables.np", "var value: number;");
+        assert!(parsed.has_errors());
+        assert!(parsed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("variable declaration needs an initializer")
+        }));
     }
 
     #[test]

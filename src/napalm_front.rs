@@ -984,6 +984,10 @@ pub struct ModuleAst {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeAliasDecl {
     pub name: Ident,
+    /// Generic parameters are erased at runtime, but retaining their names lets
+    /// the static type planner distinguish declared placeholders from misspelled
+    /// or otherwise unresolved named types inside the alias body.
+    pub type_params: Vec<Ident>,
     pub annotation: TypeAnnotation,
 }
 

@@ -373,6 +373,27 @@ fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Ty
     }
 }
 
+fn supported_alias_annotation(
+    annotation: &TypeAnnotation,
+    known: &HashMap<String, Type>,
+    type_params: &HashSet<String>,
+) -> bool {
+    match &annotation.kind {
+        TypeAnnotationKind::Named(name) => type_params.contains(name) || known.contains_key(name),
+        TypeAnnotationKind::Opaque(_) => false,
+        TypeAnnotationKind::Object(fields) => fields
+            .iter()
+            .all(|field| supported_alias_annotation(&field.annotation, known, type_params)),
+        TypeAnnotationKind::List(Some(element)) => {
+            supported_alias_annotation(element, known, type_params)
+        }
+        TypeAnnotationKind::Union(types) => types
+            .iter()
+            .all(|ty| supported_alias_annotation(ty, known, type_params)),
+        _ => true,
+    }
+}
+
 fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
     match &annotation.kind {
         TypeAnnotationKind::Object(_) => !supported_interface_annotation(annotation, known),
@@ -502,6 +523,17 @@ fn type_is_unknown(ty: &Type) -> bool {
         Type::Foreign(None) => true,
         Type::Union(types) => types.iter().any(type_is_unknown),
         _ => false,
+    }
+}
+
+#[inline]
+fn source_field_name(storage_name: &str, is_static: bool) -> &str {
+    // TypeScript-style class properties use hidden fixed-layout storage names
+    // (`_name` / `__name`). Diagnostics must never expose that compiler ABI.
+    if is_static {
+        storage_name.strip_prefix("__").unwrap_or(storage_name)
+    } else {
+        storage_name.strip_prefix('_').unwrap_or(storage_name)
     }
 }
 
@@ -1481,9 +1513,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             });
 
             pending_aliases.retain(|decl| {
-                if !supported_interface_annotation(&decl.annotation, &self.interface_types) {
+                let type_params = decl
+                    .type_params
+                    .iter()
+                    .map(|param| param.value.clone())
+                    .collect::<HashSet<_>>();
+                if !supported_alias_annotation(&decl.annotation, &self.interface_types, &type_params) {
                     return true;
                 }
+                // Generic placeholders are intentionally erased to Top here. The
+                // alias still preserves its structural shape, while concrete type
+                // arguments remain a compile-time-only surface feature for now.
                 let resolved = resolve_type_annotation(
                     &decl.annotation,
                     &self.top_level_classes,
@@ -4788,7 +4828,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             "NAPALM-T001",
                             format!(
                                 "field '{}' expects {}, got {}",
-                                name.value,
+                                source_field_name(&name.value, false),
                                 display_source_type(&expected),
                                 display_source_type(&semantic_source_type(&actual))
                             ),
@@ -4819,7 +4859,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             "NAPALM-T001",
                             format!(
                                 "static field '{}' expects {}, got {}",
-                                name.value,
+                                source_field_name(&name.value, true),
                                 display_source_type(&expected),
                                 display_source_type(&semantic_source_type(&actual))
                             ),
@@ -6551,6 +6591,22 @@ class Child is Parent {
     }
 
     #[test]
+    fn generic_structural_alias_erases_parameters_without_becoming_unresolved() {
+        let source = r#"
+            type Pair<A, B> = { first: A; second: B };
+            let pair: Pair<number, string> = { first: 1, second: "ok" };
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("generic_alias.napalm", source, "generic_alias", &module);
+        assert!(
+            !output.has_errors(),
+            "generic alias lowering diagnostics: {:#?}",
+            output.diagnostics
+        );
+        assert!(matches!(output.program.functions.first(), Some(_)));
+    }
+
+    #[test]
     fn structural_interfaces_and_types_lower_to_typed_map_accesses() {
         let source = r#"
             interface OpenPoint {
@@ -6895,6 +6951,50 @@ class Child is Parent {
                 && diagnostic.message.contains("extra")
                 && diagnostic.message.contains("closed type")
         }));
+    }
+
+    #[test]
+    fn uninitialized_typed_class_fields_do_not_synthesize_null_assignments() {
+        let source = r#"
+            class Rect {
+                name: string;
+                width: number;
+                height: number;
+                constructor(width: number, height: number) {
+                    this.name = "rect";
+                    this.width = width;
+                    this.height = height;
+                }
+                function area(): number { return this.width * this.height; }
+            }
+            var rect = new Rect(2, 3);
+            var result = rect.area();
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            !output.has_errors(),
+            "uninitialized class fields must be populated by constructors without null type errors: {:#?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn typed_class_field_diagnostics_use_source_property_names() {
+        let source = r#"
+            class Bad {
+                height: number = "wrong";
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        let diagnostic = output
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "NAPALM-T001")
+            .expect("typed field mismatch diagnostic");
+        assert!(diagnostic.message.contains("field 'height'"), "{}", diagnostic.message);
+        assert!(!diagnostic.message.contains("'_height'"), "{}", diagnostic.message);
     }
 
     #[test]
