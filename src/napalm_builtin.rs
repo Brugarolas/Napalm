@@ -36,6 +36,7 @@ pub struct BuiltinManifest {
     native_bindings: Vec<NativeBinding>,
     primitives: Vec<Option<BuiltinPrimitive>>,
     list_remove: Option<(MethodSymbol, FuncId)>,
+    list_functions: Vec<(MethodSymbol, FuncId)>,
     string_add: Option<(MethodSymbol, FuncId)>,
     string_right_add: Option<FuncId>,
     system_print: Option<(MethodSymbol, FuncId)>,
@@ -206,6 +207,14 @@ enum BuiltinPrimitive {
     StringStartsWith,
     StringEndsWith,
     StringIndexOf,
+    StringLastIndexOf,
+    StringSlice,
+    StringSubstring,
+    StringTrim,
+    StringTrimStart,
+    StringTrimEnd,
+    StringToUpperCase,
+    StringToLowerCase,
     StringToString,
     StringIterate,
     StringIteratorValue,
@@ -214,6 +223,12 @@ enum BuiltinPrimitive {
     ListCount,
     ListConcat,
     ListAdd,
+    ListPush,
+    ListPop,
+    ListShift,
+    ListUnshift,
+    ListSetLength,
+    ListFill,
     ListInsert,
     ListRemoveAt,
     ListClear,
@@ -367,8 +382,22 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::StringSubscript),
         ("contains", MethodKind::Method, 1, BuiltinPrimitive::StringContains),
         ("startsWith", MethodKind::Method, 1, BuiltinPrimitive::StringStartsWith),
+        ("startsWith", MethodKind::Method, 2, BuiltinPrimitive::StringStartsWith),
         ("endsWith", MethodKind::Method, 1, BuiltinPrimitive::StringEndsWith),
+        ("endsWith", MethodKind::Method, 2, BuiltinPrimitive::StringEndsWith),
         ("indexOf", MethodKind::Method, 1, BuiltinPrimitive::StringIndexOf),
+        ("indexOf", MethodKind::Method, 2, BuiltinPrimitive::StringIndexOf),
+        ("lastIndexOf", MethodKind::Method, 1, BuiltinPrimitive::StringLastIndexOf),
+        ("lastIndexOf", MethodKind::Method, 2, BuiltinPrimitive::StringLastIndexOf),
+        ("slice", MethodKind::Method, 1, BuiltinPrimitive::StringSlice),
+        ("slice", MethodKind::Method, 2, BuiltinPrimitive::StringSlice),
+        ("substring", MethodKind::Method, 1, BuiltinPrimitive::StringSubstring),
+        ("substring", MethodKind::Method, 2, BuiltinPrimitive::StringSubstring),
+        ("trim", MethodKind::Method, 0, BuiltinPrimitive::StringTrim),
+        ("trimStart", MethodKind::Method, 0, BuiltinPrimitive::StringTrimStart),
+        ("trimEnd", MethodKind::Method, 0, BuiltinPrimitive::StringTrimEnd),
+        ("toUpperCase", MethodKind::Method, 0, BuiltinPrimitive::StringToUpperCase),
+        ("toLowerCase", MethodKind::Method, 0, BuiltinPrimitive::StringToLowerCase),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::StringToString),
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::StringIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::StringIteratorValue),
@@ -422,9 +451,18 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
         ("length", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
+        // Keep the historical method form too. Source written before the JS-like
+        // property migration commonly uses `list.length()`.
+        ("length", MethodKind::Method, 0, BuiltinPrimitive::ListCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::ListIsEmpty),
         ("+", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
         ("add", MethodKind::Method, 1, BuiltinPrimitive::ListAdd),
+        ("push", MethodKind::Method, 1, BuiltinPrimitive::ListPush),
+        ("pop", MethodKind::Method, 0, BuiltinPrimitive::ListPop),
+        ("shift", MethodKind::Method, 0, BuiltinPrimitive::ListShift),
+        ("unshift", MethodKind::Method, 1, BuiltinPrimitive::ListUnshift),
+        ("setLength", MethodKind::Method, 1, BuiltinPrimitive::ListSetLength),
+        ("fill", MethodKind::Method, 1, BuiltinPrimitive::ListFill),
         ("insert", MethodKind::Method, 2, BuiltinPrimitive::ListInsert),
         ("removeAt", MethodKind::Method, 1, BuiltinPrimitive::ListRemoveAt),
         ("clear", MethodKind::Method, 0, BuiltinPrimitive::ListClear),
@@ -477,6 +515,118 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let null = b.const_null();
     b.ret(null);
     manifest.list_remove = Some((remove, b.finish()));
+
+    // Higher-order List operations stay in WIR instead of Host primitives. This
+    // gives callbacks ordinary Napalm call semantics, lets GC maps remain precise,
+    // and leaves the optimizer/JIT free to inline or specialize the loop later.
+    let call1 = program.intern_method("call", MethodKind::Method, 1);
+    let call2 = program.intern_method("call", MethodKind::Method, 2);
+
+    let map_method = program.intern_method("map", MethodKind::Method, 1);
+    let mut b = Builder::new(
+        program,
+        module,
+        "List.map",
+        FunctionKind::Method,
+        vec![Type::List(None), Type::Top],
+        Type::List(None),
+    );
+    let source = b.param(0);
+    let callback = b.param(1);
+    let len = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+    let result = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list: source, index }, Type::Top);
+    let mapped = b.invoke(callback, call1, vec![item]);
+    b.emit0(Inst::ListAppend { list: result, value: mapped });
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(done);
+    b.ret(result);
+    manifest.list_functions.push((map_method, b.finish()));
+
+    let filter_method = program.intern_method("filter", MethodKind::Method, 1);
+    let mut b = Builder::new(
+        program,
+        module,
+        "List.filter",
+        FunctionKind::Method,
+        vec![Type::List(None), Type::Top],
+        Type::List(None),
+    );
+    let source = b.param(0);
+    let callback = b.param(1);
+    let len = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+    let result = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let keep = b.new_block(&[]);
+    let advance = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list: source, index }, Type::Top);
+    let predicate = b.invoke(callback, call1, vec![item]);
+    b.branch(predicate, keep, vec![], advance, vec![]);
+    b.position_at(keep);
+    b.emit0(Inst::ListAppend { list: result, value: item });
+    b.jump(advance, vec![]);
+    b.position_at(advance);
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(done);
+    b.ret(result);
+    manifest.list_functions.push((filter_method, b.finish()));
+
+    let reduce_method = program.intern_method("reduce", MethodKind::Method, 2);
+    let mut b = Builder::new(
+        program,
+        module,
+        "List.reduce",
+        FunctionKind::Method,
+        vec![Type::List(None), Type::Top, Type::Top],
+        Type::Top,
+    );
+    let source = b.param(0);
+    let callback = b.param(1);
+    let initial = b.param(2);
+    let len = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let acc = b.add_block_param(header, Type::Top);
+    let body = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let result = b.add_block_param(done, Type::Top);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero, initial]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![acc]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list: source, index }, Type::Top);
+    let next_acc = b.invoke(callback, call2, vec![acc, item]);
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next, next_acc]);
+    b.position_at(done);
+    b.ret(result);
+    manifest.list_functions.push((reduce_method, b.finish()));
 
     // Map.
     let map = instance(BuiltinClass::Map);
@@ -803,6 +953,9 @@ pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &Builtin
         interpreter.bind_builtin_function(BuiltinClass::String, method, function);
     }
     if let Some((method, function)) = manifest.list_remove {
+        interpreter.bind_builtin_function(BuiltinClass::List, method, function);
+    }
+    for &(method, function) in &manifest.list_functions {
         interpreter.bind_builtin_function(BuiltinClass::List, method, function);
     }
     for binding in manifest.bindings() {
@@ -1493,6 +1646,66 @@ fn normalized_index(index: i64, len: usize) -> Result<usize, RuntimeError> {
     }
 }
 
+#[inline]
+fn string_char_len(text: &str) -> usize {
+    text.chars().count()
+}
+
+#[inline]
+fn string_char_to_byte(text: &str, index: usize) -> usize {
+    if index == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+#[inline]
+fn string_clamp_index(index: i64, len: usize) -> usize {
+    index.clamp(0, len.min(i64::MAX as usize) as i64) as usize
+}
+
+#[inline]
+fn string_relative_index(index: i64, len: usize) -> usize {
+    if index < 0 {
+        (len as i64).saturating_add(index).max(0) as usize
+    } else {
+        string_clamp_index(index, len)
+    }
+}
+
+/// Find a UTF-8 substring but report the position in Napalm String character
+/// indices rather than bytes. String indexing intentionally follows Unicode
+/// scalar values, matching `.length`, slicing and iteration.
+fn string_index_of_chars(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    let len = string_char_len(haystack);
+    let start = start.min(len);
+    if needle.is_empty() {
+        return Some(start);
+    }
+    let start_byte = string_char_to_byte(haystack, start);
+    let relative = haystack[start_byte..].find(needle)?;
+    Some(start + haystack[start_byte..start_byte + relative].chars().count())
+}
+
+fn string_last_index_of_chars(haystack: &str, needle: &str, position: usize) -> Option<usize> {
+    let len = string_char_len(haystack);
+    let position = position.min(len);
+    if needle.is_empty() {
+        return Some(position);
+    }
+    let mut found = None;
+    for (byte, _) in haystack.match_indices(needle) {
+        let index = haystack[..byte].chars().count();
+        if index > position {
+            break;
+        }
+        found = Some(index);
+    }
+    found
+}
+
 /// Resolve the containing List or Map, leaving the final subscript for the
 /// getter or setter. Intermediate list indices cannot be slices; map keys
 /// retain their usual semantics regardless of the depth of the lookup.
@@ -1685,7 +1898,11 @@ fn execute_primitive(
         NumInfinity => Ok(Value::from_num(f64::INFINITY)),
         NumNan => Ok(Value::from_num(f64::NAN)),
 
-        StringCount => Ok(Value::from_num(context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?.len() as f64)),
+        StringCount => {
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            Ok(Value::from_num(string_char_len(text) as f64))
+        }
         StringAdd => {
             // Kept as a compatibility fallback for programs compiled against an
             // older core manifest. New programs bind String.+ to the WIR helper
@@ -1707,38 +1924,173 @@ fn execute_primitive(
             Ok(Value::from_bool(if matches!(op, StringEq) { equal } else { !equal }))
         }
         StringSubscript => {
-            let byte = {
-                let bytes = context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?;
-                let index = normalized_index(integer(argument(args, 0)?, "index")?, bytes.len())?;
-                bytes[index]
+            let raw = integer(argument(args, 0)?, "index")?;
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                let len = string_char_len(text);
+                let index = if raw < 0 { len as i64 + raw } else { raw };
+                if index < 0 || index as usize >= len {
+                    None
+                } else {
+                    Some(text.chars().nth(index as usize).expect("checked String index").to_string())
+                }
             };
-            Ok(context.allocate_bytes([byte]))
-        }
-        StringContains | StringStartsWith | StringEndsWith | StringIndexOf => {
-            let haystack = context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?;
-            let needle = context.string_bytes(argument(args, 0)?).ok_or_else(|| RuntimeError::new("argument must be String"))?;
-            let position = haystack.windows(needle.len()).position(|w| w == needle);
-            match op {
-                StringContains => Ok(Value::from_bool(position.is_some())),
-                StringStartsWith => Ok(Value::from_bool(haystack.starts_with(needle))),
-                StringEndsWith => Ok(Value::from_bool(haystack.ends_with(needle))),
-                StringIndexOf => Ok(Value::from_num(position.map_or(-1.0, |p| p as f64))),
-                _ => unreachable!(),
+            match output {
+                Some(output) => Ok(context.allocate_string(output)),
+                None => Ok(Value::NULL),
             }
+        }
+        StringContains => {
+            let haystack = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let needle = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("argument must be a valid UTF-8 String"))?;
+            Ok(Value::from_bool(haystack.contains(needle)))
+        }
+        StringStartsWith => {
+            let haystack = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let needle = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("argument must be a valid UTF-8 String"))?;
+            let len = string_char_len(haystack);
+            let start = if args.len() > 2 {
+                string_clamp_index(integer(argument(args, 1)?, "position")?, len)
+            } else {
+                0
+            };
+            let byte = string_char_to_byte(haystack, start);
+            Ok(Value::from_bool(haystack[byte..].starts_with(needle)))
+        }
+        StringEndsWith => {
+            let haystack = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let needle = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("argument must be a valid UTF-8 String"))?;
+            let len = string_char_len(haystack);
+            let end = if args.len() > 2 {
+                string_clamp_index(integer(argument(args, 1)?, "end position")?, len)
+            } else {
+                len
+            };
+            let byte = string_char_to_byte(haystack, end);
+            Ok(Value::from_bool(haystack[..byte].ends_with(needle)))
+        }
+        StringIndexOf => {
+            let haystack = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let needle = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("argument must be a valid UTF-8 String"))?;
+            let len = string_char_len(haystack);
+            let start = if args.len() > 2 {
+                string_clamp_index(integer(argument(args, 1)?, "start position")?, len)
+            } else {
+                0
+            };
+            Ok(Value::from_num(
+                string_index_of_chars(haystack, needle, start).map_or(-1.0, |index| index as f64)
+            ))
+        }
+        StringLastIndexOf => {
+            let haystack = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let needle = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("argument must be a valid UTF-8 String"))?;
+            let len = string_char_len(haystack);
+            let position = if args.len() > 2 {
+                string_clamp_index(integer(argument(args, 1)?, "position")?, len)
+            } else {
+                len
+            };
+            Ok(Value::from_num(
+                string_last_index_of_chars(haystack, needle, position).map_or(-1.0, |index| index as f64)
+            ))
+        }
+        StringSlice => {
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                let len = string_char_len(text);
+                let start = string_relative_index(integer(argument(args, 0)?, "slice start")?, len);
+                let end = if args.len() > 2 {
+                    string_relative_index(integer(argument(args, 1)?, "slice end")?, len)
+                } else {
+                    len
+                };
+                if end <= start {
+                    String::new()
+                } else {
+                    let from = string_char_to_byte(text, start);
+                    let to = string_char_to_byte(text, end);
+                    text[from..to].to_owned()
+                }
+            };
+            Ok(context.allocate_string(output))
+        }
+        StringSubstring => {
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                let len = string_char_len(text);
+                let mut start = string_clamp_index(integer(argument(args, 0)?, "substring start")?, len);
+                let mut end = if args.len() > 2 {
+                    string_clamp_index(integer(argument(args, 1)?, "substring end")?, len)
+                } else {
+                    len
+                };
+                if start > end {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                let from = string_char_to_byte(text, start);
+                let to = string_char_to_byte(text, end);
+                text[from..to].to_owned()
+            };
+            Ok(context.allocate_string(output))
+        }
+        StringTrim | StringTrimStart | StringTrimEnd => {
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                match op {
+                    StringTrim => text.trim(),
+                    StringTrimStart => text.trim_start(),
+                    StringTrimEnd => text.trim_end(),
+                    _ => unreachable!(),
+                }
+                .to_owned()
+            };
+            Ok(context.allocate_string(output))
+        }
+        StringToUpperCase | StringToLowerCase => {
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                if matches!(op, StringToUpperCase) {
+                    text.to_uppercase()
+                } else {
+                    text.to_lowercase()
+                }
+            };
+            Ok(context.allocate_string(output))
         }
         StringToString => Ok(this),
         StringIterate => {
-            let len = context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?.len();
+            let len = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?
+                .chars()
+                .count();
             let next = if argument(args,0)?.is_null() { 0 } else { integer(argument(args,0)?, "iterator")? + 1 };
             Ok(if next >= 0 && (next as usize) < len { Value::from_num(next as f64) } else { Value::FALSE })
         }
         StringIteratorValue => {
-            let byte = {
-                let bytes = context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?;
-                let index = normalized_index(integer(argument(args,0)?, "iterator")?, bytes.len())?;
-                bytes[index]
+            let output = {
+                let text = context.string_utf8(this)
+                    .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+                let len = string_char_len(text);
+                let index = normalized_index(integer(argument(args,0)?, "iterator")?, len)?;
+                text.chars().nth(index).expect("normalized String iterator").to_string()
             };
-            Ok(context.allocate_bytes([byte]))
+            Ok(context.allocate_string(output))
         }
         StringFromCodePoint => {
             let point = integer(argument(args, 0)?, "code point")?;
@@ -1764,6 +2116,46 @@ fn execute_primitive(
             Ok(context.allocate_list(values))
         }
         ListAdd => context.list_push(this, argument(args,0)?),
+        ListPush => {
+            context.list_push(this, argument(args, 0)?)?;
+            Ok(Value::from_num(
+                context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))? as f64,
+            ))
+        }
+        ListPop => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            if len == 0 {
+                Ok(Value::NULL)
+            } else {
+                context.list_remove_at(this, len - 1)
+            }
+        }
+        ListShift => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            if len == 0 {
+                Ok(Value::NULL)
+            } else {
+                context.list_remove_at(this, 0)
+            }
+        }
+        ListUnshift => {
+            context.list_insert(this, 0, argument(args, 0)?)?;
+            Ok(Value::from_num(
+                context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))? as f64,
+            ))
+        }
+        ListSetLength => {
+            let len = integer(argument(args, 0)?, "Array length")?;
+            if len < 0 {
+                return Err(RuntimeError::new("Array length must be non-negative"));
+            }
+            context.list_resize(this, len as usize)?;
+            Ok(Value::from_num(len as f64))
+        }
+        ListFill => {
+            context.list_fill(this, argument(args, 0)?)?;
+            Ok(this)
+        }
         ListInsert => {
             let index = integer(argument(args,0)?, "index")?;
             let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
@@ -1792,8 +2184,13 @@ fn execute_primitive(
                 }
                 return Ok(context.allocate_list(values));
             }
-            let index = normalized_index(integer(subscript, "index")?, len)?;
-            context.list_get(container,index).ok_or_else(|| RuntimeError::new("list index out of bounds"))
+            let raw = integer(subscript, "index")?;
+            let index = if raw < 0 { len as i64 + raw } else { raw };
+            if index < 0 || index as usize >= len {
+                Ok(Value::NULL)
+            } else {
+                Ok(context.list_get(container, index as usize).unwrap_or(Value::NULL))
+            }
         }
         ListSubscriptSet | MapSubscriptSet => {
             let (&value, indices) = args[1..].split_last()
@@ -1803,8 +2200,17 @@ fn execute_primitive(
                 return context.map_set(container, subscript, value);
             }
             let len = context.list_len(container).ok_or_else(|| RuntimeError::new("receiver is not List or Map"))?;
-            let index = normalized_index(integer(subscript, "index")?, len)?;
-            context.list_set(container,index,value)
+            let raw = integer(subscript, "index")?;
+            let index = if raw < 0 {
+                let normalized = len as i64 + raw;
+                if normalized < 0 {
+                    return Err(RuntimeError::new("list index out of bounds"));
+                }
+                normalized as usize
+            } else {
+                raw as usize
+            };
+            context.list_set_expanding(container, index, value)
         }
         ListIterate => {
             let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
@@ -2044,5 +2450,23 @@ mod date_compat_tests {
         assert_eq!(date_parse_string("2024-03-05T12:20:30+02:00"), 1_709_634_030_000.0);
         assert_eq!(date_parse_string("Tue, 05 Mar 2024 10:20:30 GMT"), 1_709_634_030_000.0);
         assert!(date_parse_string("not a date").is_nan());
+    }
+}
+
+
+#[cfg(test)]
+mod string_collection_compat_tests {
+    use super::*;
+
+    #[test]
+    fn unicode_string_indices_are_character_based() {
+        let text = "café";
+        assert_eq!(string_char_len(text), 4);
+        assert_eq!(string_char_to_byte(text, 3), 3);
+        assert_eq!(string_char_to_byte(text, 4), text.len());
+        assert_eq!(string_index_of_chars(text, "é", 0), Some(3));
+        assert_eq!(string_index_of_chars("napalm", "", 999), Some(6));
+        assert_eq!(string_last_index_of_chars("napalm", "a", 6), Some(3));
+        assert_eq!(string_last_index_of_chars("napalm", "a", 2), Some(1));
     }
 }

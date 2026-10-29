@@ -3551,6 +3551,87 @@ impl HostContext<'_> {
         }
     }
 
+    /// Set a JavaScript-style Array slot, growing a generic List with null holes
+    /// when a non-negative index lies beyond the current end. Typed Lists keep
+    /// their runtime invariant: growth is rejected if their element contract does
+    /// not accept Napalm's null hole value.
+    pub fn list_set_expanding(
+        &mut self,
+        value: Value,
+        index: usize,
+        item: Value,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_ARRAY_LENGTH: usize = 16_777_216;
+        if index >= MAX_ARRAY_LENGTH {
+            return Err(RuntimeError::new("array index is too large"));
+        }
+        self.heap.check_list_write(value, item)?;
+        let len = self
+            .list_len(value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a List"))?;
+        if index >= len {
+            // Sparse source Arrays use null because Napalm deliberately has no
+            // user-visible undefined value.
+            self.heap.check_list_write(value, Value::NULL)?;
+        }
+        self.heap.remember_if_reference(value, item);
+        let resized = match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => {
+                let old_capacity = list.capacity();
+                if index >= list.len() {
+                    list.resize(index + 1, Value::NULL);
+                }
+                list[index] = item;
+                (list.capacity() != old_capacity).then_some(list.capacity())
+            }
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        };
+        if let Some(capacity) = resized {
+            self.heap
+                .set_external_bytes(value, capacity * std::mem::size_of::<Value>());
+        }
+        self.heap.refresh_jit_view(value);
+        Ok(item)
+    }
+
+    pub fn list_resize(&mut self, value: Value, len: usize) -> Result<(), RuntimeError> {
+        const MAX_ARRAY_LENGTH: usize = 16_777_216;
+        if len > MAX_ARRAY_LENGTH {
+            return Err(RuntimeError::new("invalid Array length"));
+        }
+        let current = self
+            .list_len(value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a List"))?;
+        if len > current {
+            self.heap.check_list_write(value, Value::NULL)?;
+        }
+        let resized = match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => {
+                let old_capacity = list.capacity();
+                list.resize(len, Value::NULL);
+                (list.capacity() != old_capacity).then_some(list.capacity())
+            }
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        };
+        if let Some(capacity) = resized {
+            self.heap
+                .set_external_bytes(value, capacity * std::mem::size_of::<Value>());
+        }
+        self.heap.refresh_jit_view(value);
+        Ok(())
+    }
+
+    pub fn list_fill(&mut self, value: Value, item: Value) -> Result<(), RuntimeError> {
+        self.heap.check_list_write(value, item)?;
+        self.heap.remember_if_reference(value, item);
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => list.fill(item),
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        }
+        self.heap.refresh_jit_view(value);
+        Ok(())
+    }
+
     pub fn list_push(&mut self, value: Value, item: Value) -> Result<Value, RuntimeError> {
         self.heap.check_list_write(value, item)?;
         self.heap.remember_if_reference(value, item);
@@ -16817,7 +16898,7 @@ class StructuredErrors {
     var total = 0
     try {
       defer { total = total + 1 }
-      errdefer (error) { total = total + error }
+      errdefer |error| { total = total + error }
       StructuredErrors.fail()
       total = 99999
     } catch (error) {

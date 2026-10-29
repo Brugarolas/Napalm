@@ -1468,11 +1468,14 @@ impl<'a> Parser<'a> {
             if !error_only {
                 self.bump();
             }
-            let error_binding = if error_only && self.eat("(") {
+            let error_binding = if error_only && self.eat("|") {
                 let n = self.ident()?;
-                self.expect(")")?;
+                self.expect("|")?;
                 Some(n)
             } else {
+                if error_only && self.at("(") {
+                    return self.error("errdefer bindings use `|error|`, not `(error)`");
+                }
                 None
             };
             self.lines();
@@ -1480,7 +1483,7 @@ impl<'a> Parser<'a> {
                 // `defer` and `errdefer` accept either a block or any single
                 // statement. `statement()` already handles `{ ... }`, so this
                 // keeps block syntax while also supporting concise forms such as
-                // `defer cleanup();` and `errdefer (error) report(error);`.
+                // `defer cleanup();` and `errdefer |error| report(error);`.
                 body: Box::new(self.statement()?),
                 error_only,
                 error_binding,
@@ -2582,6 +2585,57 @@ impl<'a> Parser<'a> {
             self.end(start),
         ))
     }
+    /// Parse Napalm's compact lambda syntax: `|x| expr` or `|x, y| { ... }`.
+    /// Named functions keep their ordinary parenthesized parameter lists; pipes are
+    /// reserved for anonymous closures so call-site lambdas stay visually distinct.
+    fn pipe_closure(&mut self, start: usize, async_: bool) -> Result<Expr> {
+        self.expect("|")?;
+        self.lines();
+        let mut params = Vec::new();
+        if !self.at("|") {
+            loop {
+                let param = self.ident()?;
+                self.eat("?");
+                // Parameter annotations are accepted for consistency with named
+                // functions. Runtime closure metadata remains arity-based.
+                self.annotation()?;
+                params.push(param);
+                self.lines();
+                if !self.eat(",") {
+                    break;
+                }
+                self.lines();
+            }
+        }
+        self.expect("|")?;
+        if params.len() > MAX_PARAMETERS {
+            return self.error(format!(
+                "closure has {} parameters, maximum is {}",
+                params.len(),
+                MAX_PARAMETERS
+            ));
+        }
+        self.lines();
+        let body = if self.at("{") {
+            self.function_body(params, start)?
+        } else {
+            let value = self.expr(1)?;
+            FunctionBody {
+                params,
+                kind: FunctionBodyKind::Expression(Box::new(value)),
+                span: self.end(start),
+            }
+        };
+        Ok(Expr::new(
+            if async_ {
+                ExprKind::AsyncClosure(body)
+            } else {
+                ExprKind::Closure(body)
+            },
+            self.end(start),
+        ))
+    }
+
     fn prefix(&mut self) -> Result<Expr> {
         let start = self.peek().span.start;
         if self.at("<") {
@@ -2604,6 +2658,9 @@ impl<'a> Parser<'a> {
             self.lines();
             return self.expr(16);
         }
+        if self.at("|") {
+            return self.pipe_closure(start, false);
+        }
         if self.eat("launch") {
             self.lines();
             let call = self.expr(16)?;
@@ -2613,8 +2670,12 @@ impl<'a> Parser<'a> {
             if self.eat("async") {
                 return self.error("`concurrent async` is redundant; concurrent functions are launched asynchronously and return a Promise");
             }
-            let function = self.eat("function");
-            let closure = self.closure(start, false, function)?;
+            let closure = if self.at("|") {
+                self.pipe_closure(start, false)?
+            } else {
+                let function = self.eat("function");
+                self.closure(start, false, function)?
+            };
             let span = closure.span;
             return match closure.kind {
                 ExprKind::Closure(body) => Ok(Expr::new(ExprKind::ConcurrentClosure(body), span)),
@@ -2622,6 +2683,9 @@ impl<'a> Parser<'a> {
             };
         }
         if self.eat("async") {
+            if self.at("|") {
+                return self.pipe_closure(start, true);
+            }
             let function = self.eat("function");
             return self.closure(start, true, function);
         }
@@ -4504,7 +4568,7 @@ mod napalm_syntax_tests {
             function work(fail) {
                 defer System.print("single defer");
                 errdefer System.print("single errdefer");
-                errdefer (error) System.print(error);
+                errdefer |error| System.print(error);
                 defer {
                     System.print("block defer");
                 }
@@ -4632,5 +4696,19 @@ mod napalm_syntax_tests {
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
     }
+
+    #[test]
+    fn parses_pipe_lambdas_and_pipe_errdefer_bindings() {
+        let module = assert_parses(r#"
+            function work() {
+                let mapped = [1, 2, 3].map(|x| x + 1);
+                let reduced = [1, 2, 3].reduce(|sum, x| sum + x, 0);
+                errdefer |error| System.print(error);
+                return [mapped, reduced];
+            }
+        "#);
+        assert!(!module.statements.is_empty());
+    }
+
 
 }

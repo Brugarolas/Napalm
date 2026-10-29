@@ -1,4 +1,4 @@
-fn array_work(n) {
+function array_work(n) {
     var a = [1, 2, 3, 4];
     var total = 0;
     for (var i = 0; i < n; i = i + 1) {
@@ -8,7 +8,7 @@ fn array_work(n) {
     return total;
 }
 
-fn string_work(n, text, prefix, suffix) {
+function string_work(n, text, prefix, suffix) {
     var total = 0;
     for (var i = 0; i < n; i = i + 1) {
         if (text.startsWith(prefix)) { total = total + 1; }
@@ -18,5 +18,5 @@ fn string_work(n, text, prefix, suffix) {
     return total;
 }
 
-print(array_work(200000));
-print(string_work(200000, "napalm-runtime-intrinsics", "napalm", "intrinsics"));
+System.print(array_work(200000));
+System.print(string_work(200000, "napalm-runtime-intrinsics", "napalm", "intrinsics"));

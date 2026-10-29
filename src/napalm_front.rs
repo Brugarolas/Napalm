@@ -2346,18 +2346,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_defer(&mut self, start: usize, error_only: bool) -> PResult<Stmt> {
-        let error_binding = if error_only && self.match_kind(TokenKind::LeftParen) {
+        let error_binding = if error_only && self.match_kind(TokenKind::Pipe) {
             let binding = self.parse_identifier(
                 "NAPALM-P080",
-                "expected errdefer binding name after `(`",
+                "expected errdefer binding name after `|`",
             )?;
             self.expect(
-                TokenKind::RightParen,
+                TokenKind::Pipe,
                 "NAPALM-P081",
-                "expected `)` after errdefer binding",
+                "expected `|` after errdefer binding",
             )?;
             Some(binding)
         } else {
+            if error_only && self.at(TokenKind::LeftParen) {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-P081",
+                    "errdefer bindings use `|error|`, not `(error)`",
+                    self.peek().span,
+                ));
+                return Err(());
+            }
             None
         };
         let body = Box::new(self.parse_statement()?);
@@ -4424,7 +4432,7 @@ var work = async {|value| await value }
 class Example {
   run() {
     defer { System.print("always") }
-    errdefer (deferredError) { System.print(deferredError) }
+    errdefer |deferredError| { System.print(deferredError) }
     try {
       throw "boom"
     } catch (error) {
