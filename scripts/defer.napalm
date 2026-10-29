@@ -1,9 +1,10 @@
-fn work(fail) {
+function work(fail) {
     var value = 1;
-    defer print(["last cleanup", value]);
-    errdefer |error| print(["failure cleanup", error]);
+    defer System.print(["last cleanup", value]);
+    errdefer System.print("Error detected");
+    errdefer (error) System.print(["failure cleanup", error]);
     defer {
-        print(["first cleanup", value]);
+        System.print(["first cleanup", value]);
         value = value + 1;
     }
 
@@ -12,10 +13,10 @@ fn work(fail) {
     return value;
 }
 
-print(work(false));
-try { work(true); } catch (error) { print(error); }
+System.print(work(false));
+try { work(true); } catch (error) { System.print(error); }
 
 for (var i = 0; i < 2; i = i + 1) {
-    defer print(["iteration cleanup", i]);
-    print(["iteration", i]);
+    defer System.print(["iteration cleanup", i]);
+    System.print(["iteration", i]);
 }

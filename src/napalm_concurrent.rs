@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::napalm_builtin::{install_vm_builtins, BuiltinHost, BuiltinManifest};
-use crate::napalm_tracing_jit::SharedJitProfile;
+use crate::napalm_tracing_jit::{SharedJitProfile, SharedJitRepository};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -70,6 +70,10 @@ pub(crate) struct ConcurrentRuntime {
     /// idle workers can still steal from every other lane.
     affinity_queues: Arc<Vec<Arc<Injector<ConcurrentJob>>>>,
     signals: Arc<Vec<Arc<WorkerSignal>>>,
+    /// Shared JIT repository. Phase 4 owns a dedicated compiler thread plus
+    /// immutable native code, but never owns Napalm managed values from a worker.
+    /// Every worker reconstructs its own relocation/binding table before entry.
+    shared_jit_repository: Arc<SharedJitRepository>,
     wake_cursor: AtomicUsize,
     shutdown: Arc<AtomicBool>,
     completion_rx: Receiver<ConcurrentCompletion>,
@@ -91,6 +95,7 @@ impl ConcurrentRuntime {
         let program = Arc::new(program);
         let manifest = Arc::new(manifest);
         let shared_jit_profile = Arc::new(SharedJitProfile::new(program.as_ref()));
+        let shared_jit_repository = Arc::new(SharedJitRepository::new());
         let affinity_queues = Arc::new(
             (0..worker_count)
                 .map(|_| Arc::new(Injector::new()))
@@ -130,6 +135,7 @@ impl ConcurrentRuntime {
             let worker_program = program.clone();
             let worker_manifest = manifest.clone();
             let worker_shared_jit_profile = shared_jit_profile.clone();
+            let worker_shared_jit_repository = shared_jit_repository.clone();
             let spawn = thread::Builder::new()
                 .name(format!("napalm-worker-{index}"))
                 .spawn(move || {
@@ -145,6 +151,7 @@ impl ConcurrentRuntime {
                         worker_program,
                         worker_manifest,
                         worker_shared_jit_profile,
+                        worker_shared_jit_repository,
                     );
                 });
             match spawn {
@@ -170,6 +177,7 @@ impl ConcurrentRuntime {
         Ok(Self {
             affinity_queues,
             signals,
+            shared_jit_repository,
             wake_cursor: AtomicUsize::new(0),
             shutdown,
             completion_rx,
@@ -285,12 +293,15 @@ fn worker_main(
     program: Arc<BytecodeProgram>,
     manifest: Arc<BuiltinManifest>,
     shared_jit_profile: Arc<SharedJitProfile>,
+    shared_jit_repository: Arc<SharedJitRepository>,
 ) {
     let signal = &signals[index];
     let mut vm = build_worker_vm(
         program.as_ref(),
         manifest.as_ref(),
         shared_jit_profile.clone(),
+        shared_jit_repository.clone(),
+        index as u32,
     );
 
     while !shutdown.load(AtomicOrdering::Acquire) {
@@ -321,6 +332,8 @@ fn worker_main(
                 program.as_ref(),
                 manifest.as_ref(),
                 shared_jit_profile.clone(),
+                shared_jit_repository.clone(),
+                index as u32,
             );
         }
         signal.busy.store(false, AtomicOrdering::Release);
@@ -396,6 +409,8 @@ fn build_worker_vm<'a>(
     program: &'a BytecodeProgram,
     manifest: &BuiltinManifest,
     shared_jit_profile: Arc<SharedJitProfile>,
+    shared_jit_repository: Arc<SharedJitRepository>,
+    worker_id: u32,
 ) -> Result<Interpreter<'a>, String> {
     let host = Box::new(BuiltinHost::new(manifest.clone()));
     let mut vm = Interpreter::with_host(program, host)
@@ -403,6 +418,7 @@ fn build_worker_vm<'a>(
     install_vm_builtins(&mut vm, manifest);
     vm.set_concurrent_worker(true);
     vm.set_shared_jit_profile(shared_jit_profile);
+    vm.set_shared_jit_repository(shared_jit_repository, worker_id);
     Ok(vm)
 }
 

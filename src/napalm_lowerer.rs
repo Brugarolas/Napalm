@@ -347,6 +347,8 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         ExprKind::DestructureCheck { source, .. }
         | ExprKind::Await(source) => infer_surface_type_annotation(source),
         ExprKind::Launch(_) => None,
+        ExprKind::Invoke(invoke)
+            if invoke.name.value == "toString" && invoke.args.is_empty() => direct(K::String),
         ExprKind::Name(_)
         | ExprKind::Field(_)
         | ExprKind::StaticField(_)
@@ -1853,6 +1855,11 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         keys.insert(MethodKey {
             name: "toString".to_owned(),
             kind: MethodKind::Getter,
+            arity: 0,
+        });
+        keys.insert(MethodKey {
+            name: "toString".to_owned(),
+            kind: MethodKind::Method,
             arity: 0,
         });
         // Napalm surface sugar lowered by the compiler itself.
@@ -3734,22 +3741,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_interpolated_string(&mut self, parts: &[StringPart], span: Span) -> ValueId {
         let mut result = self.builder.const_string("");
-        let to_string = self.context.symbols.expect("toString", MethodKind::Getter, 0);
         for part in parts {
             let piece = match part {
                 StringPart::Bytes(bytes) => self.lower_string_literal(bytes, span),
                 StringPart::Expression(expr) => {
                     let value = self.lower_expr(expr);
-                    let site = self.builder.fresh_site();
-                    self.builder.emit1(
-                        Inst::Invoke {
-                            site,
-                            receiver: value,
-                            method: to_string,
-                            args: Vec::new(),
-                        },
-                        Type::String,
-                    )
+                    self.lower_to_string_value(value)
                 }
             };
             result = self.builder.emit1(
@@ -3761,6 +3758,27 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
         }
         result
+    }
+
+    /// Lower the one canonical Napalm string-conversion protocol. String values
+    /// are already in canonical representation and need no dispatch; every other
+    /// value uses `toString()` so user-defined class overrides participate in the
+    /// same path as template interpolation and implicit string concatenation.
+    fn lower_to_string_value(&mut self, value: ValueId) -> ValueId {
+        if semantic_source_type(self.builder.value_type(value)) == Type::String {
+            return value;
+        }
+        let to_string = self.context.symbols.expect("toString", MethodKind::Method, 0);
+        let site = self.builder.fresh_site();
+        self.builder.emit1(
+            Inst::Invoke {
+                site,
+                receiver: value,
+                method: to_string,
+                args: Vec::new(),
+            },
+            Type::String,
+        )
     }
 
     fn lower_name(&mut self, name: &Ident) -> ValueId {
@@ -4093,6 +4111,21 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let left_type = semantic_source_type(self.builder.value_type(left));
         let right_type = semantic_source_type(self.builder.value_type(right));
+
+        // TypeScript/JavaScript-compatible `+`: when either side is statically a
+        // String, concatenate and convert the other operand through the same
+        // virtual `toString()` protocol used by template interpolation. This is
+        // deliberately lowered to StringConcat instead of dynamic String.+ so the
+        // interpreter/JIT can optimize the common String+String case directly.
+        if operator == BinaryOp::Add && (left_type == Type::String || right_type == Type::String) {
+            let left = self.lower_to_string_value(left);
+            let right = self.lower_to_string_value(right);
+            return self.builder.emit1(
+                Inst::StringConcat { left, right },
+                Type::String,
+            );
+        }
+
         let result_type = match operator {
             BinaryOp::Less
             | BinaryOp::LessEqual
@@ -4109,7 +4142,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             {
                 Type::Range
             }
-            BinaryOp::Add if left_type == Type::String && right_type == Type::String => Type::String,
             BinaryOp::Power
             | BinaryOp::Multiply
             | BinaryOp::Divide
@@ -4937,6 +4969,13 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             let args = self.lower_call_args(&invoke.args, span);
             let symbol = self.builder.intern_method(&invoke.name.value, kind, args.len() as u8);
             return self.builder.invoke_typed(receiver, symbol, args, result_type);
+        }
+        if invoke.name.value == "toString"
+            && invoke.args.is_empty()
+            && matches!(kind, MethodKind::Getter | MethodKind::Method)
+        {
+            let symbol = self.builder.intern_method("toString", kind, 0);
+            return self.builder.invoke_typed(receiver, symbol, Vec::new(), Type::String);
         }
         self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
     }

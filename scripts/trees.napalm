@@ -1,4 +1,6 @@
-fn main() {
+let start = System.clock
+
+function main() {
     // In the original benchmark, maxDepth is taken from command line arguments.
     // var maxDepth = Math.max(6, +process.argv[2] || 0);
     // We'll hardcode it here. A value of 10 is a reasonable default.
@@ -7,7 +9,7 @@ fn main() {
 
     var stretchDepth = maxDepth + 1;
     var stretchTree = createTree(stretchDepth);
-    print("stretch tree of depth " __ stretchDepth __ " check: " __ checksum(stretchTree));
+    System.print("stretch tree of depth " + stretchDepth + " check: " + checksum(stretchTree));
 
     var longLivedTree = createTree(maxDepth);
 
@@ -22,21 +24,21 @@ fn main() {
             i += 1;
         }
 
-        print(iterations __ " trees of depth " __ depth __ " check: " __ sum);
+        System.print(iterations + " trees of depth " + depth + " check: " + sum);
         depth += 2;
     }
 
-    print("long lived tree of depth " __ maxDepth __ " check: " __ checksum(longLivedTree));
+    System.print("long lived tree of depth " + maxDepth + " check: " + checksum(longLivedTree));
 }
 
-fn checksum(node) {
+function checksum(node) {
     if (node.left == null) {
         return 1;
     }
     return 1 + checksum(node.left) + checksum(node.right);
 }
 
-fn createTree(depth) {
+function createTree(depth) {
     if (depth > 0) {
         var d = depth - 1;
         return { left: createTree(d), right: createTree(d) };
@@ -46,3 +48,6 @@ fn createTree(depth) {
 }
 
 main();
+
+let elapsed = System.clock - start
+System.print(`elapsed: ${elapsed}`)

@@ -12,6 +12,11 @@ use crate::napalm_ir::{Builder, BuiltinId, CmpKind, FuncId, FunctionKind, Inst, 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate,
+    NaiveDateTime, Offset, TimeZone, Timelike, Utc,
+};
+
 #[derive(Clone, Copy, Debug)]
 pub enum BuiltinTarget {
     Instance(BuiltinClass),
@@ -31,6 +36,9 @@ pub struct BuiltinManifest {
     native_bindings: Vec<NativeBinding>,
     primitives: Vec<Option<BuiltinPrimitive>>,
     list_remove: Option<(MethodSymbol, FuncId)>,
+    string_add: Option<(MethodSymbol, FuncId)>,
+    string_right_add: Option<FuncId>,
+    system_print: Option<(MethodSymbol, FuncId)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +97,43 @@ impl BuiltinManifest {
             .copied()
             .flatten()
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DateField {
+    YearLegacy,
+    FullYear,
+    Month,
+    Date,
+    Day,
+    Hours,
+    Minutes,
+    Seconds,
+    Milliseconds,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DateSetField {
+    YearLegacy,
+    FullYear,
+    Month,
+    Date,
+    Hours,
+    Minutes,
+    Seconds,
+    Milliseconds,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DateStringFormat {
+    String,
+    UtcString,
+    IsoString,
+    DateString,
+    TimeString,
+    LocaleString,
+    LocaleDateString,
+    LocaleTimeString,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,9 +255,19 @@ enum BuiltinPrimitive {
     SystemWrite,
     SystemClock,
 
+    DateNew,
+    DateUtc,
+    DateParse,
     DateNow,
     DateNowMs,
     DateSleep,
+    DateGetTime,
+    DateGet(DateField, bool),
+    DateTimezoneOffset,
+    DateSetTime,
+    DateSet(DateSetField, bool),
+    DateToString(DateStringFormat),
+    DateToJson,
 }
 
 /// Reserves all method symbols and primitive IDs required by the core runtime.
@@ -246,17 +301,22 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::FfiPointer,
         BuiltinClass::Response,
         BuiltinClass::Headers,
+        BuiltinClass::Module,
+        BuiltinClass::Date,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
         manifest.register(program, instance(class), "toString", MethodKind::Getter, 0, BuiltinPrimitive::ObjectToString);
+        manifest.register(program, instance(class), "toString", MethodKind::Method, 0, BuiltinPrimitive::ObjectToString);
     }
 
     // Null and Bool.
     manifest.register(program, instance(BuiltinClass::Null), "!", MethodKind::Method, 0, BuiltinPrimitive::NullNot);
     manifest.register(program, instance(BuiltinClass::Null), "toString", MethodKind::Getter, 0, BuiltinPrimitive::NullToString);
+    manifest.register(program, instance(BuiltinClass::Null), "toString", MethodKind::Method, 0, BuiltinPrimitive::NullToString);
     manifest.register(program, instance(BuiltinClass::Bool), "!", MethodKind::Method, 0, BuiltinPrimitive::BoolNot);
     manifest.register(program, instance(BuiltinClass::Bool), "toString", MethodKind::Getter, 0, BuiltinPrimitive::BoolToString);
+    manifest.register(program, instance(BuiltinClass::Bool), "toString", MethodKind::Method, 0, BuiltinPrimitive::BoolToString);
 
     // Num instance methods and operators.
     let n = instance(BuiltinClass::Num);
@@ -288,6 +348,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     ] {
         manifest.register(program, n, name, MethodKind::Getter, 0, op);
     }
+    manifest.register(program, n, "toString", MethodKind::Method, 0, BuiltinPrimitive::NumToString);
     let ns = static_(BuiltinId::Num);
     manifest.register(program, ns, "fromString", MethodKind::Method, 1, BuiltinPrimitive::NumFromString);
     manifest.register(program, ns, "pi", MethodKind::Getter, 0, BuiltinPrimitive::NumPi);
@@ -301,7 +362,6 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
         ("length", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::StringIsEmpty),
-        ("+", MethodKind::Method, 1, BuiltinPrimitive::StringAdd),
         ("==", MethodKind::Method, 1, BuiltinPrimitive::StringEq),
         ("!=", MethodKind::Method, 1, BuiltinPrimitive::StringNe),
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::StringSubscript),
@@ -315,7 +375,47 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     ] {
         manifest.register(program, st, name, kind, arity, op);
     }
+    manifest.register(program, st, "toString", MethodKind::Method, 0, BuiltinPrimitive::StringToString);
     manifest.register(program, static_(BuiltinId::String), "fromCodePoint", MethodKind::Method, 1, BuiltinPrimitive::StringFromCodePoint);
+
+    // Keep String.+ inside Napalm/WIR instead of the host primitive ABI. This lets
+    // the RHS use the ordinary virtual `toString()` protocol, including methods
+    // implemented by user classes, while still exposing StringConcat to the JIT.
+    let string_add_method = program.intern_method("+", MethodKind::Method, 1);
+    let to_string_method = program.intern_method("toString", MethodKind::Method, 0);
+    let string_module = program.add_module("<core:string>", 0);
+    let mut string_add = Builder::new(
+        program,
+        string_module,
+        "String.+",
+        FunctionKind::Method,
+        vec![Type::String, Type::Top],
+        Type::String,
+    );
+    let left = string_add.param(0);
+    let right = string_add.param(1);
+    let right = string_add.invoke_typed(right, to_string_method, Vec::new(), Type::String);
+    let result = string_add.emit1(Inst::StringConcat { left, right }, Type::String);
+    string_add.ret(result);
+    manifest.string_add = Some((string_add_method, string_add.finish()));
+
+    // Dynamic `anything + String` needs the same rule even when static analysis
+    // could not see the String. The interpreter redirects such Invoke sites to
+    // this hidden helper before executing a cached receiver-specific `+` target.
+    let mut string_right_add = Builder::new(
+        program,
+        string_module,
+        "<string-right-add>",
+        FunctionKind::Method,
+        vec![Type::Top, Type::String],
+        Type::String,
+    );
+    let left = string_right_add.param(0);
+    let right = string_right_add.param(1);
+    let left = string_right_add.invoke_typed(left, to_string_method, Vec::new(), Type::String);
+    let result = string_right_add.emit1(Inst::StringConcat { left, right }, Type::String);
+    string_right_add.ret(result);
+    manifest.string_right_add = Some(string_right_add.finish());
 
     // List.
     let list = instance(BuiltinClass::List);
@@ -336,6 +436,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     ] {
         manifest.register(program, list, name, kind, arity, op);
     }
+    manifest.register(program, list, "toString", MethodKind::Method, 0, BuiltinPrimitive::ListToString);
     manifest.register(program, static_(BuiltinId::List), "filled", MethodKind::Method, 2, BuiltinPrimitive::ListFilled);
     manifest.register(program, static_(BuiltinId::List), "new", MethodKind::Method, 1, BuiltinPrimitive::ListNew);
     // Compiler-only target for `new Array<Number>(n)`. Keeping it on List avoids
@@ -420,6 +521,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, instance(BuiltinClass::MapEntry), "key", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryKey);
     manifest.register(program, instance(BuiltinClass::MapEntry), "value", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryValue);
 
+    manifest.register(program, map, "toString", MethodKind::Method, 0, BuiltinPrimitive::MapToString);
+
     // Range.
     manifest.register(program, static_(BuiltinId::Range), "new", MethodKind::Method, 2, BuiltinPrimitive::RangeNew);
     manifest.register(program, static_(BuiltinId::Range), "new", MethodKind::Method, 3, BuiltinPrimitive::RangeNew);
@@ -437,6 +540,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     ] {
         manifest.register(program, range, name, kind, arity, op);
     }
+
+    manifest.register(program, range, "toString", MethodKind::Method, 0, BuiltinPrimitive::RangeToString);
 
     // Fn.new/arity/call(...) are VM-native because closures own bytecode frame metadata.
     manifest.register_native(program, static_(BuiltinId::Fn), "new", MethodKind::Method, 1, NativeBuiltin::FnNew);
@@ -534,21 +639,141 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, instance(BuiltinClass::FfiPointer), "offset", MethodKind::Method, 1, NativeBuiltin::FfiPointerOffset);
     manifest.register_native(program, instance(BuiltinClass::FfiPointer), "readCString", MethodKind::Method, 0, NativeBuiltin::FfiPointerReadCString);
     manifest.register_native(program, instance(BuiltinClass::FfiPointer), "toString", MethodKind::Getter, 0, NativeBuiltin::FfiPointerToString);
+    manifest.register_native(program, instance(BuiltinClass::FfiPointer), "toString", MethodKind::Method, 0, NativeBuiltin::FfiPointerToString);
 
-    // System and Date are static-only engine classes.
+    // System is static-only; Date also owns heap-backed instance methods.
     let system = static_(BuiltinId::System);
     manifest.register(program, system, "print", MethodKind::Method, 0, BuiltinPrimitive::SystemPrint);
-    manifest.register(program, system, "print", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
+    let print_method = manifest.register(program, system, "print", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
+    let print_primitive = manifest.bindings.last().expect("System.print primitive was just registered").primitive;
+
+    // System.print(value) participates in the exact same virtual conversion
+    // protocol as `+` and interpolation. The bound bytecode wrapper overrides the
+    // primitive method target below, while CallPrimitive keeps a direct handle to
+    // the underlying string-printing primitive and avoids a second method lookup.
+    let system_module = program.add_module("<core:system>", 0);
+    let mut print = Builder::new(
+        program,
+        system_module,
+        "System.print",
+        FunctionKind::StaticMethod,
+        vec![Type::Top, Type::Top],
+        Type::Top,
+    );
+    let system_receiver = print.param(0);
+    let value = print.param(1);
+    let text = print.invoke_typed(value, to_string_method, Vec::new(), Type::String);
+    // Preserve the historical `System.print(value)` result (the original value),
+    // even though the primitive now receives the protocol-converted String.
+    print.emit1(
+        Inst::CallPrimitive {
+            primitive: print_primitive,
+            args: vec![system_receiver, text],
+        },
+        Type::String,
+    );
+    print.ret(value);
+    manifest.system_print = Some((print_method, print.finish()));
+
     manifest.register(program, system, "write", MethodKind::Method, 1, BuiltinPrimitive::SystemWrite);
     manifest.register(program, system, "clock", MethodKind::Getter, 0, BuiltinPrimitive::SystemClock);
     manifest.register_native(program, system, "os", MethodKind::Method, 0, NativeBuiltin::SystemOs);
     manifest.register_native(program, system, "arch", MethodKind::Method, 0, NativeBuiltin::SystemArch);
     manifest.register_native(program, system, "gc", MethodKind::Method, 0, NativeBuiltin::SystemGc);
 
+    // Date follows the JavaScript model: one heap object stores one TimeClip'd
+    // millisecond value. Constructor/static overloads are represented by distinct
+    // MethodSymbols because Napalm dispatch includes arity in the symbol identity.
     let date = static_(BuiltinId::Date);
+    for arity in 0..=7u8 {
+        manifest.register(program, date, "new", MethodKind::Method, arity, BuiltinPrimitive::DateNew);
+        manifest.register(program, date, "UTC", MethodKind::Method, arity, BuiltinPrimitive::DateUtc);
+    }
+    manifest.register(program, date, "parse", MethodKind::Method, 1, BuiltinPrimitive::DateParse);
+    manifest.register(program, date, "now", MethodKind::Method, 0, BuiltinPrimitive::DateNow);
     manifest.register(program, date, "now", MethodKind::Getter, 0, BuiltinPrimitive::DateNow);
+    manifest.register(program, date, "nowMs", MethodKind::Method, 0, BuiltinPrimitive::DateNowMs);
     manifest.register(program, date, "nowMs", MethodKind::Getter, 0, BuiltinPrimitive::DateNowMs);
     manifest.register(program, date, "sleep", MethodKind::Method, 1, BuiltinPrimitive::DateSleep);
+
+    let date_instance = instance(BuiltinClass::Date);
+    for name in ["getTime", "valueOf"] {
+        manifest.register(program, date_instance, name, MethodKind::Method, 0, BuiltinPrimitive::DateGetTime);
+    }
+    manifest.register(program, date_instance, "getTimezoneOffset", MethodKind::Method, 0, BuiltinPrimitive::DateTimezoneOffset);
+
+    for (name, field, utc) in [
+        ("getYear", DateField::YearLegacy, false),
+        ("getFullYear", DateField::FullYear, false),
+        ("getUTCFullYear", DateField::FullYear, true),
+        ("getMonth", DateField::Month, false),
+        ("getUTCMonth", DateField::Month, true),
+        ("getDate", DateField::Date, false),
+        ("getUTCDate", DateField::Date, true),
+        ("getDay", DateField::Day, false),
+        ("getUTCDay", DateField::Day, true),
+        ("getHours", DateField::Hours, false),
+        ("getUTCHours", DateField::Hours, true),
+        ("getMinutes", DateField::Minutes, false),
+        ("getUTCMinutes", DateField::Minutes, true),
+        ("getSeconds", DateField::Seconds, false),
+        ("getUTCSeconds", DateField::Seconds, true),
+        ("getMilliseconds", DateField::Milliseconds, false),
+        ("getUTCMilliseconds", DateField::Milliseconds, true),
+    ] {
+        manifest.register(program, date_instance, name, MethodKind::Method, 0, BuiltinPrimitive::DateGet(field, utc));
+    }
+
+    manifest.register(program, date_instance, "setTime", MethodKind::Method, 1, BuiltinPrimitive::DateSetTime);
+    for (name, field, utc, arities) in [
+        ("setYear", DateSetField::YearLegacy, false, 1u8..=1u8),
+        ("setFullYear", DateSetField::FullYear, false, 1u8..=3u8),
+        ("setUTCFullYear", DateSetField::FullYear, true, 1u8..=3u8),
+        ("setMonth", DateSetField::Month, false, 1u8..=2u8),
+        ("setUTCMonth", DateSetField::Month, true, 1u8..=2u8),
+        ("setDate", DateSetField::Date, false, 1u8..=1u8),
+        ("setUTCDate", DateSetField::Date, true, 1u8..=1u8),
+        ("setHours", DateSetField::Hours, false, 1u8..=4u8),
+        ("setUTCHours", DateSetField::Hours, true, 1u8..=4u8),
+        ("setMinutes", DateSetField::Minutes, false, 1u8..=3u8),
+        ("setUTCMinutes", DateSetField::Minutes, true, 1u8..=3u8),
+        ("setSeconds", DateSetField::Seconds, false, 1u8..=2u8),
+        ("setUTCSeconds", DateSetField::Seconds, true, 1u8..=2u8),
+        ("setMilliseconds", DateSetField::Milliseconds, false, 1u8..=1u8),
+        ("setUTCMilliseconds", DateSetField::Milliseconds, true, 1u8..=1u8),
+    ] {
+        for arity in arities {
+            manifest.register(program, date_instance, name, MethodKind::Method, arity, BuiltinPrimitive::DateSet(field, utc));
+        }
+    }
+
+    for (name, format) in [
+        ("toUTCString", DateStringFormat::UtcString),
+        ("toGMTString", DateStringFormat::UtcString),
+        ("toISOString", DateStringFormat::IsoString),
+        ("toDateString", DateStringFormat::DateString),
+        ("toTimeString", DateStringFormat::TimeString),
+    ] {
+        manifest.register(program, date_instance, name, MethodKind::Method, 0, BuiltinPrimitive::DateToString(format));
+    }
+    // Locale/options arguments are accepted for JS source compatibility. The
+    // current implementation deliberately uses the host locale and ignores an
+    // explicit locale/options object; Intl-style formatting can be layered later.
+    for (name, format) in [
+        ("toLocaleString", DateStringFormat::LocaleString),
+        ("toLocaleDateString", DateStringFormat::LocaleDateString),
+        ("toLocaleTimeString", DateStringFormat::LocaleTimeString),
+    ] {
+        for arity in 0..=2u8 {
+            manifest.register(program, date_instance, name, MethodKind::Method, arity, BuiltinPrimitive::DateToString(format));
+        }
+    }
+    // The unified Napalm String protocol accepts both historical getter syntax and
+    // JavaScript-style `toString()`. Date overrides the generic Object formatter.
+    manifest.register(program, date_instance, "toString", MethodKind::Getter, 0, BuiltinPrimitive::DateToString(DateStringFormat::String));
+    manifest.register(program, date_instance, "toString", MethodKind::Method, 0, BuiltinPrimitive::DateToString(DateStringFormat::String));
+    manifest.register(program, date_instance, "toJSON", MethodKind::Method, 0, BuiltinPrimitive::DateToJson);
+    manifest.register(program, date_instance, "toJSON", MethodKind::Method, 1, BuiltinPrimitive::DateToJson);
 
     manifest.register(program, static_(BuiltinId::Random), "new", MethodKind::Method, 0, BuiltinPrimitive::RandomNew);
     for arity in [1, 2] {
@@ -560,6 +785,12 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
 
 /// Connects the already-reserved manifest to a concrete interpreter.
 pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &BuiltinManifest) {
+    if let Some(function) = manifest.string_right_add {
+        interpreter.bind_string_right_add_function(function);
+    }
+    if let Some((method, function)) = manifest.string_add {
+        interpreter.bind_builtin_function(BuiltinClass::String, method, function);
+    }
     if let Some((method, function)) = manifest.list_remove {
         interpreter.bind_builtin_function(BuiltinClass::List, method, function);
     }
@@ -582,6 +813,11 @@ pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &Builtin
                 interpreter.bind_builtin_static_native(class, binding.method, binding.native);
             }
         }
+    }
+    // Bind wrapper functions after primitive/native tables so wrappers that use a
+    // primitive internally (notably System.print/1) remain the visible target.
+    if let Some((method, function)) = manifest.system_print {
+        interpreter.bind_builtin_static_function(BuiltinId::System, method, function);
     }
     // Worker VMs need the same stock primitive/native manifest as the parent.
     // Store a clone only after all bindings have been installed so `launch` can
@@ -673,6 +909,553 @@ fn argument(args: &[Value], index: usize) -> Result<Value, RuntimeError> {
 #[inline]
 fn num(value: Value, what: &str) -> Result<f64, RuntimeError> {
     value.as_num().ok_or_else(|| RuntimeError::new(format!("{what} must be a Num")))
+}
+
+const DATE_MAX_TIME_MS: f64 = 8_640_000_000_000_000.0;
+const DATE_MS_PER_SECOND: i128 = 1_000;
+const DATE_MS_PER_MINUTE: i128 = 60 * DATE_MS_PER_SECOND;
+const DATE_MS_PER_HOUR: i128 = 60 * DATE_MS_PER_MINUTE;
+const DATE_MS_PER_DAY: i128 = 24 * DATE_MS_PER_HOUR;
+const DATE_DAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DATE_MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+#[derive(Clone, Copy, Debug)]
+struct DateParts {
+    year: i64,
+    month: u32,
+    day: u32,
+    weekday: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    millisecond: u32,
+    /// Seconds east of UTC. ECMAScript getTimezoneOffset returns the negation.
+    offset_seconds: i32,
+}
+
+#[inline]
+fn time_clip(value: f64) -> f64 {
+    if !value.is_finite() || value.abs() > DATE_MAX_TIME_MS {
+        f64::NAN
+    } else {
+        value.trunc()
+    }
+}
+
+#[inline]
+fn current_epoch_millis() -> f64 {
+    let value = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64() * 1000.0,
+        Err(error) => -(error.duration().as_secs_f64() * 1000.0),
+    };
+    time_clip(value)
+}
+
+#[inline]
+fn finite_date_integer(value: f64) -> Option<i128> {
+    // All TimeClip-reachable component values fit comfortably below f64's exact
+    // integer limit. Larger source values may only produce an invalid Date unless
+    // paired with equally extreme cancellation, which Napalm intentionally avoids
+    // materializing through gigantic intermediate calendar arithmetic.
+    const LIMIT: f64 = 9_007_199_254_740_991.0;
+    (value.is_finite() && value.abs() <= LIMIT).then(|| value.trunc() as i128)
+}
+
+/// Howard Hinnant-style proleptic Gregorian conversion, expressed independently
+/// here so UTC Date operations support the entire ECMAScript TimeClip range.
+#[inline]
+fn date_days_from_civil(year: i128, month_one: i128, day: i128) -> i128 {
+    let adjusted_year = year - if month_one <= 2 { 1 } else { 0 };
+    let era = adjusted_year.div_euclid(400);
+    let yoe = adjusted_year - era * 400;
+    let shifted_month = month_one + if month_one > 2 { -3 } else { 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[inline]
+fn date_civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days as i128 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    (year as i64, month as u32, day as u32)
+}
+
+fn date_make_utc_components(
+    year: f64,
+    month: f64,
+    day: f64,
+    hour: f64,
+    minute: f64,
+    second: f64,
+    millisecond: f64,
+    adjust_short_year: bool,
+) -> f64 {
+    let (Some(mut year), Some(month), Some(day), Some(hour), Some(minute), Some(second), Some(millisecond)) = (
+        finite_date_integer(year),
+        finite_date_integer(month),
+        finite_date_integer(day),
+        finite_date_integer(hour),
+        finite_date_integer(minute),
+        finite_date_integer(second),
+        finite_date_integer(millisecond),
+    ) else {
+        return f64::NAN;
+    };
+    if adjust_short_year && (0..=99).contains(&year) {
+        year += 1900;
+    }
+    year += month.div_euclid(12);
+    let month_one = month.rem_euclid(12) + 1;
+    let days = date_days_from_civil(year, month_one, 1) + day - 1;
+    let millis = days
+        .saturating_mul(DATE_MS_PER_DAY)
+        .saturating_add(hour.saturating_mul(DATE_MS_PER_HOUR))
+        .saturating_add(minute.saturating_mul(DATE_MS_PER_MINUTE))
+        .saturating_add(second.saturating_mul(DATE_MS_PER_SECOND))
+        .saturating_add(millisecond);
+    if millis.abs() > DATE_MAX_TIME_MS as i128 {
+        f64::NAN
+    } else {
+        time_clip(millis as f64)
+    }
+}
+
+fn date_utc_parts(millis: f64) -> Option<DateParts> {
+    let millis = time_clip(millis);
+    if !millis.is_finite() {
+        return None;
+    }
+    let millis = millis as i64;
+    let day_ms = DATE_MS_PER_DAY as i64;
+    let days = millis.div_euclid(day_ms);
+    let mut rest = millis.rem_euclid(day_ms);
+    let hour = (rest / DATE_MS_PER_HOUR as i64) as u32;
+    rest %= DATE_MS_PER_HOUR as i64;
+    let minute = (rest / DATE_MS_PER_MINUTE as i64) as u32;
+    rest %= DATE_MS_PER_MINUTE as i64;
+    let second = (rest / DATE_MS_PER_SECOND as i64) as u32;
+    let millisecond = (rest % DATE_MS_PER_SECOND as i64) as u32;
+    let (year, month_one, day) = date_civil_from_days(days);
+    Some(DateParts {
+        year,
+        month: month_one - 1,
+        day,
+        weekday: (days + 4).rem_euclid(7) as u32,
+        hour,
+        minute,
+        second,
+        millisecond,
+        offset_seconds: 0,
+    })
+}
+
+#[inline]
+fn date_pick_local(result: LocalResult<DateTime<Local>>) -> Option<DateTime<Local>> {
+    match result {
+        LocalResult::Single(value) => Some(value),
+        LocalResult::Ambiguous(first, second) => {
+            if first.timestamp_millis() <= second.timestamp_millis() { Some(first) } else { Some(second) }
+        }
+        LocalResult::None => None,
+    }
+}
+
+fn date_local_datetime(millis: f64) -> Option<DateTime<Local>> {
+    let millis = time_clip(millis);
+    if !millis.is_finite() {
+        return None;
+    }
+    Utc.timestamp_millis_opt(millis as i64)
+        .single()
+        .map(|value| value.with_timezone(&Local))
+}
+
+fn date_local_parts(millis: f64) -> Option<DateParts> {
+    let value = date_local_datetime(millis)?;
+    Some(DateParts {
+        year: value.year() as i64,
+        month: value.month0(),
+        day: value.day(),
+        weekday: value.weekday().num_days_from_sunday(),
+        hour: value.hour(),
+        minute: value.minute(),
+        second: value.second(),
+        millisecond: value.timestamp_subsec_millis(),
+        offset_seconds: value.offset().fix().local_minus_utc(),
+    })
+}
+
+/// Convert normalized wall-clock fields through the host timezone. DST overlaps
+/// choose the earlier instant, matching JavaScript's compatible disambiguation.
+/// For a DST gap, shift by the observed offset delta and retry.
+fn date_local_from_naive(naive: NaiveDateTime) -> Option<f64> {
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(value) => return Some(time_clip(value.timestamp_millis() as f64)),
+        LocalResult::Ambiguous(first, second) => {
+            let value = if first.timestamp_millis() <= second.timestamp_millis() { first } else { second };
+            return Some(time_clip(value.timestamp_millis() as f64));
+        }
+        LocalResult::None => {}
+    }
+
+    let mut before = None;
+    let mut after = None;
+    for minutes in 1..=24 * 60 {
+        if before.is_none() {
+            before = date_pick_local(Local.from_local_datetime(&(naive - ChronoDuration::minutes(minutes))));
+        }
+        if after.is_none() {
+            after = date_pick_local(Local.from_local_datetime(&(naive + ChronoDuration::minutes(minutes))));
+        }
+        if before.is_some() && after.is_some() {
+            break;
+        }
+    }
+    let (before, after) = (before?, after?);
+    let before_offset = before.offset().fix().local_minus_utc();
+    let after_offset = after.offset().fix().local_minus_utc();
+    let gap = after_offset - before_offset;
+    if gap > 0 {
+        let shifted = naive + ChronoDuration::seconds(gap as i64);
+        if let Some(value) = date_pick_local(Local.from_local_datetime(&shifted)) {
+            return Some(time_clip(value.timestamp_millis() as f64));
+        }
+    }
+    Some(time_clip(after.timestamp_millis() as f64))
+}
+
+fn date_make_local_components(
+    year: f64,
+    month: f64,
+    day: f64,
+    hour: f64,
+    minute: f64,
+    second: f64,
+    millisecond: f64,
+    adjust_short_year: bool,
+) -> f64 {
+    // Normalize overflow in a timezone-independent civil domain first.
+    let normalized = date_make_utc_components(
+        year, month, day, hour, minute, second, millisecond, adjust_short_year,
+    );
+    let Some(parts) = date_utc_parts(normalized) else { return f64::NAN; };
+    let Ok(year) = i32::try_from(parts.year) else { return normalized; };
+    let Some(date) = NaiveDate::from_ymd_opt(year, parts.month + 1, parts.day) else {
+        // Chrono intentionally has a smaller civil range than ECMAScript. UTC
+        // arithmetic remains correct for those extreme years; local timezone
+        // databases do not have meaningful rules there, so fall back to UTC.
+        return normalized;
+    };
+    let Some(naive) = date.and_hms_milli_opt(
+        parts.hour,
+        parts.minute,
+        parts.second,
+        parts.millisecond,
+    ) else {
+        return f64::NAN;
+    };
+    date_local_from_naive(naive).unwrap_or(normalized)
+}
+
+fn date_number(context: &HostContext<'_>, value: Value) -> Option<f64> {
+    if let Some(value) = value.as_num() { return Some(value); }
+    if let Some(value) = value.as_bool() { return Some(if value { 1.0 } else { 0.0 }); }
+    if value.is_null() { return Some(0.0); }
+    if let Some(text) = context.string_utf8(value) {
+        let text = text.trim();
+        if text.is_empty() { return Some(0.0); }
+        return text.parse::<f64>().ok();
+    }
+    None
+}
+
+fn date_component_args(context: &HostContext<'_>, args: &[Value]) -> Option<Vec<f64>> {
+    args.iter().copied().map(|value| date_number(context, value)).collect()
+}
+
+fn date_parse_date_only(text: &str) -> Option<f64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year = std::str::from_utf8(&bytes[0..4]).ok()?.parse::<f64>().ok()?;
+    let month = std::str::from_utf8(&bytes[5..7]).ok()?.parse::<f64>().ok()?;
+    let day = std::str::from_utf8(&bytes[8..10]).ok()?.parse::<f64>().ok()?;
+    if !(1.0..=12.0).contains(&month) || !(1.0..=31.0).contains(&day) {
+        return Some(f64::NAN);
+    }
+    let value = date_make_utc_components(year, month - 1.0, day, 0.0, 0.0, 0.0, 0.0, false);
+    let parts = date_utc_parts(value)?;
+    if parts.year as f64 == year && parts.month as f64 == month - 1.0 && parts.day as f64 == day {
+        Some(value)
+    } else {
+        Some(f64::NAN)
+    }
+}
+
+fn date_parse_string(text: &str) -> f64 {
+    let text = text.trim();
+    if text.is_empty() {
+        return f64::NAN;
+    }
+    if let Some(value) = date_parse_date_only(text) {
+        return value;
+    }
+    if let Ok(value) = DateTime::parse_from_rfc3339(text) {
+        return time_clip(value.timestamp_millis() as f64);
+    }
+    if let Ok(value) = DateTime::parse_from_rfc2822(text) {
+        return time_clip(value.timestamp_millis() as f64);
+    }
+    if let Ok(value) = NaiveDateTime::parse_from_str(text, "%a, %d %b %Y %H:%M:%S GMT") {
+        return time_clip(Utc.from_utc_datetime(&value).timestamp_millis() as f64);
+    }
+
+    // Parse the exact form emitted by Date.toString(). The timezone abbreviation
+    // is decorative; the numeric GMT offset is authoritative.
+    let core = text.split_once(" (").map_or(text, |(head, _)| head);
+    if let Ok(value) = DateTime::<chrono::FixedOffset>::parse_from_str(core, "%a %b %d %Y %H:%M:%S GMT%z") {
+        return time_clip(value.timestamp_millis() as f64);
+    }
+
+    // ISO date-time without an explicit offset is local time in JavaScript.
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+        if let Ok(value) = NaiveDateTime::parse_from_str(text, format) {
+            if let Some(millis) = date_local_from_naive(value) {
+                return millis;
+            }
+        }
+    }
+    f64::NAN
+}
+
+fn date_format_year_iso(year: i64) -> String {
+    if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else if year < 0 {
+        format!("-{:06}", year.unsigned_abs())
+    } else {
+        format!("+{year:06}")
+    }
+}
+
+fn date_format_iso(millis: f64) -> Result<String, RuntimeError> {
+    let parts = date_utc_parts(millis)
+        .ok_or_else(|| RuntimeError::new("RangeError: Invalid time value"))?;
+    Ok(format!(
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        date_format_year_iso(parts.year),
+        parts.month + 1,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+        parts.millisecond,
+    ))
+}
+
+fn date_format_utc_string(millis: f64) -> String {
+    let Some(parts) = date_utc_parts(millis) else { return "Invalid Date".to_owned(); };
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        DATE_DAY_NAMES[parts.weekday as usize],
+        parts.day,
+        DATE_MONTH_NAMES[parts.month as usize],
+        if (0..=9999).contains(&parts.year) { format!("{:04}", parts.year) } else { parts.year.to_string() },
+        parts.hour,
+        parts.minute,
+        parts.second,
+    )
+}
+
+#[inline]
+fn date_format_offset(offset_seconds: i32) -> String {
+    let sign = if offset_seconds >= 0 { '+' } else { '-' };
+    let value = offset_seconds.unsigned_abs();
+    format!("{sign}{:02}{:02}", value / 3600, (value % 3600) / 60)
+}
+
+fn date_format_local(millis: f64, format: DateStringFormat) -> Result<String, RuntimeError> {
+    if matches!(format, DateStringFormat::IsoString) {
+        return date_format_iso(millis);
+    }
+    if matches!(format, DateStringFormat::UtcString) {
+        return Ok(date_format_utc_string(millis));
+    }
+    let Some(parts) = date_local_parts(millis).or_else(|| date_utc_parts(millis)) else {
+        return Ok("Invalid Date".to_owned());
+    };
+    let zone = date_local_datetime(millis)
+        .map(|value| value.format("%Z").to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "UTC".to_owned());
+    let offset = date_format_offset(parts.offset_seconds);
+    let year = if (0..=9999).contains(&parts.year) { format!("{:04}", parts.year) } else { parts.year.to_string() };
+    Ok(match format {
+        DateStringFormat::String => format!(
+            "{} {} {:02} {} {:02}:{:02}:{:02} GMT{} ({})",
+            DATE_DAY_NAMES[parts.weekday as usize],
+            DATE_MONTH_NAMES[parts.month as usize],
+            parts.day,
+            year,
+            parts.hour,
+            parts.minute,
+            parts.second,
+            offset,
+            zone,
+        ),
+        DateStringFormat::DateString => format!(
+            "{} {} {:02} {}",
+            DATE_DAY_NAMES[parts.weekday as usize],
+            DATE_MONTH_NAMES[parts.month as usize],
+            parts.day,
+            year,
+        ),
+        DateStringFormat::TimeString => format!(
+            "{:02}:{:02}:{:02} GMT{} ({})",
+            parts.hour, parts.minute, parts.second, offset, zone,
+        ),
+        DateStringFormat::LocaleString => format!(
+            "{:02}/{:02}/{}, {:02}:{:02}:{:02}",
+            parts.month + 1, parts.day, year, parts.hour, parts.minute, parts.second,
+        ),
+        DateStringFormat::LocaleDateString => format!("{:02}/{:02}/{}", parts.month + 1, parts.day, year),
+        DateStringFormat::LocaleTimeString => format!("{:02}:{:02}:{:02}", parts.hour, parts.minute, parts.second),
+        DateStringFormat::UtcString | DateStringFormat::IsoString => unreachable!(),
+    })
+}
+
+#[inline]
+fn date_field_value(parts: DateParts, field: DateField) -> f64 {
+    match field {
+        DateField::YearLegacy => parts.year as f64 - 1900.0,
+        DateField::FullYear => parts.year as f64,
+        DateField::Month => parts.month as f64,
+        DateField::Date => parts.day as f64,
+        DateField::Day => parts.weekday as f64,
+        DateField::Hours => parts.hour as f64,
+        DateField::Minutes => parts.minute as f64,
+        DateField::Seconds => parts.second as f64,
+        DateField::Milliseconds => parts.millisecond as f64,
+    }
+}
+
+fn date_set_components(
+    context: &HostContext<'_>,
+    current: f64,
+    field: DateSetField,
+    utc: bool,
+    values: &[Value],
+) -> f64 {
+    let base = if current.is_finite() {
+        if utc { date_utc_parts(current) } else { date_local_parts(current).or_else(|| date_utc_parts(current)) }
+    } else if matches!(field, DateSetField::FullYear | DateSetField::YearLegacy) {
+        // ECMAScript setFullYear can recover an invalid Date using +0 as its base.
+        if utc { date_utc_parts(0.0) } else { date_local_parts(0.0).or_else(|| date_utc_parts(0.0)) }
+    } else {
+        None
+    };
+    let Some(parts) = base else { return f64::NAN; };
+    let Some(values) = date_component_args(context, values) else { return f64::NAN; };
+    let get = |index: usize, default: f64| values.get(index).copied().unwrap_or(default);
+
+    let (year, month, day, hour, minute, second, millisecond) = match field {
+        DateSetField::YearLegacy => {
+            let mut year = get(0, parts.year as f64);
+            if year.is_finite() && (0.0..=99.0).contains(&year.trunc()) {
+                year = year.trunc() + 1900.0;
+            }
+            (
+                year,
+                parts.month as f64,
+                parts.day as f64,
+                parts.hour as f64,
+                parts.minute as f64,
+                parts.second as f64,
+                parts.millisecond as f64,
+            )
+        }
+        DateSetField::FullYear => (
+            get(0, parts.year as f64),
+            get(1, parts.month as f64),
+            get(2, parts.day as f64),
+            parts.hour as f64,
+            parts.minute as f64,
+            parts.second as f64,
+            parts.millisecond as f64,
+        ),
+        DateSetField::Month => (
+            parts.year as f64,
+            get(0, parts.month as f64),
+            get(1, parts.day as f64),
+            parts.hour as f64,
+            parts.minute as f64,
+            parts.second as f64,
+            parts.millisecond as f64,
+        ),
+        DateSetField::Date => (
+            parts.year as f64,
+            parts.month as f64,
+            get(0, parts.day as f64),
+            parts.hour as f64,
+            parts.minute as f64,
+            parts.second as f64,
+            parts.millisecond as f64,
+        ),
+        DateSetField::Hours => (
+            parts.year as f64,
+            parts.month as f64,
+            parts.day as f64,
+            get(0, parts.hour as f64),
+            get(1, parts.minute as f64),
+            get(2, parts.second as f64),
+            get(3, parts.millisecond as f64),
+        ),
+        DateSetField::Minutes => (
+            parts.year as f64,
+            parts.month as f64,
+            parts.day as f64,
+            parts.hour as f64,
+            get(0, parts.minute as f64),
+            get(1, parts.second as f64),
+            get(2, parts.millisecond as f64),
+        ),
+        DateSetField::Seconds => (
+            parts.year as f64,
+            parts.month as f64,
+            parts.day as f64,
+            parts.hour as f64,
+            parts.minute as f64,
+            get(0, parts.second as f64),
+            get(1, parts.millisecond as f64),
+        ),
+        DateSetField::Milliseconds => (
+            parts.year as f64,
+            parts.month as f64,
+            parts.day as f64,
+            parts.hour as f64,
+            parts.minute as f64,
+            parts.second as f64,
+            get(0, parts.millisecond as f64),
+        ),
+    };
+    if utc {
+        date_make_utc_components(year, month, day, hour, minute, second, millisecond, false)
+    } else {
+        date_make_local_components(year, month, day, hour, minute, second, millisecond, false)
+    }
 }
 
 #[inline]
@@ -824,7 +1607,19 @@ fn execute_primitive(
         BoolNot => Ok(Value::from_bool(!this.as_bool().ok_or_else(|| RuntimeError::new("receiver is not Bool"))?)),
         NullNot => Ok(Value::TRUE),
 
-        NumAdd => Ok(Value::from_num(num(this, "receiver")? + num(argument(args, 0)?, "argument")?)),
+        NumAdd => {
+            let lhs = num(this, "receiver")?;
+            let rhs = argument(args, 0)?;
+            if let Some(rhs_num) = rhs.as_num() {
+                Ok(Value::from_num(lhs + rhs_num))
+            } else if let Some(rhs_bytes) = context.string_bytes(rhs).map(|bytes| bytes.to_vec()) {
+                let mut out = context.format_value(this).into_bytes();
+                out.extend_from_slice(&rhs_bytes);
+                Ok(context.allocate_bytes(out))
+            } else {
+                Err(RuntimeError::new("Number.+ expects Number or String"))
+            }
+        },
         NumSub => Ok(Value::from_num(num(this, "receiver")? - num(argument(args, 0)?, "argument")?)),
         NumMul => Ok(Value::from_num(num(this, "receiver")? * num(argument(args, 0)?, "argument")?)),
         NumPow => Ok(Value::from_num(num(this, "receiver")?.powf(num(argument(args, 0)?, "argument")?))),
@@ -881,9 +1676,18 @@ fn execute_primitive(
 
         StringCount => Ok(Value::from_num(context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?.len() as f64)),
         StringAdd => {
+            // Kept as a compatibility fallback for programs compiled against an
+            // older core manifest. New programs bind String.+ to the WIR helper
+            // above so user-defined `toString()` overrides participate normally.
             let rhs = argument(args, 0)?;
-            let mut out = context.string_bytes(this).ok_or_else(|| RuntimeError::new("receiver is not String"))?.to_vec();
-            out.extend_from_slice(context.string_bytes(rhs).ok_or_else(|| RuntimeError::new("String.+ expects String"))?);
+            let mut out = context.string_bytes(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not String"))?
+                .to_vec();
+            if let Some(bytes) = context.string_bytes(rhs).map(|bytes| bytes.to_vec()) {
+                out.extend_from_slice(&bytes);
+            } else {
+                out.extend_from_slice(context.format_value(rhs).as_bytes());
+            }
             Ok(context.allocate_bytes(out))
         }
         StringEq | StringNe => {
@@ -1079,19 +1883,155 @@ fn execute_primitive(
         }
         SystemClock => Ok(Value::from_num(started.elapsed().as_secs_f64())),
 
-        DateNow => {
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-            Ok(Value::from_num(seconds))
+        DateNew => {
+            let supplied = &args[1..];
+            let millis = match supplied {
+                [] => current_epoch_millis(),
+                [value] => {
+                    if let Some(millis) = context.date_millis(*value) {
+                        millis
+                    } else if let Some(text) = context.string_utf8(*value) {
+                        date_parse_string(text)
+                    } else {
+                        date_number(context, *value).map_or(f64::NAN, time_clip)
+                    }
+                }
+                values => {
+                    let Some(values) = date_component_args(context, values) else {
+                        return Ok(context.allocate_date(f64::NAN));
+                    };
+                    date_make_local_components(
+                        values[0],
+                        values[1],
+                        values.get(2).copied().unwrap_or(1.0),
+                        values.get(3).copied().unwrap_or(0.0),
+                        values.get(4).copied().unwrap_or(0.0),
+                        values.get(5).copied().unwrap_or(0.0),
+                        values.get(6).copied().unwrap_or(0.0),
+                        true,
+                    )
+                }
+            };
+            Ok(context.allocate_date(time_clip(millis)))
         }
-        DateNowMs => {
-            let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1000.0;
+        DateUtc => {
+            let supplied = &args[1..];
+            if supplied.len() < 2 {
+                return Ok(Value::from_num(f64::NAN));
+            }
+            let Some(values) = date_component_args(context, supplied) else {
+                return Ok(Value::from_num(f64::NAN));
+            };
+            Ok(Value::from_num(date_make_utc_components(
+                values[0],
+                values[1],
+                values.get(2).copied().unwrap_or(1.0),
+                values.get(3).copied().unwrap_or(0.0),
+                values.get(4).copied().unwrap_or(0.0),
+                values.get(5).copied().unwrap_or(0.0),
+                values.get(6).copied().unwrap_or(0.0),
+                true,
+            )))
+        }
+        DateParse => {
+            let value = argument(args, 0)?;
+            let millis = if let Some(text) = context.string_utf8(value) {
+                date_parse_string(text)
+            } else {
+                date_parse_string(&context.format_value(value))
+            };
             Ok(Value::from_num(millis))
         }
+        DateNow | DateNowMs => Ok(Value::from_num(current_epoch_millis())),
         DateSleep => {
             let ms = num(argument(args,0)?, "milliseconds")?;
             if !ms.is_finite() || ms < 0.0 { return Err(RuntimeError::new("Date.sleep expects non-negative milliseconds")); }
             std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
             Ok(Value::NULL)
         }
+        DateGetTime => Ok(Value::from_num(
+            context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?
+        )),
+        DateGet(field, utc) => {
+            let millis = context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?;
+            let parts = if utc {
+                date_utc_parts(millis)
+            } else {
+                date_local_parts(millis).or_else(|| date_utc_parts(millis))
+            };
+            Ok(Value::from_num(parts.map_or(f64::NAN, |parts| date_field_value(parts, field))))
+        }
+        DateTimezoneOffset => {
+            let millis = context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?;
+            let offset = if !millis.is_finite() {
+                f64::NAN
+            } else {
+                date_local_parts(millis).map_or(0.0, |parts| -(parts.offset_seconds as f64) / 60.0)
+            };
+            Ok(Value::from_num(offset))
+        }
+        DateSetTime => {
+            let millis = time_clip(date_number(context, argument(args, 0)?).unwrap_or(f64::NAN));
+            context.set_date_millis(this, millis)?;
+            Ok(Value::from_num(millis))
+        }
+        DateSet(field, utc) => {
+            let current = context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?;
+            let millis = time_clip(date_set_components(context, current, field, utc, &args[1..]));
+            context.set_date_millis(this, millis)?;
+            Ok(Value::from_num(millis))
+        }
+        DateToString(format) => {
+            let millis = context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?;
+            Ok(context.allocate_string(date_format_local(millis, format)?))
+        }
+        DateToJson => {
+            let millis = context.date_millis(this).ok_or_else(|| RuntimeError::new("receiver is not Date"))?;
+            if !millis.is_finite() {
+                Ok(Value::NULL)
+            } else {
+                Ok(context.allocate_string(date_format_iso(millis)?))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod date_compat_tests {
+    use super::*;
+
+    #[test]
+    fn utc_construction_rolls_fields_and_preserves_pre_epoch_values() {
+        assert_eq!(
+            date_make_utc_components(2024.0, 1.0, 29.0, 13.0, 45.0, 30.0, 250.0, true),
+            1_709_214_330_250.0,
+        );
+        assert_eq!(
+            date_make_utc_components(2023.0, 13.0, 35.0, 0.0, 0.0, 0.0, 0.0, true),
+            1_709_683_200_000.0,
+        );
+        assert_eq!(
+            date_make_utc_components(1969.0, 11.0, 31.0, 23.0, 59.0, 59.0, 999.0, true),
+            -1.0,
+        );
+    }
+
+    #[test]
+    fn iso_format_supports_ecmascript_extended_years() {
+        let negative = date_make_utc_components(-1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, true);
+        assert_eq!(date_format_iso(negative).unwrap(), "-000001-01-01T00:00:00.000Z");
+        assert_eq!(
+            date_format_iso(DATE_MAX_TIME_MS).unwrap(),
+            "+275760-09-13T00:00:00.000Z",
+        );
+    }
+
+    #[test]
+    fn parser_handles_iso_date_only_offsets_and_http_dates() {
+        assert_eq!(date_parse_string("2024-03-05T10:20:30.123Z"), 1_709_634_030_123.0);
+        assert_eq!(date_parse_string("2024-03-05"), 1_709_596_800_000.0);
+        assert_eq!(date_parse_string("2024-03-05T12:20:30+02:00"), 1_709_634_030_000.0);
+        assert_eq!(date_parse_string("Tue, 05 Mar 2024 10:20:30 GMT"), 1_709_634_030_000.0);
+        assert!(date_parse_string("not a date").is_nan());
     }
 }

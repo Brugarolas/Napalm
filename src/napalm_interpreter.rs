@@ -59,8 +59,9 @@ mod interfaces;
 use self::interfaces::h_bind_interface;
 use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
-    JitAction, SharedJitProfile, TraceActivation, TraceActivationInputs, TraceHeapEntry,
+    JitAction, SharedJitProfile, SharedJitRepository, TraceActivation, TraceActivationInputs, TraceHeapEntry,
     TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
+    VmBindingDescriptor, VmBindingKind,
     TRACE_HEAP_CHUNK_BITS, TRACE_HEAP_CHUNK_MASK, TRACE_HEAP_CHUNK_SIZE,
     TRACE_PROMISE_CANCELLED, TRACE_PROMISE_FULFILLED, TRACE_PROMISE_PENDING, TRACE_PROMISE_REJECTED,
 };
@@ -1698,6 +1699,9 @@ enum HeapObject {
         to: f64,
         inclusive: bool,
     },
+    /// JavaScript-compatible Date value: milliseconds since Unix epoch. NaN
+    /// represents an invalid date, matching ECMAScript's internal time value.
+    Date { millis: f64 },
     Cell(Box<RegisterWord>),
     Closure {
         function_index: u32,
@@ -2264,6 +2268,7 @@ macro_rules! gc_descriptor {
 
 gc_descriptor!(GC_STRING, "Napalm.String", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
+gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
 gc_descriptor!(GC_CLASS, "Napalm.Class", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BUILTIN_CLASS, "Napalm.BuiltinClass", GcTraceLayout::Leaf);
@@ -2293,6 +2298,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::MapEntry { .. } | HeapObject::MapKeys { .. } => &GC_MAP_VIEW,
         HeapObject::Range { .. } => &GC_RANGE,
+        HeapObject::Date { .. } => &GC_DATE,
         HeapObject::Cell(_) => &GC_CELL,
         HeapObject::Closure { .. } => &GC_CLOSURE,
         HeapObject::ClassObject { .. } => &GC_CLASS,
@@ -2535,6 +2541,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::String(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
+        | HeapObject::Date { .. }
         | HeapObject::ClassObject { .. }
         | HeapObject::BuiltinClass { .. }
         | HeapObject::Foreign { .. }
@@ -3360,6 +3367,31 @@ impl HostContext<'_> {
         self.heap.alloc(HeapObject::Range { from, to, inclusive })
     }
 
+    /// Allocate a Date object. `millis` is already TimeClipped by the Date core
+    /// implementation; NaN is deliberately retained for Invalid Date.
+    pub fn allocate_date(&mut self, millis: f64) -> Value {
+        self.heap.alloc(HeapObject::Date { millis })
+    }
+
+    #[inline]
+    pub fn date_millis(&self, value: Value) -> Option<f64> {
+        match self.heap.get(value) {
+            Some(HeapObject::Date { millis }) => Some(*millis),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn set_date_millis(&mut self, value: Value, millis: f64) -> Result<f64, RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::Date { millis: slot }) => {
+                *slot = millis;
+                Ok(millis)
+            }
+            _ => Err(RuntimeError::new("receiver is not Date")),
+        }
+    }
+
     pub fn allocate_random(&mut self, state: u64) -> Value {
         self.heap.alloc(HeapObject::Random { state })
     }
@@ -3603,6 +3635,9 @@ impl HostContext<'_> {
             Some(HeapObject::Range { from, to, inclusive }) => {
                 let op = if *inclusive { ".." } else { "..." };
                 format!("{from}{op}{to}")
+            }
+            Some(HeapObject::Date { millis }) => {
+                if millis.is_finite() { format!("<date:{millis:.0}>") } else { "Invalid Date".to_owned() }
             }
             Some(HeapObject::MapEntry { key, value }) => {
                 if !seen.insert(handle) { return "<map entry ...>".to_owned(); }
@@ -4616,6 +4651,7 @@ pub enum NativeBuiltin {
     MapPropertyGet(MethodSymbol),
     MapPropertySet(MethodSymbol),
     MapPropertyCall(MethodSymbol),
+    UniversalToString,
     FnNew,
     FnArity,
     FnCall,
@@ -4689,9 +4725,13 @@ pub enum BuiltinClass {
     FfiPointer,
     Response,
     Headers,
+    Module,
+    /// Heap-backed JavaScript-compatible Date instances. Appended deliberately so
+    /// existing builtin receiver-class numeric identities remain stable.
+    Date,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 18;
+const BUILTIN_CLASS_COUNT: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -4719,6 +4759,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapKeys as u64),
         HeapObject::Range { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Range as u64),
+        HeapObject::Date { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Date as u64),
         HeapObject::Closure { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Closure as u64),
         HeapObject::Promise { .. } =>
@@ -4727,6 +4769,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Response as u64),
         HeapObject::Headers(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Headers as u64),
+        HeapObject::ModuleObject { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Module as u64),
         HeapObject::FiberObject { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Fiber as u64),
         HeapObject::ClassObject { class_slot } =>
@@ -4744,8 +4788,7 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
         HeapObject::FfiPointer { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FfiPointer as u64),
         HeapObject::AsyncTaskObject { .. }
-        | HeapObject::Cell(_)
-        | HeapObject::ModuleObject { .. } => return None,
+        | HeapObject::Cell(_) => return None,
     })
 }
 
@@ -5344,6 +5387,8 @@ pub struct Interpreter<'p> {
     strings: Vec<Value>,
     builtin_values: Vec<Value>,
     builtin_static_methods: Vec<Vec<Option<CallTarget>>>,
+    /// Hidden core helper for the runtime-only `anything + String` coercion arm.
+    string_right_add: Option<u32>,
     /// Constants pre-resolved to physical register words once at VM startup.
     /// Hot LOAD_CONST never reinterprets Constant or performs metadata lookup.
     resolved_constants: Vec<Vec<RegisterWord>>,
@@ -5700,6 +5745,7 @@ impl<'p> Interpreter<'p> {
             strings,
             builtin_values,
             builtin_static_methods: vec![vec![None; program.metadata.methods.len()]; BuiltinId::COUNT],
+            string_right_add: None,
             resolved_constants,
             fibers: vec![Some(main)],
             free_fibers: Vec::new(),
@@ -5761,6 +5807,16 @@ impl<'p> Interpreter<'p> {
     pub(crate) fn set_shared_jit_profile(&mut self, profile: Arc<SharedJitProfile>) {
         if let Some(jit) = self.jit.as_mut() {
             jit.set_shared_profile(Some(profile));
+        }
+    }
+
+    pub(crate) fn set_shared_jit_repository(
+        &mut self,
+        repository: Arc<SharedJitRepository>,
+        worker_id: u32,
+    ) {
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_shared_repository(Some(repository), worker_id);
         }
     }
 
@@ -5842,10 +5898,14 @@ impl<'p> Interpreter<'p> {
             .as_ref()
             .map_or(0, |options| options.hot_entry_threshold);
         let shared_profile = self.jit.as_ref().and_then(|jit| jit.shared_profile());
+        let shared_repository = self.jit.as_ref().and_then(|jit| jit.shared_repository());
         self.jit_entry_threshold = entry_threshold;
         self.jit = options.map(|options| {
             let mut jit = TracingJit::new(options);
             jit.set_shared_profile(shared_profile.clone());
+            if let Some((repository, worker_id)) = shared_repository.clone() {
+                jit.set_shared_repository(Some(repository), worker_id);
+            }
             Box::new(jit)
         });
 
@@ -5864,13 +5924,16 @@ impl<'p> Interpreter<'p> {
 
     fn invalidate_method_traces(&mut self) {
         self.method_epoch = self.method_epoch.wrapping_add(1);
-        if let Some((options, shared_profile)) = self
+        if let Some((options, shared_profile, shared_repository)) = self
             .jit
             .as_ref()
-            .map(|jit| (jit.options().clone(), jit.shared_profile()))
+            .map(|jit| (jit.options().clone(), jit.shared_profile(), jit.shared_repository()))
         {
             let mut jit = TracingJit::new(options);
             jit.set_shared_profile(shared_profile);
+            if let Some((repository, worker_id)) = shared_repository {
+                jit.set_shared_repository(Some(repository), worker_id);
+            }
             self.jit = Some(Box::new(jit));
         }
         for function in &mut self.prepared.functions {
@@ -5901,6 +5964,11 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    pub fn bind_string_right_add_function(&mut self, function: FuncId) {
+        self.string_right_add = Some(*self.prepared.function_by_id.get(&function)
+            .expect("string right-add helper must exist in the compiled program"));
+    }
+
     pub fn bind_builtin_function(&mut self, class: BuiltinClass, method: MethodSymbol, function: FuncId) {
         let function = *self.prepared.function_by_id.get(&function)
             .expect("builtin function must exist in the compiled program");
@@ -5921,6 +5989,21 @@ impl<'p> Interpreter<'p> {
         {
             *slot = Some(CallTarget::Primitive(primitive));
         }
+    }
+
+    pub fn bind_builtin_static_function(
+        &mut self,
+        builtin: BuiltinId,
+        method: MethodSymbol,
+        function: FuncId,
+    ) {
+        let function = *self.prepared.function_by_id.get(&function)
+            .expect("builtin static function must exist in the compiled program");
+        self.invalidate_method_traces();
+        let slot = self.builtin_static_methods.get_mut(builtin.index())
+            .and_then(|table| table.get_mut(method.0 as usize))
+            .expect("builtin static method must exist in the compiled program");
+        *slot = Some(CallTarget::Bytecode(function));
     }
 
     pub fn bind_builtin_static_primitive(
@@ -8546,6 +8629,7 @@ impl<'p> Interpreter<'p> {
                 return Err(RuntimeError::new("captured mutable cells cannot cross a concurrent boundary"));
             }
             Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
+            | Some(HeapObject::Date { .. })
             | Some(HeapObject::MapEntry { .. }) | Some(HeapObject::MapKeys { .. })
             | Some(HeapObject::ModuleObject { .. }) => {
                 return Err(RuntimeError::new("this runtime object cannot cross a concurrent boundary yet"));
@@ -9368,6 +9452,51 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    #[inline]
+    fn to_string_fallback_for_table(
+        &self,
+        table: &[Option<CallTarget>],
+        method: MethodSymbol,
+    ) -> Option<CallTarget> {
+        use crate::napalm_ir::MethodKind;
+
+        let signature = self.program.metadata.methods.get(method.0 as usize)?;
+        if signature.arity != 0
+            || !matches!(signature.kind, MethodKind::Getter | MethodKind::Method)
+            || self.program.metadata.string(signature.name) != Some("toString")
+        {
+            return None;
+        }
+
+        // `toString()` is now canonical, but the old property-style protocol is
+        // intentionally retained. Treat Getter and Method spellings as aliases
+        // only for this protocol, so existing `value.toString` code and modern
+        // `value.toString()` code both honor user-defined overrides.
+        let alternate_kind = match signature.kind {
+            MethodKind::Method => MethodKind::Getter,
+            MethodKind::Getter => MethodKind::Method,
+            _ => unreachable!(),
+        };
+        if let Some((index, _)) = self
+            .program
+            .metadata
+            .methods
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| {
+                candidate.name == signature.name
+                    && candidate.kind == alternate_kind
+                    && candidate.arity == 0
+            })
+        {
+            if let Some(target) = table.get(index).copied().flatten() {
+                return Some(target);
+            }
+        }
+
+        Some(CallTarget::NativeBuiltin(NativeBuiltin::UniversalToString))
+    }
+
     fn lookup_method(
         &self,
         class: ReceiverClass,
@@ -9377,13 +9506,15 @@ impl Interpreter<'_> {
         let kind = class.0 >> 56;
         let payload = (class.0 & 0x00ff_ffff_ffff_ffff) as u32;
         if kind == (CLASS_KIND_BUILTIN >> 56) {
-            let bound = self
-                .builtin_methods
-                .get(payload as usize)?
+            let table = self.builtin_methods.get(payload as usize)?;
+            let bound = table
                 .get(method.0 as usize)
                 .copied()
                 .flatten();
             if bound.is_some() { return bound; }
+            if let Some(target) = self.to_string_fallback_for_table(table, method) {
+                return Some(target);
+            }
             if payload == BuiltinClass::Map as u32 {
                 use crate::napalm_ir::MethodKind;
                 let signature = self.program.metadata.methods.get(method.0 as usize)?;
@@ -9397,12 +9528,12 @@ impl Interpreter<'_> {
             return None;
         }
         if kind == (CLASS_KIND_CORE_STATIC >> 56) {
-            return self
-                .builtin_static_methods
-                .get(payload as usize)?
+            let table = self.builtin_static_methods.get(payload as usize)?;
+            return table
                 .get(method.0 as usize)
                 .copied()
-                .flatten();
+                .flatten()
+                .or_else(|| self.to_string_fallback_for_table(table, method));
         }
 
         let is_static = kind == (CLASS_KIND_STATIC >> 56);
@@ -9420,7 +9551,11 @@ impl Interpreter<'_> {
         } else {
             &class.instance_methods
         };
-        table.get(method.0 as usize).copied().flatten()
+        table
+            .get(method.0 as usize)
+            .copied()
+            .flatten()
+            .or_else(|| self.to_string_fallback_for_table(table, method))
     }
 
     #[inline(always)]
@@ -9662,7 +9797,19 @@ impl Interpreter<'_> {
             ("-", 0) => Ok(Value::from_num(-lhs)),
             ("~", 0) => Ok(Value::from_num((!num_to_u32(lhs)) as f64)),
 
-            ("+", 1) => argument_num().map(|rhs| Value::from_num(lhs + rhs)),
+            ("+", 1) => {
+                let rhs = match argument_value() {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let Some(rhs) = rhs.as_num() {
+                    Ok(Value::from_num(lhs + rhs))
+                } else {
+                    // Stock Num.+ also implements the String concatenation arm.
+                    // Let the host primitive perform that allocation/coercion.
+                    return None;
+                }
+            },
             ("-", 1) => argument_num().map(|rhs| Value::from_num(lhs - rhs)),
             ("*", 1) => argument_num().map(|rhs| Value::from_num(lhs * rhs)),
             ("/", 1) => argument_num().map(|rhs| Value::from_num(lhs / rhs)),
@@ -9703,6 +9850,43 @@ impl Interpreter<'_> {
         Some(result)
     }
 
+    #[inline]
+    fn should_redirect_string_right_add(
+        &self,
+        op: &PreparedOp,
+        receiver: RegisterWord,
+        args: &[RegisterWord],
+    ) -> bool {
+        use crate::napalm_ir::MethodKind;
+
+        if args.len() != 1 || self.string_right_add.is_none() {
+            return false;
+        }
+        let receiver = Value::from_word(receiver);
+        if matches!(self.heap.get(receiver), Some(HeapObject::String(_))) {
+            return false;
+        }
+        let rhs = Value::from_word(args[0]);
+        if !matches!(self.heap.get(rhs), Some(HeapObject::String(_))) {
+            return false;
+        }
+        let function_index = unsafe { (*self.hot_frame).function as usize };
+        let Some(descriptor) = self
+            .program
+            .functions
+            .get(function_index)
+            .and_then(|function| function.chunk.inline_caches.get(op.x as usize))
+        else {
+            return false;
+        };
+        let Some(signature) = self.program.metadata.method(descriptor.method) else {
+            return false;
+        };
+        signature.kind == MethodKind::Method
+            && signature.arity == 1
+            && self.program.metadata.string(signature.name) == Some("+")
+    }
+
     fn invoke_target(
         &mut self,
         op: &PreparedOp,
@@ -9710,6 +9894,15 @@ impl Interpreter<'_> {
         receiver: RegisterWord,
         args: &[RegisterWord],
     ) {
+        // `+` is argument-sensitive: if the RHS is a String, concatenation wins
+        // even when this Invoke site was previously quickened for the same receiver
+        // class with a non-String argument. Redirect before using the cached target.
+        if self.should_redirect_string_right_add(op, receiver, args) {
+            let helper = self.string_right_add.expect("checked above");
+            self.enter_bytecode_call(op, helper, Some(receiver), args, None);
+            return;
+        }
+
         match target {
             CallTarget::Bytecode(function) => {
                 self.enter_bytecode_call(op, function, Some(receiver), args, None);
@@ -10035,6 +10228,27 @@ impl Interpreter<'_> {
         }
     }
 
+    fn default_to_string_text(&mut self, value: Value) -> String {
+        let named_class = match self.heap.get(value) {
+            Some(HeapObject::ClassObject { class_slot }) => Some((true, *class_slot)),
+            Some(HeapObject::Instance { class_slot, .. })
+            | Some(HeapObject::Foreign { class_slot, .. }) => Some((false, *class_slot)),
+            _ => None,
+        };
+        if let Some((is_class, class_slot)) = named_class {
+            if let Some(class) = self.classes.get(class_slot as usize) {
+                if let Some(name) = self.program.metadata.string(class.name) {
+                    return if is_class {
+                        format!("<class {name}>")
+                    } else {
+                        format!("<instance {name}>")
+                    };
+                }
+            }
+        }
+        HostContext { heap: &mut self.heap }.format_value(value)
+    }
+
     fn invoke_native_builtin(
         &mut self,
         op: &PreparedOp,
@@ -10087,6 +10301,17 @@ impl Interpreter<'_> {
                     Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
                     Err(error) => self.fail_at(op, error.message),
                 }
+            }
+            NativeBuiltin::UniversalToString => {
+                let receiver = Value::from_word(receiver);
+                // Formatting itself only allocates Rust-owned temporary memory.
+                // Publish the current stack map immediately before the managed
+                // String allocation so a collection can safely relocate roots.
+                let text = self.default_to_string_text(receiver);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = HostContext { heap: &mut self.heap }.allocate_string(text);
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FnNew => {
                 let closure = arg(0);
@@ -11450,14 +11675,18 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     let index = vm.hot_pc as usize;
 
     let threshold = vm.jit_entry_threshold;
-    if threshold == 0 {
+    if threshold == 0 || vm.jit.is_none() {
+        // The tracing manager is temporarily removed from Interpreter while a
+        // recording/native entry owns &mut TracingJit. Recursive bytecode calls
+        // may legitimately reach another entry hook during that window. Execute
+        // the saved baseline handler instead of recursively tiering (or panicking).
+        // Do not increment entry hotness here: this is a transient JIT-busy state,
+        // not evidence that this location itself became hotter.
         let prepared = vm.current_prepared();
-        let handler = unsafe {
-            prepared
-                .jit_entry_handlers
-                .get_unchecked(index)
-                .unwrap_or(*prepared.handlers.get_unchecked(index))
-        };
+        let handler = prepared
+            .jit_entry_handlers
+            .get_unchecked(index)
+            .unwrap_or(*prepared.handlers.get_unchecked(index));
         let op = vm.hot_ops.add(index);
         handler(vm, op);
         return;
@@ -11498,7 +11727,18 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         }
 
         let location = vm.trace_current_location();
-        let mut jit = vm.jit.take().unwrap();
+        // `vm.jit.is_none()` was handled above. Keep this non-panicking anyway so
+        // future changes cannot turn JIT re-entry back into a process abort.
+        let Some(mut jit) = vm.jit.take() else {
+            let prepared = vm.current_prepared();
+            let handler = prepared
+                .jit_entry_handlers
+                .get_unchecked(index)
+                .unwrap_or(*prepared.handlers.get_unchecked(index));
+            let op = vm.hot_ops.add(index);
+            handler(vm, op);
+            return;
+        };
         if cached == NO_INDEX {
             if shared_ready {
                 jit.preheat_entry_from_shared(location);
@@ -11587,6 +11827,19 @@ unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op_index=vm.hot_pc;
     let receiver=vm.reg(op.b);
     let receiver_value=Value::from_word(receiver);
+    // `anything + String` is a fallback protocol, so it must run before method
+    // lookup: Bool/null/user instances may not define `+` at all. Monomorphic
+    // sites are covered again inside invoke_target because only the argument type,
+    // not the receiver class, may change after quickening.
+    if op.c == 1 && vm.string_right_add.is_some() {
+        let mut args=[RegisterWord(0);4];
+        let count=vm.gather_call_words_small(&op,&mut args);
+        if vm.should_redirect_string_right_add(&op,receiver,&args[..count]) {
+            let helper=vm.string_right_add.expect("checked above");
+            vm.enter_bytecode_call(&op,helper,Some(receiver),&args[..count],None);
+            return;
+        }
+    }
     let class=match vm.receiver_class(receiver_value){
         Ok(class)=>class,
         Err(error)=>{vm.fail_at(&op,error.message);return;}
@@ -11663,6 +11916,11 @@ unsafe fn h_invoke_mono_bytecode_small<const N: usize>(vm:&mut Interpreter, ptr:
         return;
     };
     let args=vm.gather_call_words_const::<N>(&op);
+    if vm.should_redirect_string_right_add(&op,receiver,&args[..N]) {
+        let helper=vm.string_right_add.expect("redirect helper must be installed");
+        vm.enter_bytecode_call(&op,helper,Some(receiver),&args[..N],None);
+        return;
+    }
     vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
 }
 
@@ -11686,10 +11944,20 @@ unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
     if op.c <= 4 {
         let mut args=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(&op,&mut args);
+        if vm.should_redirect_string_right_add(&op,receiver,&args[..count]) {
+            let helper=vm.string_right_add.expect("redirect helper must be installed");
+            vm.enter_bytecode_call(&op,helper,Some(receiver),&args[..count],None);
+            return;
+        }
         vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
     } else {
         let mut args=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(&op,&mut args);
+        if vm.should_redirect_string_right_add(&op,receiver,&args[..count]) {
+            let helper=vm.string_right_add.expect("redirect helper must be installed");
+            vm.enter_bytecode_call(&op,helper,Some(receiver),&args[..count],None);
+            return;
+        }
         vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
     }
 }
@@ -12573,6 +12841,7 @@ impl Interpreter<'_> {
             Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
             Some(HeapObject::MapKeys { .. }) => "<map keys>".into(),
             Some(HeapObject::Range { from, to, inclusive }) => format!("{}{}{}", from, if *inclusive { ".." } else { "..." }, to),
+            Some(HeapObject::Date { millis }) => if millis.is_finite() { format!("<date:{millis:.0}>") } else { "Invalid Date".into() },
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
             Some(HeapObject::ClassObject { class_slot }) => self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("<class>").to_owned(),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
@@ -12615,6 +12884,139 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
+
+    fn trace_describe_vm_binding(
+        &self,
+        kind: VmBindingKind,
+        raw: u64,
+    ) -> Option<VmBindingDescriptor> {
+        match kind {
+            VmBindingKind::StableTagged => {
+                // StableTagged is currently emitted only for program String
+                // constants. Resolve by rooted value rather than by string bytes so
+                // duplicate source strings remain harmless and allocation-free.
+                let id = self
+                    .strings
+                    .iter()
+                    .position(|value| value.word().0 == raw)?;
+                Some(VmBindingDescriptor::ProgramString(StringId(id as u32)))
+            }
+            VmBindingKind::ValueAddress => {
+                let address = raw as usize;
+                let stride = std::mem::size_of::<Value>();
+                for module in &self.modules {
+                    let base = module.variables.as_ptr() as usize;
+                    let bytes = module.variables.len().checked_mul(stride)?;
+                    let end = base.checked_add(bytes)?;
+                    if address >= base && address < end {
+                        let offset = address - base;
+                        if offset % stride == 0 {
+                            return Some(VmBindingDescriptor::ModuleVariable {
+                                module: module.id,
+                                slot: (offset / stride) as u32,
+                            });
+                        }
+                    }
+                }
+                for class in &self.classes {
+                    let base = class.static_fields.as_ptr() as usize;
+                    let bytes = class.static_fields.len().checked_mul(stride)?;
+                    let end = base.checked_add(bytes)?;
+                    if address >= base && address < end {
+                        let offset = address - base;
+                        if offset % stride == 0 {
+                            return Some(VmBindingDescriptor::StaticField {
+                                class: class.id,
+                                slot: (offset / stride) as u32,
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            VmBindingKind::ProfileCounterAddress => {
+                let address = raw as usize;
+                for (function_index, counters) in self.profile_counters.iter().enumerate() {
+                    for (counter, value) in counters.iter().enumerate() {
+                        if value as *const u64 as usize == address {
+                            return Some(VmBindingDescriptor::ProfileCounter {
+                                function: self.prepared.functions.get(function_index)?.id,
+                                counter: counter as u32,
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            VmBindingKind::ClassKey => {
+                let kind = (raw >> 56) as u8;
+                let payload = (raw & 0x00ff_ffff_ffff_ffff) as usize;
+                if kind == (CLASS_KIND_BUILTIN >> 56) as u8
+                    || kind == (CLASS_KIND_CORE_STATIC >> 56) as u8
+                {
+                    return Some(VmBindingDescriptor::BuiltinClassKey(raw));
+                }
+                if kind == (CLASS_KIND_INSTANCE >> 56) as u8
+                    || kind == (CLASS_KIND_STATIC >> 56) as u8
+                    || kind == (CLASS_KIND_FOREIGN >> 56) as u8
+                {
+                    return Some(VmBindingDescriptor::NominalClassKey {
+                        kind,
+                        class: self.classes.get(payload)?.id,
+                    });
+                }
+                None
+            }
+            VmBindingKind::PreparedFunctionIndex => {
+                let function = self.prepared.functions.get(raw as usize)?.id;
+                Some(VmBindingDescriptor::PreparedFunction(function))
+            }
+            // These are translated directly by TracingJit. ShapeId is
+            // deliberately non-portable in Phase 4.
+            VmBindingKind::MethodEpoch
+            | VmBindingKind::DenseSlot
+            | VmBindingKind::FieldSlot
+            | VmBindingKind::ShapeId => None,
+        }
+    }
+
+    fn trace_resolve_vm_binding(&self, binding: &VmBindingDescriptor) -> Option<u64> {
+        match binding {
+            VmBindingDescriptor::ProgramString(id) => {
+                self.strings.get(id.0 as usize).map(|value| value.word().0)
+            }
+            VmBindingDescriptor::ModuleVariable { module, slot } => {
+                let module_slot = *self.prepared.module_by_id.get(module)? as usize;
+                let variables = &self.modules.get(module_slot)?.variables;
+                let value = variables.get(*slot as usize)?;
+                Some(value as *const Value as usize as u64)
+            }
+            VmBindingDescriptor::StaticField { class, slot } => {
+                let class_slot = *self.prepared.class_by_id.get(class)? as usize;
+                let fields = &self.classes.get(class_slot)?.static_fields;
+                let value = fields.get(*slot as usize)?;
+                Some(value as *const Value as usize as u64)
+            }
+            VmBindingDescriptor::ProfileCounter { function, counter } => {
+                let function_index = *self.prepared.function_by_id.get(function)? as usize;
+                let value = self.profile_counters.get(function_index)?.get(*counter as usize)?;
+                Some(value as *const u64 as usize as u64)
+            }
+            VmBindingDescriptor::BuiltinClassKey(raw) => Some(*raw),
+            VmBindingDescriptor::NominalClassKey { kind, class } => {
+                let slot = *self.prepared.class_by_id.get(class)? as u64;
+                Some(((*kind as u64) << 56) | slot)
+            }
+            VmBindingDescriptor::PreparedFunction(function) => {
+                self.prepared.function_by_id.get(function).copied().map(u64::from)
+            }
+            VmBindingDescriptor::MethodEpoch(expected) => {
+                (self.method_epoch == *expected).then_some(*expected)
+            }
+            VmBindingDescriptor::DenseSlot(slot) => Some(*slot as u64),
+            VmBindingDescriptor::FieldSlot(slot) => Some(*slot as u64),
+        }
+    }
 
     fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
         let class = self.heap.receiver_class(Value::from_word(receiver))?;
@@ -15102,14 +15504,10 @@ var result = Runner.run()
     }
 
     #[test]
-    fn source_concatenation_rejects_wrong_operand_types() {
+    fn source_list_concatenation_rejects_non_lists() {
         for (expression, expected) in [
             ("[] + 1", "List.+ expects List"),
             ("[] + null", "List.+ expects List"),
-            ("[] + \"text\"", "List.+ expects List"),
-            ("\"text\" + []", "String.+ expects String"),
-            ("\"text\" + 1", "String.+ expects String"),
-            ("\"text\" + null", "String.+ expects String"),
         ] {
             let (program, entry, manifest) = compile_napalm_module(&format!("{expression}\n"));
             let mut vm = source_vm(&program, &manifest);
@@ -16714,6 +17112,56 @@ interval = Timer.every(1) {
         let mut vm = source_vm(&program, &manifest);
         let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
         assert_eq!(source_result(&vm), 3.0);
+    }
+
+
+    #[test]
+    fn source_to_string_protocol_drives_concat_interpolation_and_user_overrides() {
+        let source = r#"
+class Label {
+  construct new(value) { _value = value }
+  toString() { return "Label(" + _value + ")" }
+}
+class Plain {
+  construct new() {}
+}
+function dynamicAdd(left, right) { return left + right }
+var warm = 0
+while (warm < 64) {
+  dynamicAdd(1, 2)
+  warm += 1
+}
+var label = Label.new(7)
+var first = "n=" + 10
+var second = 10 + " trees"
+var third = true + "!"
+var fourth = null + "?"
+var explicit = label.toString()
+var legacy = label.toString
+var printed = System.print(label)
+var printedText = printed.toString()
+var interpolated = `value=${label}, n=${10}`
+var listText = [1, 2].toString()
+var functionText = dynamicAdd.toString()
+var classText = Label.toString()
+var plain = Plain.new()
+var objectText = plain.toString()
+var dynamic = dynamicAdd(1, " dynamic")
+var result = first + "|" + second + "|" + third + "|" + fourth + "|" + explicit + "|" + legacy + "|" + printedText + "|" + interpolated + "|" + listText + "|" + functionText + "|" + classText + "|" + objectText + "|" + dynamic
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
+            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let context = HostContext { heap: &mut vm.heap };
+            assert_eq!(
+                context.format_value(value),
+                "n=10|10 trees|true!|null?|Label(7)|Label(7)|Label(7)|value=Label(7), n=10|[1, 2]|<fn>|<class Label>|<instance Plain>|1 dynamic",
+                "jit={jit_enabled}",
+            );
+        }
     }
 
 }

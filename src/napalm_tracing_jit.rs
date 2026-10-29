@@ -51,6 +51,7 @@ use std::fmt;
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 mod inlining;
 #[cfg(test)]
@@ -68,7 +69,7 @@ use crate::napalm_bytecode::{
 };
 use crate::napalm_ir::{
     ClassId, CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp,
-    MethodKind, MethodSymbol, PropertySlotId, StringId, StructuralLayoutId, Type,
+    MethodKind, MethodSymbol, ModuleId, PropertySlotId, StringId, StructuralLayoutId, Type,
 };
 use crate::napalm_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
@@ -534,6 +535,23 @@ pub trait TraceRuntime {
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
+
+    /// Convert one recording-time VM binding into a semantic descriptor which can
+    /// be reconstructed inside another isolated Interpreter. Returning `None`
+    /// makes the containing trace worker-private rather than risking cross-VM state.
+    fn trace_describe_vm_binding(
+        &self,
+        _kind: VmBindingKind,
+        _raw: u64,
+    ) -> Option<VmBindingDescriptor> {
+        None
+    }
+
+    /// Resolve a semantic repository binding into this Interpreter's local word.
+    /// This is cold-path work performed only when adopting shared machine code.
+    fn trace_resolve_vm_binding(&self, _binding: &VmBindingDescriptor) -> Option<u64> {
+        None
+    }
     /// Actual bytecode method selected for this receiver and inline-cache
     /// descriptor, plus up to four observed receiver classes sharing that target.
     /// The descriptor may represent ordinary Invoke or lexical InvokeSuper; the
@@ -766,7 +784,7 @@ pub trait TraceRuntime {
 // Configuration / diagnostics
 // =============================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NativeOptLevel {
     None,
     Speed,
@@ -897,6 +915,20 @@ pub struct TracingJitStats {
     pub trace_gvn_eliminated: u64,
     pub trace_licm_hoisted: u64,
     pub trace_pre_eliminated: u64,
+    /// Cross-worker repository compile claims won by this worker.
+    pub shared_repository_claims: u64,
+    /// Compile attempts deferred because another worker currently owns the slot.
+    pub shared_repository_deferrals: u64,
+    /// Private compiled traces published into a shared repository slot.
+    pub shared_repository_private_publications: u64,
+    /// Native traces compiled exactly once by the repository compiler and published.
+    pub shared_repository_shared_publications: u64,
+    /// Published native traces rebound and installed by this worker without recording/compiling.
+    pub shared_repository_shared_adoptions: u64,
+    /// Published code rejected because one VM-local binding could not be reconstructed safely.
+    pub shared_repository_rebind_rejections: u64,
+    /// Repository-native compilation failures which fell back to a private compile.
+    pub shared_repository_shared_compile_failures: u64,
     pub last_abort: Option<String>,
 }
 
@@ -5509,7 +5541,7 @@ impl CompiledExitPlan {
 // =============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum VmBindingKind {
+pub enum VmBindingKind {
     StableTagged,
     ValueAddress,
     ProfileCounterAddress,
@@ -5519,6 +5551,23 @@ enum VmBindingKind {
     DenseSlot,
     FieldSlot,
     PreparedFunctionIndex,
+}
+
+/// Cross-worker meaning of one VM-local relocation slot. Unlike `VmBindingKey`,
+/// these values contain no pointer, heap handle, worker-local class slot or
+/// prepared-function index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VmBindingDescriptor {
+    ProgramString(StringId),
+    ModuleVariable { module: ModuleId, slot: u32 },
+    StaticField { class: ClassId, slot: u32 },
+    ProfileCounter { function: FuncId, counter: u32 },
+    BuiltinClassKey(u64),
+    NominalClassKey { kind: u8, class: ClassId },
+    MethodEpoch(u64),
+    DenseSlot(u32),
+    FieldSlot(u32),
+    PreparedFunction(FuncId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -5536,16 +5585,14 @@ impl VmBindingKey {
 
 struct CompiledTrace {
     trace: Trace,
-    function: ClifFuncId,
     code_ptr: *const u8,
     entry: NativeTraceFn,
-    /// Relocation words consumed through TraceActivation::vm_bindings. This is
-    /// intentionally private to one worker/JIT in phase 2; phase 3 will replace
-    /// the raw words with repository-level binding descriptors.
+    dispatcher: NativeDispatcherFn,
+    /// Relocation words consumed through TraceActivation::vm_bindings. These are
+    /// always worker-local even when the executable body is shared.
     vm_bindings: Box<[u64]>,
-    /// Binding categories are retained even while phase 2 stores raw private
-    /// values. Two equal u64 words with different meanings must remain distinct
-    /// slots so phase 3 can replace them with semantic rebinding descriptors.
+    /// Binding categories stay attached to the local instance so StableTagged
+    /// constants and diagnostics can be reconstructed without inspecting code.
     vm_binding_keys: Box<[VmBindingKey]>,
     exits: Vec<CompiledExitPlan>,
     exit_hits: Vec<u32>,
@@ -5556,6 +5603,13 @@ struct CompiledTrace {
     /// Root loop owning this trace tree and depth from that root.
     root_trace: TraceId,
     tree_depth: u8,
+    /// Stable repository identity for either a private fallback generation or an
+    /// adopted shared executable generation.
+    shared_trace: Option<SharedTraceVersion>,
+    /// Keeps repository metadata alive explicitly for traces using shared code.
+    _shared_code: Option<Arc<SharedCompiledCode>>,
+    /// Keeps the repository compiler/JITModule alive for the shared entry pointer.
+    _shared_repository_owner: Option<Arc<SharedJitRepository>>,
     /// Consecutive entries that did too little work to amortize a transition.
     /// A long streak requests a temporary cooldown in the interpreter.
     short_exit_streak: u16,
@@ -6156,6 +6210,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
     fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
+        let dispatcher = backend.dispatcher;
         let (vm_bindings, vm_binding_keys, vm_binding_slots) = collect_vm_bindings(self.trace);
         let CraneliftBackend { module, context, function_context, scalar_helpers, .. } = backend;
         let arena = bumpalo::Bump::new();
@@ -6501,9 +6556,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
         Ok(CompiledTrace {
             trace: self.trace.clone(),
-            function,
             code_ptr,
             entry,
+            dispatcher,
             vm_bindings,
             vm_binding_keys,
             exit_hits: vec![0; self.exit_plans.len()],
@@ -6511,6 +6566,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
             native_links: vec![u32::MAX; self.exit_plans.len()].into_boxed_slice(),
             root_trace: trace_id,
             tree_depth: 0,
+            shared_trace: None,
+            _shared_code: None,
+            _shared_repository_owner: None,
             exits: self.exit_plans,
             short_exit_streak: 0,
             debug_text: disassembly.or(clif_text),
@@ -9382,6 +9440,426 @@ impl SharedJitProfile {
     }
 }
 
+/// Stable cross-worker identity for one trace compilation site.
+///
+/// Phase 4 keeps this identity stable while publishing reentrant native code for
+/// traces whose VM dependencies can be reconstructed in another isolated worker.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedTraceId(pub u32);
+
+/// One concrete recording/compilation generation for a stable shared site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedTraceVersion {
+    pub id: SharedTraceId,
+    pub generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SharedTraceKey {
+    Entry(TraceLocation),
+    Loop(TraceLocation),
+    Side {
+        root: TraceLocation,
+        start: TraceLocation,
+        close_at: TraceLocation,
+        parent_exit: u32,
+    },
+}
+
+/// Exact recording/code-generation configuration attached to a repository slot.
+/// Workers normally share one option set, but keying it explicitly prevents a
+/// later per-worker option change from adopting code with different semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SharedJitConfigKey {
+    hot_loop_threshold: u32,
+    hot_entry_threshold: u32,
+    min_entry_trace_bytecodes: u32,
+    max_trace_steps: usize,
+    max_failures_before_blacklist: u16,
+    hot_side_exit_threshold: u32,
+    native_loop_iteration_budget: u32,
+    optimize_trace_ir: bool,
+    cranelift_opt_level: NativeOptLevel,
+    cranelift_enable_verifier: bool,
+    cranelift_dump_ir: bool,
+    cranelift_dump_disassembly: bool,
+    no_runtime_calls_in_native_trace: bool,
+}
+
+impl SharedJitConfigKey {
+    #[inline]
+    fn from_options(options: &TracingJitOptions) -> Self {
+        Self {
+            hot_loop_threshold: options.hot_loop_threshold,
+            hot_entry_threshold: options.hot_entry_threshold,
+            min_entry_trace_bytecodes: options.min_entry_trace_bytecodes,
+            max_trace_steps: options.max_trace_steps,
+            max_failures_before_blacklist: options.max_failures_before_blacklist,
+            hot_side_exit_threshold: options.hot_side_exit_threshold,
+            native_loop_iteration_budget: options.native_loop_iteration_budget,
+            optimize_trace_ir: options.optimize_trace_ir,
+            cranelift_opt_level: options.cranelift_opt_level,
+            cranelift_enable_verifier: options.cranelift_enable_verifier,
+            cranelift_dump_ir: options.cranelift_dump_ir,
+            cranelift_dump_disassembly: options.cranelift_dump_disassembly,
+            no_runtime_calls_in_native_trace: options.no_runtime_calls_in_native_trace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SharedRepositoryKey {
+    site: SharedTraceKey,
+    config: SharedJitConfigKey,
+}
+
+const REPOSITORY_IDLE: u32 = 0;
+const REPOSITORY_COMPILING: u32 = 1;
+const REPOSITORY_PRIVATE_READY: u32 = 2;
+const REPOSITORY_SHARED_READY: u32 = 3;
+const NO_REPOSITORY_WORKER: u32 = u32::MAX;
+
+/// Immutable executable artifact published by the repository. The code itself is
+/// owned by the repository compiler thread's Cranelift JITModule; this object only
+/// carries stable addresses plus semantic relocation recipes.
+struct SharedCompiledCode {
+    version: SharedTraceVersion,
+    trace: Trace,
+    entry_addr: usize,
+    dispatcher_addr: usize,
+    binding_keys: Box<[VmBindingKey]>,
+    bindings: Box<[VmBindingDescriptor]>,
+    exits: Vec<CompiledExitPlan>,
+    debug_text: Option<String>,
+}
+
+/// Compiler-thread result before a repository generation is attached to it.
+struct SharedCodeImage {
+    trace: Trace,
+    entry_addr: usize,
+    dispatcher_addr: usize,
+    binding_keys: Box<[VmBindingKey]>,
+    exits: Vec<CompiledExitPlan>,
+    debug_text: Option<String>,
+}
+
+impl SharedCodeImage {
+    fn from_compiled(compiled: CompiledTrace) -> Self {
+        Self {
+            trace: compiled.trace,
+            entry_addr: compiled.entry as usize,
+            dispatcher_addr: compiled.dispatcher as usize,
+            binding_keys: compiled.vm_binding_keys,
+            exits: compiled.exits,
+            debug_text: compiled.debug_text,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SharedBackendKey {
+    opt_level: NativeOptLevel,
+    verifier: bool,
+}
+
+impl SharedBackendKey {
+    fn from_options(options: &TracingJitOptions) -> Self {
+        Self {
+            opt_level: options.cranelift_opt_level,
+            verifier: options.cranelift_enable_verifier,
+        }
+    }
+}
+
+enum SharedCompilerRequest {
+    Compile {
+        trace: Trace,
+        options: TracingJitOptions,
+        reply: std::sync::mpsc::SyncSender<Result<SharedCodeImage, String>>,
+    },
+    Shutdown,
+}
+
+/// Cranelift's JITModule remains confined to one OS thread. This avoids requiring
+/// JITModule itself to be Send/Sync while keeping its executable allocations alive
+/// for exactly as long as SharedJitRepository is alive.
+struct SharedNativeCompiler {
+    tx: std::sync::mpsc::Sender<SharedCompilerRequest>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl SharedNativeCompiler {
+    fn new() -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedCompilerRequest>();
+        let join = std::thread::Builder::new()
+            .name("napalm-shared-jit".to_owned())
+            .spawn(move || shared_native_compiler_main(rx))
+            .ok()?;
+        Some(Self { tx, join: Mutex::new(Some(join)) })
+    }
+
+    fn compile(
+        &self,
+        trace: Trace,
+        options: TracingJitOptions,
+    ) -> Result<SharedCodeImage, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(SharedCompilerRequest::Compile {
+                trace,
+                options,
+                reply: reply_tx,
+            })
+            .map_err(|_| "shared JIT compiler thread is unavailable".to_owned())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "shared JIT compiler thread terminated during compilation".to_owned())?
+    }
+}
+
+impl Drop for SharedNativeCompiler {
+    fn drop(&mut self) {
+        let _ = self.tx.send(SharedCompilerRequest::Shutdown);
+        if let Some(join) = self.join.lock().take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn shared_native_compiler_main(rx: std::sync::mpsc::Receiver<SharedCompilerRequest>) {
+    let mut backends = HashMap::<SharedBackendKey, CraneliftBackend>::default();
+
+    while let Ok(request) = rx.recv() {
+        let SharedCompilerRequest::Compile { trace, options, reply } = request else {
+            break;
+        };
+
+        let key = SharedBackendKey::from_options(&options);
+        if !backends.contains_key(&key) {
+            match CraneliftBackend::new(&options) {
+                Ok(backend) => {
+                    backends.insert(key, backend);
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+            }
+        }
+
+        let result = (|| {
+            let compiler = CraneliftTraceCompiler::new(&trace, &options)
+                .map_err(|error| error.to_string())?;
+            let backend = backends
+                .get_mut(&key)
+                .ok_or_else(|| "shared JIT backend disappeared".to_owned())?;
+            match compiler.compile(backend) {
+                Ok(compiled) => Ok(SharedCodeImage::from_compiled(compiled)),
+                Err(error) => {
+                    // Do not let a failed FunctionBuilder poison the next request.
+                    backend.function_context = FunctionBuilderContext::new();
+                    backend.context.clear();
+                    Err(error.to_string())
+                }
+            }
+        })();
+        let _ = reply.send(result);
+    }
+}
+
+struct SharedTraceSlot {
+    id: SharedTraceId,
+    state: AtomicU32,
+    generation: AtomicU32,
+    attempts: AtomicU32,
+    failures: AtomicU32,
+    private_compiles: AtomicU32,
+    shared_compiles: AtomicU32,
+    last_owner: AtomicU32,
+    shared_code: Mutex<Option<Arc<SharedCompiledCode>>>,
+}
+
+impl SharedTraceSlot {
+    fn new(id: SharedTraceId) -> Self {
+        Self {
+            id,
+            state: AtomicU32::new(REPOSITORY_IDLE),
+            generation: AtomicU32::new(0),
+            attempts: AtomicU32::new(0),
+            failures: AtomicU32::new(0),
+            private_compiles: AtomicU32::new(0),
+            shared_compiles: AtomicU32::new(0),
+            last_owner: AtomicU32::new(NO_REPOSITORY_WORKER),
+            shared_code: Mutex::new(None),
+        }
+    }
+}
+
+/// Shared cold-tier repository used by all isolated concurrent workers.
+///
+/// Phase 4 adds a dedicated Cranelift compiler thread and immutable published
+/// machine code. Worker Interpreters never share Napalm managed values: each
+/// adoption reconstructs a private relocation table from semantic descriptors.
+/// Non-portable traces (currently dynamic Map shapes and any unknown binding)
+/// retain the Phase-3 private-compilation path.
+pub(crate) struct SharedJitRepository {
+    slots: Mutex<HashMap<SharedRepositoryKey, Arc<SharedTraceSlot>>>,
+    next_id: AtomicU32,
+    compiler: Option<SharedNativeCompiler>,
+}
+
+impl Default for SharedJitRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedJitRepository {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::default()),
+            next_id: AtomicU32::new(0),
+            compiler: SharedNativeCompiler::new(),
+        }
+    }
+
+    fn slot(&self, key: SharedRepositoryKey) -> Arc<SharedTraceSlot> {
+        let mut slots = self.slots.lock();
+        slots
+            .entry(key)
+            .or_insert_with(|| {
+                let id = SharedTraceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+                Arc::new(SharedTraceSlot::new(id))
+            })
+            .clone()
+    }
+
+    fn try_claim(
+        &self,
+        site: SharedTraceKey,
+        config: SharedJitConfigKey,
+        worker: u32,
+    ) -> SharedCompileClaim {
+        let slot = self.slot(SharedRepositoryKey { site, config });
+        loop {
+            let state = slot.state.load(Ordering::Acquire);
+            if state == REPOSITORY_SHARED_READY {
+                if let Some(code) = slot.shared_code.lock().clone() {
+                    return SharedCompileClaim::Ready(code);
+                }
+                // A shared publication stores the Arc before the Release state.
+                // Recover defensively if that invariant was ever violated.
+                let _ = slot.state.compare_exchange(
+                    REPOSITORY_SHARED_READY,
+                    REPOSITORY_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                continue;
+            }
+            if state == REPOSITORY_COMPILING {
+                return SharedCompileClaim::Busy(slot.id);
+            }
+            debug_assert!(state == REPOSITORY_IDLE || state == REPOSITORY_PRIVATE_READY);
+            if slot
+                .state
+                .compare_exchange_weak(
+                    state,
+                    REPOSITORY_COMPILING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                slot.attempts.fetch_add(1, Ordering::Relaxed);
+                let generation = slot.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                slot.last_owner.store(worker, Ordering::Release);
+                return SharedCompileClaim::Claimed(SharedCompileTicket {
+                    slot,
+                    worker,
+                    generation,
+                    finished: false,
+                });
+            }
+        }
+    }
+
+    fn compile_shared(
+        &self,
+        trace: &Trace,
+        options: &TracingJitOptions,
+    ) -> Result<SharedCodeImage, String> {
+        self.compiler
+            .as_ref()
+            .ok_or_else(|| "shared native compiler could not be started".to_owned())?
+            .compile(trace.clone(), options.clone())
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.lock().len()
+    }
+}
+
+enum SharedCompileClaim {
+    Disabled,
+    Claimed(SharedCompileTicket),
+    Ready(Arc<SharedCompiledCode>),
+    Busy(SharedTraceId),
+}
+
+/// RAII compile ownership. Dropping an unfinished ticket releases the slot so a
+/// recording abort, lowering error or early return cannot permanently wedge it.
+struct SharedCompileTicket {
+    slot: Arc<SharedTraceSlot>,
+    worker: u32,
+    generation: u32,
+    finished: bool,
+}
+
+impl SharedCompileTicket {
+    #[inline]
+    fn trace_id(&self) -> SharedTraceId {
+        self.slot.id
+    }
+
+    #[inline]
+    fn version(&self) -> SharedTraceVersion {
+        SharedTraceVersion { id: self.slot.id, generation: self.generation }
+    }
+
+    fn publish_private(mut self) {
+        debug_assert_eq!(self.slot.last_owner.load(Ordering::Acquire), self.worker);
+        self.slot.private_compiles.fetch_add(1, Ordering::Relaxed);
+        self.slot.state.store(REPOSITORY_PRIVATE_READY, Ordering::Release);
+        self.finished = true;
+    }
+
+    fn publish_shared(mut self, code: Arc<SharedCompiledCode>) {
+        debug_assert_eq!(self.slot.last_owner.load(Ordering::Acquire), self.worker);
+        debug_assert_eq!(code.version, self.version());
+        *self.slot.shared_code.lock() = Some(code);
+        self.slot.shared_compiles.fetch_add(1, Ordering::Relaxed);
+        self.slot.state.store(REPOSITORY_SHARED_READY, Ordering::Release);
+        self.finished = true;
+    }
+
+    fn fail(mut self) {
+        self.slot.failures.fetch_add(1, Ordering::Relaxed);
+        self.slot.state.store(REPOSITORY_IDLE, Ordering::Release);
+        self.finished = true;
+    }
+}
+
+impl Drop for SharedCompileTicket {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.slot.state.store(REPOSITORY_IDLE, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct LoopState {
     hotness: u32,
@@ -9392,6 +9870,8 @@ struct LoopState {
     /// A globally-hot location primes this worker only once. After a local
     /// recording failure the normal worker-local retry/backoff policy takes over.
     shared_primed: bool,
+    /// Stable repository identity corresponding to this worker-local trace copy.
+    repository_trace: Option<SharedTraceVersion>,
 }
 
 #[derive(Clone, Debug)]
@@ -9426,9 +9906,13 @@ enum SideExitDispatch {
 pub struct TracingJit {
     options: TracingJitOptions,
     backend: Option<CraneliftBackend>,
-    /// Aggregate heat is the only JIT state shared by concurrent workers in
-    /// phase 2. Native code and every speculative/runtime binding stay private.
+    /// Aggregate heat is shared by concurrent workers; native trace ownership is
+    /// coordinated separately by the Phase-4 repository below.
     shared_profile: Option<Arc<SharedJitProfile>>,
+    /// Cross-worker trace repository. Portable root/entry traces publish immutable
+    /// machine code here; every worker rebuilds its own VM relocation table.
+    shared_repository: Option<Arc<SharedJitRepository>>,
+    shared_worker_id: u32,
     loops: HashMap<LoopKey, LoopState>,
     entries: HashMap<TraceLocation, LoopState>,
     traces: Vec<Option<CompiledTrace>>,
@@ -9437,8 +9921,8 @@ pub struct TracingJit {
     /// dispatcher invocation, so pointers installed in TraceActivation stay valid.
     entry_table: Vec<usize>,
     link_table_ptrs: Vec<usize>,
-    /// Parallel TraceId -> per-worker relocation table. Keeping this private to
-    /// the TracingJit is the explicit phase-2 boundary: only profile heat is shared.
+    /// Parallel TraceId -> per-worker relocation table. Even when machine code is
+    /// shared, every isolated worker keeps these VM-local addresses private.
     vm_binding_table_ptrs: Vec<usize>,
     next_trace_id: u32,
     stats: TracingJitStats,
@@ -9488,6 +9972,8 @@ impl TracingJit {
             options,
             backend: None,
             shared_profile: None,
+            shared_repository: None,
+            shared_worker_id: NO_REPOSITORY_WORKER,
             loops: HashMap::default(),
             entries: HashMap::default(),
             traces: Vec::new(),
@@ -9509,6 +9995,45 @@ impl TracingJit {
 
     pub(crate) fn shared_profile(&self) -> Option<Arc<SharedJitProfile>> {
         self.shared_profile.clone()
+    }
+
+    pub(crate) fn set_shared_repository(
+        &mut self,
+        repository: Option<Arc<SharedJitRepository>>,
+        worker_id: u32,
+    ) {
+        self.shared_repository = repository;
+        self.shared_worker_id = worker_id;
+    }
+
+    pub(crate) fn shared_repository(&self) -> Option<(Arc<SharedJitRepository>, u32)> {
+        self.shared_repository
+            .as_ref()
+            .map(|repository| (repository.clone(), self.shared_worker_id))
+    }
+
+    fn claim_repository(&mut self, key: SharedTraceKey) -> SharedCompileClaim {
+        let Some(repository) = self.shared_repository.clone() else {
+            return SharedCompileClaim::Disabled;
+        };
+        match repository.try_claim(
+            key,
+            SharedJitConfigKey::from_options(&self.options),
+            self.shared_worker_id,
+        ) {
+            SharedCompileClaim::Claimed(ticket) => {
+                self.stats.shared_repository_claims =
+                    self.stats.shared_repository_claims.saturating_add(1);
+                SharedCompileClaim::Claimed(ticket)
+            }
+            SharedCompileClaim::Ready(code) => SharedCompileClaim::Ready(code),
+            SharedCompileClaim::Busy(id) => {
+                self.stats.shared_repository_deferrals =
+                    self.stats.shared_repository_deferrals.saturating_add(1);
+                SharedCompileClaim::Busy(id)
+            }
+            SharedCompileClaim::Disabled => SharedCompileClaim::Disabled,
+        }
     }
 
     /// Increment the shared cold-entry counter without entering the manager
@@ -9597,6 +10122,193 @@ impl TracingJit {
         result
     }
 
+
+    fn describe_shared_bindings<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        trace: &Trace,
+    ) -> Option<(Box<[VmBindingKey]>, Box<[VmBindingDescriptor]>)> {
+        let (_, keys, _) = collect_vm_bindings(trace);
+        let mut descriptors = Vec::with_capacity(keys.len());
+        for key in keys.iter().copied() {
+            let descriptor = match key.kind {
+                // Shape IDs are allocated independently by each isolated heap.
+                // Sharing them requires a semantic shape schema, not a numeric ID.
+                VmBindingKind::ShapeId => return None,
+                VmBindingKind::MethodEpoch => VmBindingDescriptor::MethodEpoch(key.raw),
+                VmBindingKind::DenseSlot => VmBindingDescriptor::DenseSlot(key.raw as u32),
+                VmBindingKind::FieldSlot => VmBindingDescriptor::FieldSlot(key.raw as u32),
+                _ => runtime.trace_describe_vm_binding(key.kind, key.raw)?,
+            };
+            descriptors.push(descriptor);
+        }
+        Some((keys, descriptors.into_boxed_slice()))
+    }
+
+    fn rebind_shared_bindings<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        code: &SharedCompiledCode,
+    ) -> Option<Box<[u64]>> {
+        if code.binding_keys.len() != code.bindings.len() {
+            return None;
+        }
+        let mut words = Vec::with_capacity(code.bindings.len());
+        for binding in code.bindings.iter() {
+            let word = match binding {
+                // The generated direct semantics are valid only for the method
+                // table epoch under which the trace was recorded.
+                VmBindingDescriptor::MethodEpoch(expected) => {
+                    if runtime.trace_method_epoch() != *expected {
+                        return None;
+                    }
+                    *expected
+                }
+                VmBindingDescriptor::DenseSlot(slot) => *slot as u64,
+                VmBindingDescriptor::FieldSlot(slot) => *slot as u64,
+                _ => runtime.trace_resolve_vm_binding(binding)?,
+            };
+            words.push(word);
+        }
+        Some(words.into_boxed_slice())
+    }
+
+    fn instantiate_shared_code<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        local_id: TraceId,
+        code: Arc<SharedCompiledCode>,
+    ) -> Option<CompiledTrace> {
+        // Side traces currently encode their closing root TraceId as a native
+        // immediate. Root/entry traces are fully relocatable through local tables.
+        if matches!(code.trace.anchor.kind, TraceKind::Side) {
+            return None;
+        }
+        let vm_bindings = self.rebind_shared_bindings(runtime, &code)?;
+        let mut stable_tagged = HashMap::<u64, u64>::default();
+        for (key, word) in code.binding_keys.iter().zip(vm_bindings.iter()) {
+            if key.kind == VmBindingKind::StableTagged {
+                stable_tagged.insert(key.raw, *word);
+            }
+        }
+
+        let localize_constant = |constant: &mut TraceConstant| {
+            if let TraceConstant::StableTagged(bits) = constant {
+                if let Some(local) = stable_tagged.get(&*bits).copied() {
+                    *bits = local;
+                }
+            }
+        };
+
+        let mut trace = code.trace.clone();
+        trace.id = local_id;
+        for value in &mut trace.values {
+            if let TraceValueOrigin::Constant(constant) = &mut value.origin {
+                localize_constant(constant);
+            }
+        }
+        for exit in &mut trace.exits {
+            for frame in &mut exit.frames {
+                for write in &mut frame.writes {
+                    if let SnapshotValue::Constant(constant) = &mut write.value {
+                        localize_constant(constant);
+                    }
+                }
+            }
+        }
+
+        let mut exits = code.exits.clone();
+        for plan in &mut exits {
+            for write in &mut plan.writes {
+                if let ExitWriteSource::Constant(constant) = &mut write.source {
+                    localize_constant(constant);
+                }
+            }
+        }
+        let exit_count = exits.len();
+        let debug_text = code.debug_text.clone();
+        let entry: NativeTraceFn = unsafe { std::mem::transmute(code.entry_addr) };
+        let dispatcher: NativeDispatcherFn = unsafe { std::mem::transmute(code.dispatcher_addr) };
+        Some(CompiledTrace {
+            trace,
+            code_ptr: code.entry_addr as *const u8,
+            entry,
+            dispatcher,
+            vm_bindings,
+            vm_binding_keys: code.binding_keys.clone(),
+            exits,
+            exit_hits: vec![0; exit_count],
+            side_trace_attempted: vec![false; exit_count],
+            native_links: vec![u32::MAX; exit_count].into_boxed_slice(),
+            root_trace: local_id,
+            tree_depth: 0,
+            shared_trace: Some(code.version),
+            _shared_code: Some(code),
+            _shared_repository_owner: self.shared_repository.clone(),
+            short_exit_streak: 0,
+            debug_text,
+        })
+    }
+
+    fn adopt_shared_code<R: TraceRuntime>(
+        &mut self,
+        runtime: &R,
+        code: Arc<SharedCompiledCode>,
+    ) -> Option<TraceId> {
+        let id = TraceId(self.next_trace_id);
+        let compiled = self.instantiate_shared_code(runtime, id, code.clone())?;
+        self.next_trace_id = self.next_trace_id.wrapping_add(1);
+        self.insert_compiled(id, compiled);
+        if jit_events_enabled() {
+            eprintln!(
+                "[napalm-jit] adopted shared {:?} generation {} as local {:?}",
+                code.version.id, code.version.generation, id
+            );
+        }
+        self.stats.shared_repository_shared_adoptions = self
+            .stats
+            .shared_repository_shared_adoptions
+            .saturating_add(1);
+        Some(id)
+    }
+
+    fn compile_shared_code<R: TraceRuntime>(
+        &mut self,
+        runtime: &R,
+        trace: &Trace,
+        ticket: &SharedCompileTicket,
+    ) -> Result<Option<(CompiledTrace, Arc<SharedCompiledCode>)>, String> {
+        if matches!(trace.anchor.kind, TraceKind::Side)
+            || trace.exits.iter().any(|exit| matches!(exit.target, ExitTarget::Trace(_)))
+        {
+            return Ok(None);
+        }
+        let Some((expected_keys, bindings)) = self.describe_shared_bindings(runtime, trace) else {
+            return Ok(None);
+        };
+        let Some(repository) = self.shared_repository.clone() else {
+            return Ok(None);
+        };
+        let image = repository.compile_shared(trace, &self.options)?;
+        if image.binding_keys.as_ref() != expected_keys.as_ref() {
+            return Err("shared compiler produced a different VM-binding layout".to_owned());
+        }
+        let code = Arc::new(SharedCompiledCode {
+            version: ticket.version(),
+            trace: image.trace,
+            entry_addr: image.entry_addr,
+            dispatcher_addr: image.dispatcher_addr,
+            binding_keys: image.binding_keys,
+            bindings,
+            exits: image.exits,
+            debug_text: image.debug_text,
+        });
+        let compiled = self
+            .instantiate_shared_code(runtime, trace.id, code.clone())
+            .ok_or_else(|| "owner could not rebind its own shared trace".to_owned())?;
+        Ok(Some((compiled, code)))
+    }
+
     pub fn trace(&self, id: TraceId) -> Option<&Trace> {
         self.compiled(id).map(|compiled| &compiled.trace)
     }
@@ -9636,13 +10348,42 @@ impl TracingJit {
         if self.options.hot_entry_threshold == 0 { return Ok(JitAction::Interpreted); }
         let location = runtime.trace_current_location();
         self.stats.entry_hits += 1;
-        let state = self.entries.entry(location).or_default();
-        if state.blacklisted { return Ok(JitAction::Blacklisted); }
-        if let Some(trace) = state.trace { return self.enter_compiled(runtime, trace); }
-        state.hotness = state.hotness.saturating_add(1);
-        if state.hotness < self.options.hot_entry_threshold.max(state.retry_after) {
-            return Ok(JitAction::Interpreted);
+        {
+            let state = self.entries.entry(location).or_default();
+            if state.blacklisted { return Ok(JitAction::Blacklisted); }
+            if let Some(trace) = state.trace { return self.enter_compiled(runtime, trace); }
+            state.hotness = state.hotness.saturating_add(1);
+            if state.hotness < self.options.hot_entry_threshold.max(state.retry_after) {
+                return Ok(JitAction::Interpreted);
+            }
         }
+
+        let repository_ticket = match self.claim_repository(SharedTraceKey::Entry(location)) {
+            SharedCompileClaim::Disabled => None,
+            SharedCompileClaim::Claimed(ticket) => Some(ticket),
+            SharedCompileClaim::Ready(code) => {
+                let version = code.version;
+                if let Some(id) = self.adopt_shared_code(runtime, code) {
+                    let state = self.entries.get_mut(&location).unwrap();
+                    state.trace = Some(id);
+                    state.repository_trace = Some(version);
+                    // Unlike a freshly recorded entry, adoption has not executed
+                    // the prefix yet, so native code can take over immediately.
+                    return self.enter_compiled(runtime, id);
+                }
+                self.stats.shared_repository_rebind_rejections = self
+                    .stats
+                    .shared_repository_rebind_rejections
+                    .saturating_add(1);
+                None
+            }
+            SharedCompileClaim::Busy(_busy) => {
+                if let Some(state) = self.entries.get_mut(&location) {
+                    state.hotness = self.options.hot_entry_threshold / 2;
+                }
+                return Ok(JitAction::Interpreted);
+            }
+        };
         let id = TraceId(self.next_trace_id);
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started += 1;
@@ -9679,23 +10420,76 @@ impl TracingJit {
                     ));
                     return Ok(JitAction::Blacklisted);
                 }
-                self.compile_trace(&trace).map_err(|error| error.to_string())
+                if let Some(ticket) = repository_ticket.as_ref() {
+                    match self.compile_shared_code(runtime, &trace, ticket) {
+                        Ok(Some((compiled, code))) => Ok((compiled, Some(code))),
+                        Ok(None) => self
+                            .compile_trace(&trace)
+                            .map(|compiled| (compiled, None))
+                            .map_err(|error| error.to_string()),
+                        Err(shared_error) => {
+                            self.stats.shared_repository_shared_compile_failures = self
+                                .stats
+                                .shared_repository_shared_compile_failures
+                                .saturating_add(1);
+                            self.compile_trace(&trace)
+                                .map(|compiled| (compiled, None))
+                                .map_err(|local_error| format!(
+                                    "shared compile failed: {shared_error}; private fallback failed: {local_error}"
+                                ))
+                        }
+                    }
+                } else {
+                    self.compile_trace(&trace)
+                        .map(|compiled| (compiled, None))
+                        .map_err(|error| error.to_string())
+                }
             }
             Err(RecordOutcome::Abort(reason)) => Err(reason.to_string()),
             Err(RecordOutcome::Fatal(error)) => return Err(error),
         };
         match result {
-            Ok(compiled) => {
+            Ok((mut compiled, published_code)) => {
+                let shared_id = repository_ticket.as_ref().map(SharedCompileTicket::version);
+                if compiled.shared_trace.is_none() {
+                    compiled.shared_trace = shared_id;
+                }
                 self.insert_compiled(id, compiled);
-                self.entries.get_mut(&location).unwrap().trace = Some(id);
+                let state = self.entries.get_mut(&location).unwrap();
+                state.trace = Some(id);
+                state.repository_trace = shared_id;
                 self.stats.traces_compiled += 1;
                 self.stats.entry_traces_compiled += 1;
+                if let Some(ticket) = repository_ticket {
+                    if let Some(code) = published_code {
+                        if jit_events_enabled() {
+                            eprintln!(
+                                "[napalm-jit] published shared {:?} generation {}",
+                                code.version.id, code.version.generation
+                            );
+                        }
+                        ticket.publish_shared(code);
+                        self.stats.shared_repository_shared_publications = self
+                            .stats
+                            .shared_repository_shared_publications
+                            .saturating_add(1);
+                    } else {
+                        ticket.publish_private();
+                        self.stats.shared_repository_private_publications = self
+                            .stats
+                            .shared_repository_private_publications
+                            .saturating_add(1);
+                    }
+                }
                 if jit_events_enabled() {
                     eprintln!("[napalm-jit] compiled entry {:?} at {:?}:{}", id, location.function, location.pc.0);
                 }
                 Ok(JitAction::Compiled { trace: id })
             }
             Err(reason) => {
+                if let Some(ticket) = repository_ticket {
+                    ticket.fail();
+                }
                 self.stats.recordings_aborted += 1;
                 self.stats.last_abort = Some(reason.clone());
                 let state = self.entries.get_mut(&location).unwrap();
@@ -9741,26 +10535,53 @@ impl TracingJit {
 
         self.stats.loop_header_hits += 1;
 
-        let state = self.loops.entry(key).or_default();
-        if !state.shared_primed
-            && shared_hotness >= self.options.hot_loop_threshold.max(1)
         {
-            state.shared_primed = true;
-            let threshold = self.options.hot_loop_threshold.max(state.retry_after).max(1);
-            state.hotness = state.hotness.max(threshold.saturating_sub(1));
-        }
-        if state.blacklisted {
-            return Ok(JitAction::Blacklisted);
+            let state = self.loops.entry(key).or_default();
+            if !state.shared_primed
+                && shared_hotness >= self.options.hot_loop_threshold.max(1)
+            {
+                state.shared_primed = true;
+                let threshold = self.options.hot_loop_threshold.max(state.retry_after).max(1);
+                state.hotness = state.hotness.max(threshold.saturating_sub(1));
+            }
+            if state.blacklisted {
+                return Ok(JitAction::Blacklisted);
+            }
+
+            if let Some(trace) = state.trace {
+                return self.enter_compiled(runtime, trace);
+            }
+
+            state.hotness = state.hotness.saturating_add(1);
+            if state.hotness < self.options.hot_loop_threshold.max(state.retry_after) {
+                return Ok(JitAction::Interpreted);
+            }
         }
 
-        if let Some(trace) = state.trace {
-            return self.enter_compiled(runtime, trace);
-        }
-
-        state.hotness = state.hotness.saturating_add(1);
-        if state.hotness < self.options.hot_loop_threshold.max(state.retry_after) {
-            return Ok(JitAction::Interpreted);
-        }
+        let repository_ticket = match self.claim_repository(SharedTraceKey::Loop(location)) {
+            SharedCompileClaim::Disabled => None,
+            SharedCompileClaim::Claimed(ticket) => Some(ticket),
+            SharedCompileClaim::Ready(code) => {
+                let version = code.version;
+                if let Some(id) = self.adopt_shared_code(runtime, code) {
+                    let state = self.loops.get_mut(&key).unwrap();
+                    state.trace = Some(id);
+                    state.repository_trace = Some(version);
+                    return self.enter_compiled(runtime, id);
+                }
+                self.stats.shared_repository_rebind_rejections = self
+                    .stats
+                    .shared_repository_rebind_rejections
+                    .saturating_add(1);
+                None
+            }
+            SharedCompileClaim::Busy(_busy) => {
+                if let Some(state) = self.loops.get_mut(&key) {
+                    state.hotness = self.options.hot_loop_threshold / 2;
+                }
+                return Ok(JitAction::Interpreted);
+            }
+        };
 
         let trace_id = TraceId(self.next_trace_id);
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
@@ -9770,6 +10591,9 @@ impl TracingJit {
         let trace = match recorder.record(runtime) {
             Ok(trace) => trace,
             Err(RecordOutcome::Abort(reason)) => {
+                if let Some(ticket) = repository_ticket {
+                    ticket.fail();
+                }
                 self.stats.last_abort = Some(reason.to_string());
                 self.stats.recordings_aborted += 1;
                 if jit_events_enabled() {
@@ -9824,9 +10648,37 @@ impl TracingJit {
         self.stats.trace_licm_hoisted += trace.stats.licm_hoisted as u64;
         self.stats.trace_pre_eliminated += trace.stats.pre_eliminated as u64;
 
-        let compiled = match self.compile_trace(&trace) {
+        let compile_result = if let Some(ticket) = repository_ticket.as_ref() {
+            match self.compile_shared_code(runtime, &trace, ticket) {
+                Ok(Some((compiled, code))) => Ok((compiled, Some(code))),
+                Ok(None) => self
+                    .compile_trace(&trace)
+                    .map(|compiled| (compiled, None)),
+                Err(shared_error) => {
+                    self.stats.shared_repository_shared_compile_failures = self
+                        .stats
+                        .shared_repository_shared_compile_failures
+                        .saturating_add(1);
+                    self.compile_trace(&trace).map(|compiled| (compiled, None)).map_err(|local_error| {
+                        TracingJitError::CraneliftLowering {
+                            trace: trace.id,
+                            message: format!(
+                                "shared compile failed: {shared_error}; private fallback failed: {local_error}"
+                            ),
+                        }
+                    })
+                }
+            }
+        } else {
+            self.compile_trace(&trace).map(|compiled| (compiled, None))
+        };
+
+        let (mut compiled, published_code) = match compile_result {
             Ok(compiled) => compiled,
             Err(error) => {
+                if let Some(ticket) = repository_ticket {
+                    ticket.fail();
+                }
                 self.stats.last_abort = Some(error.to_string());
                 if jit_events_enabled() {
                     eprintln!(
@@ -9850,9 +10702,38 @@ impl TracingJit {
             }
         };
 
+        let shared_id = repository_ticket.as_ref().map(SharedCompileTicket::version);
+        if compiled.shared_trace.is_none() {
+            compiled.shared_trace = shared_id;
+        }
         self.stats.traces_compiled += 1;
-        self.loops.get_mut(&key).unwrap().trace = Some(trace_id);
+        {
+            let state = self.loops.get_mut(&key).unwrap();
+            state.trace = Some(trace_id);
+            state.repository_trace = shared_id;
+        }
         self.insert_compiled(trace_id, compiled);
+        if let Some(ticket) = repository_ticket {
+            if let Some(code) = published_code {
+                if jit_events_enabled() {
+                    eprintln!(
+                        "[napalm-jit] published shared {:?} generation {}",
+                        code.version.id, code.version.generation
+                    );
+                }
+                ticket.publish_shared(code);
+                self.stats.shared_repository_shared_publications = self
+                    .stats
+                    .shared_repository_shared_publications
+                    .saturating_add(1);
+            } else {
+                ticket.publish_private();
+                self.stats.shared_repository_private_publications = self
+                    .stats
+                    .shared_repository_private_publications
+                    .saturating_add(1);
+            }
+        }
         if jit_events_enabled() {
             eprintln!(
                 "[napalm-jit] compiled {:?} at {:?}:{} (bytecodes={}, nodes={}, exits={}, phis={})",
@@ -9952,14 +10833,11 @@ impl TracingJit {
                 self.options.native_loop_iteration_budget
             };
 
-            let dispatcher = self
-                .backend
-                .as_ref()
-                .ok_or_else(|| TracingJitError::CraneliftLowering {
-                    trace: trace_id,
-                    message: "native backend disappeared".to_owned(),
-                })?
-                .dispatcher;
+            // The dispatcher is part of the executable ownership domain. Shared
+            // traces use the repository compiler's dispatcher; private traces use
+            // this worker's local backend. Either dispatcher can indirect-call a
+            // mixed local table of shared and private trace entry points.
+            let dispatcher = self.compiled(trace_id).unwrap().dispatcher;
 
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
             if matches!(self.compiled(trace_id).unwrap().trace.anchor.kind, TraceKind::Entry) {
@@ -10027,6 +10905,34 @@ impl TracingJit {
         close_at: TraceLocation,
         link_to: TraceId,
     ) -> Result<Option<TraceId>, TracingJitError> {
+        let root = self
+            .compiled(link_to)
+            .map(|compiled| compiled.trace.anchor.location)
+            .unwrap_or(close_at);
+        let repository_ticket = match self.claim_repository(SharedTraceKey::Side {
+            root,
+            start,
+            close_at,
+            parent_exit: parent_exit.0,
+        }) {
+            SharedCompileClaim::Disabled => None,
+            SharedCompileClaim::Claimed(ticket) => Some(ticket),
+            // Side traces still contain a local closing TraceId immediate. Phase 4
+            // shares root/entry machine code; side traces stay worker-private.
+            SharedCompileClaim::Ready(_code) => None,
+            SharedCompileClaim::Busy(_busy) => {
+                // `apply_side_exit` marks the edge attempted before calling us. A
+                // repository deferral is not a real attempt, so let this worker
+                // retry after the current global compiler releases the slot.
+                if let Some(compiled) = self.compiled_mut(parent) {
+                    if let Some(attempted) = compiled.side_trace_attempted.get_mut(parent_exit.0 as usize) {
+                        *attempted = false;
+                    }
+                }
+                return Ok(None);
+            }
+        };
+
         let trace_id = TraceId(self.next_trace_id);
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started = self.stats.recordings_started.saturating_add(1);
@@ -10035,6 +10941,9 @@ impl TracingJit {
         let trace = match recorder.record_side(runtime, close_at, link_to) {
             Ok(trace) => trace,
             Err(RecordOutcome::Abort(reason)) => {
+                if let Some(ticket) = repository_ticket {
+                    ticket.fail();
+                }
                 self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
                 self.stats.side_recordings_aborted = self.stats.side_recordings_aborted.saturating_add(1);
                 self.stats.last_abort = Some(reason.to_string());
@@ -10107,6 +11016,9 @@ impl TracingJit {
         let mut compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
             Err(error) => {
+                if let Some(ticket) = repository_ticket {
+                    ticket.fail();
+                }
                 self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
                 self.stats.side_recordings_aborted = self.stats.side_recordings_aborted.saturating_add(1);
                 self.stats.last_abort = Some(error.to_string());
@@ -10124,10 +11036,19 @@ impl TracingJit {
             .compiled(parent)
             .map(|compiled| compiled.tree_depth)
             .unwrap_or(0);
+        let shared_id = repository_ticket.as_ref().map(SharedCompileTicket::version);
         compiled.root_trace = link_to;
         compiled.tree_depth = parent_depth.saturating_add(1);
+        compiled.shared_trace = shared_id;
         self.insert_compiled(trace_id, compiled);
         self.stitch(parent, parent_exit, trace_id)?;
+        if let Some(ticket) = repository_ticket {
+            ticket.publish_private();
+            self.stats.shared_repository_private_publications = self
+                .stats
+                .shared_repository_private_publications
+                .saturating_add(1);
+        }
         self.stats.traces_compiled = self.stats.traces_compiled.saturating_add(1);
         self.stats.side_traces_compiled = self.stats.side_traces_compiled.saturating_add(1);
 
@@ -10530,7 +11451,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         activation.exit_id
     }
 
@@ -10620,7 +11541,7 @@ mod tests {
                 for initial in [42.0f64, -10.0] {
                     cell.0 = initial.to_bits();
                     activation.reset_result();
-                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     assert_eq!(f64::from_bits(cell.0), 7.0);
                     assert_eq!(f64::from_bits(registers[1].0), if budget == 1 { initial } else { 7.0 });
                 }
@@ -10711,7 +11632,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
-                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     let actual = f64::from_bits(general[1].0);
                     assert!(if expected.is_nan() { actual.is_nan() }
                         else { actual.to_bits() == expected.to_bits() },
@@ -10759,7 +11680,7 @@ mod tests {
                         // Failed entry specialization must leave all VM state intact.
                         general[0] = RegisterWord(TAG_TRUE);
                         let before = general.map(|v| v.0);
-                        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                         assert_eq!(general.map(|v| v.0), before);
                         general[0] = RegisterWord(0.0f64.to_bits());
                     }
@@ -10767,7 +11688,7 @@ mod tests {
                     // Finite test bound also catches a broken loop-carried PRE value.
                     for _ in 0..6 {
                         activation.reset_result();
-                        let result = unsafe { invoke_native_trace(&compiled, &mut activation) };
+                        let result = unsafe { invoke_native_trace(compiled, &mut activation) };
                         assert_eq!(result, TRACE_RESULT_SIDE_EXIT);
                         snapshots.push(general.map(|v| v.0));
                         let counter = if tagged { f64::from_bits(general[0].0) as u64 }
@@ -10916,7 +11837,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
@@ -10986,7 +11907,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0], RegisterWord(0x1111));
         assert_eq!(general[1], RegisterWord(0xdead_beef));
@@ -11073,7 +11994,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2], RegisterWord(0xfeed_face));
 
@@ -11085,7 +12006,7 @@ mod tests {
         );
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
         entry.kind.store(
@@ -11099,7 +12020,7 @@ mod tests {
         entry.len.store(10, Ordering::Relaxed);
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
 
@@ -11108,7 +12029,7 @@ mod tests {
         entry.len.store(9, Ordering::Relaxed);
         entry.kind.store(TraceHeapKind::List as u32, Ordering::Release);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
     }
@@ -11169,7 +12090,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[1], answer);
 
@@ -11180,7 +12101,7 @@ mod tests {
         );
         activation.reset_result();
         general[1] = RegisterWord(0);
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
     }
 
@@ -11321,7 +12242,7 @@ mod tests {
 
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(3);
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2].0 as u32 as i32, 7);
 
@@ -11329,9 +12250,111 @@ mod tests {
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(0);
         general[2] = RegisterWord(0xdead_beef);
-        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, invalid.0);
         assert_eq!(general[2].0, 0xdead_beef);
     }
+
+    #[test]
+    fn phase4_repository_returns_the_exact_published_shared_generation() {
+        let repository = SharedJitRepository::new();
+        let location = TraceLocation::new(FuncId(3), BytecodePc(5));
+        let key = SharedTraceKey::Loop(location);
+        let config = SharedJitConfigKey::from_options(&TracingJitOptions::default());
+        let ticket = match repository.try_claim(key, config, 0) {
+            SharedCompileClaim::Claimed(ticket) => ticket,
+            _ => panic!("first shared publication must own the slot"),
+        };
+        let version = ticket.version();
+        let mut builder = crate::napalm_trace_ir::TraceBuilder::new(
+            TraceId(0),
+            TraceAnchor { kind: TraceKind::Loop, location },
+        );
+        builder.set_terminator(TraceTerminator::RuntimeReturn);
+        let trace = builder.finish().unwrap();
+        let code = Arc::new(SharedCompiledCode {
+            version,
+            trace,
+            entry_addr: 1,
+            dispatcher_addr: 1,
+            binding_keys: Vec::new().into_boxed_slice(),
+            bindings: Vec::new().into_boxed_slice(),
+            exits: Vec::new(),
+            debug_text: None,
+        });
+        ticket.publish_shared(code.clone());
+
+        match repository.try_claim(key, config, 1) {
+            SharedCompileClaim::Ready(adopted) => {
+                assert_eq!(adopted.version, version);
+                assert!(Arc::ptr_eq(&adopted, &code));
+            }
+            _ => panic!("published portable code must be returned without a new compile claim"),
+        }
+    }
+
+    #[test]
+    fn phase4_repository_serializes_private_compile_claims_and_reuses_site_identity() {
+        let repository = SharedJitRepository::new();
+        let location = TraceLocation::new(FuncId(7), BytecodePc(13));
+        let key = SharedTraceKey::Loop(location);
+        let config = SharedJitConfigKey::from_options(&TracingJitOptions::default());
+
+        let first = match repository.try_claim(key, config, 0) {
+            SharedCompileClaim::Claimed(ticket) => ticket,
+            SharedCompileClaim::Busy(_) => panic!("first worker must win an idle repository slot"),
+            SharedCompileClaim::Ready(_) | SharedCompileClaim::Disabled => unreachable!(),
+        };
+        let first_version = first.version();
+        assert_eq!(first_version.generation, 1);
+
+        match repository.try_claim(key, config, 1) {
+            SharedCompileClaim::Busy(id) => assert_eq!(id, first_version.id),
+            SharedCompileClaim::Claimed(_) => panic!("second worker must not compile concurrently"),
+            SharedCompileClaim::Ready(_) | SharedCompileClaim::Disabled => unreachable!(),
+        }
+
+        // Dropping an unfinished ticket releases the slot. This models recording
+        // aborts and early errors that leave baseline execution authoritative.
+        drop(first);
+        let second = match repository.try_claim(key, config, 1) {
+            SharedCompileClaim::Claimed(ticket) => ticket,
+            SharedCompileClaim::Busy(_) => panic!("released slot must be claimable"),
+            SharedCompileClaim::Ready(_) | SharedCompileClaim::Disabled => unreachable!(),
+        };
+        let second_version = second.version();
+        assert_eq!(second_version.id, first_version.id);
+        assert_eq!(second_version.generation, 2);
+        second.publish_private();
+
+        // PRIVATE_READY remains claimable in Phase 4: it means the previous
+        // recording contained a deliberately non-portable binding (for example a
+        // dynamic Map shape), so another worker still needs a private copy.
+        let third = match repository.try_claim(key, config, 2) {
+            SharedCompileClaim::Claimed(ticket) => ticket,
+            SharedCompileClaim::Busy(_) => panic!("private-ready slot must be claimable"),
+            SharedCompileClaim::Ready(_) | SharedCompileClaim::Disabled => unreachable!(),
+        };
+        let third_version = third.version();
+        assert_eq!(third_version.id, first_version.id);
+        assert_eq!(third_version.generation, 3);
+        third.publish_private();
+        assert_eq!(repository.slot_count(), 1);
+
+        // A worker using materially different recording/codegen options must not
+        // adopt the first configuration's slot or executable generation.
+        let mut other_config = config;
+        other_config.native_loop_iteration_budget =
+            other_config.native_loop_iteration_budget.saturating_add(1);
+        let different = match repository.try_claim(key, other_config, 3) {
+            SharedCompileClaim::Claimed(ticket) => ticket,
+            SharedCompileClaim::Busy(_) => panic!("different JIT config must have its own slot"),
+            SharedCompileClaim::Ready(_) | SharedCompileClaim::Disabled => unreachable!(),
+        };
+        assert_ne!(different.trace_id(), first_version.id);
+        different.publish_private();
+        assert_eq!(repository.slot_count(), 2);
+    }
+
 
 }

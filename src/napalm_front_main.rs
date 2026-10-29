@@ -1320,7 +1320,11 @@ impl<'a> Parser<'a> {
             };
             self.lines();
             StmtKind::Defer {
-                body: Box::new(self.block()?),
+                // `defer` and `errdefer` accept either a block or any single
+                // statement. `statement()` already handles `{ ... }`, so this
+                // keeps block syntax while also supporting concise forms such as
+                // `defer cleanup();` and `errdefer (error) report(error);`.
+                body: Box::new(self.statement()?),
                 error_only,
                 error_binding,
             }
@@ -3824,6 +3828,31 @@ mod napalm_syntax_tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("rest parameters are not implemented yet")));
+    }
+
+    #[test]
+    fn parses_defer_and_errdefer_with_block_or_single_statement() {
+        let module = assert_parses(r#"
+            function work(fail) {
+                defer System.print("single defer");
+                errdefer System.print("single errdefer");
+                errdefer (error) System.print(error);
+                defer {
+                    System.print("block defer");
+                }
+
+                if (fail) {
+                    throw "boom";
+                }
+            }
+
+            for (let i = 0; i < 2; i = i + 1) {
+                defer System.print(i);
+                System.print(i);
+            }
+        "#);
+
+        assert!(!module.statements.is_empty());
     }
 
     #[test]

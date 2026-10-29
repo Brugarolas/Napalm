@@ -25,6 +25,7 @@ parking_lot = "0.13.0" # Concurrency primitives
 #archery = "1.2.1" # Faster Arc
 triomphe = "0.1.14" # Faster Arc
 rclite = "0.4.2" # Optimized Rc for memory usage
+chrono = "0.4.45" # Date and time library for Rust
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
 
 libffi = "5.2.0" # Native C calls
