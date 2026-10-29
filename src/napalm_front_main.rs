@@ -124,6 +124,13 @@ enum BindingPattern {
     Default { pattern: Box<BindingPattern>, value: Expr },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnumMemberValueKind {
+    NumericConstant,
+    String,
+    ComputedNumeric,
+}
+
 impl BindingPattern {
     fn span(&self) -> Span {
         match self {
@@ -627,6 +634,7 @@ impl<'a> Parser<'a> {
             && !self.at("class")
             && !self.at("abstract")
             && !self.at("interface")
+            && !self.at("enum")
             && !self.at("function")
             && !(self.at("async") && matches!(self.next_text(), "function" | "concurrent"))
             && !(self.at("concurrent") && matches!(self.next_text(), "function" | "async"))
@@ -771,14 +779,16 @@ impl<'a> Parser<'a> {
             return self.error("unsupported `declare` declaration");
         }
 
-        if self.at("enum") || self.at("namespace") {
+        if self.at("namespace") {
             return self.error(format!(
                 "`{}` is recognized TypeScript syntax but is not lowered yet",
                 self.text()
             ));
         }
 
-        let mut out = if self.at("let") || self.at("const") || self.at("var") {
+        let mut out = if self.eat("enum") {
+            self.enum_declaration(start)?
+        } else if self.at("let") || self.at("const") || self.at("var") {
             let immutable = self.eat("const");
             if !immutable {
                 self.bump();
@@ -954,6 +964,153 @@ impl<'a> Parser<'a> {
         }
         self.error(format!("unterminated `{open}` ... `{close}` block"))
     }
+    fn enum_declaration(&mut self, start: usize) -> Result<Vec<Stmt>> {
+        let name = self.ident()?;
+        self.immutable.insert(name.span);
+        self.lines();
+        self.expect("{")?;
+        self.lines();
+
+        let mut out = Vec::new();
+        let empty_map = Expr::new(ExprKind::Map(Vec::new()), name.span);
+        out.push(Stmt {
+            kind: StmtKind::Variable {
+                name: name.clone(),
+                annotation: None,
+                initializer: Some(empty_map),
+            },
+            span: Span::new(start, name.span.end),
+        });
+
+        let mut previous_name: Option<(String, Span)> = None;
+        let mut previous_kind: Option<EnumMemberValueKind> = None;
+        let mut member_kinds: HashMap<String, EnumMemberValueKind> = HashMap::default();
+        let mut member_names: HashSet<String> = HashSet::default();
+
+        while !self.at("}") {
+            let (member_name, member_span) = if self.peek().kind == Kind::Word {
+                let ident = self.ident()?;
+                (ident.value, ident.span)
+            } else if self.peek().kind == Kind::String {
+                let expr = self.string_expr()?;
+                let ExprKind::String(bytes) = expr.kind else {
+                    return self.error("enum member names cannot be interpolated");
+                };
+                let member_name = String::from_utf8(bytes).map_err(|_| {
+                    self.diagnostics.push(Diagnostic::error(
+                        "NAPALM-P001",
+                        "enum member names must be valid UTF-8",
+                        expr.span,
+                    ));
+                })?;
+                (member_name, expr.span)
+            } else {
+                return self.error("expected enum member name");
+            };
+
+            if !member_names.insert(member_name.clone()) {
+                return self.error(format!("duplicate enum member '{member_name}'"));
+            }
+
+            self.lines();
+            let (mut value, value_kind) = if self.eat("=") {
+                self.lines();
+                let mut value = self.expr(0)?;
+                let kind = enum_initializer_kind(&value, &member_kinds);
+                rewrite_enum_member_references(&mut value, &name, &member_names, &member_name);
+                (value, kind)
+            } else if let Some((previous, previous_span)) = &previous_name {
+                match previous_kind {
+                    Some(EnumMemberValueKind::NumericConstant) => {
+                        let previous_value = enum_member_read(&name, previous, *previous_span);
+                        let one = Expr::new(ExprKind::Number(1.0), member_span);
+                        (
+                            Expr::new(
+                                ExprKind::Binary {
+                                    left: Box::new(previous_value),
+                                    operator: BinaryOp::Add,
+                                    right: Box::new(one),
+                                },
+                                member_span,
+                            ),
+                            EnumMemberValueKind::NumericConstant,
+                        )
+                    }
+                    Some(EnumMemberValueKind::String | EnumMemberValueKind::ComputedNumeric) => {
+                        return self.error(format!(
+                            "enum member '{member_name}' needs an initializer after a non-constant numeric member"
+                        ));
+                    }
+                    None => unreachable!(),
+                }
+            } else {
+                (
+                    Expr::new(ExprKind::Number(0.0), member_span),
+                    EnumMemberValueKind::NumericConstant,
+                )
+            };
+
+            // Rewrite references once more after auto-generation. This is a no-op
+            // for generated values, but keeps the path uniform for future forms.
+            rewrite_enum_member_references(&mut value, &name, &member_names, &member_name);
+
+            let forward_target = enum_member_target(&name, &member_name, member_span);
+            let forward = Expr::new(
+                ExprKind::Assign {
+                    target: Box::new(forward_target),
+                    value: Box::new(value),
+                },
+                member_span,
+            );
+            out.push(Stmt {
+                kind: StmtKind::Expression(forward),
+                span: member_span,
+            });
+
+            if value_kind != EnumMemberValueKind::String {
+                let reverse_key = enum_member_read(&name, &member_name, member_span);
+                let reverse_target = enum_dynamic_target(&name, reverse_key, member_span);
+                let reverse_value = Expr::new(
+                    ExprKind::String(member_name.as_bytes().to_vec()),
+                    member_span,
+                );
+                let reverse = Expr::new(
+                    ExprKind::Assign {
+                        target: Box::new(reverse_target),
+                        value: Box::new(reverse_value),
+                    },
+                    member_span,
+                );
+                out.push(Stmt {
+                    kind: StmtKind::Expression(reverse),
+                    span: member_span,
+                });
+            }
+
+            member_kinds.insert(member_name.clone(), value_kind);
+            previous_name = Some((member_name, member_span));
+            previous_kind = Some(value_kind);
+
+            self.lines();
+            if self.eat(",") {
+                self.lines();
+                if self.at("}") {
+                    break;
+                }
+            } else if !self.at("}") {
+                return self.error("expected `,` or `}` after enum member");
+            }
+        }
+
+        self.expect("}")?;
+        self.eat(";");
+        let end = self.tokens.get(self.pos.saturating_sub(1)).map_or(name.span.end, |token| token.span.end);
+        if let Some(first) = out.first_mut() {
+            first.span = Span::new(start, end);
+        }
+        Ok(out)
+    }
+
     fn variables(&mut self, immutable: bool) -> Result<Vec<Stmt>> {
         let mut out = Vec::new();
         loop {
@@ -3243,6 +3400,193 @@ fn synthesize_class_property(
     (getter, setter, assignment)
 }
 
+fn enum_name_expr(enum_name: &Ident, span: Span) -> Expr {
+    Expr::new(
+        ExprKind::Name(Spanned::new(enum_name.value.clone(), span)),
+        span,
+    )
+}
+
+fn enum_string_key(name: &str, span: Span) -> Expr {
+    Expr::new(ExprKind::String(name.as_bytes().to_vec()), span)
+}
+
+fn enum_dynamic_target(enum_name: &Ident, key: Expr, span: Span) -> Expr {
+    Expr::new(
+        ExprKind::Subscript {
+            receiver: Box::new(enum_name_expr(enum_name, span)),
+            args: vec![key],
+        },
+        span,
+    )
+}
+
+fn enum_member_target(enum_name: &Ident, member: &str, span: Span) -> Expr {
+    enum_dynamic_target(enum_name, enum_string_key(member, span), span)
+}
+
+fn enum_member_read(enum_name: &Ident, member: &str, span: Span) -> Expr {
+    enum_member_target(enum_name, member, span)
+}
+
+fn enum_initializer_kind(
+    expr: &Expr,
+    prior: &HashMap<String, EnumMemberValueKind>,
+) -> EnumMemberValueKind {
+    match &expr.kind {
+        ExprKind::String(_) => EnumMemberValueKind::String,
+        ExprKind::Number(_) => EnumMemberValueKind::NumericConstant,
+        ExprKind::Name(name) => prior
+            .get(&name.value)
+            .copied()
+            .unwrap_or(EnumMemberValueKind::ComputedNumeric),
+        ExprKind::Grouped(inner) => enum_initializer_kind(inner, prior),
+        ExprKind::Unary { operator, operand } => {
+            let operand = enum_initializer_kind(operand, prior);
+            if operand == EnumMemberValueKind::NumericConstant
+                && matches!(operator, UnaryOp::Negate | UnaryOp::Complement)
+            {
+                EnumMemberValueKind::NumericConstant
+            } else {
+                EnumMemberValueKind::ComputedNumeric
+            }
+        }
+        ExprKind::Binary { left, operator, right } => {
+            let left = enum_initializer_kind(left, prior);
+            let right = enum_initializer_kind(right, prior);
+            if left == EnumMemberValueKind::NumericConstant
+                && right == EnumMemberValueKind::NumericConstant
+                && matches!(
+                    operator,
+                    BinaryOp::Power
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Modulo
+                        | BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitXor
+                        | BinaryOp::BitOr
+                )
+            {
+                EnumMemberValueKind::NumericConstant
+            } else {
+                EnumMemberValueKind::ComputedNumeric
+            }
+        }
+        _ => EnumMemberValueKind::ComputedNumeric,
+    }
+}
+
+fn rewrite_enum_member_references(
+    expr: &mut Expr,
+    enum_name: &Ident,
+    members: &HashSet<String>,
+    current_member: &str,
+) {
+    match &mut expr.kind {
+        ExprKind::Name(name) if name.value != current_member && members.contains(&name.value) => {
+            let member = name.value.clone();
+            let span = name.span;
+            *expr = enum_member_read(enum_name, &member, span);
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Grouped(operand)
+        | ExprKind::Await(operand)
+        | ExprKind::Launch(operand)
+        | ExprKind::DestructureCheck { source: operand, .. }
+        | ExprKind::Spread(operand) => {
+            rewrite_enum_member_references(operand, enum_name, members, current_member);
+        }
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Logical { left, right, .. }
+        | ExprKind::DestructureGet { source: left, key: right }
+        | ExprKind::DestructureRest { source: left, key: right } => {
+            rewrite_enum_member_references(left, enum_name, members, current_member);
+            rewrite_enum_member_references(right, enum_name, members, current_member);
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            rewrite_enum_member_references(condition, enum_name, members, current_member);
+            rewrite_enum_member_references(then_expr, enum_name, members, current_member);
+            rewrite_enum_member_references(else_expr, enum_name, members, current_member);
+        }
+        ExprKind::Assign { target, value }
+        | ExprKind::Update { target, value, .. }
+        | ExprKind::LogicalAssign { target, value, .. } => {
+            rewrite_enum_member_references(target, enum_name, members, current_member);
+            rewrite_enum_member_references(value, enum_name, members, current_member);
+        }
+        ExprKind::Invoke(invoke) => {
+            if let Some(receiver) = &mut invoke.receiver {
+                rewrite_enum_member_references(receiver, enum_name, members, current_member);
+            }
+            for arg in &mut invoke.args {
+                rewrite_enum_member_references(arg, enum_name, members, current_member);
+            }
+        }
+        ExprKind::Subscript { receiver, args } => {
+            rewrite_enum_member_references(receiver, enum_name, members, current_member);
+            for arg in args {
+                rewrite_enum_member_references(arg, enum_name, members, current_member);
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                rewrite_enum_member_references(item, enum_name, members, current_member);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for entry in entries {
+                rewrite_enum_member_references(&mut entry.key, enum_name, members, current_member);
+                rewrite_enum_member_references(&mut entry.value, enum_name, members, current_member);
+            }
+        }
+        ExprKind::InterpolatedString(parts) => {
+            for part in parts {
+                if let StringPart::Expression(value) = part {
+                    rewrite_enum_member_references(value, enum_name, members, current_member);
+                }
+            }
+        }
+        ExprKind::OptionalChain { base, segments } => {
+            rewrite_enum_member_references(base, enum_name, members, current_member);
+            for segment in segments {
+                match segment {
+                    OptionalChainSegment::Property { call_args, .. } => {
+                        if let Some(args) = call_args {
+                            for arg in args {
+                                rewrite_enum_member_references(arg, enum_name, members, current_member);
+                            }
+                        }
+                    }
+                    OptionalChainSegment::Subscript { key, .. } => {
+                        rewrite_enum_member_references(key, enum_name, members, current_member);
+                    }
+                    OptionalChainSegment::Call { args, .. } => {
+                        for arg in args {
+                            rewrite_enum_member_references(arg, enum_name, members, current_member);
+                        }
+                    }
+                }
+            }
+        }
+        ExprKind::Closure(_)
+        | ExprKind::AsyncClosure(_)
+        | ExprKind::ConcurrentClosure(_)
+        | ExprKind::Null
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Name(_)
+        | ExprKind::Field(_)
+        | ExprKind::StaticField(_)
+        | ExprKind::This
+        | ExprKind::Super(_) => {}
+    }
+}
+
 fn invoke(receiver: Expr, name: &str, args: Vec<Expr>, span: Span) -> Expr {
     Expr::new(
         ExprKind::Invoke(InvokeExpr {
@@ -3828,6 +4172,37 @@ mod napalm_syntax_tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("rest parameters are not implemented yet")));
+    }
+
+    #[test]
+    fn parses_runtime_enums_as_ordered_map_initialization() {
+        let module = assert_parses(r#"
+            enum Color { Red, Green, Blue }
+            enum Status { Pending = 10, Running, Failed = -1, Done = 20 }
+            enum Direction { Up = "up", Down = "down" }
+
+            function local_enum() {
+                enum State { Start = 3, Next, End = Next + 5 }
+                return function () { return [State.Start, State.Next, State.End]; };
+            }
+        "#);
+
+        // Each enum begins with one binding. Numeric members add forward and
+        // reverse assignments; string members only add the forward assignment.
+        assert!(matches!(module.statements[0].kind, StmtKind::Variable { .. }));
+        assert!(matches!(module.statements[1].kind, StmtKind::Expression(_)));
+        assert!(matches!(module.statements[2].kind, StmtKind::Expression(_)));
+        assert!(!module.statements.is_empty());
+    }
+
+    #[test]
+    fn enum_auto_increment_after_string_member_requires_initializer() {
+        let parsed = parse("enum.np", r#"enum Bad { A = "a", B }"#);
+        assert!(parsed.has_errors());
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("needs an initializer")));
     }
 
     #[test]
