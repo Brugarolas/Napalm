@@ -262,8 +262,13 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             };
             direct(K::List(element))
         }
+        ExprKind::ListComprehension { element, .. } => {
+            let element = infer_surface_type_annotation(element).map(Box::new);
+            direct(K::List(element))
+        }
         ExprKind::Map(_) => direct(K::Map),
         ExprKind::Closure(_) | ExprKind::AsyncClosure(_) | ExprKind::ConcurrentClosure(_) => direct(K::Closure),
+        ExprKind::TypedCollection { annotation, .. } => Some(annotation.clone()),
         ExprKind::Grouped(inner) => infer_surface_type_annotation(inner),
         ExprKind::Unary { operator, operand } => match operator {
             UnaryOp::Not => direct(K::Bool),
@@ -367,7 +372,8 @@ fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Ty
         TypeAnnotationKind::Named(n) => known.contains_key(n),
         TypeAnnotationKind::Opaque(_) => false,
         TypeAnnotationKind::Object(fields) => fields.iter().all(|f| supported_interface_annotation(&f.annotation, known)),
-        TypeAnnotationKind::List(Some(t)) => supported_interface_annotation(t, known),
+        TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => supported_interface_annotation(t, known),
+        TypeAnnotationKind::GenericMap(k, v) => supported_interface_annotation(k, known) && supported_interface_annotation(v, known),
         TypeAnnotationKind::Union(ts) => ts.iter().all(|t| supported_interface_annotation(t, known)),
         _ => true,
     }
@@ -384,9 +390,10 @@ fn supported_alias_annotation(
         TypeAnnotationKind::Object(fields) => fields
             .iter()
             .all(|field| supported_alias_annotation(&field.annotation, known, type_params)),
-        TypeAnnotationKind::List(Some(element)) => {
+        TypeAnnotationKind::List(Some(element)) | TypeAnnotationKind::Set(Some(element)) => {
             supported_alias_annotation(element, known, type_params)
         }
+        TypeAnnotationKind::GenericMap(k, v) => supported_alias_annotation(k, known, type_params) && supported_alias_annotation(v, known, type_params),
         TypeAnnotationKind::Union(types) => types
             .iter()
             .all(|ty| supported_alias_annotation(ty, known, type_params)),
@@ -397,7 +404,8 @@ fn supported_alias_annotation(
 fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
     match &annotation.kind {
         TypeAnnotationKind::Object(_) => !supported_interface_annotation(annotation, known),
-        TypeAnnotationKind::List(Some(t)) => invalid_structural_annotation(t, known),
+        TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => invalid_structural_annotation(t, known),
+        TypeAnnotationKind::GenericMap(k, v) => invalid_structural_annotation(k, known) || invalid_structural_annotation(v, known),
         TypeAnnotationKind::Union(ts) => ts.iter().any(|t| invalid_structural_annotation(t, known)),
         _ => false,
     }
@@ -422,6 +430,10 @@ fn resolve_type_annotation(
             Type::List(Some(Box::new(resolve_type_annotation(element, classes, interfaces))))
         }
         K::Map => Type::Map,
+        K::GenericMap(k, v) => Type::GenericMap(
+            Box::new(resolve_type_annotation(k, classes, interfaces)),
+            Box::new(resolve_type_annotation(v, classes, interfaces))),
+        K::Set(element) => Type::Set(element.as_ref().map(|t| Box::new(resolve_type_annotation(t, classes, interfaces)))),
         K::Object(fields) => Type::Interface(fields.iter().map(|field| ir::InterfaceFieldType {
             name: field.name.value.clone(),
             ty: resolve_type_annotation(&field.annotation, classes, interfaces),
@@ -435,6 +447,7 @@ fn resolve_type_annotation(
             "Fiber" => Type::Fiber,
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
+            "Set" => Type::Set(None),
             "Object" => Type::Top,
             "Array" | "List" => Type::List(None),
             class_name => classes
@@ -481,7 +494,7 @@ fn requires_runtime_contract(ty: &Type) -> bool {
     match ty {
         // Structural objects and typed Lists carry persistent runtime contracts so
         // aliases through `any` cannot bypass later writes.
-        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => true,
+        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
         _ => false,
     }
@@ -545,6 +558,7 @@ fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Interface(_) | Type::Record(_), Type::Map | Type::Interface(_) | Type::Record(_)) => true,
             (Type::List(Some(e)), Type::List(Some(a))) => may_satisfy(e, a),
+            (Type::GenericMap(_, _), Type::Map) | (Type::Set(Some(_)), Type::Set(None)) => true,
             (e, Type::Union(ts)) => ts.iter().all(|a| may_satisfy(e, a)),
             (Type::Union(ts), a) => ts.iter().any(|e| may_satisfy(e, a)),
             _ => expected.accepts(actual),
@@ -565,6 +579,9 @@ fn display_source_type(ty: &Type) -> String {
         Type::List(None) => "any[]".to_owned(),
         Type::List(Some(element)) => format!("{}[]", display_source_type(element)),
         Type::Map => "Map".to_owned(),
+        Type::GenericMap(k, v) => format!("Map<{}, {}>", display_source_type(k), display_source_type(v)),
+        Type::Set(None) => "Set".to_owned(),
+        Type::Set(Some(t)) => format!("Set<{}>", display_source_type(t)),
         Type::Interface(_) => "interface".to_owned(),
         Type::Record(_) => "type".to_owned(),
         Type::Range => "Range".to_owned(),
@@ -596,6 +613,9 @@ fn display_type_annotation(annotation: &TypeAnnotation) -> String {
         K::List(None) => "any[]".to_owned(),
         K::List(Some(element)) => format!("{}[]", display_type_annotation(element)),
         K::Map => "Map".to_owned(),
+        K::GenericMap(k, v) => format!("Map<{}, {}>", display_type_annotation(k), display_type_annotation(v)),
+        K::Set(None) => "Set".to_owned(),
+        K::Set(Some(t)) => format!("Set<{}>", display_type_annotation(t)),
         K::Object(_) => "object interface".to_owned(),
         K::Closure => "Function".to_owned(),
         K::Named(name) | K::Opaque(name) => name.clone(),
@@ -821,6 +841,20 @@ impl<'ast> Analyzer<'ast> {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    fn iterable_element_source_type(&self, expr: &Expr) -> Option<TypeAnnotation> {
+        let annotation = match &expr.kind {
+            ExprKind::Name(name) => self
+                .resolve(&name.value)
+                .and_then(|binding| self.analysis.bindings[binding.0 as usize].source_type.clone()),
+            ExprKind::Grouped(inner) => return self.iterable_element_source_type(inner),
+            _ => infer_surface_type_annotation(expr),
+        }?;
+        match annotation.kind {
+            TypeAnnotationKind::List(Some(element)) => Some(*element),
+            _ => None,
+        }
+    }
+
     fn note_binding_use(&mut self, ident: &Ident, write: bool) {
         let Some(binding) = self.resolve(&ident.value) else {
             if is_implicit_receiver_name(&ident.value) {
@@ -1019,13 +1053,32 @@ impl<'ast> Analyzer<'ast> {
                     self.visit_expr(item);
                 }
             }
+            ExprKind::ListComprehension { element, clauses } => {
+                let mut scopes = 0usize;
+                for clause in clauses {
+                    // The iterable sees bindings introduced by earlier clauses,
+                    // but never its own binding. Filters do see the new binding.
+                    self.visit_expr(&clause.iterable);
+                    let source_type = self.iterable_element_source_type(&clause.iterable);
+                    self.push_scope();
+                    scopes += 1;
+                    self.declare_typed(&clause.binding, source_type);
+                    for filter in &clause.filters {
+                        self.visit_expr(filter);
+                    }
+                }
+                self.visit_expr(element);
+                for _ in 0..scopes {
+                    self.pop_scope();
+                }
+            }
             ExprKind::Map(entries) => {
                 for entry in entries {
                     self.visit_expr(&entry.key);
                     self.visit_expr(&entry.value);
                 }
             }
-            ExprKind::Grouped(inner) => self.visit_expr(inner),
+            ExprKind::TypedCollection { expression: inner, .. } | ExprKind::Grouped(inner) => self.visit_expr(inner),
             ExprKind::Unary { operand, .. } => self.visit_expr(operand),
             ExprKind::DestructureGet { source: left, key: right }
             | ExprKind::DestructureRest { source: left, key: right }
@@ -3725,7 +3778,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             ExprKind::This => self.lower_this(expr.span),
             ExprKind::Super(super_expr) => self.lower_super(super_expr, expr.span),
             ExprKind::List(items) => self.lower_list(items),
+            ExprKind::ListComprehension { element, clauses } => {
+                self.lower_list_comprehension(element, clauses)
+            }
             ExprKind::Map(entries) => self.lower_map(entries),
+            ExprKind::TypedCollection { expression, annotation } => {
+                let value = self.lower_expr(expression);
+                let expected = resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types);
+                self.bind_interface(value, &expected)
+            }
             ExprKind::Grouped(inner) => self.lower_expr(inner),
             ExprKind::Unary { operator, operand } => self.lower_unary(*operator, operand),
             ExprKind::Binary {
@@ -3865,12 +3926,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 );
                 return self.builder.const_null();
             }
+            let ty = self
+                .context
+                .module_binding_types
+                .get(&name.value)
+                .map(|binding| binding.expected.clone())
+                .unwrap_or(Type::Top);
             return self.builder.emit1(
                 Inst::LoadModuleVar {
                     module: self.context.module,
                     slot,
                 },
-                Type::Top,
+                ty,
             );
         }
         self.error(
@@ -4034,6 +4101,213 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 .refine_value_type(list, Type::List(Some(Box::new(element))));
         }
         list
+    }
+
+    fn lower_list_comprehension(
+        &mut self,
+        element: &Expr,
+        clauses: &[front::ListComprehensionClause],
+    ) -> ValueId {
+        let list = self.builder.emit1(
+            Inst::AllocList { capacity: None },
+            Type::List(None),
+        );
+
+        // The parser always produces at least one clause, but keeping this path
+        // total makes synthesized ASTs and future transforms safe.
+        if clauses.is_empty() {
+            let value = self.lower_expr(element);
+            let ty = semantic_source_type(self.builder.value_type(value));
+            self.builder.emit0(Inst::ListAppend { list, value });
+            if !type_is_unknown(&ty) {
+                self.builder
+                    .refine_value_type(list, Type::List(Some(Box::new(ty))));
+            }
+            return list;
+        }
+
+        if let Some(element_type) =
+            self.lower_list_comprehension_clause(list, element, clauses, 0)
+        {
+            if !type_is_unknown(&element_type) {
+                self.builder.refine_value_type(
+                    list,
+                    Type::List(Some(Box::new(element_type))),
+                );
+            }
+        }
+        list
+    }
+
+    /// Lower one comprehension clause as an ordinary iterator-protocol loop.
+    /// Nested clauses recurse from the current loop body, which means their
+    /// iterable expression is re-evaluated once per enclosing item exactly as
+    /// source semantics require. No closure or temporary collection is created.
+    fn lower_list_comprehension_clause(
+        &mut self,
+        list: ValueId,
+        element: &Expr,
+        clauses: &[front::ListComprehensionClause],
+        clause_index: usize,
+    ) -> Option<Type> {
+        let clause = &clauses[clause_index];
+        let sequence = self.lower_expr(&clause.iterable);
+        let base_env = self.env.clone();
+        let carried = self.comprehension_carried_bindings(element, clauses, clause_index);
+        let iterator_initial = self.builder.const_null();
+
+        let header = self.new_block(&[]);
+        let iterator_param = self.builder.add_block_param(header, Type::Top);
+        let mut header_params = HashMap::default();
+        for binding in &carried {
+            let ty = self.binding_flow_type(*binding, &base_env);
+            header_params.insert(*binding, self.builder.add_block_param(header, ty));
+        }
+
+        let body = self.new_block(&[]);
+        let exit = self.new_block(&[]);
+        let mut exit_params = HashMap::default();
+        for binding in &carried {
+            let ty = self.binding_flow_type(*binding, &base_env);
+            exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
+        }
+
+        let mut entry_args = vec![iterator_initial];
+        entry_args.extend(self.values_for_bindings(&carried, &base_env));
+        self.builder.jump(header, entry_args);
+        self.builder.seal_block(header);
+        self.builder.position_at(header);
+        self.env = base_env.clone();
+        for binding in &carried {
+            self.env
+                .insert(*binding, Storage::Value(header_params[binding]));
+        }
+
+        let iterate = self.context.symbols.expect("iterate", MethodKind::Method, 1);
+        let iterator = self.builder.invoke(sequence, iterate, vec![iterator_param]);
+        let false_args = self.values_for_bindings(&carried, &self.env);
+        self.builder
+            .branch(iterator, body, Vec::new(), exit, false_args);
+
+        self.builder.position_at(body);
+        let iterator_value = self
+            .context
+            .symbols
+            .expect("iteratorValue", MethodKind::Method, 1);
+        let item = self
+            .builder
+            .invoke(sequence, iterator_value, vec![iterator]);
+        if let Some(binding) = self
+            .context
+            .analysis
+            .declaration_map
+            .get(&clause.binding.span)
+            .copied()
+        {
+            // When the iterable has a retained element annotation (for example
+            // `Person[]`), make the comprehension variable a real typed boundary.
+            // Module globals are also loaded with their retained type, so this
+            // remains true for top-level comprehensions over typed collections.
+            if !self.binding_types.contains_key(&binding) {
+                if let Type::List(Some(element)) =
+                    semantic_source_type(self.builder.value_type(sequence))
+                {
+                    self.binding_types.insert(
+                        binding,
+                        StaticBindingType {
+                            expected: (*element).clone(),
+                            origin: clause.binding.span,
+                            display: display_source_type(&element),
+                        },
+                    );
+                }
+            }
+            // The guard both protects untyped/custom iterators and refines the SSA
+            // value seen by property access and the JIT inside the comprehension.
+            let item = self.check_binding_assignment(binding, item, clause.binding.span);
+            self.bind_initial(binding, item);
+        }
+
+        // Every filter is a short-circuiting guard. A rejected item jumps
+        // directly to the current loop's next iteration while preserving any
+        // outer SSA locals mutated while evaluating the filter itself.
+        for filter in &clause.filters {
+            let condition = self.lower_expr(filter);
+            let accepted = self.new_block(&[]);
+            let rejected = self.new_block(&[]);
+            self.builder
+                .branch(condition, accepted, Vec::new(), rejected, Vec::new());
+
+            let filter_env = self.env.clone();
+            self.builder.position_at(rejected);
+            self.env = filter_env.clone();
+            let mut back = vec![iterator];
+            back.extend(self.values_for_bindings(&carried, &self.env));
+            self.builder.jump(header, back);
+
+            self.builder.position_at(accepted);
+            self.env = filter_env;
+        }
+
+        let element_type = if clause_index + 1 < clauses.len() {
+            self.lower_list_comprehension_clause(
+                list,
+                element,
+                clauses,
+                clause_index + 1,
+            )
+        } else {
+            let value = self.lower_expr(element);
+            let ty = semantic_source_type(self.builder.value_type(value));
+            self.builder.emit0(Inst::ListAppend { list, value });
+            Some(ty)
+        };
+
+        if !self.current_terminated() {
+            let mut back = vec![iterator];
+            back.extend(self.values_for_bindings(&carried, &self.env));
+            self.builder.jump(header, back);
+        }
+
+        self.builder.seal_block(exit);
+        self.builder.position_at(exit);
+        self.env = base_env;
+        for binding in &carried {
+            self.env
+                .insert(*binding, Storage::Value(exit_params[binding]));
+        }
+
+        element_type
+    }
+
+    fn comprehension_carried_bindings(
+        &self,
+        element: &Expr,
+        clauses: &[front::ListComprehensionClause],
+        clause_index: usize,
+    ) -> Vec<BindingId> {
+        let mut writes = HashSet::default();
+
+        // The current iterable has already run before entering its loop. Its
+        // filters, every nested iterable/filter, and the element expression all
+        // execute inside this loop and therefore can create loop-carried locals.
+        for filter in &clauses[clause_index].filters {
+            collect_written_bindings_expr(filter, self.context.analysis, &mut writes);
+        }
+        for clause in clauses.iter().skip(clause_index + 1) {
+            collect_written_bindings_expr(&clause.iterable, self.context.analysis, &mut writes);
+            for filter in &clause.filters {
+                collect_written_bindings_expr(filter, self.context.analysis, &mut writes);
+            }
+        }
+        collect_written_bindings_expr(element, self.context.analysis, &mut writes);
+
+        let mut result: Vec<_> = writes
+            .into_iter()
+            .filter(|binding| matches!(self.env.get(binding), Some(Storage::Value(_))))
+            .collect();
+        result.sort_unstable();
+        result
     }
 
     fn append_iterable_to_list(&mut self, list: ValueId, sequence: ValueId) {
@@ -5081,7 +5355,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         // Dot syntax preserves builtin Map getter precedence. Brackets always
         // address the property, even for these reserved member names.
-        if kind == MethodKind::Getter && !matches!(invoke.name.value.as_str(), "count" | "isEmpty" | "keys" | "toString") {
+        if kind == MethodKind::Getter && !matches!(invoke.name.value.as_str(), "count" | "size" | "isEmpty" | "keys" | "toString") {
             if let Some((ty, layout, slot)) = self.structural_property_info(receiver, &invoke.name.value) {
                 let key = self.builder.const_string(&invoke.name.value);
                 return self.builder.emit1(
@@ -5646,13 +5920,22 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 collect_fields_expr(item, instance, statics)
             }
         }
+        ExprKind::ListComprehension { element, clauses } => {
+            collect_fields_expr(element, instance, statics);
+            for clause in clauses {
+                collect_fields_expr(&clause.iterable, instance, statics);
+                for filter in &clause.filters {
+                    collect_fields_expr(filter, instance, statics);
+                }
+            }
+        }
         ExprKind::Map(entries) => {
             for entry in entries {
                 collect_fields_expr(&entry.key, instance, statics);
                 collect_fields_expr(&entry.value, instance, statics);
             }
         }
-        ExprKind::Grouped(inner) => collect_fields_expr(inner, instance, statics),
+        ExprKind::TypedCollection { expression: inner, .. } | ExprKind::Grouped(inner) => collect_fields_expr(inner, instance, statics),
         ExprKind::Unary { operand, .. } => collect_fields_expr(operand, instance, statics),
         ExprKind::DestructureGet { source: left, key: right }
             | ExprKind::DestructureRest { source: left, key: right }
@@ -5976,13 +6259,22 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 collect_method_keys_expr(item, out)
             }
         }
+        ExprKind::ListComprehension { element, clauses } => {
+            collect_method_keys_expr(element, out);
+            for clause in clauses {
+                collect_method_keys_expr(&clause.iterable, out);
+                for filter in &clause.filters {
+                    collect_method_keys_expr(filter, out);
+                }
+            }
+        }
         ExprKind::Map(entries) => {
             for entry in entries {
                 collect_method_keys_expr(&entry.key, out);
                 collect_method_keys_expr(&entry.value, out);
             }
         }
-        ExprKind::Grouped(inner) => collect_method_keys_expr(inner, out),
+        ExprKind::TypedCollection { expression: inner, .. } | ExprKind::Grouped(inner) => collect_method_keys_expr(inner, out),
         ExprKind::Logical { left, right, .. } => {
             collect_method_keys_expr(left, out);
             collect_method_keys_expr(right, out)
@@ -6104,13 +6396,22 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 collect_strings_expr(item, out)
             }
         }
+        ExprKind::ListComprehension { element, clauses } => {
+            collect_strings_expr(element, out);
+            for clause in clauses {
+                collect_strings_expr(&clause.iterable, out);
+                for filter in &clause.filters {
+                    collect_strings_expr(filter, out);
+                }
+            }
+        }
         ExprKind::Map(entries) => {
             for entry in entries {
                 collect_strings_expr(&entry.key, out);
                 collect_strings_expr(&entry.value, out)
             }
         }
-        ExprKind::Grouped(inner) => collect_strings_expr(inner, out),
+        ExprKind::TypedCollection { expression: inner, .. } | ExprKind::Grouped(inner) => collect_strings_expr(inner, out),
         ExprKind::Unary { operand, .. } => collect_strings_expr(operand, out),
         ExprKind::DestructureGet { source: left, key: right }
             | ExprKind::DestructureRest { source: left, key: right }
@@ -6286,13 +6587,22 @@ fn collect_written_bindings_expr(
                 collect_written_bindings_expr(item, analysis, out)
             }
         }
+        ExprKind::ListComprehension { element, clauses } => {
+            for clause in clauses {
+                collect_written_bindings_expr(&clause.iterable, analysis, out);
+                for filter in &clause.filters {
+                    collect_written_bindings_expr(filter, analysis, out);
+                }
+            }
+            collect_written_bindings_expr(element, analysis, out);
+        }
         ExprKind::Map(entries) => {
             for entry in entries {
                 collect_written_bindings_expr(&entry.key, analysis, out);
                 collect_written_bindings_expr(&entry.value, analysis, out)
             }
         }
-        ExprKind::Grouped(inner) => collect_written_bindings_expr(inner, analysis, out),
+        ExprKind::TypedCollection { expression: inner, .. } | ExprKind::Grouped(inner) => collect_written_bindings_expr(inner, analysis, out),
         ExprKind::Unary { operand, .. } => collect_written_bindings_expr(operand, analysis, out),
         ExprKind::DestructureGet { source: left, key: right }
             | ExprKind::DestructureRest { source: left, key: right }
@@ -6771,6 +7081,66 @@ class Child is Parent {
                 crate::napalm_interpreter::ExecutionResult::Returned(_)
             ));
         }
+    }
+
+    #[test]
+    fn list_comprehensions_lower_to_ssa_loops_and_execute_without_closures() {
+        let source = r#"
+            function run() {
+                const values = [1, 2, 3, 4];
+                const doubled = [x * 2 for x in values if x >= 3];
+                const nested = [x * 10 + y for x in [1, 2] for y in [3, 4] if y == 4];
+                const people = [
+                    { name: "Alice", age: 22 },
+                    { name: "Bob", age: 40 },
+                    { name: "Charlie", age: 55 },
+                    { name: "Dave", age: 14 }
+                ];
+                const above30 = [
+                    { name: person.name, age: person.age }
+                    for person in people
+                    if person.age >= 30
+                ];
+                return doubled.length == 2
+                    && doubled[0] == 6
+                    && doubled[1] == 8
+                    && nested.length == 2
+                    && nested[0] == 14
+                    && nested[1] == 24
+                    && above30.length == 2
+                    && above30[0].name == "Bob"
+                    && above30[1].name == "Charlie";
+            }
+            if (!run()) { throw "wrong comprehension result"; }
+        "#;
+        let module = parse_typescript(source);
+        let mut program = ir::Program::new();
+        let manifest = crate::napalm_builtin::install_hir_builtins(&mut program);
+        let output = lower_module(&mut program, "comprehensions.napalm", source, "comprehensions", &module);
+        assert!(!output.has_errors(), "{:#?}", output.diagnostics);
+        for function in &program.functions {
+            ir::verify_function(function).unwrap();
+        }
+
+        // A comprehension lowers directly to iterator/ListAppend control flow;
+        // it does not synthesize callback closures or map/filter intermediates.
+        let closure_count = program.functions.iter()
+            .filter(|function| matches!(function.kind, FunctionKind::Closure))
+            .count();
+        // The source-declared `run` function is itself one closure; the
+        // comprehensions must not add any more.
+        assert_eq!(closure_count, 1);
+
+        let entry = output.lowered.unwrap().entry;
+        let bytecode = crate::napalm_pipeline::compile_program(&mut program).unwrap();
+        let host = crate::napalm_builtin::BuiltinHost::new(manifest.clone());
+        let mut vm = crate::napalm_interpreter::Interpreter::with_host(&bytecode, Box::new(host)).unwrap();
+        crate::napalm_builtin::install_vm_builtins(&mut vm, &manifest);
+        vm.set_jit_options(None);
+        assert!(matches!(
+            vm.run_module(entry).unwrap(),
+            crate::napalm_interpreter::ExecutionResult::Returned(_)
+        ));
     }
 
     #[test]

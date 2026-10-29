@@ -1,0 +1,19 @@
+type Person = {
+    name: string;
+    age: number;
+};
+
+const people: Person[] = [
+    { name: "Alice", age: 22 },
+    { name: "Bob", age: 40 },
+    { name: "Charlie", age: 55 },
+    { name: "Dave", age: 14 }
+];
+
+const above_30: Person[] = [
+    { name: person.name, age: person.age }
+    for person in people
+    if person.age >= 30
+];
+
+System.print(above_30)

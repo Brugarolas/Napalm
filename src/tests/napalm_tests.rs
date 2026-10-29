@@ -488,6 +488,14 @@ fn interface_error(source: &str, require_native: bool) {
     let mut hir = Program::new();
     let manifest = napalm_builtin::install_hir_builtins(&mut hir);
     let lowered = lower_module(&mut hir, "interface.nap", source, "interface", &parsed.module);
+    if lowered.has_errors() {
+        // A statically proven bad write is already rejected before any catch can
+        // run. Tests explicitly requiring native execution must still reach the VM.
+        assert!(!require_native, "native test rejected during lowering: {:?}", lowered.diagnostics);
+        assert!(lowered.diagnostics.iter().all(|diagnostic| matches!(diagnostic.code, "NAPALM-T001" | "NAPALM-T003")),
+            "unexpected compilation failure: {:?}", lowered.diagnostics);
+        return;
+    }
     assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
     let entry = lowered.lowered.unwrap().entry;
     let program = compile_program(&mut hir).unwrap();

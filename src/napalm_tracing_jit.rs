@@ -11471,7 +11471,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         activation.exit_id
     }
 
@@ -11561,7 +11561,7 @@ mod tests {
                 for initial in [42.0f64, -10.0] {
                     cell.0 = initial.to_bits();
                     activation.reset_result();
-                    assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     assert_eq!(f64::from_bits(cell.0), 7.0);
                     assert_eq!(f64::from_bits(registers[1].0), if budget == 1 { initial } else { 7.0 });
                 }
@@ -11652,7 +11652,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
-                    assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                     let actual = f64::from_bits(general[1].0);
                     assert!(if expected.is_nan() { actual.is_nan() }
                         else { actual.to_bits() == expected.to_bits() },
@@ -11700,7 +11700,7 @@ mod tests {
                         // Failed entry specialization must leave all VM state intact.
                         general[0] = RegisterWord(TAG_TRUE);
                         let before = general.map(|v| v.0);
-                        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
                         assert_eq!(general.map(|v| v.0), before);
                         general[0] = RegisterWord(0.0f64.to_bits());
                     }
@@ -11708,7 +11708,7 @@ mod tests {
                     // Finite test bound also catches a broken loop-carried PRE value.
                     for _ in 0..6 {
                         activation.reset_result();
-                        let result = unsafe { invoke_native_trace(compiled, &mut activation) };
+                        let result = unsafe { invoke_native_trace(&compiled, &mut activation) };
                         assert_eq!(result, TRACE_RESULT_SIDE_EXIT);
                         snapshots.push(general.map(|v| v.0));
                         let counter = if tagged { f64::from_bits(general[0].0) as u64 }
@@ -11857,7 +11857,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
@@ -11927,7 +11927,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[0], RegisterWord(0x1111));
         assert_eq!(general[1], RegisterWord(0xdead_beef));
@@ -12014,7 +12014,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2], RegisterWord(0xfeed_face));
 
@@ -12026,7 +12026,7 @@ mod tests {
         );
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
         entry.kind.store(
@@ -12040,7 +12040,7 @@ mod tests {
         entry.len.store(10, Ordering::Relaxed);
         general[2] = RegisterWord(0);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
 
@@ -12049,7 +12049,7 @@ mod tests {
         entry.len.store(9, Ordering::Relaxed);
         entry.kind.store(TraceHeapKind::List as u32, Ordering::Release);
         activation.reset_result();
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
         assert_eq!(general[2], RegisterWord(0));
     }
@@ -12110,7 +12110,7 @@ mod tests {
         });
         activation.current_links = compiled.native_links.as_ptr();
 
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[1], answer);
 
@@ -12121,7 +12121,7 @@ mod tests {
         );
         activation.reset_result();
         general[1] = RegisterWord(0);
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, slow.0);
     }
 
@@ -12262,7 +12262,7 @@ mod tests {
 
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(3);
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, success.0);
         assert_eq!(general[2].0 as u32 as i32, 7);
 
@@ -12270,7 +12270,7 @@ mod tests {
         general[0] = RegisterWord(21);
         general[1] = RegisterWord(0);
         general[2] = RegisterWord(0xdead_beef);
-        assert_eq!(unsafe { invoke_native_trace(compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
         assert_eq!(activation.exit_id, invalid.0);
         assert_eq!(general[2].0, 0xdead_beef);
     }

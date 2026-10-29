@@ -1040,6 +1040,8 @@ pub enum TypeAnnotationKind {
     String,
     List(Option<Box<TypeAnnotation>>),
     Map,
+    GenericMap(Box<TypeAnnotation>, Box<TypeAnnotation>),
+    Set(Option<Box<TypeAnnotation>>),
     Object(Vec<InterfaceField>),
     Closure,
     Named(String),
@@ -1308,8 +1310,11 @@ pub enum ExprKind {
     This,
     Super(SuperExpr),
     List(Vec<Expr>),
+    ListComprehension { element: Box<Expr>, clauses: Vec<ListComprehensionClause> },
     Map(Vec<MapEntry>),
     Grouped(Box<Expr>),
+    /// A constructor whose generic arguments install a persistent collection contract.
+    TypedCollection { expression: Box<Expr>, annotation: TypeAnnotation },
     Unary {
         operator: UnaryOp,
         operand: Box<Expr>,
@@ -1374,6 +1379,14 @@ pub enum ExprKind {
     AsyncClosure(FunctionBody),
     /// A closure that may only be entered through `launch`; it cannot capture lexical state.
     ConcurrentClosure(FunctionBody),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListComprehensionClause {
+    pub binding: Ident,
+    pub iterable: Expr,
+    pub filters: Vec<Expr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1467,13 +1480,21 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                     visit_expr(item, out);
                 }
             }
+            ExprKind::ListComprehension { element, clauses } => {
+                for clause in clauses {
+                    visit_expr(&clause.iterable, out);
+                    for filter in &clause.filters { visit_expr(filter, out); }
+                }
+                visit_expr(element, out);
+            }
             ExprKind::Map(entries) => {
                 for entry in entries {
                     visit_expr(&entry.key, out);
                     visit_expr(&entry.value, out);
                 }
             }
-            ExprKind::Grouped(inner)
+            ExprKind::TypedCollection { expression: inner, .. }
+            | ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
             | ExprKind::Await(inner)
             | ExprKind::Launch(inner)

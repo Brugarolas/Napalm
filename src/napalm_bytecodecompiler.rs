@@ -1275,6 +1275,8 @@ fn type_may_reference(ty: &Type) -> bool {
         Type::String
         | Type::List(_)
         | Type::Map
+        | Type::GenericMap(_, _)
+        | Type::Set(_)
         | Type::Interface(_)
         | Type::Record(_)
         | Type::Range

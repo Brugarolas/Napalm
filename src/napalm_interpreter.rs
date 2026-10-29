@@ -1428,13 +1428,57 @@ impl MapShapeTable {
     }
 }
 
+/// Ordered dictionary fallback. Hashing finds entries; the dense vector preserves
+/// insertion order across shape promotion, GC, updates and delete/reinsert.
+#[derive(Debug, Default)]
+struct MapDictionary {
+    indices: FastMap<MapKey, usize>,
+    entries: Vec<(MapKey, Value)>,
+}
+
+impl MapDictionary {
+    fn len(&self) -> usize { self.entries.len() }
+    fn is_empty(&self) -> bool { self.entries.is_empty() }
+    fn reserve(&mut self, additional: usize) {
+        self.indices.reserve(additional);
+        self.entries.reserve(additional);
+    }
+    fn external_bytes(&self) -> usize {
+        self.indices.capacity() * std::mem::size_of::<(MapKey, usize)>()
+            + self.entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
+    }
+    fn get(&self, key: &MapKey) -> Option<&Value> {
+        self.indices.get(key).map(|&index| &self.entries[index].1)
+    }
+    fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> {
+        if let Some(&index) = self.indices.get(&key) {
+            return Some(std::mem::replace(&mut self.entries[index].1, value));
+        }
+        self.indices.insert(key.clone(), self.entries.len());
+        self.entries.push((key, value));
+        None
+    }
+    fn remove(&mut self, key: &MapKey) -> Option<Value> {
+        let index = self.indices.remove(key)?;
+        let (_, value) = self.entries.remove(index);
+        for (offset, (key, _)) in self.entries[index..].iter().enumerate() {
+            *self.indices.get_mut(key).unwrap() = index + offset;
+        }
+        Some(value)
+    }
+    fn clear(&mut self) { self.indices.clear(); self.entries.clear(); }
+    fn iter(&self) -> impl Iterator<Item = (&MapKey, &Value)> {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+}
+
 #[derive(Debug)]
 enum NapalmMapStorage {
     /// Object-like fast representation. The shape owns immutable shared string
     /// keys while values are stored densely by slot.
     Shaped { shape: u32, values: Vec<Value> },
     /// General Napalm Map semantics for arbitrary key types and highly dynamic maps.
-    Dictionary(FastMap<MapKey, Value>),
+    Dictionary(MapDictionary),
 }
 
 #[derive(Debug)]
@@ -1477,7 +1521,7 @@ impl NapalmMap {
                 values.capacity() * std::mem::size_of::<Value>()
             }
             NapalmMapStorage::Dictionary(entries) => {
-                entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
+                entries.external_bytes()
             }
         }
     }
@@ -1498,7 +1542,7 @@ impl NapalmMap {
     fn promote_to_dictionary(&mut self, shapes: &MapShapeTable) {
         let old = std::mem::replace(
             &mut self.storage,
-            NapalmMapStorage::Dictionary(FastMap::default()),
+            NapalmMapStorage::Dictionary(MapDictionary::default()),
         );
         match old {
             NapalmMapStorage::Dictionary(entries) => {
@@ -1507,7 +1551,7 @@ impl NapalmMap {
             NapalmMapStorage::Shaped { shape, values } => {
                 let keys = shapes.keys(shape);
                 debug_assert_eq!(keys.len(), values.len());
-                let mut entries = FastMap::default();
+                let mut entries = MapDictionary::default();
                 entries.reserve(values.len());
                 for (key, value) in keys.iter().cloned().zip(values.into_iter()) {
                     entries.insert(MapKey::String(key), value);
@@ -1527,14 +1571,14 @@ impl NapalmMap {
                 debug_assert!(index < keys.len());
                 Some(MapKey::String(unsafe { keys.get_unchecked(index) }.clone()))
             }
-            NapalmMapStorage::Dictionary(entries) => entries.keys().nth(index).cloned(),
+            NapalmMapStorage::Dictionary(entries) => entries.entries.get(index).map(|(key, _)| key.clone()),
         }
     }
 
     fn nth_value(&self, index: usize) -> Option<Value> {
         match &self.storage {
             NapalmMapStorage::Shaped { values, .. } => values.get(index).copied(),
-            NapalmMapStorage::Dictionary(entries) => entries.values().nth(index).copied(),
+            NapalmMapStorage::Dictionary(entries) => entries.entries.get(index).map(|(_, value)| *value),
         }
     }
 }
@@ -1747,6 +1791,7 @@ enum HeapObject {
     String(NapalmString),
     List(Vec<Value>),
     Map(NapalmMap),
+    Set { map: Value },
     MapEntry { key: Value, value: Value },
     MapKeys { map: Value },
     Range {
@@ -2178,7 +2223,7 @@ unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
                 }
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, &value) in entries {
+                for (key, &value) in entries.iter() {
                     if let MapKey::Object(handle) = key {
                         visit_handle(*handle, visitor);
                     }
@@ -2195,7 +2240,7 @@ unsafe fn trace_map_view(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
             visit_value(*key, visitor);
             visit_value(*value, visitor);
         }
-        HeapObject::MapKeys { map } => visit_value(*map, visitor),
+        HeapObject::MapKeys { map } | HeapObject::Set { map } => visit_value(*map, visitor),
         _ => {}
     }
 }
@@ -2402,7 +2447,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::String(_) => &GC_STRING,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
-        HeapObject::MapEntry { .. } | HeapObject::MapKeys { .. } => &GC_MAP_VIEW,
+        HeapObject::MapEntry { .. } | HeapObject::MapKeys { .. } | HeapObject::Set { .. } => &GC_MAP_VIEW,
         HeapObject::Range { .. } => &GC_RANGE,
         HeapObject::Date { .. } => &GC_DATE,
         HeapObject::Cell(_) => &GC_CELL,
@@ -2579,7 +2624,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
             push_value_handle(*key, roots);
             push_value_handle(*value, roots);
         }
-        HeapObject::MapKeys { map } => push_value_handle(*map, roots),
+        HeapObject::MapKeys { map } | HeapObject::Set { map } => push_value_handle(*map, roots),
         HeapObject::List(values) => {
             for &value in values { push_value_handle(value, roots); }
         }
@@ -2588,7 +2633,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 for &value in values { push_value_handle(value, roots); }
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, &value) in entries {
+                for (key, &value) in entries.iter() {
                     if let MapKey::Object(handle) = key { roots.push(*handle); }
                     push_value_handle(value, roots);
                 }
@@ -2673,6 +2718,8 @@ struct Heap {
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
     map_shapes: MapShapeTable,
+    /// Immutable slot-to-class identity for contracts checked by host primitives.
+    contract_class_ids: Vec<ClassId>,
     #[cfg(test)]
     allocations: Vec<Value>,
 }
@@ -2716,6 +2763,7 @@ impl Default for Heap {
             _allocation_root_registration: allocation_root_registration,
             stack_owner: Value::NULL,
             map_shapes: MapShapeTable::default(),
+            contract_class_ids: Vec::new(),
             #[cfg(test)]
             allocations: Vec::new(),
         }
@@ -3481,6 +3529,19 @@ impl HostContext<'_> {
         Ok(value)
     }
 
+    pub fn allocate_set(&mut self) -> Value {
+        let map = self.allocate_map();
+        let map = self.root(map);
+        self.heap.alloc(HeapObject::Set { map: map.value() })
+    }
+
+    pub fn set_source(&self, value: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get(value) {
+            Some(HeapObject::Set { map }) => Ok(*map),
+            _ => Err(RuntimeError::new("receiver is not a Set")),
+        }
+    }
+
     pub fn allocate_map(&mut self) -> Value {
         self.heap.alloc(HeapObject::Map(NapalmMap::default()))
     }
@@ -3847,6 +3908,16 @@ impl HostContext<'_> {
                 let text = format!("{}: {}", self.format_value_inner(*key, seen), self.format_value_inner(*value, seen));
                 seen.remove(&handle);
                 text
+            }
+            Some(HeapObject::Set { map }) => {
+                if !seen.insert(handle) { return "Set {...}".to_owned(); }
+                let text = match self.heap.get(*map) {
+                    Some(HeapObject::Map(map)) => (0..map.len()).filter_map(|i| map.nth_value(i))
+                        .map(|item| self.format_value_inner(item, seen)).collect::<Vec<_>>().join(", "),
+                    _ => String::new(),
+                };
+                seen.remove(&handle);
+                format!("Set {{{text}}}")
             }
             Some(HeapObject::MapKeys { .. }) => "<map keys>".to_owned(),
             Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
@@ -4976,9 +5047,10 @@ pub enum BuiltinClass {
     /// Heap-backed JavaScript-compatible Date instances. Appended deliberately so
     /// existing builtin receiver-class numeric identities remain stable.
     Date,
+    Set,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 20;
+const BUILTIN_CLASS_COUNT: usize = 21;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -4998,6 +5070,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::String as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
+        HeapObject::Set { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Set as u64),
         HeapObject::Map(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64),
         HeapObject::MapEntry { .. } =>
@@ -5815,6 +5889,7 @@ impl<'p> Interpreter<'p> {
                 .into_boxed_slice(),
         });
         let mut heap = Heap::default();
+        heap.contract_class_ids = program.metadata.classes.iter().map(|class| class.id).collect();
         for layout in &program.metadata.structural_layouts {
             if heap.map_shapes.register_layout_family(layout).is_none() {
                 return Err(RuntimeError::new(format!(
@@ -8981,6 +9056,7 @@ impl<'p> Interpreter<'p> {
             }
             Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
+            | Some(HeapObject::Set { .. })
             | Some(HeapObject::MapEntry { .. }) | Some(HeapObject::MapKeys { .. })
             | Some(HeapObject::ModuleObject { .. }) => {
                 return Err(RuntimeError::new("this runtime object cannot cross a concurrent boundary yet"));
@@ -11740,6 +11816,8 @@ impl Interpreter<'_> {
             }
             Type::Interface(_) | Type::Record(_) => self.heap.interface_matches(Value::from_word(word), expected),
             Type::Map => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Map(_))),
+            Type::Set(None) => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Set { .. })),
+            Type::GenericMap(_, _) | Type::Set(Some(_)) => self.heap.interface_matches(Value::from_word(word), expected),
             Type::Range => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::Range { .. })),
             Type::Closure(function) => match self.heap.get(Value::from_word(word)) {
                 Some(HeapObject::Closure { function_index, .. }) => function.map_or(true, |id| self.prepared.function_by_id.get(&id).copied() == Some(*function_index)),
@@ -11766,7 +11844,7 @@ impl Interpreter<'_> {
     ) -> Result<(), RuntimeError> {
         fn needs_contract(ty: &Type) -> bool {
             match ty {
-                Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) => true,
+                Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
                 Type::Union(types) => types.iter().any(needs_contract),
                 _ => false,
             }
@@ -13774,6 +13852,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
             Some(HeapObject::MapKeys { .. }) => "<map keys>".into(),
+            Some(HeapObject::Set { map }) => format!("<set:{}>", self.heap.map_len(*map).unwrap_or(0)),
             Some(HeapObject::Range { from, to, inclusive }) => format!("{}{}{}", from, if *inclusive { ".." } else { "..." }, to),
             Some(HeapObject::Date { millis }) => if millis.is_finite() { format!("<date:{millis:.0}>") } else { "Invalid Date".into() },
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
@@ -15660,6 +15739,7 @@ var result = Runner.run()
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
+    include!("tests/napalm_collections_tests.rs");
 
     #[test]
     fn shaped_maps_share_shapes_use_pic_and_promote_for_general_keys() {

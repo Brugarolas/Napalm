@@ -129,6 +129,8 @@ pub enum Type {
     // Napalm-visible heap/runtime types.
     List(Option<Box<Type>>),
     Map,
+    GenericMap(Box<Type>, Box<Type>),
+    Set(Option<Box<Type>>),
     /// Open structural object contract declared with `interface`.
     Interface(Vec<InterfaceFieldType>),
     /// Closed structural object contract declared with `type X = { ... }`.
@@ -207,6 +209,8 @@ impl Type {
             Type::String
                 | Type::List(_)
                 | Type::Map
+                | Type::GenericMap(_, _)
+                | Type::Set(_)
                 | Type::Interface(_)
                 | Type::Record(_)
                 | Type::Range
@@ -241,7 +245,10 @@ impl Type {
                             .all(|class| expected.contains(*class)))
             }
             (Num, Int32 | F64) => true,
-            (Map, Interface(_) | Record(_)) => true,
+            (Map, Interface(_) | Record(_) | GenericMap(_, _)) => true,
+            (Set(None), Set(_)) => true,
+            (Set(Some(e)), Set(Some(a))) => e == a,
+            (GenericMap(ek, ev), GenericMap(ak, av)) => ek == ak && ev == av,
             (Foreign(None), Foreign(_)) => true,
             (Closure(None), Closure(_)) => true,
             (List(None), List(_)) => true,
@@ -367,6 +374,9 @@ impl fmt::Debug for Type {
             List(None) => write!(f, "List<?>"),
             List(Some(ty)) => write!(f, "List<{ty:?}>") ,
             Map => write!(f, "Map"),
+            GenericMap(k, v) => write!(f, "Map<{k:?}, {v:?}>"),
+            Set(None) => write!(f, "Set"),
+            Set(Some(t)) => write!(f, "Set<{t:?}>"),
             Interface(fields) => write!(f, "Interface{fields:?}"),
             Record(fields) => write!(f, "Record{fields:?}"),
             Range => write!(f, "Range"),
@@ -464,14 +474,15 @@ pub enum BuiltinId {
     Fetch = 17,
     /// Runtime support for lazy computed properties and dependency-tracked watchers.
     Reactive = 18,
+    Set = 19,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
-        Self::Timer, Self::FFI, Self::Fetch, Self::Reactive,
+        Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -487,6 +498,7 @@ impl BuiltinId {
             Self::FFI => "FFI",
             Self::Fetch => "fetch",
             Self::Reactive => "__Reactive",
+            Self::Set => "Set",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }

@@ -37,6 +37,7 @@ pub struct BuiltinManifest {
     primitives: Vec<Option<BuiltinPrimitive>>,
     list_remove: Option<(MethodSymbol, FuncId)>,
     list_functions: Vec<(MethodSymbol, FuncId)>,
+    collection_functions: Vec<(BuiltinTarget, MethodSymbol, FuncId)>,
     string_add: Option<(MethodSymbol, FuncId)>,
     string_right_add: Option<FuncId>,
     system_print: Option<(MethodSymbol, FuncId)>,
@@ -241,6 +242,19 @@ enum BuiltinPrimitive {
     ListNew,
     ListNewNumber,
 
+    MapNew,
+    MapSet,
+    MapDelete,
+    SetNew,
+    SetCount,
+    SetIsEmpty,
+    SetAdd,
+    SetHas,
+    SetDelete,
+    SetClear,
+    SetIterate,
+    SetIteratorValue,
+    SetValues,
     MapCount,
     MapContainsKey,
     MapSubscript,
@@ -304,6 +318,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::String,
         BuiltinClass::List,
         BuiltinClass::Map,
+        BuiltinClass::Set,
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
@@ -628,9 +643,34 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     b.ret(result);
     manifest.list_functions.push((reduce_method, b.finish()));
 
+    // Map/Set primitives share the ordered Map storage and its key equality.
+    manifest.register(program, static_(BuiltinId::Map), "new", MethodKind::Method, 0, BuiltinPrimitive::MapNew);
+    manifest.register(program, static_(BuiltinId::Set), "new", MethodKind::Method, 0, BuiltinPrimitive::SetNew);
+    let set = instance(BuiltinClass::Set);
+    for (name, kind, arity, op) in [
+        ("size", MethodKind::Getter, 0, BuiltinPrimitive::SetCount),
+        ("count", MethodKind::Getter, 0, BuiltinPrimitive::SetCount),
+        ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::SetIsEmpty),
+        ("add", MethodKind::Method, 1, BuiltinPrimitive::SetAdd),
+        ("has", MethodKind::Method, 1, BuiltinPrimitive::SetHas),
+        ("delete", MethodKind::Method, 1, BuiltinPrimitive::SetDelete),
+        ("clear", MethodKind::Method, 0, BuiltinPrimitive::SetClear),
+        ("iterate", MethodKind::Method, 1, BuiltinPrimitive::SetIterate),
+        ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::SetIteratorValue),
+        ("values", MethodKind::Method, 0, BuiltinPrimitive::SetValues),
+        ("keys", MethodKind::Method, 0, BuiltinPrimitive::SetValues),
+    ] {
+        manifest.register(program, set, name, kind, arity, op);
+    }
     // Map.
     let map = instance(BuiltinClass::Map);
     for (name, kind, arity, op) in [
+        ("size", MethodKind::Getter, 0, BuiltinPrimitive::MapCount),
+        ("get", MethodKind::Method, 1, BuiltinPrimitive::MapSubscript),
+        ("set", MethodKind::Method, 2, BuiltinPrimitive::MapSet),
+        ("has", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
+        ("delete", MethodKind::Method, 1, BuiltinPrimitive::MapDelete),
+        ("keys", MethodKind::Method, 0, BuiltinPrimitive::MapKeys),
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::MapIsEmpty),
         ("containsKey", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
@@ -672,6 +712,36 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, instance(BuiltinClass::MapEntry), "value", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryValue);
 
     manifest.register(program, map, "toString", MethodKind::Method, 0, BuiltinPrimitive::MapToString);
+
+    // Expose the existing Map bytecode intrinsics through the public API. The
+    // tracing JIT can inline these bodies and use shaped/PIC access or checked
+    // dictionary helpers without losing the contracts on generic Maps.
+    let module = program.add_module("<core:collections>", 0);
+    for (name, kind, arity) in [
+        ("get", MethodKind::Method, 1),
+        ("set", MethodKind::Method, 2),
+        ("size", MethodKind::Getter, 0),
+    ] {
+        let method = program.intern_method(name, kind, arity);
+        let mut params = vec![Type::Map];
+        params.extend((0..arity).map(|_| Type::Top));
+        let mut b = Builder::new(program, module, format!("Map.{name}"), FunctionKind::Method, params, Type::Top);
+        let receiver = b.param(0);
+        let result = match name {
+            "get" => { let key = b.param(1); b.emit1(Inst::MapGet { map: receiver, key }, Type::Top) }
+            "set" => {
+                let key = b.param(1); let value = b.param(2);
+                b.emit0(Inst::MapSet { map: receiver, key, value });
+                receiver
+            }
+            _ => {
+                let len = b.emit1(Inst::MapLen { map: receiver }, Type::Int32);
+                b.emit1(Inst::Int32ToNum { value: len }, Type::Num)
+            }
+        };
+        b.ret(result);
+        manifest.collection_functions.push((map, method, b.finish()));
+    }
 
     // Range.
     manifest.register(program, static_(BuiltinId::Range), "new", MethodKind::Method, 2, BuiltinPrimitive::RangeNew);
@@ -976,6 +1046,12 @@ pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &Builtin
             BuiltinTarget::Static(class) => {
                 interpreter.bind_builtin_static_native(class, binding.method, binding.native);
             }
+        }
+    }
+    for &(target, method, function) in &manifest.collection_functions {
+        match target {
+            BuiltinTarget::Instance(class) => interpreter.bind_builtin_function(class, method, function),
+            BuiltinTarget::Static(class) => interpreter.bind_builtin_static_function(class, method, function),
         }
     }
     // Bind wrapper functions after primitive/native tables so wrappers that use a
@@ -2247,8 +2323,44 @@ fn execute_primitive(
             )
         }
 
+        MapNew => Ok(context.allocate_map()),
+        SetNew => Ok(context.allocate_set()),
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),
         MapContainsKey => Ok(Value::from_bool(context.map_contains_key(this, argument(args,0)?)?)),
+        MapSet => { context.map_set(this, argument(args,0)?, argument(args,1)?)?; Ok(this) }
+        MapDelete => {
+            let key = argument(args,0)?;
+            let existed = context.map_contains_key(this, key)?;
+            context.map_remove(this, key)?;
+            Ok(Value::from_bool(existed))
+        }
+        SetCount | SetIsEmpty | SetAdd | SetHas | SetDelete | SetClear | SetIterate | SetIteratorValue | SetValues => {
+            let map = context.set_source(this)?;
+            match op {
+                SetCount => Ok(Value::from_num(context.map_len(map).unwrap() as f64)),
+                SetIsEmpty => Ok(Value::from_bool(context.map_len(map).unwrap() == 0)),
+                SetAdd => {
+                    let item = argument(args,0)?;
+                    context.map_set(map, item, item)?;
+                    Ok(this)
+                }
+                SetHas => Ok(Value::from_bool(context.map_contains_key(map, argument(args,0)?)?)),
+                SetDelete => {
+                    let item = argument(args,0)?;
+                    let existed = context.map_contains_key(map, item)?;
+                    context.map_remove(map, item)?;
+                    Ok(Value::from_bool(existed))
+                }
+                SetClear => { context.map_clear(map)?; Ok(Value::NULL) }
+                SetIterate => {
+                    let next = if argument(args,0)?.is_null() { 0 } else { integer(argument(args,0)?, "iterator")? + 1 };
+                    Ok(if next >= 0 && (next as usize) < context.map_len(map).unwrap() { Value::from_num(next as f64) } else { Value::FALSE })
+                }
+                SetIteratorValue => context.map_nth_value(map, integer(argument(args,0)?, "iterator")? as usize),
+                SetValues => Ok(this),
+                _ => unreachable!(),
+            }
+        }
         MapRemove => context.map_remove(this, argument(args,0)?),
         MapClear => { context.map_clear(this)?; Ok(Value::NULL) }
         MapIterate | MapKeysIterate => {

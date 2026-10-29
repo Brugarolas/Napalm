@@ -83,6 +83,8 @@ The register VM, SSA optimizer, tracing JIT, moving GC, Fibers, Promise/timer sc
 
 The standard library retains its existing API (`System.print`, `list.add`, `list.count`, `Timer.delay`, `Fiber`, etc.). Values, truthiness, equality, numbers, strings, collections and iteration keep the engine's dynamic semantics; using familiar syntax does not change them into ECMAScript semantics. Missing values use `null`; there is no separate `undefined`. Both equality spellings use the same non-coercing operation. The VM accepts at most 16 parameters/arguments.
 
+`Map` and `Set` provide native collection operations, insertion order, and persistent generic contracts through `Map<K, V>` and `Set<T>`, including generic constructors. See [collections](docs/COLLECTIONS.md) and [the Map/Set example](scripts/map.napalm).
+
 Destructuring currently operates on Lists and Maps, including empty patterns; it rejects `null` and other receiver types. Rest parameters (`function f(...args)`), defaults for whole parameters and omitted optional arguments remain unsupported; defaults inside destructured parameters are supported. Parameter arity is still fixed.
 
 Other limits include `switch`, generators, regular-expression literals, namespace imports/exports, JSX, enums, decorators and user-defined operator/subscript declarations. Use explicit constructors and `super(...)` in derived classes, and normal named methods in place of operator declarations. Methods can still be overloaded by arity as an engine extension.

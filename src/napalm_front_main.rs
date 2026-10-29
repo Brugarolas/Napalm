@@ -266,7 +266,13 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                     .map(|part| Box::new(classify_compact_type(part, span)));
                 TypeAnnotation::new(K::List(element), span)
             }
-            "Map" | "ReadonlyMap" | "Record" => TypeAnnotation::new(K::Map, span),
+            "Map" | "ReadonlyMap" if arguments.len() == 2 => TypeAnnotation::new(K::GenericMap(
+                Box::new(classify_variable_type(arguments[0], span)),
+                Box::new(classify_variable_type(arguments[1], span))), span),
+            "Set" | "ReadonlySet" if arguments.len() == 1 => TypeAnnotation::new(K::Set(
+                Some(Box::new(classify_variable_type(arguments[0], span)))), span),
+            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet" => TypeAnnotation::new(K::Never, span),
+            "Record" => TypeAnnotation::new(K::Map, span),
             "Function" | "Fn" => TypeAnnotation::new(K::Closure, span),
             _ => TypeAnnotation::new(K::Named(base.to_owned()), span),
         };
@@ -2757,6 +2763,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat("new") {
             let mut name = self.ident()?;
+            let collection_name = name.value.clone();
             let is_array = name.value == "Array";
             if is_array {
                 // Array is surface syntax over Napalm's List runtime identity.
@@ -2778,6 +2785,7 @@ impl<'a> Parser<'a> {
             }
 
             let mut constructor = "new";
+            let mut collection_annotation = None;
             if self.at("<") {
                 if is_array {
                     let type_start = self.peek().span.start;
@@ -2798,14 +2806,30 @@ impl<'a> Parser<'a> {
                         }
                     }
                 } else {
+                    let type_start = self.peek().span.start;
                     self.type_arguments()?;
+                    let type_end = self.tokens[self.pos - 1].span.end;
+                    if matches!(collection_name.as_str(), "Map" | "Set") {
+                        let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
+                        let annotation = classify_variable_type(&spelling, self.end(start));
+                        if matches!(annotation.kind, TypeAnnotationKind::Never) {
+                            return self.error("Map expects two type arguments; Set expects one");
+                        }
+                        collection_annotation = Some(annotation);
+                    }
                 }
             }
             let args = self.args()?;
             if is_array && args.len() != 1 {
                 return self.error("Array(size) expects exactly one size argument");
             }
-            return Ok(invoke(receiver, constructor, args, self.end(start)));
+            let expression = invoke(receiver, constructor, args, self.end(start));
+            return Ok(match collection_annotation {
+                Some(annotation) => Expr::new(ExprKind::TypedCollection {
+                    expression: Box::new(expression), annotation,
+                }, self.end(start)),
+                None => expression,
+            });
         }
         if self.eat("super") {
             let method = if self.eat(".") {
@@ -2852,13 +2876,61 @@ impl<'a> Parser<'a> {
                     self.lines();
                     continue;
                 }
-                let item = if self.eat("...") {
+                let spread = self.eat("...");
+                let item = if spread {
                     self.lines();
                     let value = self.expr(1)?;
                     Expr::new(ExprKind::Spread(Box::new(value)), self.end(item_start))
                 } else {
                     self.expr(0)?
                 };
+
+                // List comprehensions deliberately reuse `for ... in` rather than
+                // introducing a second collection-specific iterator syntax. They
+                // are only recognized after the first element expression, so normal
+                // list literals and destructuring remain unambiguous.
+                self.lines();
+                if items.is_empty() && !spread && self.eat("for") {
+                    let mut clauses = Vec::new();
+                    loop {
+                        self.lines();
+                        let clause_start = self.peek().span.start;
+                        let binding = self.ident()?;
+                        self.lines();
+                        self.expect("in")?;
+                        self.lines();
+                        let iterable = self.expr(0)?;
+                        let mut filters = Vec::new();
+                        loop {
+                            self.lines();
+                            if !self.eat("if") {
+                                break;
+                            }
+                            self.lines();
+                            filters.push(self.expr(0)?);
+                        }
+                        clauses.push(ListComprehensionClause {
+                            binding,
+                            iterable,
+                            filters,
+                            span: self.end(clause_start),
+                        });
+                        self.lines();
+                        if !self.eat("for") {
+                            break;
+                        }
+                    }
+                    self.lines();
+                    self.expect("]")?;
+                    return Ok(Expr::new(
+                        ExprKind::ListComprehension {
+                            element: Box::new(item),
+                            clauses,
+                        },
+                        self.end(start),
+                    ));
+                }
+
                 items.push(item);
                 self.lines();
                 if !self.eat(",") {
@@ -3881,6 +3953,7 @@ fn rewrite_enum_member_references(
             *expr = enum_member_read(enum_name, &member, span);
         }
         ExprKind::Unary { operand, .. }
+        | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
         | ExprKind::Await(operand)
         | ExprKind::Launch(operand)
@@ -3924,6 +3997,17 @@ fn rewrite_enum_member_references(
             for item in items {
                 rewrite_enum_member_references(item, enum_name, members, current_member);
             }
+        }
+        ExprKind::ListComprehension { element, clauses } => {
+            for clause in clauses {
+                rewrite_enum_member_references(
+                    &mut clause.iterable, enum_name, members, current_member,
+                );
+                for filter in &mut clause.filters {
+                    rewrite_enum_member_references(filter, enum_name, members, current_member);
+                }
+            }
+            rewrite_enum_member_references(element, enum_name, members, current_member);
         }
         ExprKind::Map(entries) => {
             for entry in entries {
@@ -4220,6 +4304,22 @@ fn validate_bindings(
                         self.expr(e);
                     }
                 }
+                ExprKind::ListComprehension { element, clauses } => {
+                    let mut scopes = 0usize;
+                    for clause in clauses {
+                        self.expr(&clause.iterable);
+                        self.scopes.push(HashMap::default());
+                        scopes += 1;
+                        self.declare(&clause.binding);
+                        for filter in &clause.filters {
+                            self.expr(filter);
+                        }
+                    }
+                    self.expr(element);
+                    for _ in 0..scopes {
+                        self.scopes.pop();
+                    }
+                }
                 ExprKind::Map(entries) => {
                     for e in entries {
                         if matches!(&e.value.kind, ExprKind::Assign { target, .. } if target.span == e.key.span) {
@@ -4231,7 +4331,8 @@ fn validate_bindings(
                     }
                 }
                 ExprKind::Unary { operand, .. }
-                | ExprKind::Grouped(operand)
+                | ExprKind::TypedCollection { expression: operand, .. }
+        | ExprKind::Grouped(operand)
                 | ExprKind::Await(operand)
                 | ExprKind::Launch(operand)
                 | ExprKind::DestructureCheck { source: operand, .. }
@@ -4816,6 +4917,40 @@ mod napalm_syntax_tests {
         "#);
         assert!(!module.statements.is_empty());
     }
+
+    #[test]
+    fn parses_list_comprehensions_with_filters_and_nested_clauses() {
+        let module = assert_parses(r#"
+            const values = [1, 2, 3, 4];
+            const doubled = [x * 2 for x in values if x >= 3];
+            const pairs = [x * 10 + y for x in [1, 2] for y in [3, 4] if y == 4];
+            const projected = [{ name: person.name, age: person.age }
+                for person in people if person.age >= 30];
+        "#);
+
+        let StmtKind::Variable { initializer: Some(initializer), .. } = &module.statements[1].kind else {
+            panic!("expected comprehension initializer");
+        };
+        let ExprKind::ListComprehension { element, clauses } = &initializer.kind else {
+            panic!("expected list comprehension");
+        };
+        assert!(matches!(element.kind, ExprKind::Binary { operator: BinaryOp::Multiply, .. }));
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].binding.value, "x");
+        assert_eq!(clauses[0].filters.len(), 1);
+
+        let StmtKind::Variable { initializer: Some(initializer), .. } = &module.statements[2].kind else {
+            panic!("expected nested comprehension initializer");
+        };
+        let ExprKind::ListComprehension { clauses, .. } = &initializer.kind else {
+            panic!("expected nested list comprehension");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].binding.value, "x");
+        assert_eq!(clauses[1].binding.value, "y");
+        assert_eq!(clauses[1].filters.len(), 1);
+    }
+
 
 
 }

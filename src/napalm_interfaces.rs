@@ -37,7 +37,7 @@ impl Heap {
         // typed-list contract therefore needs neither another deep traversal nor a
         // duplicate installation plan. This is especially valuable for nested
         // typed object graphs passed repeatedly through typed APIs.
-        if matches!(expected, Type::Interface(_) | Type::Record(_) | Type::List(Some(_)))
+        if matches!(expected, Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)))
             && self.interface_matches(value, expected)
         {
             return Ok(());
@@ -50,7 +50,33 @@ impl Heap {
             Type::Bool => value.is_bool(),
             Type::Num => value.is_num(),
             Type::String => matches!(self.get(value), Some(HeapObject::String(_))),
+            Type::Range => matches!(self.get(value), Some(HeapObject::Range { .. })),
+            Type::Fiber => matches!(self.get(value), Some(HeapObject::FiberObject { .. })),
+            Type::Instance(classes) => match self.get(value) {
+                Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => {
+                    classes.is_unknown() || self.contract_class_ids.get(*class_slot as usize)
+                        .is_some_and(|id| classes.contains(*id))
+                }
+                _ => false,
+            },
             Type::Map => matches!(self.get(value), Some(HeapObject::Map(_))),
+            Type::GenericMap(key_type, value_type) => {
+                let Some(HeapObject::Map(map)) = self.get(value) else { return Err(mismatch(path, expected)); };
+                for i in 0..map.len() {
+                    self.plan_map_key(&map.nth_key(&self.map_shapes, i).unwrap(), key_type, plan)?;
+                    self.plan_contract(map.nth_value(i).unwrap(), value_type, "map value", plan)?;
+                }
+                plan.push((value, expected.clone()));
+                true
+            }
+            Type::Set(element) => {
+                let Some(HeapObject::Set { map }) = self.get(value) else { return Err(mismatch(path, expected)); };
+                if let Some(element) = element {
+                    self.plan_contract(*map, &Type::GenericMap(element.clone(), element.clone()), "set element", plan)?;
+                    plan.push((value, expected.clone()));
+                }
+                true
+            }
             Type::Closure(_) => matches!(self.get(value), Some(HeapObject::Closure { .. })),
             Type::List(element) => {
                 let Some(HeapObject::List(items)) = self.get(value) else {
@@ -134,6 +160,29 @@ impl Heap {
         }
     }
 
+    fn plan_map_key(&self, key: &MapKey, expected: &Type, plan: &mut Vec<(Value, Type)>) -> Result<(), RuntimeError> {
+        // String keys are owned bytes, not GC values; all other keys can be checked
+        // with the ordinary value checker without allocating temporary strings.
+        if let MapKey::String(_) = key {
+            fn accepts_string(ty: &Type) -> bool {
+                match ty {
+                    Type::Top | Type::String => true,
+                    Type::Union(types) => types.iter().any(accepts_string),
+                    _ => false,
+                }
+            }
+            return if accepts_string(expected) { Ok(()) } else { Err(mismatch("map key", expected)) };
+        }
+        let value = match key {
+            MapKey::Null => Value::NULL,
+            MapKey::Bool(v) => Value::from_bool(*v),
+            MapKey::Num(bits) => Value::from_num(f64::from_bits(*bits)),
+            MapKey::Object(handle) => Value::from_heap(*handle),
+            MapKey::String(_) => unreachable!(),
+        };
+        self.plan_contract(value, expected, "map key", plan)
+    }
+
     fn install_contracts(&mut self, plan: Vec<(Value, Type)>) {
         for (value, ty) in plan {
             let Some(object) = self.object(value) else {
@@ -158,7 +207,10 @@ impl Heap {
             // Keep the distinction between "not a shaped map" and "typed shape
             // allocation failed". The latter must invalidate already-compiled
             // shaped traces, so it falls back to dictionary representation.
-            let typed_shape = shape.map(|shape| self.map_shapes.apply_contract(shape, &ty));
+            let typed_shape = shape.map(|shape| {
+                if matches!(ty, Type::GenericMap(_, _)) { None }
+                else { self.map_shapes.apply_contract(shape, &ty) }
+            });
             let object = self.object(value).expect("validated contract owner");
             let managed = unsafe { managed_object_mut(object) };
             managed
@@ -185,6 +237,8 @@ impl Heap {
                 .has_contract
                 .store(1, Ordering::Relaxed);
             self.handle_table.refresh(handle, &managed.object);
+            let bytes = external_bytes_for(&managed.object);
+            self.set_external_bytes(value, bytes);
         }
     }
 
@@ -280,6 +334,13 @@ impl Heap {
 
         let mut plan = Vec::new();
         for contract in &contracts {
+            if let Type::GenericMap(key_type, value_type) = contract {
+                if let (Some(key), Some(item)) = (key, item) {
+                    self.plan_map_key(key, key_type, &mut plan)?;
+                    self.plan_contract(item, value_type, "map value", &mut plan)?;
+                }
+                continue;
+            }
             let (fields, closed) = match contract {
                 Type::Interface(fields) => (fields, false),
                 Type::Record(fields) => (fields, true),
