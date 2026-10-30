@@ -4349,6 +4349,33 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_map(&mut self, entries: &[front::MapEntry]) -> ValueId {
+        // Fixed string-key object literals have no observable access to the map
+        // until construction finishes. Evaluate their values first, then allocate
+        // and initialize the map in one contiguous instruction run. Besides
+        // shortening the lifetime of partially-built parents in recursive code,
+        // this deliberately exposes `AllocMap; MapSet...` to the baseline VM's
+        // small-literal superinstruction. Computed keys and spreads retain the
+        // exact source evaluation order below.
+        let fixed_string_literal = !entries.is_empty()
+            && entries.iter().all(|entry| {
+                !entry.spread && matches!(entry.key.kind, ExprKind::String(_))
+            });
+        if fixed_string_literal {
+            let mut lowered = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let value = self.lower_expr(&entry.value);
+                // String literal keys are side-effect free, so delaying their
+                // materialization cannot change source-visible evaluation order.
+                let key = self.lower_expr(&entry.key);
+                lowered.push((key, value));
+            }
+            let map = self.builder.emit1(Inst::AllocMap, Type::Map);
+            for (key, value) in lowered {
+                self.builder.emit0(Inst::MapSet { map, key, value });
+            }
+            return map;
+        }
+
         let map = self.builder.emit1(Inst::AllocMap, Type::Map);
         for entry in entries {
             if entry.spread {

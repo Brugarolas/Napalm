@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [profile.release]
-lto = true
+lto = "thin"
 opt-level = 3
+codegen-units = 1
 overflow-checks = false
 
 [dependencies]
@@ -17,7 +18,7 @@ ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 #papaya = "0.2.5" # Concurrent hash map
 #small-map = "0.1.5" # Small map optimization
-smallbox = "0.8.8" # Small Box<T> optimization
+smallbox = "0.8.9" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
 compact_str = "0.10.0" # String drop-in replacement
 parking_lot = "0.13.0" # Concurrency primitives
@@ -33,7 +34,7 @@ libloading = "0.9.0" # Dynamic library loading
 crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
 
 bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
-cranelift = { version = "0.137.0", features = ["jit", "module", "native"] } #JIT
+cranelift = { version = "0.137.1", features = ["jit", "module", "native"] } #JIT
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] }

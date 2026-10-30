@@ -227,6 +227,10 @@ pub const TRACE_RUNTIME_MODE_MAP_SET: u32 = 11 << TRACE_RUNTIME_MODE_SHIFT;
 /// generated code into TraceActivation scratch storage; the runtime helper only
 /// pushes the already-resolved callee and runs it back to the caller.
 pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
+/// Fused small object-literal allocation. The runtime helper consumes the
+/// prepared AllocMap + MapSet superinstruction and resumes after the complete
+/// literal, so generated traces pay one GC/runtime boundary instead of N+1.
+pub const TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL: u32 = 13 << TRACE_RUNTIME_MODE_SHIFT;
 
 /// Direct-call scratch describes closure ABI rather than method/receiver ABI.
 /// The source opcode may be CallClosure or an Invoke("call") proven to resolve
@@ -498,6 +502,14 @@ pub enum ObservedClass {
     UnknownHeap,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmallMapLiteralTraceInfo {
+    /// Number of MapSet bytecodes fused with the leading AllocMap.
+    pub field_count: u8,
+    /// Raw bytecode continuation after the whole literal.
+    pub continuation: BytecodePc,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapedMapAccess {
     pub shape: u32,
@@ -535,6 +547,17 @@ pub trait TraceRuntime {
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
+
+    /// Observe a prepared AllocMap + MapSet small-literal superinstruction.
+    /// The recorder still validates the baseline bytecodes individually, while
+    /// generated code can execute the equivalent allocation in one runtime call.
+    fn trace_small_map_literal(
+        &self,
+        _function: FuncId,
+        _pc: BytecodePc,
+    ) -> Option<SmallMapLiteralTraceInfo> {
+        None
+    }
 
     /// Reactive class-field tracking is an interpreter/runtime side effect. When
     /// enabled, field bytecodes must remain runtime leaves so native traces cannot
@@ -712,6 +735,19 @@ pub trait TraceRuntime {
         &self,
         _map: RegisterWord,
         _key: RegisterWord,
+    ) -> Option<ShapedMapAccess> {
+        None
+    }
+
+    /// Observe an ordinary dynamic getter that currently resolves to the Map
+    /// property fallback. The runtime validates the actual method target, so the
+    /// recorder may replace Invoke with a native shape/slot load guarded by the
+    /// method epoch and observed map shape.
+    fn trace_map_property_access(
+        &self,
+        _function: FuncId,
+        _cache: u32,
+        _map: RegisterWord,
     ) -> Option<ShapedMapAccess> {
         None
     }
@@ -1736,6 +1772,48 @@ impl<'a> TraceRecorder<'a> {
         Ok(ExpectedStep::Runtime { terminal: false })
     }
 
+    /// Fuse a prepared AllocMap + MapSet small object literal into one generated
+    /// runtime boundary. Recording still executes every original bytecode, so the
+    /// optimization cannot hide an interpreter/JIT semantic mismatch.
+    fn runtime_gc_small_map_literal(
+        &self,
+        op: &RecordedOp,
+        info: SmallMapLiteralTraceInfo,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::AllocMap
+            || info.field_count == 0
+            || info.field_count > 4
+            || info.continuation.0 & TRACE_RUNTIME_MODE_MASK != 0
+        {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        let used = builder
+            .trace()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+            .count();
+        if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        builder.runtime_gc_leaf(
+            op.location,
+            BytecodePc(info.continuation.0 | TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL),
+        );
+        builder.reload_slot_after_runtime(
+            FrameSlot::General(Reg(op.a)),
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        Ok(ExpectedStep::RuntimeFused {
+            next: TraceLocation::new(op.location.function, info.continuation),
+            bytecodes: info.field_count as usize + 1,
+        })
+    }
+
     /// Non-GC counterpart of runtime_gc_specialized. This is useful for
     /// container mutations that require Rust Vec/hash-map bookkeeping but never
     /// allocate through the Napalm collector. The trace skips opcode redispatch
@@ -1774,6 +1852,70 @@ impl<'a> TraceRecorder<'a> {
             builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
         }
         Ok(ExpectedStep::Runtime { terminal: false })
+    }
+
+    fn record_map_property_invoke<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        function: &BytecodeFunction,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<bool, RecordingAbort> {
+        if op.opcode != Opcode::Invoke || op.c != 0 {
+            return Ok(false);
+        }
+        let Some(descriptor) = function.chunk.inline_caches.get(op.x as usize) else {
+            return Ok(false);
+        };
+        if descriptor.home_class.is_some() {
+            return Ok(false);
+        }
+        let Some(signature) = program.metadata.method(descriptor.method) else {
+            return Ok(false);
+        };
+        if signature.kind != MethodKind::Getter || signature.arity != 0 {
+            return Ok(false);
+        }
+
+        let map_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let Some(access) = runtime.trace_map_property_access(
+            op.location.function,
+            op.x,
+            map_word,
+        ) else {
+            return Ok(false);
+        };
+
+        let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+        let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+        let key = builder.constant(TraceConstant::String(signature.name));
+        let field_type = access.read_type.clone().unwrap_or(Type::Top);
+        let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+        let result = builder.emit1(
+            TraceInst::HeapMapGetShaped {
+                map,
+                key,
+                expected_key: access.key_bytes,
+                shape: access.shape,
+                slot: access.slot as u32,
+                exit,
+            },
+            trace_ty,
+            trace_rep,
+        );
+        if !matches!(field_type, Type::Top) {
+            builder.set_proven_type(result, field_type);
+        }
+        self.write_gpr(builder, op.a, result);
+        Ok(true)
     }
 
     fn record_num_invoke<R: TraceRuntime>(
@@ -3646,7 +3788,9 @@ impl<'a> TraceRecorder<'a> {
             Bailout => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
             Invoke => {
-                if self.record_num_invoke(runtime, program, function, op, builder)? {
+                if self.record_num_invoke(runtime, program, function, op, builder)?
+                    || self.record_map_property_invoke(runtime, program, function, op, builder)?
+                {
                     Ok(ExpectedStep::Exact(next))
                 } else {
                     self.inline_or_runtime_call(runtime, program, op, builder)
@@ -4720,10 +4864,22 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::RuntimeCall)
             }
 
+            AllocMap => {
+                if let Some(info) = runtime.trace_small_map_literal(op.location.function, op.location.pc) {
+                    self.runtime_gc_small_map_literal(op, info, builder)
+                } else {
+                    self.runtime_gc_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
+
             // Allocation/mutation helpers below may collect, but their bytecode
             // contract keeps execution in the same frame. Preserve unrelated SSA
             // values across the memory epoch and reload only architectural outputs.
-            AllocCell | MakeClosure | AllocList | AllocListCap | AllocMap
+            AllocCell | MakeClosure | AllocList | AllocListCap
             | StringConcat | StringSlice | MakeRange => {
                 self.runtime_gc_leaf(
                     op,
@@ -5188,6 +5344,8 @@ impl<'a> TraceRecorder<'a> {
                     // after executing the boundary and stops cleanly otherwise.
                     Ok(step @ ExpectedStep::RuntimeCall) => step,
                     Ok(step @ ExpectedStep::Runtime { terminal: false }) => step,
+                    Ok(step @ ExpectedStep::RuntimeFused { next, .. })
+                        if next.pc.0 > location.pc.0 && !visited.contains(&next) => step,
                     Ok(_) | Err(_) => {
                         builder = checkpoint;
                         break;
@@ -5203,6 +5361,22 @@ impl<'a> TraceRecorder<'a> {
                 _ => runtime.trace_execute_unfused_step(),
             }
             .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+
+            let mut recorded_bytecodes = 1usize;
+            if let ExpectedStep::RuntimeFused { next, bytecodes } = expected {
+                recorded_bytecodes = bytecodes.max(1);
+                for _ in 1..recorded_bytecodes {
+                    if !step.running || step.frame_changed {
+                        break;
+                    }
+                    step = runtime
+                        .trace_execute_unfused_step()
+                        .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+                }
+                if step.running && !step.frame_changed && step.after == next {
+                    step = TraceStep::simple(location, next);
+                }
+            }
 
             if let ExpectedStep::Inlined { next, callee, steps: callee_steps } = expected {
                 if !step.running || step.after != TraceLocation::new(callee, BytecodePc(0)) {
@@ -5225,8 +5399,21 @@ impl<'a> TraceRecorder<'a> {
                 builder.trace_mut().stats.recorded_bytecodes += callee_steps;
             }
 
-            steps += 1;
-            builder.trace_mut().stats.recorded_bytecodes += 1;
+            steps = steps.saturating_add(recorded_bytecodes);
+            let recorded_total = builder
+                .trace()
+                .stats
+                .recorded_bytecodes
+                .saturating_add(recorded_bytecodes);
+            builder.trace_mut().stats.recorded_bytecodes = recorded_total;
+
+            if let ExpectedStep::RuntimeFused { next, .. } = expected {
+                if !step.running || step.frame_changed || step.after != next {
+                    runtime_end = true;
+                    break;
+                }
+                continue;
+            }
 
             if let ExpectedStep::Runtime { terminal } = expected {
                 if terminal || !step.running || step.frame_changed
@@ -5409,6 +5596,9 @@ enum ExpectedStep {
     Exact(TraceLocation),
     Inlined { next: TraceLocation, callee: FuncId, steps: usize },
     Runtime { terminal: bool },
+    /// One generated runtime helper replaces several contiguous baseline
+    /// bytecodes. Recording executes all `bytecodes` to validate exact semantics.
+    RuntimeFused { next: TraceLocation, bytecodes: usize },
     RuntimeCall,
 }
 
@@ -9975,7 +10165,7 @@ impl TracingJit {
                 let exit = builder.add_side_exit(ExitReason::GuardValue, next.pc);
                 builder.set_terminator(TraceTerminator::Exit(exit));
             },
-            ExpectedStep::Runtime { .. } | ExpectedStep::RuntimeCall => {
+            ExpectedStep::Runtime { .. } | ExpectedStep::RuntimeFused { .. } | ExpectedStep::RuntimeCall => {
                 builder.prepare_memory_loop();
                 builder.set_terminator(TraceTerminator::RuntimeReturn);
             },

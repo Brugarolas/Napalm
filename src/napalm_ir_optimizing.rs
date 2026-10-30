@@ -5,7 +5,7 @@ use bumpalo::{Bump, collections::Vec as BumpVec};
 use smallvec::SmallVec;
 
 use crate::napalm_ir::{
-    BlockId, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
+    BlockId, CallConv, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
     FieldSlot, FuncId, Function, FunctionKind, Inst, InstId, IntBinOp, IntUnaryOp, MemoizationKind,
     MethodKind, ModuleId, ModuleSlot, Node, Program, SiteId, StaticFieldSlot, StringId, Type, ValueDef,
     ValueId,
@@ -137,7 +137,135 @@ struct MemoCandidate {
 
 impl ProgramOptimization for AutoMemoization {
     fn optimize_program(&mut self, program: &mut Program) -> bool {
-        analyze_auto_memoization(program)
+        // Source functions are represented as immutable module-held closures and
+        // ordinary calls arrive as Invoke("call"). Resolve those identities once
+        // at whole-program time so recursive/hot calls can use the direct bytecode
+        // ABI instead of Closure method dispatch on every edge.
+        let direct_calls = rewrite_known_function_calls(program);
+        analyze_auto_memoization(program) | direct_calls
+    }
+}
+
+fn rewrite_known_function_calls(program: &mut Program) -> bool {
+    let module_functions = discover_module_function_bindings(program);
+    if module_functions.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for function_index in 0..program.functions.len() {
+        let (replacements, changed_blocks) = {
+            let function = &program.functions[function_index];
+            let mut replacements = Vec::<(InstId, Inst)>::new();
+            let mut changed_blocks = SmallVec::<[usize; 8]>::new();
+            for (block_ix, block) in function.blocks.iter().enumerate() {
+                let replacements_before = replacements.len();
+                for &id in &block.insts {
+                    let node = &function.nodes[id.0 as usize];
+                    match &node.kind {
+                        Inst::Invoke { receiver, method, args, .. } => {
+                            let Some(signature) = program.method(*method) else { continue; };
+                            if signature.kind != MethodKind::Method
+                                || signature.arity as usize != args.len()
+                                || program.string(signature.name) != Some("call")
+                            {
+                                continue;
+                            }
+                            let Some(callee) = resolve_direct_call_callee(
+                                function,
+                                *receiver,
+                                &module_functions,
+                                0,
+                            ) else { continue; };
+                            let Some(target) = program.function(callee) else { continue; };
+                            if target.kind != FunctionKind::Closure
+                                || target.is_async
+                                || target.is_concurrent
+                                || !target.captures.is_empty()
+                                || target.signature.params.len() != args.len()
+                            {
+                                continue;
+                            }
+                            replacements.push((id, Inst::CallDirect {
+                                conv: CallConv::Napalm,
+                                callee,
+                                args: args.clone(),
+                            }));
+                        }
+                        Inst::TailInvoke { receiver, method, args, .. } => {
+                            let Some(signature) = program.method(*method) else { continue; };
+                            if signature.kind != MethodKind::Method
+                                || signature.arity as usize != args.len()
+                                || program.string(signature.name) != Some("call")
+                            {
+                                continue;
+                            }
+                            let Some(callee) = resolve_direct_call_callee(
+                                function,
+                                *receiver,
+                                &module_functions,
+                                0,
+                            ) else { continue; };
+                            let Some(target) = program.function(callee) else { continue; };
+                            if target.kind != FunctionKind::Closure
+                                || target.is_async
+                                || target.is_concurrent
+                                || !target.captures.is_empty()
+                                || target.signature.params.len() != args.len()
+                            {
+                                continue;
+                            }
+                            replacements.push((id, Inst::TailCallDirect {
+                                conv: CallConv::Napalm,
+                                callee,
+                                args: args.clone(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if replacements.len() != replacements_before {
+                    changed_blocks.push(block_ix);
+                }
+            }
+            (replacements, changed_blocks)
+        };
+
+        if replacements.is_empty() {
+            continue;
+        }
+        let function = &mut program.functions[function_index];
+        for (id, replacement) in replacements {
+            function.nodes[id.0 as usize].kind = replacement;
+        }
+        for block_ix in changed_blocks {
+            repair_effect_chain(function, block_ix);
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn resolve_direct_call_callee(
+    function: &Function,
+    value: ValueId,
+    module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
+    depth: u8,
+) -> Option<FuncId> {
+    if depth >= 16 {
+        return None;
+    }
+    let value_info = function.value(value)?;
+    let ValueDef::InstResult(inst, 0) = value_info.def else {
+        return None;
+    };
+    match &function.node(inst)?.kind {
+        Inst::MakeClosure { function, .. } => Some(*function),
+        Inst::Move(source) => {
+            resolve_direct_call_callee(function, *source, module_functions, depth + 1)
+        }
+        Inst::LoadModuleVar { module, slot } => module_functions.get(&(*module, *slot)).copied(),
+        _ => None,
     }
 }
 
@@ -2865,10 +2993,14 @@ mod typed_object_tests {
         init.finish();
 
         assert!(AutoMemoization.optimize_program(&mut program));
-        assert_eq!(
-            program.functions[fib_id.0 as usize].memoization,
-            MemoizationKind::Recursive
-        );
+        let fib_function = &program.functions[fib_id.0 as usize];
+        assert_eq!(fib_function.memoization, MemoizationKind::Recursive);
+        assert!(fib_function.blocks.iter().flat_map(|block| block.insts.iter()).any(|id| {
+            matches!(
+                &fib_function.nodes[id.0 as usize].kind,
+                Inst::CallDirect { callee, .. } if *callee == fib_id
+            )
+        }));
     }
 
     #[test]

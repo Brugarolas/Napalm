@@ -59,8 +59,9 @@ mod interfaces;
 use self::interfaces::h_bind_interface;
 use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
-    JitAction, SharedJitProfile, SharedJitRepository, TraceActivation, TraceActivationInputs, TraceHeapEntry,
-    TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
+    JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
+    TraceActivationInputs, TraceHeapEntry, TraceHeapKind, TraceRuntime, TraceStep, TracingJit,
+    TracingJitOptions, TracingJitStats,
     VmBindingDescriptor, VmBindingKind,
     TRACE_HEAP_CHUNK_BITS, TRACE_HEAP_CHUNK_MASK, TRACE_HEAP_CHUNK_SIZE,
     TRACE_PROMISE_CANCELLED, TRACE_PROMISE_FULFILLED, TRACE_PROMISE_PENDING, TRACE_PROMISE_REJECTED,
@@ -1472,6 +1473,46 @@ impl MapDictionary {
     }
 }
 
+const SMALL_MAP_POOL_MAX_FIELDS: usize = 4;
+const SMALL_MAP_POOL_LOCAL_BATCH: usize = 32;
+const SMALL_MAP_POOL_GLOBAL_LIMIT_PER_CLASS: usize = 2048;
+
+struct SmallMapBufferPool {
+    buckets: [Mutex<Vec<Vec<Value>>>; SMALL_MAP_POOL_MAX_FIELDS],
+}
+
+impl SmallMapBufferPool {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| Mutex::new(Vec::new())),
+        }
+    }
+
+    fn recycle(&self, mut values: Vec<Value>) {
+        let capacity = values.capacity();
+        if capacity == 0 || capacity > SMALL_MAP_POOL_MAX_FIELDS {
+            return;
+        }
+        values.clear();
+        // Cleanup may run on several GC workers. Pooling is opportunistic: never
+        // lengthen an STW pause waiting for another worker that is recycling the
+        // same capacity class. Contended buffers simply fall back to normal free.
+        let Some(mut bucket) = self.buckets[capacity - 1].try_lock() else {
+            return;
+        };
+        if bucket.len() < SMALL_MAP_POOL_GLOBAL_LIMIT_PER_CLASS {
+            bucket.push(values);
+        }
+    }
+}
+
+static SMALL_MAP_BUFFER_POOL: OnceLock<SmallMapBufferPool> = OnceLock::new();
+
+#[inline]
+fn small_map_buffer_pool() -> &'static SmallMapBufferPool {
+    SMALL_MAP_BUFFER_POOL.get_or_init(SmallMapBufferPool::new)
+}
+
 #[derive(Debug)]
 enum NapalmMapStorage {
     /// Object-like fast representation. The shape owns immutable shared string
@@ -1498,6 +1539,23 @@ impl Default for NapalmMap {
 }
 
 impl NapalmMap {
+    #[inline]
+    fn with_shaped_buffer(shape: u32, values: Vec<Value>) -> Self {
+        Self { storage: NapalmMapStorage::Shaped { shape, values } }
+    }
+
+    #[inline]
+    fn take_recyclable_small_buffer(&mut self) -> Option<Vec<Value>> {
+        let NapalmMapStorage::Shaped { values, .. } = &mut self.storage else {
+            return None;
+        };
+        let capacity = values.capacity();
+        if capacity == 0 || capacity > SMALL_MAP_POOL_MAX_FIELDS {
+            return None;
+        }
+        Some(std::mem::take(values))
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         match &self.storage {
@@ -1537,6 +1595,43 @@ impl NapalmMap {
             (NapalmMapStorage::Shaped { .. }, _) => None,
             (NapalmMapStorage::Dictionary(entries), _) => entries.get(key).copied(),
         }
+    }
+
+    /// Insert into a map that has not been published to the managed heap yet.
+    /// No write barrier, contract validation, sidecar refresh or GC interaction is
+    /// required because the complete object is traced as an allocation root when
+    /// `Heap::alloc` eventually publishes it.
+    fn insert_unpublished(
+        &mut self,
+        shapes: &mut MapShapeTable,
+        key: MapKey,
+        value: Value,
+    ) -> Option<u16> {
+        if let NapalmMapStorage::Shaped { shape, values } = &mut self.storage {
+            if let MapKey::String(bytes) = &key {
+                if let Some(slot) = shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()) {
+                    unsafe { *values.get_unchecked_mut(slot as usize) = value; }
+                    return Some(slot);
+                }
+                if let Some((next_shape, slot)) = shapes.transition_with_contract(
+                    *shape,
+                    bytes.clone(),
+                    ShapeSlotContract::default(),
+                ) {
+                    debug_assert_eq!(slot as usize, values.len());
+                    values.push(value);
+                    *shape = next_shape;
+                    return Some(slot);
+                }
+            }
+            self.promote_to_dictionary(shapes);
+        }
+
+        let NapalmMapStorage::Dictionary(entries) = &mut self.storage else {
+            unreachable!("map promotion must produce dictionary storage")
+        };
+        entries.insert(key, value);
+        None
     }
 
     fn promote_to_dictionary(&mut self, shapes: &MapShapeTable) {
@@ -1870,6 +1965,7 @@ const HANDLE_CHUNK_SIZE: usize = TRACE_HEAP_CHUNK_SIZE;
 const HANDLE_CHUNK_MASK: u32 = TRACE_HEAP_CHUNK_MASK;
 const MAX_HANDLE_CHUNKS: usize = 1 << 14; // 16,777,216 simultaneous handle IDs.
 const FREE_HANDLE_NONE: u32 = 0;
+const HANDLE_RECYCLE_BATCH: usize = 32;
 
 type HandleEntry = TraceHeapEntry;
 
@@ -1980,6 +2076,51 @@ impl HandleTable {
             return None;
         }
         Some(unsafe { &*chunk.add((handle & HANDLE_CHUNK_MASK) as usize) })
+    }
+
+    /// Pop several recycled handles with one free-list CAS. Fresh handles still
+    /// use the ordinary monotonic path, so an interpreter that dies with a local
+    /// cache cannot leak never-published handle IDs.
+    fn take_recycled_batch(&self, out: &mut Vec<u32>, max: usize) -> usize {
+        let limit = max.min(HANDLE_RECYCLE_BATCH);
+        if limit == 0 {
+            return 0;
+        }
+
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == FREE_HANDLE_NONE {
+                return 0;
+            }
+
+            let mut handles = [0u32; HANDLE_RECYCLE_BATCH];
+            let mut cursor = head;
+            let mut count = 0usize;
+            while cursor != FREE_HANDLE_NONE && count < limit {
+                let handle = cursor - 1;
+                handles[count] = handle;
+                cursor = self.entry(handle).next_free.load(Ordering::Relaxed);
+                count += 1;
+            }
+
+            if self
+                .free_head
+                .compare_exchange_weak(head, cursor, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            out.reserve(count);
+            for &handle in &handles[..count] {
+                let entry = self.entry(handle);
+                entry.next_free.store(FREE_HANDLE_NONE, Ordering::Relaxed);
+                debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
+                self.generation_entry(handle).fetch_add(1, Ordering::Relaxed);
+                out.push(handle);
+            }
+            return count;
+        }
     }
 
     fn allocate_handle(&self) -> u32 {
@@ -2130,6 +2271,22 @@ impl HandleTable {
             .address
             .load(Ordering::Relaxed);
         (address != 0).then(|| unsafe { GcObject::from_address(address) })
+    }
+
+    fn return_unused(&self, handle: u32) {
+        let entry = self.entry(handle);
+        debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            entry.next_free.store(head, Ordering::Relaxed);
+            if self
+                .free_head
+                .compare_exchange_weak(head, handle + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     fn release(&self, handle: u32) {
@@ -2402,6 +2559,15 @@ unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 
 unsafe fn cleanup_managed_object(object: GcObject) {
     let managed = unsafe { managed_object_mut(object) };
+    // Small object-like Maps keep their dense values in a stable external Vec so
+    // JIT sidecars remain valid across moving collections. Recycle that backing
+    // allocation rather than freeing/reallocating it for the next short-lived
+    // literal. The managed object and stable handle themselves still die normally.
+    if let HeapObject::Map(map) = &mut managed.object {
+        if let Some(values) = map.take_recyclable_small_buffer() {
+            small_map_buffer_pool().recycle(values);
+        }
+    }
     handles().release(managed.handle);
     unsafe { std::ptr::drop_in_place(managed) };
 }
@@ -2718,6 +2884,12 @@ struct Heap {
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
     map_shapes: MapShapeTable,
+    /// Recycled stable handles are pulled from the global Treiber stack in small
+    /// batches, amortizing the CAS/generation traffic on allocation-heavy code.
+    recycled_handles: Vec<u32>,
+    /// Per-mutator small shaped-map buffers. GC workers return dead buffers to a
+    /// bounded global pool; the mutator refills these local buckets in batches.
+    small_map_buffers: [Vec<Vec<Value>>; SMALL_MAP_POOL_MAX_FIELDS],
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
     #[cfg(test)]
@@ -2763,6 +2935,8 @@ impl Default for Heap {
             _allocation_root_registration: allocation_root_registration,
             stack_owner: Value::NULL,
             map_shapes: MapShapeTable::default(),
+            recycled_handles: Vec::with_capacity(HANDLE_RECYCLE_BATCH),
+            small_map_buffers: std::array::from_fn(|_| Vec::new()),
             contract_class_ids: Vec::new(),
             #[cfg(test)]
             allocations: Vec::new(),
@@ -2770,14 +2944,68 @@ impl Default for Heap {
     }
 }
 
+impl Drop for Heap {
+    fn drop(&mut self) {
+        for handle in self.recycled_handles.drain(..) {
+            self.handle_table.return_unused(handle);
+        }
+        for bucket in &mut self.small_map_buffers {
+            for values in bucket.drain(..) {
+                small_map_buffer_pool().recycle(values);
+            }
+        }
+    }
+}
+
 impl Heap {
+    #[inline]
+    fn allocate_handle_fast(&mut self) -> u32 {
+        if let Some(handle) = self.recycled_handles.pop() {
+            return handle;
+        }
+        self.handle_table
+            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
+        if let Some(handle) = self.recycled_handles.pop() {
+            handle
+        } else {
+            self.handle_table.allocate_handle()
+        }
+    }
+
+    fn take_small_map_buffer(&mut self, capacity: usize) -> (Vec<Value>, bool) {
+        debug_assert!((1..=SMALL_MAP_POOL_MAX_FIELDS).contains(&capacity));
+        let local = &mut self.small_map_buffers[capacity - 1];
+        if let Some(mut values) = local.pop() {
+            values.clear();
+            return (values, true);
+        }
+
+        let pool = small_map_buffer_pool();
+        let mut global = pool.buckets[capacity - 1].lock();
+        let available = global.len().min(SMALL_MAP_POOL_LOCAL_BATCH);
+        if available != 0 {
+            for _ in 1..available {
+                if let Some(values) = global.pop() {
+                    local.push(values);
+                }
+            }
+            if let Some(mut values) = global.pop() {
+                drop(global);
+                values.clear();
+                return (values, true);
+            }
+        }
+        drop(global);
+        (Vec::with_capacity(capacity), false)
+    }
+
     #[inline]
     fn alloc(&mut self, object: HeapObject) -> Value {
         // Protect references which currently live only in the Rust-side object
         // being constructed. Mutator::allocate() may rendezvous for GC before it
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
-        let handle = self.handle_table.allocate_handle();
+        let handle = self.allocate_handle_fast();
         let receiver_class = heap_object_receiver_class(&object);
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
@@ -2912,6 +3140,145 @@ impl Heap {
         // than paying a second stable-handle table lookup for the same receiver.
         let key = self.map_key(key_value)?;
         Ok(map.get(&self.map_shapes, &key).unwrap_or(Value::NULL))
+    }
+
+    /// Property-name fast path used by quickened dynamic Map getters. The method
+    /// symbol already fixes the UTF-8 key, so shaped-map hits need neither a
+    /// temporary managed String nor an Arc clone/hash computation.
+    fn map_get_named_with_pic(
+        &self,
+        map_value: Value,
+        key: &[u8],
+        hash: u64,
+        cache: &mut MapInlineCacheState,
+    ) -> Result<Value, RuntimeError> {
+        let map = match self.get(map_value) {
+            Some(HeapObject::Map(map)) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+
+        if let Some((shape, values)) = map.shaped() {
+            if let Some(slot) = cache.probe(&self.map_shapes, shape, hash, key) {
+                return Ok(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            if let Some(slot) = self.map_shapes.slot_hashed(shape, hash, key) {
+                cache.insert(shape, slot);
+                return Ok(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            return Ok(Value::NULL);
+        }
+
+        // Dictionary mode is deliberately the cold fallback. It needs an owned
+        // key because dictionary entries may outlive this lookup, while shaped
+        // object-like maps stay entirely allocation-free on the hot path.
+        let encoded = MapKey::String(MapStringKey {
+            bytes: Arc::from(key),
+            hash,
+        });
+        Ok(map.get(&self.map_shapes, &encoded).unwrap_or(Value::NULL))
+    }
+
+    fn alloc_map_from_pairs<const N: usize>(
+        &mut self,
+        pairs: [(Value, Value); N],
+    ) -> Result<Value, RuntimeError> {
+        let mut site = SmallMapAllocationSite::default();
+        self.alloc_map_from_site(pairs, &mut site)
+    }
+
+    fn alloc_map_from_site<const N: usize>(
+        &mut self,
+        pairs: [(Value, Value); N],
+        site: &mut SmallMapAllocationSite,
+    ) -> Result<Value, RuntimeError> {
+        debug_assert!(N != 0 && N <= SMALL_MAP_POOL_MAX_FIELDS);
+        site.allocations = site.allocations.wrapping_add(1);
+
+        if site.initialized && !site.disabled && site.field_count as usize == N {
+            let mut matches = true;
+            for (index, (key, _)) in pairs.iter().enumerate() {
+                let Some(handle) = key.heap_handle() else {
+                    matches = false;
+                    break;
+                };
+                if handle != site.key_handles[index] {
+                    matches = false;
+                    break;
+                }
+                if !site.stable_program_keys
+                    && self.handle_table.generation(handle) != Some(site.key_generations[index])
+                {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if matches {
+                let value_count = site.value_count as usize;
+                debug_assert!(value_count <= N);
+                let (mut values, reused) = self.take_small_map_buffer(N);
+                values.resize(value_count, Value::NULL);
+                for (index, (_, value)) in pairs.iter().enumerate() {
+                    let slot = site.slots[index] as usize;
+                    debug_assert!(slot < value_count);
+                    unsafe { *values.get_unchecked_mut(slot) = *value; }
+                }
+                site.specialized_allocations = site.specialized_allocations.wrapping_add(1);
+                if reused {
+                    site.recycled_buffer_hits = site.recycled_buffer_hits.wrapping_add(1);
+                }
+                return Ok(self.alloc(HeapObject::Map(NapalmMap::with_shaped_buffer(
+                    site.shape,
+                    values,
+                ))));
+            }
+
+            site.polymorphic_misses = site.polymorphic_misses.saturating_add(1);
+            if site.polymorphic_misses >= 4 {
+                site.disabled = true;
+            }
+        }
+
+        // Cold or polymorphic path. Pre-size from the small-buffer recycler so the
+        // first shape build still avoids allocator churn after a nursery cycle.
+        let (values, reused) = self.take_small_map_buffer(N);
+        let mut map = NapalmMap::with_shaped_buffer(0, values);
+        let mut cacheable = !site.disabled;
+        let mut key_handles = [0u32; SMALL_MAP_POOL_MAX_FIELDS];
+        let mut key_generations = [0u64; SMALL_MAP_POOL_MAX_FIELDS];
+        let mut slots = [0u16; SMALL_MAP_POOL_MAX_FIELDS];
+
+        for (index, (key_value, value)) in pairs.iter().copied().enumerate() {
+            match self.identity(key_value) {
+                Some(identity) => {
+                    key_handles[index] = identity.handle;
+                    key_generations[index] = identity.generation;
+                }
+                None => cacheable = false,
+            }
+            let key = self.map_key(key_value)?;
+            match map.insert_unpublished(&mut self.map_shapes, key, value) {
+                Some(slot) => slots[index] = slot,
+                None => cacheable = false,
+            }
+        }
+
+        if reused {
+            site.recycled_buffer_hits = site.recycled_buffer_hits.wrapping_add(1);
+        }
+        if cacheable && !site.initialized {
+            if let NapalmMapStorage::Shaped { shape, values } = &map.storage {
+                site.initialized = true;
+                site.field_count = N as u8;
+                site.value_count = values.len() as u8;
+                site.shape = *shape;
+                site.key_handles = key_handles;
+                site.key_generations = key_generations;
+                site.slots = slots;
+            }
+        }
+
+        Ok(self.alloc(HeapObject::Map(map)))
     }
 
     fn map_get_property_with_pic(
@@ -4232,6 +4599,12 @@ struct PreparedFunction {
     /// hot call site can guard one ReceiverClass and call its target without
     /// touching the function/IC metadata hierarchy.
     quick_invokes: Vec<QuickInvokeSite>,
+    /// One property-name PIC per prepared op. Dynamic Map getters use this after
+    /// monomorphic invoke quickening, avoiding temporary key construction.
+    quick_map_properties: Vec<MapPropertyQuickState>,
+    /// Allocation-site specialization for fused small object literals. Each site
+    /// learns one stable key identity set, final shape and key->slot mapping.
+    small_map_literal_sites: Vec<SmallMapAllocationSite>,
     quickened_invoke_ops: Vec<u32>,
     /// MapGet/MapSet and typed property prepared ops allocate
     /// entries here. PreparedOp::cache stores the dense cache index so x/y remain
@@ -4618,7 +4991,15 @@ impl PreparedProgram {
             })
             .collect();
 
-        install_superinstructions(&temps, &mut handlers, &mut ops, &target_ops);
+        let mut small_map_literal_sites = Vec::new();
+        install_superinstructions(
+            &temps,
+            &mut handlers,
+            &mut ops,
+            &mut call_args,
+            &mut small_map_literal_sites,
+            &target_ops,
+        );
 
         // Switch tables are immutable after preparation. Store their direct
         // address in the executable op stream; original_ops retains the logical
@@ -4743,6 +5124,8 @@ impl PreparedProgram {
             jit_trace_headers,
             quickened_numeric_ops: Vec::new(),
             quick_invokes: vec![QuickInvokeSite::default(); op_count],
+            quick_map_properties: vec![MapPropertyQuickState::default(); op_count],
+            small_map_literal_sites,
             quickened_invoke_ops: Vec::new(),
             map_inline_caches: vec![MapInlineCacheState::default(); map_inline_cache_count],
             entry_this_dst,
@@ -4801,14 +5184,68 @@ fn install_superinstructions(
     temps: &[TempOp],
     handlers: &mut [Handler],
     ops: &mut [PreparedOp],
+    call_args: &mut Vec<Reg>,
+    small_map_literal_sites: &mut Vec<SmallMapAllocationSite>,
     target_ops: &FastSet<u32>,
 ) {
     if temps.len() < 2 { return; }
+
+    // A constituent covered by a super-instruction remains a valid logical PC.
+    // Keep its original baseline handler installed so JIT/deopt/debug re-entry is
+    // a normal O(1) dispatch. `covered` exists only while preparing the function
+    // and prevents a later super-instruction from overlapping an earlier one.
+    // The hot sequential path still skips covered constituents through the
+    // leading super-instruction's `next`/specialized handler, so retaining these
+    // handlers has zero execution cost on the fused path.
+    let mut covered = vec![false; temps.len()];
+
     for index in 0..temps.len() - 1 {
-        if handlers[index] as usize == (h_unreachable_fused as Handler) as usize { continue; }
+        if covered[index] { continue; }
         if target_ops.contains(&((index + 1) as u32)) { continue; }
         let first = temps[index].opcode;
         let second = temps[index + 1].opcode;
+
+        // Small fixed object literals are emitted as one AllocMap followed by a
+        // contiguous run of MapSet instructions. Build the complete unpublished
+        // map first and publish it once: this removes N dispatches, N GC polls,
+        // N post barriers and N JIT-sidecar refreshes from the construction path.
+        if first == Opcode::AllocMap {
+            let map_reg = temps[index].a;
+            let mut count = 0usize;
+            while count < 4 && index + 1 + count < temps.len() {
+                let next_index = index + 1 + count;
+                let candidate = temps[next_index];
+                if covered[next_index]
+                    || candidate.opcode != Opcode::MapSet
+                    || candidate.a != map_reg
+                    || target_ops.contains(&(next_index as u32))
+                {
+                    break;
+                }
+                count += 1;
+            }
+            if count != 0 {
+                let offset = call_args.len() as u32;
+                for pair in &temps[index + 1..index + 1 + count] {
+                    call_args.push(Reg(pair.b));
+                    call_args.push(Reg(pair.c));
+                }
+                ops[index].args_offset = offset;
+                ops[index].c = count as u8;
+                ops[index].cache = small_map_literal_sites.len() as u32;
+                small_map_literal_sites.push(SmallMapAllocationSite::default());
+                ops[index].next = (index + 1 + count) as u32;
+                handlers[index] = match count {
+                    1 => h_alloc_map_literal::<1>,
+                    2 => h_alloc_map_literal::<2>,
+                    3 => h_alloc_map_literal::<3>,
+                    4 => h_alloc_map_literal::<4>,
+                    _ => unreachable!(),
+                };
+                covered[index + 1..index + 1 + count].fill(true);
+                continue;
+            }
+        }
 
         // compare -> conditional branch is extremely common in loops. Preserve
         // the Bool result for exact SSA/debug semantics, but remove one dispatch.
@@ -4816,12 +5253,12 @@ fn install_superinstructions(
             && matches!(second, Opcode::JumpIfFalse | Opcode::JumpIfTrue)
             && temps[index].a == temps[index + 1].a
         {
-            // Keep the real branch opcode in the adjacent token. The fused handler
-            // executes it without dispatch, but retaining its raw_pc makes tracing
-            // and backedge accounting observe the exact logical branch source.
+            // Keep the real branch opcode/handler in the adjacent token. The fused
+            // handler executes its PreparedOp directly without dispatch, while a
+            // deopt/JIT/debug re-entry at the branch still gets the baseline path.
             ops[index].flags = if second == Opcode::JumpIfTrue { 1 } else { 0 };
             handlers[index] = fused_compare_branch_handler(first);
-            handlers[index + 1] = h_unreachable_fused;
+            covered[index + 1] = true;
             continue;
         }
 
@@ -4831,6 +5268,7 @@ fn install_superinstructions(
         if first == Opcode::Move
             && second == Opcode::Move
             && index + 2 < temps.len()
+            && !covered[index + 2]
             && temps[index + 2].opcode == Opcode::Move
             && !target_ops.contains(&((index + 2) as u32))
         {
@@ -4840,8 +5278,8 @@ fn install_superinstructions(
                 | ((temps[index + 2].b as u32) << 8);
             ops[index].next = (index + 3) as u32;
             handlers[index] = h_move_move_move;
-            handlers[index + 1] = h_unreachable_fused;
-            handlers[index + 2] = h_unreachable_fused;
+            covered[index + 1] = true;
+            covered[index + 2] = true;
             continue;
         }
 
@@ -4851,7 +5289,7 @@ fn install_superinstructions(
         if second == Opcode::Jump {
             if let Some(handler) = fused_alu_jump_handler(first) {
                 handlers[index] = handler;
-                handlers[index + 1] = h_unreachable_fused;
+                covered[index + 1] = true;
                 continue;
             }
         }
@@ -4864,14 +5302,14 @@ fn install_superinstructions(
                 | ((temps[index + 1].b as u32) << 8);
             ops[index].next = (index + 2) as u32;
             handlers[index] = h_move_move;
-            handlers[index + 1] = h_unreachable_fused;
+            covered[index + 1] = true;
             continue;
         }
 
         if first == Opcode::Move && second == Opcode::Return && temps[index].a == temps[index + 1].a {
             ops[index].next = (index + 2) as u32;
             handlers[index] = h_move_return;
-            handlers[index + 1] = h_unreachable_fused;
+            covered[index + 1] = true;
             continue;
         }
 
@@ -4879,7 +5317,7 @@ fn install_superinstructions(
         // with the branch so block-parameter lowering pays one less dispatch.
         if first == Opcode::Move && second == Opcode::Jump {
             handlers[index] = h_move_jump;
-            handlers[index + 1] = h_unreachable_fused;
+            covered[index + 1] = true;
             continue;
         }
 
@@ -4904,7 +5342,7 @@ fn install_superinstructions(
             };
             if let Some(handler) = fused {
                 handlers[index] = handler;
-                handlers[index + 1] = h_unreachable_fused;
+                covered[index + 1] = true;
                 continue;
             }
         }
@@ -4931,12 +5369,11 @@ fn install_superinstructions(
             };
             if redundant {
                 ops[index].next = (index + 2) as u32;
-                handlers[index + 1] = h_unreachable_fused;
+                covered[index + 1] = true;
             }
         }
     }
 }
-
 #[inline]
 const fn is_compare_opcode(opcode: Opcode) -> bool {
     matches!(opcode,
@@ -5371,6 +5808,49 @@ impl MapInlineCacheState {
             self.megamorphic = true;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SmallMapAllocationSite {
+    initialized: bool,
+    disabled: bool,
+    stable_program_keys: bool,
+    field_count: u8,
+    value_count: u8,
+    polymorphic_misses: u8,
+    shape: u32,
+    key_handles: [u32; SMALL_MAP_POOL_MAX_FIELDS],
+    key_generations: [u64; SMALL_MAP_POOL_MAX_FIELDS],
+    slots: [u16; SMALL_MAP_POOL_MAX_FIELDS],
+    allocations: u32,
+    specialized_allocations: u32,
+    recycled_buffer_hits: u32,
+}
+
+impl Default for SmallMapAllocationSite {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            disabled: false,
+            stable_program_keys: false,
+            field_count: 0,
+            value_count: 0,
+            polymorphic_misses: 0,
+            shape: 0,
+            key_handles: [0; SMALL_MAP_POOL_MAX_FIELDS],
+            key_generations: [0; SMALL_MAP_POOL_MAX_FIELDS],
+            slots: [0; SMALL_MAP_POOL_MAX_FIELDS],
+            allocations: 0,
+            specialized_allocations: 0,
+            recycled_buffer_hits: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MapPropertyQuickState {
+    cache: MapInlineCacheState,
+    key_hash: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -10593,21 +11073,36 @@ impl Interpreter<'_> {
         target: CallTarget,
     ) {
         let index = op_index as usize;
+        let map_property_hash = match target {
+            CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(method)) => self
+                .program
+                .metadata
+                .method(method)
+                .and_then(|signature| self.program.metadata.string(signature.name))
+                .map(|name| fast_hash_bytes(name.as_bytes())),
+            _ => None,
+        };
+
         let Some(function) = self.prepared.functions.get_mut(function_index as usize) else { return; };
         if index >= function.handlers.len() || index >= function.ops.len() { return; }
         if function.ops[index].flags != 0 { return; }
 
         function.quick_invokes[index] = QuickInvokeSite { class, target };
-        let handler = match target {
-            CallTarget::Bytecode(_) => match function.ops[index].c {
-                0 => h_invoke_mono_bytecode_small::<0>,
-                1 => h_invoke_mono_bytecode_small::<1>,
-                2 => h_invoke_mono_bytecode_small::<2>,
-                3 => h_invoke_mono_bytecode_small::<3>,
-                4 => h_invoke_mono_bytecode_small::<4>,
-                _ => h_invoke_mono_bytecode,
-            },
-            _ => h_invoke_mono,
+        let handler = if let Some(key_hash) = map_property_hash.filter(|_| function.ops[index].c == 0) {
+            function.quick_map_properties[index].key_hash = key_hash;
+            h_invoke_mono_map_property_get
+        } else {
+            match target {
+                CallTarget::Bytecode(_) => match function.ops[index].c {
+                    0 => h_invoke_mono_bytecode_small::<0>,
+                    1 => h_invoke_mono_bytecode_small::<1>,
+                    2 => h_invoke_mono_bytecode_small::<2>,
+                    3 => h_invoke_mono_bytecode_small::<3>,
+                    4 => h_invoke_mono_bytecode_small::<4>,
+                    _ => h_invoke_mono_bytecode,
+                },
+                _ => h_invoke_mono,
+            }
         };
         function.set_handler(index, handler);
         function.quickened_invoke_ops.push(op_index);
@@ -12546,7 +13041,9 @@ fn fused_alu_return_handler(opcode: Opcode) -> Option<Handler> {
 
 unsafe fn h_nop(vm: &mut Interpreter, ptr: *const PreparedOp) { vm.advance(&*ptr); }
 unsafe fn h_trap(vm: &mut Interpreter, ptr: *const PreparedOp) { vm.fail_at(&*ptr, "TRAP executed"); }
-unsafe fn h_unreachable_fused(vm: &mut Interpreter, ptr: *const PreparedOp) { vm.fail_at(&*ptr, "entered fused-away instruction"); }
+unsafe fn h_unreachable_fused(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    vm.fail_at(unsafe { &*ptr }, "entered unreachable fused handler");
+}
 
 unsafe fn h_move(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let op = &*ptr; let value = vm.reg(op.b); vm.set_reg(op.a, value); vm.advance(op);
@@ -12842,6 +13339,54 @@ unsafe fn invoke_args_and_target(
         let mut args=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(op,&mut args);
         vm.invoke_target(op,target,receiver,&args[..count]);
+    }
+}
+
+unsafe fn h_invoke_mono_map_property_get(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { *ptr };
+    let receiver = unsafe { vm.reg(op.b) };
+    let map = Value::from_word(receiver);
+    let site = vm.current_quick_invoke();
+    if !vm.receiver_matches_class(map, site.class) {
+        vm.disable_current_monomorphic_invoke();
+        unsafe { h_invoke(vm, ptr) };
+        return;
+    }
+    let CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(method)) = site.target else {
+        unsafe { h_invoke_mono(vm, ptr) };
+        return;
+    };
+    let Some(signature) = vm.program.metadata.method(method) else {
+        vm.disable_current_monomorphic_invoke();
+        unsafe { h_invoke(vm, ptr) };
+        return;
+    };
+    let Some(name) = vm.program.metadata.string(signature.name) else {
+        vm.disable_current_monomorphic_invoke();
+        unsafe { h_invoke(vm, ptr) };
+        return;
+    };
+
+    let function = unsafe { (*vm.hot_frame).function as usize };
+    let state = unsafe {
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .quick_map_properties
+            .as_mut_ptr()
+            .add(vm.hot_pc as usize)
+    };
+    match vm.heap.map_get_named_with_pic(
+        map,
+        name.as_bytes(),
+        unsafe { (*state).key_hash },
+        unsafe { &mut (*state).cache },
+    ) {
+        Ok(value) => unsafe {
+            vm.set_reg(op.a, value.word());
+            vm.advance(&op);
+        },
+        Err(error) => vm.fail_at(&op, error.message),
     }
 }
 
@@ -13369,6 +13914,78 @@ unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){
 }
 
 unsafe fn h_alloc_map(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::Map(NapalmMap::default()));vm.set_reg(op.a,v.word());vm.advance(op)}
+
+fn allocate_prepared_small_map_literal<const N: usize>(
+    vm: &mut Interpreter<'_>,
+    op: &PreparedOp,
+) -> Result<Value, RuntimeError> {
+    debug_assert_eq!(op.c as usize, N);
+    let offset = op.args_offset as usize;
+    let mut pairs = [(Value::NULL, Value::NULL); N];
+    let args = &vm.current_prepared().call_args;
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        let key_reg = unsafe { args.get_unchecked(offset + index * 2).0 };
+        let value_reg = unsafe { args.get_unchecked(offset + index * 2 + 1).0 };
+        *pair = (
+            Value::from_word(unsafe { vm.reg(key_reg) }),
+            Value::from_word(unsafe { vm.reg(value_reg) }),
+        );
+    }
+
+    let function = unsafe { (*vm.hot_frame).function as usize };
+    debug_assert!(
+        vm.prepared
+            .functions
+            .get(function)
+            .is_some_and(|prepared| (op.cache as usize) < prepared.small_map_literal_sites.len())
+    );
+    let site = unsafe {
+        vm.prepared
+            .functions
+            .get_unchecked_mut(function)
+            .small_map_literal_sites
+            .as_mut_ptr()
+            .add(op.cache as usize)
+    };
+    if unsafe { !(*site).initialized } {
+        // Program String constants are rooted for the VM lifetime, so their
+        // handles cannot be recycled. Once a literal proves all keys come from
+        // that pool, hot allocations only compare u32 handles and avoid per-key
+        // generation atomics. Dynamic-key sites retain the generation guard.
+        let stable = pairs.iter().all(|(key, _)| {
+            vm.strings.iter().any(|candidate| candidate.raw_bits() == key.raw_bits())
+        });
+        unsafe { (*site).stable_program_keys = stable; }
+    }
+    vm.heap.alloc_map_from_site(pairs, unsafe { &mut *site })
+}
+
+fn allocate_prepared_small_map_literal_dynamic(
+    vm: &mut Interpreter<'_>,
+    op: &PreparedOp,
+) -> Result<Value, RuntimeError> {
+    match op.c {
+        1 => allocate_prepared_small_map_literal::<1>(vm, op),
+        2 => allocate_prepared_small_map_literal::<2>(vm, op),
+        3 => allocate_prepared_small_map_literal::<3>(vm, op),
+        4 => allocate_prepared_small_map_literal::<4>(vm, op),
+        _ => Err(RuntimeError::new("invalid small Map literal field count")),
+    }
+}
+
+unsafe fn h_alloc_map_literal<const N: usize>(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+
+    match allocate_prepared_small_map_literal::<N>(vm, op) {
+        Ok(value) => unsafe {
+            vm.set_reg(op.a, value.word());
+            vm.advance(op);
+        },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
 unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.map_len(map){Some(len)=>{vm.set_reg(op.a,i32_word(len as i32));vm.advance(op)},None=>vm.fail_at(op,"MapLen operand is not map")}}
 fn map_get_value(
     vm: &mut Interpreter<'_>,
@@ -13897,6 +14514,52 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
+
+    fn trace_small_map_literal(
+        &self,
+        function: FuncId,
+        pc: BytecodePc,
+    ) -> Option<SmallMapLiteralTraceInfo> {
+        let prepared = self.current_prepared();
+        if prepared.id != function {
+            return None;
+        }
+        let index = self.hot_pc as usize;
+        let original = prepared.original_ops.get(index)?;
+        if original.raw_pc != pc.0 {
+            return None;
+        }
+        let bytecode = self.program.function(function)?;
+        if bytecode.chunk.code.get(original.raw_pc as usize)?.opcode()? != Opcode::AllocMap {
+            return None;
+        }
+
+        let fused = prepared.ops.get(index)?;
+        let field_count = fused.c as usize;
+        if field_count == 0
+            || field_count > SMALL_MAP_POOL_MAX_FIELDS
+            || fused.next as usize != index + 1 + field_count
+            || fused.args_offset as usize + field_count * 2 > prepared.call_args.len()
+            || fused.cache as usize >= prepared.small_map_literal_sites.len()
+        {
+            return None;
+        }
+
+        for offset in 0..field_count {
+            let candidate = prepared.original_ops.get(index + 1 + offset)?;
+            if candidate.a != original.a
+                || bytecode.chunk.code.get(candidate.raw_pc as usize)?.opcode()? != Opcode::MapSet
+            {
+                return None;
+            }
+        }
+
+        let continuation = prepared.original_ops.get(fused.next as usize)?.raw_pc;
+        Some(SmallMapLiteralTraceInfo {
+            field_count: field_count as u8,
+            continuation: BytecodePc(continuation),
+        })
+    }
 
     fn trace_reactive_enabled(&self) -> bool { self.reactive_enabled }
     fn trace_reactive_tracking_active(&self) -> bool { self.reactive_tracking_active }
@@ -14537,6 +15200,49 @@ impl TraceRuntime for Interpreter<'_> {
         })
     }
 
+    fn trace_map_property_access(
+        &self,
+        function: FuncId,
+        cache: u32,
+        map: RegisterWord,
+    ) -> Option<crate::napalm_tracing_jit::ShapedMapAccess> {
+        let caller = self.program.function(function)?;
+        let descriptor = caller.chunk.inline_caches.get(cache as usize)?;
+        if descriptor.home_class.is_some() {
+            return None;
+        }
+        let signature = self.program.metadata.method(descriptor.method)?;
+        if signature.kind != crate::napalm_ir::MethodKind::Getter || signature.arity != 0 {
+            return None;
+        }
+
+        let map_value = Value::from_word(map);
+        let class = self.heap.receiver_class(map_value)?;
+        if self.lookup_method(class, descriptor.method, None)
+            != Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(descriptor.method)))
+        {
+            return None;
+        }
+        let map = match self.heap.get(map_value)? {
+            HeapObject::Map(map) => map,
+            _ => return None,
+        };
+        let (shape, _) = map.shaped()?;
+        let key = self.program.metadata.string(signature.name)?.as_bytes();
+        let hash = fast_hash_bytes(key);
+        let slot = self.heap.map_shapes.slot_hashed(shape, hash, key)?;
+        let contract = self.heap.map_shapes.slot_contract(shape, slot);
+        Some(crate::napalm_tracing_jit::ShapedMapAccess {
+            shape,
+            slot,
+            key_bytes: key.to_vec(),
+            read_type: contract.read_type.clone(),
+            write_type: contract.write_type.clone(),
+            readonly: contract.readonly,
+            write_runtime_checked: contract.write_runtime_checked,
+        })
+    }
+
     fn trace_structural_map_access(
         &self,
         map: RegisterWord,
@@ -14836,6 +15542,7 @@ impl Interpreter<'_> {
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_APPEND
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_INSERT
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL
         );
         if requires_gc {
             self.mark_gc_point(&op);
@@ -14925,6 +15632,18 @@ impl Interpreter<'_> {
                 let value = Value::from_word(unsafe { self.reg(op.c) });
                 map_set_value(self, map, key, value, op.x as usize)
             }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL
+                if opcode == Opcode::AllocMap =>
+            {
+                let prepared = *self
+                    .current_prepared()
+                    .ops
+                    .get(self.hot_pc as usize)
+                    .ok_or_else(|| RuntimeError::new("small Map literal prepared op is missing"))?;
+                allocate_prepared_small_map_literal_dynamic(self, &prepared).map(|value| {
+                    unsafe { self.set_reg(op.a, value.word()) };
+                })
+            }
             _ => return Err(RuntimeError::new("specialized collection mode/opcode mismatch")),
         };
 
@@ -14970,7 +15689,8 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REMOVE
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REMOVE
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_GET
-            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET => {
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL => {
                 vm.trace_execute_collection_fast(mode, continuation)
             }
             _ => Err(RuntimeError::new("unknown JIT runtime helper mode")),
@@ -15033,6 +15753,36 @@ mod tests {
         program
     }
 
+
+    #[test]
+    fn recycled_handle_batch_reuses_one_free_list_cas_path() {
+        let table = HandleTable::new();
+        let handle = table.allocate_handle();
+        let generation = table.generation(handle).unwrap();
+        table.return_unused(handle);
+
+        let mut batch = Vec::new();
+        assert_eq!(table.take_recycled_batch(&mut batch, HANDLE_RECYCLE_BATCH), 1);
+        assert_eq!(batch, vec![handle]);
+        assert_eq!(table.generation(handle), Some(generation + 1));
+        assert_eq!(table.entry(handle).address.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn small_map_buffer_pool_retains_external_storage_without_values() {
+        let pool = SmallMapBufferPool::new();
+        let mut values = Vec::with_capacity(2);
+        values.push(Value::from_num(1.0));
+        values.push(Value::from_num(2.0));
+        let allocation = values.as_ptr();
+
+        pool.recycle(values);
+        let mut bucket = pool.buckets[1].lock();
+        let recycled = bucket.pop().expect("two-slot buffer should be pooled");
+        assert!(recycled.is_empty());
+        assert_eq!(recycled.capacity(), 2);
+        assert_eq!(recycled.as_ptr(), allocation);
+    }
 
     #[test]
     fn recursive_memo_table_stays_enabled_under_initial_misses() {
