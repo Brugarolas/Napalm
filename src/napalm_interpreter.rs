@@ -57,6 +57,9 @@ mod collection_ops;
 #[path = "napalm_interfaces.rs"]
 mod interfaces;
 use self::interfaces::h_bind_interface;
+#[path = "napalm_function_jit.rs"]
+mod function_jit;
+use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
 use self::collection_ops::*;
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -3158,7 +3161,11 @@ impl Heap {
         };
 
         if let Some((shape, values)) = map.shaped() {
-            if let Some(slot) = cache.probe(&self.map_shapes, shape, hash, key) {
+            // This cache belongs to one fixed getter symbol. Once a shape has
+            // resolved that property, shape identity alone proves the slot;
+            // comparing the canonical key hash/bytes again on every hit is
+            // redundant and was measurable in recursive object walkers.
+            if let Some(slot) = cache.probe_property(shape) {
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
             if let Some(slot) = self.map_shapes.slot_hashed(shape, hash, key) {
@@ -5847,10 +5854,23 @@ impl Default for SmallMapAllocationSite {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct MapPropertyQuickState {
     cache: MapInlineCacheState,
     key_hash: u64,
+    /// Cache the immutable property symbol itself so the hot path skips method
+    /// lookup and hashing while keeping PreparedFunction trivially movable.
+    key_string: StringId,
+}
+
+impl Default for MapPropertyQuickState {
+    fn default() -> Self {
+        Self {
+            cache: MapInlineCacheState::default(),
+            key_hash: 0,
+            key_string: StringId(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6182,6 +6202,9 @@ impl MemoTable {
 
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
+    /// Whole-function Cranelift tier for hot call/recursion-heavy functions.
+    /// Auto-memoized functions are permanently excluded by the tier itself.
+    whole_function_jit: Option<Box<WholeFunctionJit>>,
     jit_entry_threshold: u32,
     method_epoch: u64,
     program: &'p BytecodeProgram,
@@ -6546,6 +6569,10 @@ impl<'p> Interpreter<'p> {
         let last_gc_collections = heap.collection_count();
         let jit = Box::new(TracingJit::default());
         let jit_entry_threshold = jit.options().hot_entry_threshold;
+        let whole_function_jit = WholeFunctionJit::new(
+            prepared.functions.len(),
+            jit_entry_threshold,
+        ).ok().map(Box::new);
         // Native builtin registration interns every Reactive signature, even for
         // programs that never use reactivity. Detect actual bytecode call sites
         // instead so ordinary programs retain fully native field traces.
@@ -6566,6 +6593,7 @@ impl<'p> Interpreter<'p> {
         let (external_wake_tx, external_wake_rx) = mpsc::channel();
         Ok(Self {
             jit: Some(jit),
+            whole_function_jit,
             jit_entry_threshold,
             method_epoch: 0,
             program,
@@ -6734,6 +6762,11 @@ impl<'p> Interpreter<'p> {
         let entry_threshold = options
             .as_ref()
             .map_or(0, |options| options.hot_entry_threshold);
+        self.whole_function_jit = options.as_ref().and_then(|_| {
+            WholeFunctionJit::new(self.prepared.functions.len(), entry_threshold)
+                .ok()
+                .map(Box::new)
+        });
         let shared_profile = self.jit.as_ref().and_then(|jit| jit.shared_profile());
         let shared_repository = self.jit.as_ref().and_then(|jit| jit.shared_repository());
         self.jit_entry_threshold = entry_threshold;
@@ -6757,6 +6790,11 @@ impl<'p> Interpreter<'p> {
 
     pub fn jit_stats(&self) -> Option<&TracingJitStats> {
         self.jit.as_ref().map(|jit| jit.stats())
+    }
+
+    /// Diagnostics for the call/recursion-oriented whole-function tier.
+    pub(crate) fn whole_function_jit_stats(&self) -> Option<WholeFunctionJitStats> {
+        self.whole_function_jit.as_ref().map(|jit| jit.stats())
     }
 
     fn invalidate_method_traces(&mut self) {
@@ -6790,6 +6828,7 @@ impl<'p> Interpreter<'p> {
                 let index = op_index as usize;
                 if index < function.handlers.len() && index < function.ops.len() {
                     function.quick_invokes[index] = QuickInvokeSite::default();
+                    function.quick_map_properties[index] = MapPropertyQuickState::default();
                     function.set_handler(index, h_invoke);
                     function.ops[index].flags = 0;
                 }
@@ -11073,13 +11112,16 @@ impl Interpreter<'_> {
         target: CallTarget,
     ) {
         let index = op_index as usize;
-        let map_property_hash = match target {
+        let map_property_key = match target {
             CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(method)) => self
                 .program
                 .metadata
                 .method(method)
-                .and_then(|signature| self.program.metadata.string(signature.name))
-                .map(|name| fast_hash_bytes(name.as_bytes())),
+                .and_then(|signature| {
+                    self.program.metadata.string(signature.name).map(|name| {
+                        (fast_hash_bytes(name.as_bytes()), signature.name)
+                    })
+                }),
             _ => None,
         };
 
@@ -11088,8 +11130,10 @@ impl Interpreter<'_> {
         if function.ops[index].flags != 0 { return; }
 
         function.quick_invokes[index] = QuickInvokeSite { class, target };
-        let handler = if let Some(key_hash) = map_property_hash.filter(|_| function.ops[index].c == 0) {
-            function.quick_map_properties[index].key_hash = key_hash;
+        let handler = if let Some((key_hash, key_string)) = map_property_key.filter(|_| function.ops[index].c == 0) {
+            let property = &mut function.quick_map_properties[index];
+            property.key_hash = key_hash;
+            property.key_string = key_string;
             h_invoke_mono_map_property_get
         } else {
             match target {
@@ -12772,6 +12816,7 @@ fn same_handler(left: Handler, right: Handler) -> bool {
 #[inline(always)]
 fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
     same_handler(handler, h_invoke_mono as Handler)
+        || same_handler(handler, h_invoke_mono_map_property_get as Handler)
         || same_handler(handler, h_invoke_mono_bytecode as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<0> as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<1> as Handler)
@@ -13352,18 +13397,8 @@ unsafe fn h_invoke_mono_map_property_get(vm: &mut Interpreter, ptr: *const Prepa
         unsafe { h_invoke(vm, ptr) };
         return;
     }
-    let CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(method)) = site.target else {
+    let CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(_method)) = site.target else {
         unsafe { h_invoke_mono(vm, ptr) };
-        return;
-    };
-    let Some(signature) = vm.program.metadata.method(method) else {
-        vm.disable_current_monomorphic_invoke();
-        unsafe { h_invoke(vm, ptr) };
-        return;
-    };
-    let Some(name) = vm.program.metadata.string(signature.name) else {
-        vm.disable_current_monomorphic_invoke();
-        unsafe { h_invoke(vm, ptr) };
         return;
     };
 
@@ -13375,6 +13410,11 @@ unsafe fn h_invoke_mono_map_property_get(vm: &mut Interpreter, ptr: *const Prepa
             .quick_map_properties
             .as_mut_ptr()
             .add(vm.hot_pc as usize)
+    };
+    let Some(name) = vm.program.metadata.string(unsafe { (*state).key_string }) else {
+        vm.disable_current_monomorphic_invoke();
+        unsafe { h_invoke(vm, ptr) };
+        return;
     };
     match vm.heap.map_get_named_with_pic(
         map,
@@ -13601,6 +13641,7 @@ unsafe fn h_invoke_num_quick_specialized<const OP: u8, const BRANCH: u8>(
 unsafe fn h_call_direct_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let words=vm.gather_call_words_const::<N>(op);
+    if unsafe { function_jit::try_direct_call(vm, op, &words[..N]) } { return; }
     vm.enter_direct_bytecode_call(op,op.x,&words[..N],None);
 }
 
@@ -13620,10 +13661,12 @@ unsafe fn h_call_direct(vm:&mut Interpreter, ptr:*const PreparedOp){
     if op.c <= 4 {
         let mut words=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(op,&mut words);
+        if unsafe { function_jit::try_direct_call(vm, op, &words[..count]) } { return; }
         vm.enter_direct_bytecode_call(op,op.x,&words[..count],None);
     } else {
         let mut words=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(op,&mut words);
+        if unsafe { function_jit::try_direct_call(vm, op, &words[..count]) } { return; }
         vm.enter_direct_bytecode_call(op,op.x,&words[..count],None);
     }
 }
