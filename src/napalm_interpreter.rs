@@ -1890,6 +1890,7 @@ enum HeapObject {
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
+    Proxy { target: Value, handler: Value },
     MapEntry { key: Value, value: Value },
     MapKeys { map: Value },
     Range {
@@ -2394,6 +2395,14 @@ unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     }
 }
 
+unsafe fn trace_proxy(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Proxy { target, handler } = &managed.object {
+        visit_value(*target, visitor);
+        visit_value(*handler, visitor);
+    }
+}
+
 unsafe fn trace_map_view(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     match &unsafe { managed_object(object) }.object {
         HeapObject::MapEntry { key, value } => {
@@ -2600,6 +2609,7 @@ gc_descriptor!(GC_HEADERS, "Napalm.Headers", GcTraceLayout::Custom(trace_headers
 gc_descriptor!(GC_MODULE, "Napalm.Module", GcTraceLayout::Leaf);
 gc_descriptor!(GC_LIST, "Napalm.List", GcTraceLayout::Custom(trace_list));
 gc_descriptor!(GC_MAP, "Napalm.Map", GcTraceLayout::Custom(trace_map));
+gc_descriptor!(GC_PROXY, "Napalm.Proxy", GcTraceLayout::Custom(trace_proxy));
 gc_descriptor!(GC_MAP_VIEW, "Napalm.MapView", GcTraceLayout::Custom(trace_map_view));
 gc_descriptor!(GC_CELL, "Napalm.Cell", GcTraceLayout::Custom(trace_cell));
 gc_descriptor!(GC_CLOSURE, "Napalm.Closure", GcTraceLayout::Custom(trace_closure));
@@ -2616,6 +2626,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::String(_) => &GC_STRING,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
+        HeapObject::Proxy { .. } => &GC_PROXY,
         HeapObject::MapEntry { .. } | HeapObject::MapKeys { .. } | HeapObject::Set { .. } => &GC_MAP_VIEW,
         HeapObject::Range { .. } => &GC_RANGE,
         HeapObject::Date { .. } => &GC_DATE,
@@ -2789,6 +2800,10 @@ fn collect_fiber_state_handles(
 
 fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
     match object {
+        HeapObject::Proxy { target, handler } => {
+            push_value_handle(*target, roots);
+            push_value_handle(*handler, roots);
+        }
         HeapObject::MapEntry { key, value } => {
             push_value_handle(*key, roots);
             push_value_handle(*value, roots);
@@ -4254,6 +4269,7 @@ impl HostContext<'_> {
         match self.heap.get(value) {
             Some(HeapObject::Random { .. }) => "<random>".to_owned(),
             Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes.as_ref()).into_owned(),
+            Some(HeapObject::Proxy { .. }) => "<proxy>".to_owned(),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { return "[...]".to_owned(); }
                 let text = values.iter().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
@@ -5407,6 +5423,15 @@ pub enum NativeBuiltin {
     MapPropertyGet(MethodSymbol),
     MapPropertySet(MethodSymbol),
     MapPropertyCall(MethodSymbol),
+    ProxyPropertyGet(MethodSymbol),
+    ProxyPropertySet(MethodSymbol),
+    ProxyPropertyCall(MethodSymbol),
+    ProxyNew,
+    ProxyOwnKeys,
+    ProxyHas,
+    ProxyDelete,
+    ProxySubscriptGet,
+    ProxySubscriptSet,
     UniversalToString,
     FnNew,
     FnArity,
@@ -5492,9 +5517,12 @@ pub enum BuiltinClass {
     /// existing builtin receiver-class numeric identities remain stable.
     Date,
     Set,
+    /// Heap-backed JavaScript-style transparent proxy. Appended so Set and all
+    /// previous receiver-class numeric identities remain stable.
+    Proxy,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 21;
+const BUILTIN_CLASS_COUNT: usize = 22;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -5518,6 +5546,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Set as u64),
         HeapObject::Map(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64),
+        HeapObject::Proxy { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Proxy as u64),
         HeapObject::MapEntry { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapEntry as u64),
         HeapObject::MapKeys { .. } =>
@@ -9549,6 +9579,9 @@ impl<'p> Interpreter<'p> {
                     entries: Arc::from(entries.into_boxed_slice()),
                 }
             }
+            Some(HeapObject::Proxy { .. }) => {
+                return Err(RuntimeError::new("Proxy objects cannot cross a concurrent boundary yet"));
+            }
             Some(HeapObject::Closure { .. }) => {
                 return Err(RuntimeError::new("functions cannot be passed as concurrent arguments"));
             }
@@ -10932,6 +10965,16 @@ impl Interpreter<'_> {
                     _ => None,
                 };
             }
+            if payload == BuiltinClass::Proxy as u32 {
+                use crate::napalm_ir::MethodKind;
+                let signature = self.program.metadata.methods.get(method.0 as usize)?;
+                return match signature.kind {
+                    MethodKind::Getter => Some(CallTarget::NativeBuiltin(NativeBuiltin::ProxyPropertyGet(method))),
+                    MethodKind::Setter => Some(CallTarget::NativeBuiltin(NativeBuiltin::ProxyPropertySet(method))),
+                    MethodKind::Method => Some(CallTarget::NativeBuiltin(NativeBuiltin::ProxyPropertyCall(method))),
+                    _ => None,
+                };
+            }
             return None;
         }
         if kind == (CLASS_KIND_CORE_STATIC >> 56) {
@@ -11678,6 +11721,78 @@ impl Interpreter<'_> {
         HostContext { heap: &mut self.heap }.format_value(value)
     }
 
+    fn proxy_parts(&self, proxy: Value) -> Result<(Value, Value), RuntimeError> {
+        match self.heap.get(proxy) {
+            Some(HeapObject::Proxy { target, handler }) => Ok((*target, *handler)),
+            _ => Err(RuntimeError::new("receiver is not a Proxy")),
+        }
+    }
+
+    fn proxy_trap(&self, handler: Value, name: &str) -> Result<Option<Value>, RuntimeError> {
+        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(name.as_bytes())));
+        let value = self.heap.map_get_encoded(handler, &key)
+            .map_err(|_| RuntimeError::new("Proxy handler must be an object/Map"))?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if !matches!(self.heap.get(value), Some(HeapObject::Closure { .. })) {
+            return Err(RuntimeError::new(format!("Proxy trap '{name}' must be a function")));
+        }
+        Ok(Some(value))
+    }
+
+    fn enter_proxy_trap(
+        &mut self,
+        op: &PreparedOp,
+        trap: Value,
+        values: &[Value],
+    ) -> Result<(), RuntimeError> {
+        let function = match self.heap.get(trap) {
+            Some(HeapObject::Closure { function_index, .. }) => *function_index,
+            _ => return Err(RuntimeError::new("Proxy trap is not a function")),
+        };
+        let prepared = self.prepared.functions.get(function as usize)
+            .ok_or_else(|| RuntimeError::new("Proxy trap function does not exist"))?;
+        if prepared.is_async || prepared.is_concurrent {
+            return Err(RuntimeError::new("Proxy traps must be synchronous"));
+        }
+        let mut words = [RegisterWord(0); 4];
+        if values.len() > words.len() {
+            return Err(RuntimeError::new("Proxy trap argument limit exceeded"));
+        }
+        for (index, value) in values.iter().copied().enumerate() {
+            words[index] = value.word();
+        }
+        self.enter_bytecode_call(op, function, None, &words[..values.len()], Some(trap));
+        Ok(())
+    }
+
+    fn proxy_property_name(&self, method: MethodSymbol) -> Result<String, RuntimeError> {
+        let signature = self.program.metadata.methods.get(method.0 as usize)
+            .ok_or_else(|| RuntimeError::new("Proxy property method metadata is missing"))?;
+        Ok(self.program.metadata.string(signature.name).unwrap_or("").to_owned())
+    }
+
+    fn proxy_fallback_keys(&mut self, target: Value) -> Result<Value, RuntimeError> {
+        let len = self.heap.map_len(target)
+            .ok_or_else(|| RuntimeError::new("Proxy target is not an object/Map"))?;
+        let mut context = HostContext { heap: &mut self.heap };
+        let mut keys = Vec::with_capacity(len);
+        // map_nth_key materializes String keys as managed Strings. Keep every one
+        // rooted until the result List has been allocated; otherwise the List
+        // allocation itself could collect a key that only lives in this Rust Vec.
+        let mut roots = Vec::with_capacity(len);
+        for index in 0..len {
+            let key = context.map_nth_key(target, index)?;
+            roots.push(context.root(key));
+            keys.push(key);
+        }
+        keys.sort_by(|left, right| {
+            context.format_value(*left).cmp(&context.format_value(*right))
+        });
+        Ok(context.allocate_list(keys))
+    }
+
     fn invoke_native_builtin(
         &mut self,
         op: &PreparedOp,
@@ -11702,6 +11817,232 @@ impl Interpreter<'_> {
             return;
         }
         match native {
+            NativeBuiltin::ProxyNew => {
+                let target = arg(0);
+                let handler = arg(1);
+                if target.heap_handle().is_none() {
+                    self.fail_at(op, "Proxy target must be an object");
+                    return;
+                }
+                if !matches!(self.heap.get(handler), Some(HeapObject::Map(_))) {
+                    self.fail_at(op, "Proxy handler must be an object/Map");
+                    return;
+                }
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::Proxy { target, handler });
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::ProxyPropertyGet(method) => {
+                let proxy = Value::from_word(receiver);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let name = match self.proxy_property_name(method) {
+                    Ok(name) => name,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "get") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let key = HostContext { heap: &mut self.heap }.allocate_string(&name);
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key, proxy]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                let result = HostContext { heap: &mut self.heap }.map_get(target, key);
+                match result {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxyPropertySet(method) => {
+                let proxy = Value::from_word(receiver);
+                let value = arg(0);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let name = match self.proxy_property_name(method) {
+                    Ok(name) => name,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "set") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let key = HostContext { heap: &mut self.heap }.allocate_string(&name);
+                if let Some(trap) = trap {
+                    // JS set traps return success. Napalm currently forwards that
+                    // trap result for the assignment expression; statement-form
+                    // assignments naturally discard it.
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key, value, proxy]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                let result = HostContext { heap: &mut self.heap }.map_set(target, key, value);
+                match result {
+                    Ok(_) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxySubscriptGet => {
+                let proxy = Value::from_word(receiver);
+                let key = arg(0);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "get") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key, proxy]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                match (HostContext { heap: &mut self.heap }).map_get(target, key) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxySubscriptSet => {
+                let proxy = Value::from_word(receiver);
+                let key = arg(0);
+                let value = arg(1);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "set") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key, value, proxy]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                match (HostContext { heap: &mut self.heap }).map_set(target, key, value) {
+                    Ok(_) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxyHas => {
+                let proxy = Value::from_word(receiver);
+                let key = arg(0);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "has") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                match (HostContext { heap: &mut self.heap }).map_contains_key(target, key) {
+                    Ok(value) => unsafe {
+                        self.set_reg(op.a, Value::from_bool(value).word());
+                        self.advance(op);
+                    },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxyDelete => {
+                let proxy = Value::from_word(receiver);
+                let key = arg(0);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "deleteProperty") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target, key]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                let mut context = HostContext { heap: &mut self.heap };
+                match context.map_contains_key(target, key) {
+                    Ok(true) => {
+                        if let Err(error) = context.map_remove(target, key) {
+                            self.fail_at(op, error.message);
+                            return;
+                        }
+                        unsafe { self.set_reg(op.a, Value::TRUE.word()); self.advance(op); }
+                    }
+                    Ok(false) => unsafe { self.set_reg(op.a, Value::TRUE.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxyOwnKeys => {
+                let proxy = Value::from_word(receiver);
+                let (target, handler) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let trap = match self.proxy_trap(handler, "ownKeys") {
+                    Ok(trap) => trap,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                if let Some(trap) = trap {
+                    if let Err(error) = self.enter_proxy_trap(op, trap, &[target]) {
+                        self.fail_at(op, error.message);
+                    }
+                    return;
+                }
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.proxy_fallback_keys(target) {
+                    Ok(keys) => unsafe { self.set_reg(op.a, keys.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::ProxyPropertyCall(method) => {
+                // Bound Proxy methods (keys/values/entries/...) are resolved before
+                // this fallback. For arbitrary callable target properties, preserve
+                // Map-object call behavior. A future continuation hook can make a
+                // user `get` trap participate in the two-stage get-then-call path.
+                let proxy = Value::from_word(receiver);
+                let (target, _) = match self.proxy_parts(proxy) {
+                    Ok(parts) => parts,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let name = match self.proxy_property_name(method) {
+                    Ok(name) => name,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(name.as_bytes())));
+                let value = match self.heap.map_get_encoded(target, &key) {
+                    Ok(value) => value,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let function = match self.heap.get(value) {
+                    Some(HeapObject::Closure { function_index, .. }) => *function_index,
+                    _ => { self.fail_at(op, "proxied property is not a function"); return; }
+                };
+                self.enter_bytecode_call(op, function, None, args, Some(value));
+            }
             NativeBuiltin::MapPropertyGet(method) | NativeBuiltin::MapPropertySet(method) | NativeBuiltin::MapPropertyCall(method) => {
                 let signature = &self.program.metadata.methods[method.0 as usize];
                 let key = MapKey::String(MapStringKey::new(Arc::from(self.program.metadata.string(signature.name).unwrap_or("").as_bytes())));
@@ -14510,6 +14851,7 @@ impl Interpreter<'_> {
             Some(HeapObject::String(string)) => String::from_utf8_lossy(string.as_ref()).into_owned(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
+            Some(HeapObject::Proxy { .. }) => "<proxy>".into(),
             Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
             Some(HeapObject::MapKeys { .. }) => "<map keys>".into(),
             Some(HeapObject::Set { map }) => format!("<set:{}>", self.heap.map_len(*map).unwrap_or(0)),

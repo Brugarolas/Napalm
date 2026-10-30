@@ -2711,7 +2711,35 @@ impl<'a> Parser<'a> {
         if self.arrow_ahead() {
             return self.closure(start, false, false);
         }
-        if matches!(self.text(), "typeof" | "delete" | "void" | "...") {
+        if self.eat("delete") {
+            self.lines();
+            let target = self.expr(16)?;
+            let span = self.end(start);
+            let (receiver, key) = match target.kind {
+                ExprKind::Invoke(invoke)
+                    if invoke.syntax == InvokeSyntax::Getter
+                        && invoke.args.is_empty()
+                        && invoke.receiver.is_some() =>
+                {
+                    let receiver = *invoke.receiver.expect("checked above");
+                    let key = Expr::new(
+                        ExprKind::String(invoke.name.value.into_bytes()),
+                        invoke.name.span,
+                    );
+                    (receiver, key)
+                }
+                ExprKind::Subscript { receiver, mut args } if args.len() == 1 => {
+                    (*receiver, args.remove(0))
+                }
+                _ => {
+                    return self.error(
+                        "`delete` expects a property or subscript target such as `delete object.key` or `delete object[key]`",
+                    );
+                }
+            };
+            return Ok(invoke(receiver, "__delete", vec![key], span));
+        }
+        if matches!(self.text(), "typeof" | "void" | "...") {
             return self.error(format!(
                 "`{}` is recognized TypeScript syntax but is not lowered yet",
                 self.text()
@@ -4082,6 +4110,7 @@ fn infix(op: &str) -> Option<(u8, BinaryOp)> {
         "<=" => (9, LessEqual),
         ">" => (9, Greater),
         ">=" => (9, GreaterEqual),
+        "in" => (9, In),
         "instanceof" => (9, Is),
         "<<" => (10, ShiftLeft),
         ">>" => (10, ShiftRight),
@@ -4950,6 +4979,28 @@ mod napalm_syntax_tests {
         assert_eq!(clauses[1].binding.value, "y");
         assert_eq!(clauses[1].filters.len(), 1);
     }
+
+
+    #[test]
+    fn parses_proxy_in_delete_and_object_spread_surface_syntax() {
+        let module = assert_parses(r#"
+            var target = { foo: 10 };
+            var handler = {
+                get: function (t, key, recv) { return t[key]; },
+                set: function (t, key, value, recv) { t[key] = value; return true; },
+                has: function (t, key) { return key in t; },
+                deleteProperty: function (t, key) { delete t[key]; return true; },
+                ownKeys: function (t) { return t.keys(); }
+            };
+            var proxy = new Proxy(target, handler);
+            var present = "foo" in proxy;
+            delete proxy.foo;
+            delete proxy["bar"];
+            var copy = { ...proxy, extra: 1 };
+        "#);
+        assert!(!module.statements.is_empty());
+    }
+
 
 
 

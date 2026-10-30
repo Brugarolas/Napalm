@@ -38,6 +38,7 @@ pub struct BuiltinManifest {
     list_remove: Option<(MethodSymbol, FuncId)>,
     list_functions: Vec<(MethodSymbol, FuncId)>,
     collection_functions: Vec<(BuiltinTarget, MethodSymbol, FuncId)>,
+    proxy_functions: Vec<(MethodSymbol, FuncId)>,
     string_add: Option<(MethodSymbol, FuncId)>,
     string_right_add: Option<FuncId>,
     system_print: Option<(MethodSymbol, FuncId)>,
@@ -245,6 +246,10 @@ enum BuiltinPrimitive {
     MapNew,
     MapSet,
     MapDelete,
+    MapSpreadInto,
+    MapKeysList,
+    MapValuesList,
+    MapEntriesList,
     SetNew,
     SetCount,
     SetIsEmpty,
@@ -319,6 +324,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
+        BuiltinClass::Proxy,
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
@@ -670,10 +676,15 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("set", MethodKind::Method, 2, BuiltinPrimitive::MapSet),
         ("has", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
         ("delete", MethodKind::Method, 1, BuiltinPrimitive::MapDelete),
-        ("keys", MethodKind::Method, 0, BuiltinPrimitive::MapKeys),
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::MapIsEmpty),
         ("containsKey", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
+        ("__has", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
+        ("__delete", MethodKind::Method, 1, BuiltinPrimitive::MapDelete),
+        ("__spreadInto", MethodKind::Method, 1, BuiltinPrimitive::MapSpreadInto),
+        ("keys", MethodKind::Method, 0, BuiltinPrimitive::MapKeysList),
+        ("values", MethodKind::Method, 0, BuiltinPrimitive::MapValuesList),
+        ("entries", MethodKind::Method, 0, BuiltinPrimitive::MapEntriesList),
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::MapSubscript),
         ("[]=", MethodKind::SubscriptSetter, 2, BuiltinPrimitive::MapSubscriptSet),
         ("remove", MethodKind::Method, 1, BuiltinPrimitive::MapRemove),
@@ -699,6 +710,179 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
             }
         }
     }
+
+    // Proxy. The proxy object itself owns no properties: property/subscript
+    // operations are dispatched by the interpreter to the handler traps. Higher-
+    // order enumeration lives in WIR so trap calls remain ordinary Napalm calls.
+    manifest.register_native(
+        program,
+        static_(BuiltinId::Proxy),
+        "new",
+        MethodKind::Method,
+        2,
+        NativeBuiltin::ProxyNew,
+    );
+    manifest.register_native(
+        program,
+        instance(BuiltinClass::Proxy),
+        "__ownKeys",
+        MethodKind::Method,
+        0,
+        NativeBuiltin::ProxyOwnKeys,
+    );
+    manifest.register_native(
+        program,
+        instance(BuiltinClass::Proxy),
+        "__has",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::ProxyHas,
+    );
+    manifest.register_native(
+        program,
+        instance(BuiltinClass::Proxy),
+        "__delete",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::ProxyDelete,
+    );
+    manifest.register_native(
+        program,
+        instance(BuiltinClass::Proxy),
+        "[]",
+        MethodKind::SubscriptGetter,
+        1,
+        NativeBuiltin::ProxySubscriptGet,
+    );
+    manifest.register_native(
+        program,
+        instance(BuiltinClass::Proxy),
+        "[]=",
+        MethodKind::SubscriptSetter,
+        2,
+        NativeBuiltin::ProxySubscriptSet,
+    );
+
+    let proxy_module = program.add_module("<core:proxy>", 0);
+    let own_keys = program.intern_method("__ownKeys", MethodKind::Method, 0);
+    let subscript = program.intern_method("[]", MethodKind::SubscriptGetter, 1);
+
+    let keys_method = program.intern_method("keys", MethodKind::Method, 0);
+    let mut b = Builder::new(
+        program,
+        proxy_module,
+        "Proxy.keys",
+        FunctionKind::Method,
+        vec![Type::Top],
+        Type::List(None),
+    );
+    let proxy = b.param(0);
+    let keys = b.invoke_typed(proxy, own_keys, Vec::new(), Type::List(None));
+    b.ret(keys);
+    manifest.proxy_functions.push((keys_method, b.finish()));
+
+    let values_method = program.intern_method("values", MethodKind::Method, 0);
+    let mut b = Builder::new(
+        program,
+        proxy_module,
+        "Proxy.values",
+        FunctionKind::Method,
+        vec![Type::Top],
+        Type::List(None),
+    );
+    let proxy = b.param(0);
+    let keys = b.invoke_typed(proxy, own_keys, Vec::new(), Type::List(None));
+    let len = b.emit1(Inst::ListLen { list: keys }, Type::Int32);
+    let result = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![]);
+    b.position_at(body);
+    let key = b.emit1(Inst::ListGet { list: keys, index }, Type::Top);
+    let value = b.invoke(proxy, subscript, vec![key]);
+    b.emit0(Inst::ListAppend { list: result, value });
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(done);
+    b.ret(result);
+    manifest.proxy_functions.push((values_method, b.finish()));
+
+    let entries_method = program.intern_method("entries", MethodKind::Method, 0);
+    let mut b = Builder::new(
+        program,
+        proxy_module,
+        "Proxy.entries",
+        FunctionKind::Method,
+        vec![Type::Top],
+        Type::List(None),
+    );
+    let proxy = b.param(0);
+    let keys = b.invoke_typed(proxy, own_keys, Vec::new(), Type::List(None));
+    let len = b.emit1(Inst::ListLen { list: keys }, Type::Int32);
+    let result = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![]);
+    b.position_at(body);
+    let key = b.emit1(Inst::ListGet { list: keys, index }, Type::Top);
+    let value = b.invoke(proxy, subscript, vec![key]);
+    let two = b.const_i32(2);
+    let pair = b.emit1(Inst::AllocList { capacity: Some(two) }, Type::List(None));
+    b.emit0(Inst::ListAppend { list: pair, value: key });
+    b.emit0(Inst::ListAppend { list: pair, value });
+    b.emit0(Inst::ListAppend { list: result, value: pair });
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(done);
+    b.ret(result);
+    manifest.proxy_functions.push((entries_method, b.finish()));
+
+    let spread_method = program.intern_method("__spreadInto", MethodKind::Method, 1);
+    let mut b = Builder::new(
+        program,
+        proxy_module,
+        "Proxy.__spreadInto",
+        FunctionKind::Method,
+        vec![Type::Top, Type::Map],
+        Type::Map,
+    );
+    let proxy = b.param(0);
+    let destination = b.param(1);
+    let keys = b.invoke_typed(proxy, own_keys, Vec::new(), Type::List(None));
+    let len = b.emit1(Inst::ListLen { list: keys }, Type::Int32);
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let done = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], done, vec![]);
+    b.position_at(body);
+    let key = b.emit1(Inst::ListGet { list: keys, index }, Type::Top);
+    let value = b.invoke(proxy, subscript, vec![key]);
+    b.emit0(Inst::MapSet { map: destination, key, value });
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(done);
+    b.ret(destination);
+    manifest.proxy_functions.push((spread_method, b.finish()));
 
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapKeysCount),
@@ -1027,6 +1211,9 @@ pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &Builtin
     }
     for &(method, function) in &manifest.list_functions {
         interpreter.bind_builtin_function(BuiltinClass::List, method, function);
+    }
+    for &(method, function) in &manifest.proxy_functions {
+        interpreter.bind_builtin_function(BuiltinClass::Proxy, method, function);
     }
     for binding in manifest.bindings() {
         match binding.target {
@@ -2331,8 +2518,57 @@ fn execute_primitive(
         MapDelete => {
             let key = argument(args,0)?;
             let existed = context.map_contains_key(this, key)?;
-            context.map_remove(this, key)?;
+            if existed {
+                let _ = context.map_remove(this, key)?;
+            }
             Ok(Value::from_bool(existed))
+        }
+        MapSpreadInto => {
+            let destination = argument(args, 0)?;
+            let len = context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
+            for index in 0..len {
+                let key = context.map_nth_key(this, index)?;
+                let value = context.map_nth_value(this, index)?;
+                context.map_set(destination, key, value)?;
+            }
+            Ok(destination)
+        }
+        MapKeysList | MapValuesList | MapEntriesList => {
+            let len = context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
+            let mut pairs = Vec::with_capacity(len);
+            // map_nth_key may allocate managed Strings. Keep each materialized key
+            // rooted until the result List has been published.
+            let mut key_roots = Vec::with_capacity(len);
+            for index in 0..len {
+                let key = context.map_nth_key(this, index)?;
+                key_roots.push(context.root(key));
+                let value = context.map_nth_value(this, index)?;
+                pairs.push((key, value));
+            }
+            // Napalm object enumeration is deterministic for ordinary Maps. Proxy
+            // ownKeys preserves its trap-provided order separately.
+            pairs.sort_by(|(left, _), (right, _)| {
+                context.format_value(*left).cmp(&context.format_value(*right))
+            });
+            match op {
+                MapKeysList => Ok(context.allocate_list(
+                    pairs.into_iter().map(|(key, _)| key).collect()
+                )),
+                MapValuesList => Ok(context.allocate_list(
+                    pairs.into_iter().map(|(_, value)| value).collect()
+                )),
+                MapEntriesList => {
+                    let mut entries = Vec::with_capacity(pairs.len());
+                    let mut entry_roots = Vec::with_capacity(pairs.len());
+                    for (key, value) in pairs {
+                        let entry = context.allocate_list(vec![key, value]);
+                        entry_roots.push(context.root(entry));
+                        entries.push(entry);
+                    }
+                    Ok(context.allocate_list(entries))
+                }
+                _ => unreachable!(),
+            }
         }
         SetCount | SetIsEmpty | SetAdd | SetHas | SetDelete | SetClear | SetIterate | SetIteratorValue | SetValues => {
             let map = context.set_source(this)?;

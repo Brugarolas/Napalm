@@ -475,14 +475,17 @@ pub enum BuiltinId {
     /// Runtime support for lazy computed properties and dependency-tracked watchers.
     Reactive = 18,
     Set = 19,
+    /// JavaScript-style transparent object interception. Appended so existing
+    /// builtin IDs (notably Set) remain stable across the Proxy addition.
+    Proxy = 20,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
-        Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set,
+        Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set, Self::Proxy,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -499,6 +502,7 @@ impl BuiltinId {
             Self::Fetch => "fetch",
             Self::Reactive => "__Reactive",
             Self::Set => "Set",
+            Self::Proxy => "Proxy",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }

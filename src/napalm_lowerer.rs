@@ -286,6 +286,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             | BinaryOp::LessEqual
             | BinaryOp::Greater
             | BinaryOp::GreaterEqual
+            | BinaryOp::In
             | BinaryOp::Is
             | BinaryOp::Equal
             | BinaryOp::NotEqual => direct(K::Bool),
@@ -1988,6 +1989,11 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         keys.insert(MethodKey {
             name: "[]".to_owned(),
             kind: MethodKind::SubscriptGetter,
+            arity: 1,
+        });
+        keys.insert(MethodKey {
+            name: "__spreadInto".to_owned(),
+            kind: MethodKind::Method,
             arity: 1,
         });
 
@@ -4436,7 +4442,25 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn copy_map_entries(&mut self, map: ValueId, source: ValueId) {
-        self.builder.emit0(Inst::MapSpread { map, source });
+        let source_type = semantic_source_type(self.builder.value_type(source));
+        if matches!(source_type, Type::Map | Type::Interface(_) | Type::Record(_)) {
+            self.builder.emit0(Inst::MapSpread { map, source });
+            return;
+        }
+
+        // Dynamic sources may be Proxies. Let runtime dispatch decide whether this
+        // is a plain Map fast copy or a Proxy enumeration honoring ownKeys/get.
+        let method = self.context.symbols.expect("__spreadInto", MethodKind::Method, 1);
+        let site = self.builder.fresh_site();
+        let _ = self.builder.emit1(
+            Inst::Invoke {
+                site,
+                receiver: source,
+                method,
+                args: vec![map],
+            },
+            Type::Map,
+        );
     }
 
     fn lower_unary(&mut self, operator: UnaryOp, operand: &Expr) -> ValueId {
@@ -4472,6 +4496,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self
                 .builder
                 .emit1(Inst::IsInstance { value: left, class: right }, Type::Bool);
+        }
+        if operator == BinaryOp::In {
+            let method = self.context.symbols.expect("__has", MethodKind::Method, 1);
+            let site = self.builder.fresh_site();
+            return self.builder.emit1(
+                Inst::Invoke {
+                    site,
+                    receiver: right,
+                    method,
+                    args: vec![left],
+                },
+                Type::Bool,
+            );
         }
 
         let left_type = semantic_source_type(self.builder.value_type(left));
@@ -5802,6 +5839,7 @@ fn binary_operator_name(operator: BinaryOp) -> &'static str {
         BinaryOp::LessEqual => "<=",
         BinaryOp::Greater => ">",
         BinaryOp::GreaterEqual => ">=",
+        BinaryOp::In => "__has",
         BinaryOp::Is => "is",
         BinaryOp::Equal => "==",
         BinaryOp::NotEqual => "!=",
