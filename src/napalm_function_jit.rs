@@ -1,9 +1,11 @@
 //! Whole-function Cranelift tier for hot synchronous bytecode functions.
 //!
-//! This tier intentionally executes against the interpreter's existing frame and
-//! register stack. GC-capable helpers therefore reuse the bytecode safepoint maps,
-//! and direct calls still flow through `enter_direct_bytecode_call`, preserving
-//! auto-memoization, async semantics and the normal frame ABI.
+//! Top-level entries execute against the interpreter's existing frame/register
+//! stack. Eligible non-memoized self-recursion uses a lightweight native shadow
+//! frame instead of constructing another Napalm `Frame`; the VM root provider
+//! scans those native registers with the ordinary bytecode `ReferenceMap`.
+//! Calls that cannot use that ABI still flow through `enter_direct_bytecode_call`,
+//! preserving auto-memoization, async semantics and the normal frame ABI.
 
 use super::*;
 use cranelift::codegen::ir::{BlockArg, UserFuncName};
@@ -11,7 +13,7 @@ use cranelift::codegen::settings::{self, Configurable};
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{default_libcall_names, Linkage, Module};
-use cranelift::prelude::*;
+use cranelift::prelude::{AbiParam, FloatCC, InstBuilder, IntCC, MemFlagsData, types};
 use std::ffi::c_void;
 use std::mem::offset_of;
 
@@ -32,6 +34,8 @@ pub(super) struct WholeFunctionJitStats {
     pub rejected_functions: u64,
     pub native_entries: u64,
     pub native_direct_calls: u64,
+    /// Self-recursive calls executed through the lightweight GC-visible native ABI.
+    pub native_recursive_calls: u64,
     pub baseline_direct_calls: u64,
 }
 
@@ -61,6 +65,8 @@ pub(super) struct WholeFunctionJit {
     runtime_op: cranelift::module::FuncId,
     direct_call: cranelift::module::FuncId,
     small_map_literal: cranelift::module::FuncId,
+    native_self_call: cranelift::module::FuncId,
+    small_map_literal_regs: cranelift::module::FuncId,
     slots: Vec<FunctionSlot>,
     threshold: u32,
     active_depth: u32,
@@ -84,6 +90,11 @@ impl WholeFunctionJit {
         builder.symbol("napalm_wfjit_runtime_op", napalm_wfjit_runtime_op as *const u8);
         builder.symbol("napalm_wfjit_direct_call", napalm_wfjit_direct_call as *const u8);
         builder.symbol("napalm_wfjit_small_map_literal", napalm_wfjit_small_map_literal as *const u8);
+        builder.symbol("napalm_wfjit_native_self_call", napalm_wfjit_native_self_call as *const u8);
+        builder.symbol(
+            "napalm_wfjit_small_map_literal_regs",
+            napalm_wfjit_small_map_literal_regs as *const u8,
+        );
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("Napalm whole-function JIT requires a 64-bit host".to_owned());
@@ -104,6 +115,26 @@ impl WholeFunctionJit {
             .declare_function("napalm_wfjit_small_map_literal", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function small-map helper: {e}"))?;
 
+        // Lightweight native-recursion helpers receive the owning function/op
+        // identity plus the explicit register base. They never rely on hot-frame
+        // register pointers, which is what lets nested calls avoid a Napalm Frame.
+        let mut native_call_sig = module.make_signature();
+        native_call_sig.params.push(AbiParam::new(pointer));
+        native_call_sig.params.push(AbiParam::new(types::I32));
+        native_call_sig.params.push(AbiParam::new(types::I32));
+        native_call_sig.params.push(AbiParam::new(pointer));
+        native_call_sig.returns.push(AbiParam::new(types::I64));
+        let native_self_call_id = module
+            .declare_function("napalm_wfjit_native_self_call", Linkage::Import, &native_call_sig)
+            .map_err(|e| format!("cannot declare native self-call helper: {e}"))?;
+        let small_map_regs_id = module
+            .declare_function(
+                "napalm_wfjit_small_map_literal_regs",
+                Linkage::Import,
+                &native_call_sig,
+            )
+            .map_err(|e| format!("cannot declare register-based small-map helper: {e}"))?;
+
         let context = module.make_context();
         let function_context = FunctionBuilderContext::new();
         let result = Self {
@@ -113,6 +144,8 @@ impl WholeFunctionJit {
             runtime_op: runtime_id,
             direct_call: direct_id,
             small_map_literal: small_map_id,
+            native_self_call: native_self_call_id,
+            small_map_literal_regs: small_map_regs_id,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
             threshold: if entry_threshold == 0 { u32::MAX } else { entry_threshold.saturating_mul(2).max(MIN_WHOLE_FUNCTION_HOTNESS) },
             active_depth: 0,
@@ -203,9 +236,13 @@ impl WholeFunctionJit {
         self.context.func.name = UserFuncName::user(1, func_id.as_u32());
         self.function_context = FunctionBuilderContext::new();
 
+        let native_recursive_safe =
+            native_recursive_body_safe(function_index, function, bytecode);
         let runtime_module_id = self.runtime_op;
         let direct_module_id = self.direct_call;
         let small_map_module_id = self.small_map_literal;
+        let native_self_module_id = self.native_self_call;
+        let small_map_regs_module_id = self.small_map_literal_regs;
 
         {
             let target_config = self.module.target_config();
@@ -229,7 +266,10 @@ impl WholeFunctionJit {
 
             let runtime_ref = self.module.declare_func_in_func(runtime_module_id, b.func);
             let direct_ref = self.module.declare_func_in_func(direct_module_id, b.func);
-            let small_map_ref = self.module.declare_func_in_func(small_map_module_id, b.func);
+            let _small_map_ref = self.module.declare_func_in_func(small_map_module_id, b.func);
+            let native_self_ref = self.module.declare_func_in_func(native_self_module_id, b.func);
+            let small_map_regs_ref =
+                self.module.declare_func_in_func(small_map_regs_module_id, b.func);
 
             for index in 0..function.ops.len() {
                 b.switch_to_block(blocks[index]);
@@ -377,13 +417,39 @@ impl WholeFunctionJit {
                             && prepared_op.c <= 4
                             && prepared_op.next > index as u32 + 1 =>
                     {
-                        regs = call_runtime_helper(&mut b, small_map_ref, vm, index as u32, abort);
+                        let value = call_native_value_helper(
+                            &mut b,
+                            small_map_regs_ref,
+                            vm,
+                            function_index,
+                            index as u32,
+                            regs,
+                            abort,
+                        );
+                        store_reg(&mut b, regs, op.a, value);
                         let target = prepared_op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
                     }
+                    Opcode::CallDirect
+                        if native_recursive_safe && prepared_op.x == function_index =>
+                    {
+                        let value = call_native_value_helper(
+                            &mut b,
+                            native_self_ref,
+                            vm,
+                            function_index,
+                            index as u32,
+                            regs,
+                            abort,
+                        );
+                        store_reg(&mut b, regs, op.a, value);
+                        let target = op.next as usize;
+                        if target >= blocks.len() { b.ins().jump(abort, &[]); }
+                        else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
                     Opcode::CallDirect => {
-                        regs = call_runtime_helper(&mut b, direct_ref, vm, index as u32, abort);
+                        regs = call_runtime_helper(&mut b, direct_ref, vm, regs, index as u32, abort);
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
@@ -426,7 +492,7 @@ impl WholeFunctionJit {
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
                     }
                     _ => {
-                        regs = call_runtime_helper(&mut b, runtime_ref, vm, index as u32, abort);
+                        regs = call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort);
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
@@ -575,7 +641,7 @@ fn emit_numeric_quick_fast_path(
     b.seal_block(calculate);
 
     b.switch_to_block(fallback);
-    let fallback_regs = call_runtime_helper(b, runtime_ref, vm, op_index, abort);
+    let fallback_regs = call_runtime_helper(b, runtime_ref, vm, regs, op_index, abort);
     b.ins().jump(done, &[BlockArg::Value(fallback_regs)]);
     b.seal_block(fallback);
 
@@ -734,13 +800,171 @@ fn emit_map_property_fast_path(
     }
 
     b.switch_to_block(fallback);
-    let fallback_regs = call_runtime_helper(b, runtime_ref, vm, op_index, abort);
+    let fallback_regs = call_runtime_helper(b, runtime_ref, vm, regs, op_index, abort);
     b.ins().jump(done, &[BlockArg::Value(fallback_regs)]);
     b.seal_block(fallback);
 
     b.switch_to_block(done);
     b.seal_block(done);
     b.block_params(done)[0]
+}
+
+
+/// Whether a compiled function may recurse through the lightweight native ABI.
+///
+/// A bailout from a nested native call replays the outermost self-call in the
+/// ordinary interpreter frame. Restrict this path to replay-safe operations so a
+/// speculative guard failure cannot duplicate an externally visible store or
+/// host effect. Small object-literal allocation is allowed because an abandoned
+/// object is unreachable and therefore semantically invisible.
+fn native_recursive_body_safe(
+    function_index: u32,
+    function: &PreparedFunction,
+    bytecode: &BytecodeFunction,
+) -> bool {
+    if function.uses_this
+        || function.capture_count != 0
+        || function.memoization.enabled()
+        || function.is_async
+        || function.is_concurrent
+        || !function.exception_handlers.is_empty()
+        || function.needs_argument_bank
+        || function.needs_return_bank
+    {
+        return false;
+    }
+
+    let mut seen = vec![false; function.ops.len()];
+    let mut work = vec![0usize];
+    while let Some(index) = work.pop() {
+        if index >= function.ops.len() || seen[index] {
+            continue;
+        }
+        seen[index] = true;
+
+        let prepared = function.ops[index];
+        let op = function.original_ops[index];
+        let Some(opcode) = bytecode
+            .chunk
+            .code
+            .get(op.raw_pc as usize)
+            .and_then(|word| word.opcode())
+        else {
+            return false;
+        };
+
+        let replay_safe = match opcode {
+            Opcode::Nop
+            | Opcode::Move
+            | Opcode::Swap
+            | Opcode::LoadNull
+            | Opcode::LoadFalse
+            | Opcode::LoadTrue
+            | Opcode::LoadI8
+            | Opcode::LoadI32
+            | Opcode::LoadConst
+            | Opcode::Jump
+            | Opcode::JumpIfFalse
+            | Opcode::JumpIfTrue
+            | Opcode::Return
+            | Opcode::INeg
+            | Opcode::IBitNot
+            | Opcode::IAdd
+            | Opcode::ISub
+            | Opcode::IMul
+            | Opcode::IBitAnd
+            | Opcode::IBitOr
+            | Opcode::IBitXor
+            | Opcode::IShl
+            | Opcode::IShrU
+            | Opcode::ISar
+            | Opcode::FNeg
+            | Opcode::FAdd
+            | Opcode::FSub
+            | Opcode::FMul
+            | Opcode::FDiv
+            | Opcode::ICmpEq
+            | Opcode::ICmpNe
+            | Opcode::ICmpLt
+            | Opcode::ICmpLe
+            | Opcode::ICmpGt
+            | Opcode::ICmpGe
+            | Opcode::FCmpEq
+            | Opcode::FCmpNe
+            | Opcode::FCmpLt
+            | Opcode::FCmpLe
+            | Opcode::FCmpGt
+            | Opcode::FCmpGe
+            | Opcode::RefEq => true,
+            Opcode::CallDirect => prepared.x == function_index,
+            Opcode::Invoke => {
+                native_numeric_quick(function, index).is_some()
+                    || native_map_property_pic(function, index).is_some()
+            }
+            Opcode::AllocMap => {
+                prepared.c > 0
+                    && prepared.c <= 4
+                    && prepared.next > index as u32 + 1
+            }
+            _ => false,
+        };
+        if !replay_safe {
+            return false;
+        }
+
+        if let Some(&root_map) = function.gc_map_by_op.get(index) {
+            if root_map != NO_INDEX {
+                let Some(map) = function.gc_maps.get(root_map as usize) else {
+                    return false;
+                };
+                // Native shadow frames expose only GPR storage. Any function
+                // whose reachable safepoint needs ARG/RET/SPECIAL banks keeps
+                // the ordinary Napalm frame ABI instead.
+                if map.arguments != 0 || map.returns != 0 || map.special != 0 {
+                    return false;
+                }
+            }
+        }
+
+        match opcode {
+            Opcode::Return => {}
+            Opcode::Jump => {
+                let target = prepared.x as usize;
+                if target >= function.ops.len() {
+                    return false;
+                }
+                work.push(target);
+            }
+            Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
+                let target = prepared.x as usize;
+                let fallthrough = op.next as usize;
+                if target >= function.ops.len() || fallthrough >= function.ops.len() {
+                    return false;
+                }
+                work.push(target);
+                work.push(fallthrough);
+            }
+            Opcode::AllocMap
+                if prepared.c > 0
+                    && prepared.c <= 4
+                    && prepared.next > index as u32 + 1 =>
+            {
+                let target = prepared.next as usize;
+                if target >= function.ops.len() {
+                    return false;
+                }
+                work.push(target);
+            }
+            _ => {
+                let target = op.next as usize;
+                if target >= function.ops.len() {
+                    return false;
+                }
+                work.push(target);
+            }
+        }
+    }
+    true
 }
 
 #[inline]
@@ -822,9 +1046,27 @@ fn call_runtime_helper(
     b: &mut FunctionBuilder<'_>,
     helper: cranelift::codegen::ir::FuncRef,
     vm: cranelift::prelude::Value,
+    current_regs: cranelift::prelude::Value,
     op: u32,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
+    // The legacy runtime helpers execute against Interpreter::hot_registers.
+    // A native shadow-frame callee has a different register base, so crossing
+    // such a helper would silently operate on its outer interpreter frame.
+    // Bail the complete native recursion chain instead; the top-level Napalm
+    // frame will replay the call through the authoritative baseline path.
+    let hot_regs = b.ins().load(
+        types::I64,
+        MemFlagsData::trusted(),
+        vm,
+        offset_of!(Interpreter<'static>, hot_registers) as i32,
+    );
+    let is_top_frame = b.ins().icmp(IntCC::Equal, current_regs, hot_regs);
+    let runtime = b.create_block();
+    b.ins().brif(is_top_frame, runtime, &[], abort, &[]);
+    b.switch_to_block(runtime);
+    b.seal_block(runtime);
+
     let op = b.ins().iconst(types::I32, op as i64);
     let call = b.ins().call(helper, &[vm, op]);
     let regs = b.inst_results(call)[0];
@@ -832,6 +1074,31 @@ fn call_runtime_helper(
     let ok = b.create_block();
     b.append_block_param(ok, b.func.dfg.value_type(regs));
     b.ins().brif(failed, abort, &[], ok, &[BlockArg::Value(regs)]);
+    b.seal_block(ok);
+    b.switch_to_block(ok);
+    b.block_params(ok)[0]
+}
+
+/// Call a helper that operates on an explicit GPR base and returns one Napalm
+/// register word. `WFJIT_BAILOUT` is reserved and propagates directly to the
+/// enclosing whole-function bailout block.
+fn call_native_value_helper(
+    b: &mut FunctionBuilder<'_>,
+    helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    function_index: u32,
+    op_index: u32,
+    regs: cranelift::prelude::Value,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let function = b.ins().iconst(types::I32, function_index as i64);
+    let op = b.ins().iconst(types::I32, op_index as i64);
+    let call = b.ins().call(helper, &[vm, function, op, regs]);
+    let value = b.inst_results(call)[0];
+    let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
+    let ok = b.create_block();
+    b.append_block_param(ok, types::I64);
+    b.ins().brif(failed, abort, &[], ok, &[BlockArg::Value(value)]);
     b.seal_block(ok);
     b.switch_to_block(ok);
     b.block_params(ok)[0]
@@ -921,6 +1188,307 @@ unsafe fn execute_native_direct_call(
     {
         vm.return_from_frame(RegisterWord(result), None);
     }
+}
+
+
+#[inline(always)]
+unsafe fn wfjit_set_native_root_map(
+    vm: &mut Interpreter<'_>,
+    function_index: u32,
+    op_index: u32,
+    registers: *mut RegisterWord,
+) -> bool {
+    let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+        return false;
+    };
+    let Some(&root_map) = function.gc_map_by_op.get(op_index as usize) else {
+        return false;
+    };
+    if root_map == NO_INDEX {
+        return false;
+    }
+
+    if registers == vm.hot_registers {
+        if vm.hot_frame.is_null() || vm.hot_function_index != function_index {
+            return false;
+        }
+        // Keep the ordinary Fiber frame precise while the top-level native body
+        // is active. hot_pc is also the exact replay point if a nested native
+        // speculation bails out.
+        unsafe { (*vm.hot_frame).root_map = root_map; }
+        vm.hot_pc = op_index;
+        return true;
+    }
+
+    let shadow = vm.native_shadow_top;
+    if shadow.is_null() {
+        return false;
+    }
+    let frame = unsafe { &mut *shadow };
+    if frame.registers != registers || frame.function != function_index {
+        return false;
+    }
+    frame.root_map = root_map;
+    true
+}
+
+#[inline(always)]
+unsafe fn wfjit_call_source_reg(
+    function: &PreparedFunction,
+    op: &PreparedOp,
+    index: usize,
+) -> Option<u8> {
+    if index >= op.c as usize {
+        return None;
+    }
+    if op.c <= 4 {
+        Some(((op.args_offset >> (index * 8)) & 0xff) as u8)
+    } else {
+        function
+            .call_args
+            .get(op.args_offset as usize + index)
+            .map(|reg| reg.0)
+    }
+}
+
+fn allocate_prepared_small_map_literal_from_regs<const N: usize>(
+    vm: &mut Interpreter<'_>,
+    function_index: u32,
+    op: &PreparedOp,
+    registers: *mut RegisterWord,
+) -> Result<Value, RuntimeError> {
+    debug_assert_eq!(op.c as usize, N);
+    let function_ptr = unsafe {
+        vm.prepared
+            .functions
+            .as_mut_ptr()
+            .add(function_index as usize)
+    };
+    let offset = op.args_offset as usize;
+    let mut pairs = [(Value::NULL, Value::NULL); N];
+    let args = unsafe { &(*function_ptr).call_args };
+
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        let key_reg = unsafe { args.get_unchecked(offset + index * 2).0 };
+        let value_reg = unsafe { args.get_unchecked(offset + index * 2 + 1).0 };
+        *pair = (
+            Value::from_word(unsafe { *registers.add(key_reg as usize) }),
+            Value::from_word(unsafe { *registers.add(value_reg as usize) }),
+        );
+    }
+
+    let site_index = op.cache as usize;
+    if site_index >= unsafe { (*function_ptr).small_map_literal_sites.len() } {
+        return Err(RuntimeError::new("invalid whole-function small Map literal site"));
+    }
+    let site = unsafe {
+        (*function_ptr)
+            .small_map_literal_sites
+            .as_mut_ptr()
+            .add(site_index)
+    };
+    if unsafe { !(*site).initialized } {
+        let stable = pairs.iter().all(|(key, _)| {
+            vm.strings
+                .iter()
+                .any(|candidate| candidate.raw_bits() == key.raw_bits())
+        });
+        unsafe { (*site).stable_program_keys = stable; }
+    }
+
+    vm.heap.alloc_map_from_site(pairs, unsafe { &mut *site })
+}
+
+unsafe extern "C" fn napalm_wfjit_small_map_literal_regs(
+    vm: *mut c_void,
+    function_index: u32,
+    op_index: u32,
+    registers: *mut RegisterWord,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running
+        || registers.is_null()
+        || !unsafe { wfjit_set_native_root_map(vm, function_index, op_index, registers) }
+    {
+        return WFJIT_BAILOUT;
+    }
+
+    // Poll before reading the literal operands. Their stable handles are rooted by
+    // the precise map installed above and remain valid even if MMTk moves objects.
+    vm.maybe_collect();
+    if vm.run_state != RunState::Running {
+        return WFJIT_BAILOUT;
+    }
+
+    let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(&op) = function.ops.get(op_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+
+    let result = match op.c {
+        1 => allocate_prepared_small_map_literal_from_regs::<1>(
+            vm, function_index, &op, registers,
+        ),
+        2 => allocate_prepared_small_map_literal_from_regs::<2>(
+            vm, function_index, &op, registers,
+        ),
+        3 => allocate_prepared_small_map_literal_from_regs::<3>(
+            vm, function_index, &op, registers,
+        ),
+        4 => allocate_prepared_small_map_literal_from_regs::<4>(
+            vm, function_index, &op, registers,
+        ),
+        _ => return WFJIT_BAILOUT,
+    };
+
+    result.map_or(WFJIT_BAILOUT, Value::raw_bits)
+}
+
+/// Lightweight self-recursive native call.
+///
+/// No Napalm Frame/FrameBanks/register-stack entry is created. The callee's GPRs
+/// live on this Rust/native stack frame and a `NativeShadowFrame` exposes exactly
+/// the live managed registers to MMTk. Auto-memoized functions can never reach
+/// this helper because whole-function compilation rejects them, and the helper
+/// repeats that guard defensively.
+unsafe extern "C" fn napalm_wfjit_native_self_call(
+    vm: *mut c_void,
+    function_index: u32,
+    op_index: u32,
+    caller_registers: *mut RegisterWord,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || caller_registers.is_null() {
+        return WFJIT_BAILOUT;
+    }
+    if !unsafe {
+        wfjit_set_native_root_map(vm, function_index, op_index, caller_registers)
+    } {
+        return WFJIT_BAILOUT;
+    }
+
+    let (op, arity, reg_count, entry_gc_map, entry_arg_dsts, entry) = {
+        let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+            return WFJIT_BAILOUT;
+        };
+        if function.memoization.enabled()
+            || function.uses_this
+            || function.capture_count != 0
+            || function.needs_argument_bank
+            || function.is_async
+            || function.is_concurrent
+            || !function.exception_handlers.is_empty()
+        {
+            return WFJIT_BAILOUT;
+        }
+        let Some(&op) = function.ops.get(op_index as usize) else {
+            return WFJIT_BAILOUT;
+        };
+        if op.x != function_index || op.c as usize > ARGUMENT_REGISTER_COUNT {
+            return WFJIT_BAILOUT;
+        }
+        let Some(entry) = vm
+            .whole_function_jit
+            .as_ref()
+            .and_then(|jit| {
+                (jit.active_depth < MAX_NATIVE_CALL_DEPTH)
+                    .then(|| jit.entry(function_index))
+                    .flatten()
+            })
+        else {
+            return WFJIT_BAILOUT;
+        };
+        (
+            op,
+            function.arity as usize,
+            function.frame.general_register_count as usize,
+            function.entry_gc_map,
+            function.entry_arg_dsts,
+            entry,
+        )
+    };
+
+    if reg_count > GENERAL_REGISTER_COUNT || entry_gc_map == NO_INDEX {
+        return WFJIT_BAILOUT;
+    }
+
+    // Gather source values before constructing the callee storage. No GC-capable
+    // operation occurs here; the caller map above protects every live reference.
+    let mut arguments = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+    let count = op.c as usize;
+    {
+        let function = unsafe {
+            vm.prepared
+                .functions
+                .get_unchecked(function_index as usize)
+        };
+        for index in 0..count {
+            let Some(source) = (unsafe { wfjit_call_source_reg(function, &op, index) }) else {
+                return WFJIT_BAILOUT;
+            };
+            arguments[index] = unsafe { *caller_registers.add(source as usize) };
+        }
+    }
+
+    let mut storage =
+        std::mem::MaybeUninit::<[RegisterWord; GENERAL_REGISTER_COUNT]>::uninit();
+    let callee_registers = storage.as_mut_ptr().cast::<RegisterWord>();
+
+    for index in 0..count {
+        let destination = entry_arg_dsts[index];
+        if destination != u16::MAX {
+            unsafe {
+                callee_registers
+                    .add(destination as usize)
+                    .write(arguments[index]);
+            }
+        }
+    }
+    let mut missing = count.min(arity);
+    while missing < arity {
+        let destination = entry_arg_dsts[missing];
+        if destination != u16::MAX {
+            unsafe {
+                callee_registers
+                    .add(destination as usize)
+                    .write(Value::NULL.word());
+            }
+        }
+        missing += 1;
+    }
+
+    let previous = vm.native_shadow_top;
+    let mut shadow = NativeShadowFrame {
+        previous,
+        registers: callee_registers,
+        function: function_index,
+        root_map: entry_gc_map,
+        reg_count: reg_count as u16,
+        _padding: 0,
+    };
+    vm.native_shadow_top = &mut shadow;
+
+    if let Some(jit) = vm.whole_function_jit.as_mut() {
+        jit.active_depth = jit.active_depth.saturating_add(1);
+        jit.stats.native_recursive_calls =
+            jit.stats.native_recursive_calls.saturating_add(1);
+        jit.stats.native_entries = jit.stats.native_entries.saturating_add(1);
+    }
+
+    let result = unsafe { entry(vm as *mut _ as *mut c_void, callee_registers) };
+
+    if let Some(jit) = vm.whole_function_jit.as_mut() {
+        jit.active_depth = jit.active_depth.saturating_sub(1);
+    }
+    debug_assert_eq!(
+        vm.native_shadow_top,
+        &mut shadow as *mut NativeShadowFrame,
+        "whole-function native shadow-frame chain corrupted"
+    );
+    vm.native_shadow_top = previous;
+    result
 }
 
 unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {

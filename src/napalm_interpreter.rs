@@ -75,7 +75,7 @@ use crate::napalm_bytecode::{
     BytecodeFunction, BytecodePc, BytecodeProgram, BytecodeVerifier, ClassGuardDescriptor,
     DeoptLocation, FrameLayout, IncomingSource, Opcode, ReferenceMap, Reg, RegisterKind,
     RegisterWord, SpecialReg, SwitchTable, TypeGuardDescriptor,
-    ARGUMENT_REGISTER_COUNT, RETURN_REGISTER_COUNT, SPECIAL_REGISTER_COUNT,
+    ARGUMENT_REGISTER_COUNT, GENERAL_REGISTER_COUNT, RETURN_REGISTER_COUNT, SPECIAL_REGISTER_COUNT,
 };
 use crate::napalm_ir::{
     BailoutReason, BuiltinId, ClassId, ClassSet, Constant, ForeignFnId, FuncId, FunctionKind,
@@ -6019,6 +6019,22 @@ impl Frame {
     }
 }
 
+/// GC-visible register frame used only by whole-function JIT native-to-native calls.
+///
+/// The frame is linked into `Interpreter::native_shadow_top` while native code is
+/// executing without a corresponding Napalm `Frame`. Register words remain
+/// NaN-boxed/stable-handle values, so GC only needs the bytecode `ReferenceMap`
+/// to identify which general registers contain managed references.
+#[repr(C)]
+struct NativeShadowFrame {
+    previous: *mut NativeShadowFrame,
+    registers: *mut RegisterWord,
+    function: u32,
+    root_map: u32,
+    reg_count: u16,
+    _padding: u16,
+}
+
 struct FiberState {
     object: Value,
     status: FiberStatus,
@@ -6235,6 +6251,12 @@ pub struct Interpreter<'p> {
     /// Whole-function Cranelift tier for hot call/recursion-heavy functions.
     /// Auto-memoized functions are permanently excluded by the tier itself.
     whole_function_jit: Option<Box<WholeFunctionJit>>,
+    /// Top of the native-only whole-function JIT shadow-frame chain.
+    ///
+    /// Ordinary interpreter frames remain rooted through their managed Fiber.
+    /// This chain exists only while a compiled caller invokes another compiled
+    /// function without constructing a Napalm `Frame`.
+    native_shadow_top: *mut NativeShadowFrame,
     jit_entry_threshold: u32,
     method_epoch: u64,
     program: &'p BytecodeProgram,
@@ -6379,6 +6401,33 @@ unsafe impl GcRootProvider for VmRootProvider {
                 root(unsafe { fiber.get() }.object);
             }
         }
+
+        // Whole-function JIT native-to-native calls intentionally do not create
+        // ordinary Fiber frames. Their register arrays live on the parked native
+        // stack and are described by the same precise bytecode ReferenceMaps.
+        // Stable heap handles mean the register words themselves never need
+        // rewriting when MMTk moves an object.
+        let mut shadow = vm.native_shadow_top;
+        while !shadow.is_null() {
+            // SAFETY: shadow frames are linked only while their native stack
+            // storage is live, and GC observes them only at an STW rendezvous.
+            let frame = unsafe { &*shadow };
+            if frame.root_map != NO_INDEX {
+                if let Some(function) = vm.prepared.functions.get(frame.function as usize) {
+                    if let Some(map) = function.gc_maps.get(frame.root_map as usize) {
+                        let count = (frame.reg_count as usize).min(GENERAL_REGISTER_COUNT);
+                        for index in 0..count {
+                            if map.general_is_reference(Reg(index as u8)) {
+                                let word = unsafe { *frame.registers.add(index) };
+                                root(Value::from_word(word));
+                            }
+                        }
+                    }
+                }
+            }
+            shadow = frame.previous;
+        }
+
         vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
         for &promise in vm.pending_fetches.values() { root(promise); }
         for &promise in vm.pending_concurrent.values() { root(promise); }
@@ -6389,6 +6438,10 @@ unsafe impl GcRootProvider for VmRootProvider {
 
 impl Drop for Interpreter<'_> {
     fn drop(&mut self) {
+        debug_assert!(
+            self.native_shadow_top.is_null(),
+            "dropping Interpreter with an active whole-function JIT shadow frame"
+        );
         // Remove every VM-owned strong root and force a full collection while
         // the mutator and its native resources are still alive. Managed fibers
         // and closures are self-contained (Arc/Box-backed), so externally rooted
@@ -6624,6 +6677,7 @@ impl<'p> Interpreter<'p> {
         Ok(Self {
             jit: Some(jit),
             whole_function_jit,
+            native_shadow_top: std::ptr::null_mut(),
             jit_entry_threshold,
             method_epoch: 0,
             program,
