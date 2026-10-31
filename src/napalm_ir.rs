@@ -529,6 +529,15 @@ pub struct ModuleExport {
     pub slot: ModuleSlot,
 }
 
+/// Code-only module binding copied into isolated concurrent workers. The binding
+/// carries no managed state: workers materialize a fresh zero-capture Closure
+/// pointing at the same immutable bytecode function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WorkerFunctionBinding {
+    pub slot: ModuleSlot,
+    pub function: FuncId,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
     pub id: ModuleId,
@@ -542,6 +551,9 @@ pub struct ModuleInfo {
     pub exports: Vec<ModuleExport>,
     /// Slots preinitialized by the VM with engine-provided core class objects.
     pub builtin_bindings: Vec<BuiltinBinding>,
+    /// Synchronous top-level functions that may be referenced by isolated
+    /// concurrent workers without transferring the owning module's data state.
+    pub worker_function_bindings: Vec<WorkerFunctionBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -2308,6 +2320,7 @@ impl Program {
             variable_count,
             exports: Vec::new(),
             builtin_bindings: Vec::new(),
+            worker_function_bindings: Vec::new(),
         };
         let index = self.modules.len();
         self.modules.push(info);
@@ -2345,6 +2358,29 @@ impl Program {
             assert!(binding.slot.0 < module.variable_count, "builtin module slot {:?} out of range for {:?}", binding.slot, id);
         }
         module.builtin_bindings = bindings;
+    }
+
+    pub fn set_module_worker_function_bindings(
+        &mut self,
+        id: ModuleId,
+        bindings: Vec<WorkerFunctionBinding>,
+    ) {
+        let index = *self.module_index.get(&id).unwrap_or_else(|| panic!("unknown module {id:?}"));
+        let variable_count = self.modules[index].variable_count;
+        for binding in &bindings {
+            assert!(
+                binding.slot.0 < variable_count,
+                "worker function module slot {:?} out of range for {:?}",
+                binding.slot,
+                id
+            );
+            assert!(
+                self.function_index.contains_key(&binding.function),
+                "worker function binding references unknown function {:?}",
+                binding.function
+            );
+        }
+        self.modules[index].worker_function_bindings = bindings;
     }
 
     pub fn add_class(

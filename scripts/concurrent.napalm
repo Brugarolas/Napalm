@@ -1,0 +1,198 @@
+// concurrency_benchmark.napalm
+//
+// CPU-bound concurrency benchmark for Napalm.
+//
+// The benchmark performs the same kind of expensive computation in two ways:
+//
+//   1. Five concurrent tasks, all launched before awaiting.
+//   2. Five sequential calls on the current thread.
+//
+// Different seeds are used for the concurrent and sequential phases to avoid
+// automatic memoization accidentally turning the second phase into cache hits.
+
+const TASK_COUNT: Number = 5;
+
+// Increase or decrease this value until one heavyLoad() call takes roughly
+// 1-2 seconds on your machine.
+//
+// The modulo-heavy workload is intentional: it creates a long dependency chain
+// and makes it difficult for the optimizer to eliminate or trivially simplify
+// the loop.
+const WORK_ITERATIONS: Number = 4_000_000;
+
+
+function heavyLoad(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        // LCG-style dependent computation.
+        // Every iteration depends on the result of the previous one.
+        state = (state * 48271 + 1) % 2147483647;
+
+        // Add another dependency so the final state cannot simply be discarded.
+        accumulator = accumulator + (state % 1009);
+
+        // Periodically perturb the state using the accumulated result.
+        // This prevents the loop from degenerating into a simple recurrence
+        // whose final result could potentially be computed more aggressively.
+        if ((i % 4096) == 0) {
+            state = (state + (accumulator % 65521)) % 2147483647;
+        }
+    }
+
+    return accumulator + state;
+}
+
+
+concurrent function concurrentHeavyLoad(
+    seed: Number,
+    iterations: Number
+): Number {
+    return heavyLoad(seed, iterations);
+}
+
+
+async function runBenchmark() {
+    System.print("========================================");
+    System.print("Napalm CPU concurrency benchmark");
+    System.print("========================================");
+    System.print("Tasks:");
+    System.print(TASK_COUNT);
+    System.print("Iterations per task:");
+    System.print(WORK_ITERATIONS);
+
+    // ------------------------------------------------------------
+    // Warm-up
+    // ------------------------------------------------------------
+    //
+    // Give the interpreter/JIT a chance to see and compile the hot loop before
+    // either timed phase starts. This keeps compilation cost from unfairly
+    // affecting the first measurement.
+
+    System.print("");
+    System.print("Warming up...");
+
+    let warmupResult: Number = heavyLoad(17, 250_000);
+
+    // Keep the result observable.
+    System.print("Warm-up checksum:");
+    System.print(warmupResult);
+
+
+    // ============================================================
+    // Concurrent benchmark
+    // ============================================================
+
+    System.print("");
+    System.print("----------------------------------------");
+    System.print("CONCURRENT RUN");
+    System.print("----------------------------------------");
+
+    const concurrentStart = System.clock;
+
+    // IMPORTANT:
+    //
+    // Launch every task before awaiting any of them.
+    //
+    // Awaiting immediately after every launch would serialize the test and
+    // would therefore not measure parallel execution.
+
+    let p1 = launch concurrentHeavyLoad(101, WORK_ITERATIONS);
+    let p2 = launch concurrentHeavyLoad(102, WORK_ITERATIONS);
+    let p3 = launch concurrentHeavyLoad(103, WORK_ITERATIONS);
+    let p4 = launch concurrentHeavyLoad(104, WORK_ITERATIONS);
+    let p5 = launch concurrentHeavyLoad(105, WORK_ITERATIONS);
+
+    let concurrent = await Promise.all([p1, p2, p3, p4, p5])
+
+    const concurrentEnd = System.clock;
+    const concurrentMs = concurrentEnd - concurrentStart;
+
+    System.print("Concurrent time (ms):");
+    System.print(concurrentMs);
+
+
+    // ============================================================
+    // Sequential benchmark
+    // ============================================================
+
+    System.print("");
+    System.print("----------------------------------------");
+    System.print("SEQUENTIAL RUN");
+    System.print("----------------------------------------");
+
+    const sequentialStart = System.clock;
+
+    // Use different arguments from the concurrent phase.
+    //
+    // Napalm can memoize suitable pure functions. Reusing exactly the same
+    // arguments could therefore turn this phase into a memoization benchmark
+    // instead of a CPU concurrency benchmark.
+
+    let s1: Number = heavyLoad(201, WORK_ITERATIONS);
+    let s2: Number = heavyLoad(202, WORK_ITERATIONS);
+    let s3: Number = heavyLoad(203, WORK_ITERATIONS);
+    let s4: Number = heavyLoad(204, WORK_ITERATIONS);
+    let s5: Number = heavyLoad(205, WORK_ITERATIONS);
+
+    const sequentialEnd = System.clock;
+    const sequentialMs = sequentialEnd - sequentialStart;
+
+    const sequentialChecksum: Number = s1 + s2 + s3 + s4 + s5;
+
+    System.print("Sequential time (ms):");
+    System.print(sequentialMs);
+
+
+    // ============================================================
+    // Results
+    // ============================================================
+
+    const speedup: Number = sequentialMs / concurrentMs;
+    const idealSpeedup: Number = TASK_COUNT;
+    const parallelEfficiency: Number = (speedup / idealSpeedup) * 100;
+
+    System.print("");
+    System.print("========================================");
+    System.print("RESULTS");
+    System.print("========================================");
+
+    System.print("Concurrent time (ms):");
+    System.print(concurrentMs);
+
+    System.print("Sequential time (ms):");
+    System.print(sequentialMs);
+
+    System.print("Speedup:");
+    System.print(speedup);
+
+    System.print("Maximum theoretical speedup:");
+    System.print(idealSpeedup);
+
+    System.print("Parallel efficiency (%):");
+    System.print(parallelEfficiency);
+
+    System.print("");
+
+    if (concurrentMs < sequentialMs) {
+        System.print("PASS: concurrent execution was faster.");
+    } else {
+        System.print("FAIL: concurrent execution was not faster.");
+    }
+
+    if (speedup >= 4.0) {
+        System.print("EXCELLENT: near-linear scaling for five CPU-bound tasks.");
+    } else if (speedup >= 3.0) {
+        System.print("GOOD: substantial real parallelism detected.");
+    } else if (speedup >= 1.5) {
+        System.print("WARNING: parallelism works, but scaling is poor.");
+    } else {
+        System.print("ERROR: tasks may not actually be executing in parallel.");
+    }
+
+    System.print("========================================");
+}
+
+
+await runBenchmark();

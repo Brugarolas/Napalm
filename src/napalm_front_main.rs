@@ -20,7 +20,7 @@ enum Kind {
     #[regex(r"[a-zA-Z_$][a-zA-Z0-9_$]*")]
     Word,
     #[regex(
-        r"0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|([0-9]+(\.[0-9]+)?|\.[0-9]+)([eE][+-]?[0-9]+)?"
+        r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|(?:[0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*)?|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?"
     )]
     Number,
     #[token("\"", string)]
@@ -161,6 +161,10 @@ struct Parser<'a> {
     exports: Vec<(Ident, Ident)>,
     immutable: HashSet<Span>,
     parameter_patterns: HashMap<Span, BindingPattern>,
+    /// Parameter annotations are keyed by the parameter's stable source span until
+    /// the corresponding FunctionBody is assembled. This keeps the existing AST
+    /// parameter representation compact while preserving TypeScript annotations.
+    parameter_types: HashMap<Span, TypeAnnotation>,
 }
 
 fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
@@ -435,6 +439,7 @@ impl<'a> Parser<'a> {
             exports: Vec::new(),
             immutable: HashSet::default(),
             parameter_patterns: HashMap::default(),
+            parameter_types: HashMap::default(),
         }
     }
     fn peek(&self) -> Tok {
@@ -1741,6 +1746,9 @@ impl<'a> Parser<'a> {
             // argument lowering is added deliberately.
             self.eat("?");
             let annotation = self.variable_annotation()?;
+            if let Some(annotation) = annotation.as_ref() {
+                self.parameter_types.insert(param.span, annotation.clone());
+            }
             if self.eat("=") {
                 return self.error("default parameters are not implemented yet");
             }
@@ -1760,6 +1768,13 @@ impl<'a> Parser<'a> {
         }
         Ok((params, properties))
     }
+    fn take_parameter_types(&mut self, params: &[Ident]) -> Vec<Option<TypeAnnotation>> {
+        params
+            .iter()
+            .map(|param| self.parameter_types.remove(&param.span))
+            .collect()
+    }
+
     fn parameter_bindings(&mut self, params: &[Ident]) -> Result<Vec<Stmt>> {
         let mut prefix = Vec::new();
         for param in params {
@@ -1777,10 +1792,12 @@ impl<'a> Parser<'a> {
         let StmtKind::Block(body_statements) = block.kind else {
             unreachable!()
         };
+        let param_types = self.take_parameter_types(&params);
         let mut statements = self.parameter_bindings(&params)?;
         statements.extend(body_statements);
         Ok(FunctionBody {
             params,
+            param_types,
             kind: FunctionBodyKind::Statements(statements),
             span: self.end(start),
         })
@@ -2566,14 +2583,23 @@ impl<'a> Parser<'a> {
         if self.at("<") {
             self.type_parameters()?;
         }
-        let params = if self.at("(") {
+        let parenthesized = self.at("(");
+        let params = if parenthesized {
             self.params()?
         } else {
             let param = self.ident()?;
             self.eat("?");
+            if let Some(annotation) = self.variable_annotation()? {
+                self.parameter_types.insert(param.span, annotation);
+            }
             vec![param]
         };
-        self.annotation()?;
+        // Named functions and parenthesized arrow functions may carry a return
+        // annotation here. For an unparenthesized arrow the preceding annotation
+        // was the parameter annotation itself.
+        if function || parenthesized {
+            self.annotation()?;
+        }
         let body = if function {
             self.function_body(params, start)?
         } else {
@@ -2583,13 +2609,14 @@ impl<'a> Parser<'a> {
                 self.function_body(params, start)?
             } else {
                 let value = self.expr(1)?;
+                let param_types = self.take_parameter_types(&params);
                 let mut statements = self.parameter_bindings(&params)?;
                 let kind = if statements.is_empty() { FunctionBodyKind::Expression(Box::new(value)) }
                 else {
                     statements.push(Stmt { span: value.span, kind: StmtKind::Return(Some(value)) });
                     FunctionBodyKind::Statements(statements)
                 };
-                FunctionBody { params, kind, span: self.end(start) }
+                FunctionBody { params, param_types, kind, span: self.end(start) }
             }
         };
         Ok(Expr::new(
@@ -2612,9 +2639,11 @@ impl<'a> Parser<'a> {
             loop {
                 let param = self.ident()?;
                 self.eat("?");
-                // Parameter annotations are accepted for consistency with named
-                // functions. Runtime closure metadata remains arity-based.
-                self.annotation()?;
+                // Preserve the annotation so lowering can validate and refine the
+                // dynamic call-boundary value before the body observes it.
+                if let Some(annotation) = self.variable_annotation()? {
+                    self.parameter_types.insert(param.span, annotation);
+                }
                 params.push(param);
                 self.lines();
                 if !self.eat(",") {
@@ -2636,8 +2665,10 @@ impl<'a> Parser<'a> {
             self.function_body(params, start)?
         } else {
             let value = self.expr(1)?;
+            let param_types = self.take_parameter_types(&params);
             FunctionBody {
                 params,
+                param_types,
                 kind: FunctionBodyKind::Expression(Box::new(value)),
                 span: self.end(start),
             }
@@ -3032,7 +3063,14 @@ impl<'a> Parser<'a> {
             return self.string_expr();
         }
         if self.peek().kind == Kind::Number {
-            let text = self.text();
+            let source = self.text();
+            let normalized;
+            let text = if source.as_bytes().contains(&b'_') {
+                normalized = source.replace('_', "");
+                normalized.as_str()
+            } else {
+                source
+            };
             self.bump();
             let n = if text.starts_with("0x") || text.starts_with("0X") {
                 u64::from_str_radix(&text[2..], 16).ok().map(|n| n as f64)
@@ -3547,6 +3585,7 @@ impl<'a> Parser<'a> {
                     attributes: Vec::new(),
                     body: Some(FunctionBody {
                         params: Vec::new(),
+                        param_types: Vec::new(),
                         kind: FunctionBodyKind::Statements(statements),
                         span: self.end(start),
                     }),
@@ -3592,6 +3631,7 @@ impl<'a> Parser<'a> {
                 attributes: Vec::new(),
                 body: Some(FunctionBody {
                     params: Vec::new(),
+                    param_types: Vec::new(),
                     kind: FunctionBodyKind::Statements(static_initializers),
                     span: self.end(start),
                 }),
@@ -3733,6 +3773,7 @@ fn synthesize_computed_property(
         attributes: Vec::new(),
         body: Some(FunctionBody {
             params: Vec::new(),
+            param_types: Vec::new(),
             kind: FunctionBodyKind::Statements(vec![
                 guarded_eval,
                 Stmt {
@@ -3836,11 +3877,13 @@ fn synthesize_class_property(
     let param = Spanned::new("<value>".into(), member.span);
     let read = FunctionBody {
         params: Vec::new(),
+        param_types: Vec::new(),
         kind: FunctionBodyKind::Expression(Box::new(field.clone())),
         span: member.span,
     };
     let write = FunctionBody {
         params: Vec::new(),
+        param_types: Vec::new(),
         kind: FunctionBodyKind::Expression(Box::new(Expr::new(
             ExprKind::Assign {
                 target: Box::new(field.clone()),
@@ -5003,5 +5046,41 @@ mod napalm_syntax_tests {
 
 
 
+
+
+    #[test]
+    fn parses_numeric_digit_separators() {
+        let module = assert_parses(r#"
+            const decimal = 4_000_000;
+            const fractional = 12_345.67_89;
+            const scientific = 1_000e+3_0;
+            const hex = 0xFF_FF;
+            const binary = 0b1010_0101;
+            const octal = 0o755_123;
+        "#);
+
+        let expected = [
+            4_000_000.0,
+            12_345.6789,
+            1_000e30,
+            65_535.0,
+            165.0,
+            0o755123 as f64,
+        ];
+        for (statement, expected) in module.statements.iter().zip(expected) {
+            let StmtKind::Variable { initializer: Some(initializer), .. } = &statement.kind else {
+                panic!("expected numeric variable initializer");
+            };
+            let ExprKind::Number(actual) = &initializer.kind else {
+                panic!("expected numeric literal");
+            };
+            assert_eq!(*actual, expected);
+        }
+
+        for invalid in ["1__000", "1_", "0x_FF", "1_.0", "1._0", "1e_3"] {
+            let parsed = parse("numeric-separator-invalid.np", invalid);
+            assert!(parsed.has_errors(), "invalid numeric separator unexpectedly parsed: {invalid}");
+        }
+    }
 
 }

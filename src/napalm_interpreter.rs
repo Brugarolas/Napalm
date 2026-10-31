@@ -6887,8 +6887,22 @@ impl<'p> Interpreter<'p> {
                 let original = function.original_ops[index];
                 let Some(opcode) = bytecode[original.raw_pc as usize].opcode() else { continue; };
                 if !matches!(opcode, Opcode::LoadModuleVar | Opcode::StoreModuleVar) { continue; }
-                let module = unsafe { modules.get_unchecked_mut(original.x as usize) };
-                let pointer = unsafe { module.variables.as_mut_ptr().add(original.y as usize) } as usize as u64;
+                let module_index = original.x as usize;
+                let slot = original.y;
+                if opcode == Opcode::LoadModuleVar {
+                    let info = unsafe { program.metadata.modules.get_unchecked(module_index) };
+                    let worker_readable = info
+                        .builtin_bindings
+                        .iter()
+                        .any(|binding| binding.slot.0 == slot)
+                        || info
+                            .worker_function_bindings
+                            .iter()
+                            .any(|binding| binding.slot.0 == slot);
+                    function.ops[index].cache = worker_readable as u32;
+                }
+                let module = unsafe { modules.get_unchecked_mut(module_index) };
+                let pointer = unsafe { module.variables.as_mut_ptr().add(slot as usize) } as usize as u64;
                 function.ops[index].x = pointer as u32;
                 function.ops[index].y = (pointer >> 32) as u32;
             }
@@ -7064,8 +7078,86 @@ impl<'p> Interpreter<'p> {
         self.concurrent_manifest = Some(manifest);
     }
 
-    pub(crate) fn set_concurrent_worker(&mut self, worker: bool) {
+    pub(crate) fn set_concurrent_worker(&mut self, worker: bool) -> Result<(), RuntimeError> {
         self.is_concurrent_worker = worker;
+        if !worker {
+            return Ok(());
+        }
+
+        // Whole-function native compilation lowers immutable bytecode directly and
+        // therefore bypasses prepared-op module guards. Keep it disabled in an
+        // isolated worker for now. The tracing JIT remains enabled: a forbidden
+        // module-data path cannot be recorded because its guarded baseline load
+        // fails before the recorder can observe a successful operation.
+        self.whole_function_jit = None;
+
+        // Workers receive immutable bytecode, never the parent VM's managed
+        // module state. Recreate only explicitly marked zero-capture function
+        // closures in the worker heap so ordinary synchronous helpers can be
+        // called without sharing their defining environment.
+        let bindings = self
+            .program
+            .metadata
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .worker_function_bindings
+                    .iter()
+                    .copied()
+                    .map(move |binding| (module.id, binding))
+            })
+            .collect::<Vec<_>>();
+
+        for (module_id, binding) in bindings {
+            let module_slot = *self
+                .prepared
+                .module_by_id
+                .get(&module_id)
+                .ok_or_else(|| RuntimeError::new(format!(
+                    "concurrent worker is missing module {:?}",
+                    module_id
+                )))? as usize;
+            let function_index = *self
+                .prepared
+                .function_by_id
+                .get(&binding.function)
+                .ok_or_else(|| RuntimeError::new(format!(
+                    "concurrent worker is missing function {:?}",
+                    binding.function
+                )))?;
+            let function = self
+                .prepared
+                .functions
+                .get(function_index as usize)
+                .ok_or_else(|| RuntimeError::new("concurrent worker function index is invalid"))?;
+            if function.capture_count != 0 || function.is_async || function.is_concurrent {
+                return Err(RuntimeError::new(format!(
+                    "worker-callable function {:?} must be synchronous, non-concurrent, and capture-free",
+                    binding.function
+                )));
+            }
+            let reference_indices = function.capture_reference_indices.clone();
+            let closure = self.heap.alloc(HeapObject::Closure {
+                function_index,
+                captures: Vec::<RegisterWord>::new().into_boxed_slice(),
+                reference_indices,
+            });
+            let variables = &mut self
+                .modules
+                .get_mut(module_slot)
+                .ok_or_else(|| RuntimeError::new("concurrent worker module slot is invalid"))?
+                .variables;
+            let target = variables
+                .get_mut(binding.slot.0 as usize)
+                .ok_or_else(|| RuntimeError::new("concurrent worker function binding slot is invalid"))?;
+            *target = closure;
+        }
+
+        // Publish the freshly materialized module roots before any worker code can
+        // allocate or trigger a collection.
+        self.sync_persistent_roots();
+        Ok(())
     }
 
     pub(crate) fn set_shared_jit_profile(&mut self, profile: Arc<SharedJitProfile>) {
@@ -9124,7 +9216,7 @@ impl<'p> Interpreter<'p> {
     fn promise_all(&mut self, input: Value) -> Result<Value, RuntimeError> {
         let inputs = self.promise_input_list(input, "all")?;
         if inputs.is_empty() {
-            let values = self.allocate_list(Vec::new());
+            let values = self.heap.alloc(HeapObject::List(Vec::new()));
             let values_root = self.add_root(values);
             let promise = self.allocate_promise(PromiseState::Fulfilled(values));
             self.release_root(values_root);
@@ -9204,32 +9296,42 @@ impl<'p> Interpreter<'p> {
         &mut self,
         errors: Vec<Value>,
     ) -> Result<Value, RuntimeError> {
-        let errors = self.allocate_list(errors);
+        let errors = self.heap.alloc(HeapObject::List(errors));
         let errors_root = self.add_root(errors);
-        let error = self.allocate_map();
+        let error = self.heap.alloc(HeapObject::Map(NapalmMap::default()));
         let error_root = self.add_root(error);
 
-        let name_key = self.allocate_string("name");
-        let name_key_root = self.add_root(name_key);
-        let name = self.allocate_string("AggregateError");
+        let name = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            &b"AggregateError"[..],
+        ))));
         let name_root = self.add_root(name);
-        let message_key = self.allocate_string("message");
-        let message_key_root = self.add_root(message_key);
-        let message = self.allocate_string("All promises were rejected");
+        let message = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            &b"All promises were rejected"[..],
+        ))));
         let message_root = self.add_root(message);
-        let errors_key = self.allocate_string("errors");
-        let errors_key_root = self.add_root(errors_key);
 
-        let result = self
-            .map_set(error, name_key, name)
-            .and_then(|_| self.map_set(error, message_key, message))
-            .and_then(|_| self.map_set(error, errors_key, errors));
+        let result = (|| -> Result<(), RuntimeError> {
+            let fields: [(&[u8], Value); 3] = [
+                (&b"name"[..], name),
+                (&b"message"[..], message),
+                (&b"errors"[..], errors),
+            ];
+            for (key, value) in fields {
+                self.heap.remember_if_reference(error, value);
+                let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(key)));
+                let structural = self.heap.map_set_encoded(error, key, value, None)?;
+                if structural {
+                    if let Some(bytes) = self.heap.map_external_bytes(error) {
+                        self.heap.set_external_bytes(error, bytes);
+                    }
+                    self.heap.refresh_jit_view(error);
+                }
+            }
+            Ok(())
+        })();
 
-        self.release_root(errors_key_root);
         self.release_root(message_root);
-        self.release_root(message_key_root);
         self.release_root(name_root);
-        self.release_root(name_key_root);
         self.release_root(error_root);
         self.release_root(errors_root);
         result?;
@@ -9255,7 +9357,7 @@ impl<'p> Interpreter<'p> {
                 self.heap.remember_if_reference(promise, value);
                 let values = {
                     let Ok(cell) = self.promise_cell(promise) else { return; };
-                    let PromiseState::Pending { aggregate, .. } = unsafe { cell.get_mut() } else {
+                    let PromiseState::Pending { aggregate, .. } = (unsafe { cell.get_mut() }) else {
                         return;
                     };
                     let Some(PromiseAggregate::All { remaining, values }) = aggregate.as_mut() else {
@@ -9273,7 +9375,7 @@ impl<'p> Interpreter<'p> {
                 };
 
                 let promise_root = self.add_root(promise);
-                let values = self.allocate_list(values);
+                let values = self.heap.alloc(HeapObject::List(values));
                 let values_root = self.add_root(values);
                 let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(values));
                 self.release_root(values_root);
@@ -9297,7 +9399,7 @@ impl<'p> Interpreter<'p> {
         self.heap.remember_if_reference(promise, reason);
         let errors = {
             let Ok(cell) = self.promise_cell(promise) else { return; };
-            let PromiseState::Pending { aggregate, .. } = unsafe { cell.get_mut() } else {
+            let PromiseState::Pending { aggregate, .. } = (unsafe { cell.get_mut() }) else {
                 return;
             };
             let Some(PromiseAggregate::Any { remaining, errors }) = aggregate.as_mut() else {
@@ -14340,7 +14442,11 @@ unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
                         return;
                     }
                 }
-                vm.fail_at(&op,error.message);return;
+                let message = format!(
+                    "{} (receiver={receiver_value:?}, receiver_class={class:?})",
+                    error.message
+                );
+                vm.fail_at(&op,message);return;
             }
         },
     };
@@ -14892,9 +14998,35 @@ unsafe fn module_slot_ptr(op: &PreparedOp) -> *mut Value {
     (((op.y as u64) << 32) | op.x as u64) as usize as *mut Value
 }
 
-unsafe fn h_load_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*module_slot_ptr(op);vm.set_reg(op.a,v.word());vm.advance(op)}
-unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*module_slot_ptr(op);vm.return_from_frame(v.word(),None)}
-unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.a));*module_slot_ptr(op)=value;vm.advance(op)}
+unsafe fn h_load_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker && op.cache == 0 {
+        vm.fail_at(op,"concurrent worker cannot read module data; pass the value through launch arguments");
+        return;
+    }
+    let v=*module_slot_ptr(op);
+    vm.set_reg(op.a,v.word());
+    vm.advance(op)
+}
+unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker && op.cache == 0 {
+        vm.fail_at(op,"concurrent worker cannot read module data; pass the value through launch arguments");
+        return;
+    }
+    let v=*module_slot_ptr(op);
+    vm.return_from_frame(v.word(),None)
+}
+unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker {
+        vm.fail_at(op,"concurrent worker cannot write module data; return the value or pass state explicitly");
+        return;
+    }
+    let value=Value::from_word(vm.reg(op.a));
+    *module_slot_ptr(op)=value;
+    vm.advance(op)
+}
 
 unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Cell(Box::new(vm.reg(op.b))));vm.set_reg(op.a,value.word());vm.advance(op)}
 unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,**value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
@@ -16055,6 +16187,9 @@ impl TraceRuntime for Interpreter<'_> {
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
+            if opcode == Opcode::LoadModuleVar {
+                op.cache = prepared_op.cache;
+            }
         }
         if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent) {
             op.cache = self.current_prepared().ops[self.hot_pc as usize].cache;
@@ -16778,7 +16913,7 @@ mod tests {
 
     fn simple_program(chunk: crate::napalm_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new() });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new() });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
@@ -16891,6 +17026,37 @@ mod tests {
             &parsed.module,
         );
         assert!(!lowered.has_errors(), "lowering diagnostics: {:#?}", lowered.diagnostics);
+        let entry = lowered
+            .lowered
+            .as_ref()
+            .expect("module should lower successfully")
+            .entry;
+        let bytecode = compile_program(&mut hir).expect("compilation pipeline should succeed");
+        (bytecode, entry, manifest)
+    }
+
+    fn compile_typescript_module(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {
+        let parsed = crate::napalm_front_main::parse("typed_runtime_test.napalm", source);
+        assert!(
+            !parsed.has_errors(),
+            "TypeScript parse diagnostics: {:#?}",
+            parsed.diagnostics
+        );
+
+        let mut hir = Program::new();
+        let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+        let lowered = lower_module(
+            &mut hir,
+            "typed_runtime_test.napalm",
+            source,
+            "typed_runtime_test",
+            &parsed.module,
+        );
+        assert!(
+            !lowered.has_errors(),
+            "TypeScript lowering diagnostics: {:#?}",
+            lowered.diagnostics
+        );
         let entry = lowered
             .lowered
             .as_ref()
@@ -17599,6 +17765,101 @@ var result = Runner.run()
     fn source_result(vm: &Interpreter<'_>) -> f64 {
         vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
     }
+
+    #[test]
+    fn typescript_typed_numeric_parameters_execute_heavy_loop_without_dynamic_dispatch_failure() {
+        let source = r#"
+function heavyLoad(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        state = (state * 48271 + 1) % 2147483647;
+        accumulator = accumulator + (state % 1009);
+        if ((i % 64) == 0) {
+            state = (state + (accumulator % 65521)) % 2147483647;
+        }
+    }
+    return accumulator + state;
+}
+let result = heavyLoad(17, 1000);
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+
+        let mut state = 17.0f64;
+        let mut accumulator = 0.0f64;
+        for i in 0..1000usize {
+            state = (state * 48271.0 + 1.0) % 2147483647.0;
+            accumulator += state % 1009.0;
+            if i % 64 == 0 {
+                state = (state + accumulator % 65521.0) % 2147483647.0;
+            }
+        }
+        let expected = accumulator + state;
+
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 2,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected module return")
+            };
+            assert_eq!(source_result(&vm), expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_function_can_execute_capture_free_synchronous_helper() {
+        let source = r#"
+function heavyLoad(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        state = (state * 48271 + 1) % 2147483647;
+        accumulator = accumulator + (state % 1009);
+    }
+    return accumulator + state;
+}
+
+concurrent function concurrentHeavyLoad(seed: Number, iterations: Number): Number {
+    return heavyLoad(seed, iterations);
+}
+
+let p1 = launch concurrentHeavyLoad(101, 200);
+let p2 = launch concurrentHeavyLoad(102, 200);
+let p3 = launch concurrentHeavyLoad(103, 200);
+let p4 = launch concurrentHeavyLoad(104, 200);
+let p5 = launch concurrentHeavyLoad(105, 200);
+let r1: Number = await p1;
+let r2: Number = await p2;
+let r3: Number = await p3;
+let r4: Number = await p4;
+let r5: Number = await p5;
+let result = r1 + r2 + r3 + r4 + r5;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+
+        let reference = |seed: f64| {
+            let mut state = seed;
+            let mut accumulator = 0.0f64;
+            for _ in 0..200 {
+                state = (state * 48271.0 + 1.0) % 2147483647.0;
+                accumulator += state % 1009.0;
+            }
+            accumulator + state
+        };
+        let expected = (101..=105).map(|seed| reference(seed as f64)).sum::<f64>();
+
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+            panic!("expected module return after concurrent jobs settle")
+        };
+        assert_eq!(source_result(&vm), expected);
+    }
+
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");

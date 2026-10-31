@@ -2198,6 +2198,9 @@ impl FunctionOptimization for ControlFlowCleanup {
             changed = true;
         }
 
+        #[cfg(debug_assertions)]
+        debug_assert_reachable_block_param_uses(function, &reachable);
+
         if changed {
             let live = live_node_bitmap(function);
             function
@@ -2229,6 +2232,35 @@ impl FunctionOptimization for ControlFlowCleanup {
         }
 
         changed
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_reachable_block_param_uses(function: &Function, reachable: &[bool]) {
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        if !reachable.get(block_index).copied().unwrap_or(false) {
+            continue;
+        }
+        for &inst in &block.insts {
+            let Some(node) = function.node(inst) else {
+                continue;
+            };
+            for operand in node.kind.operands() {
+                let Some(value) = function.value(operand) else {
+                    continue;
+                };
+                let ValueDef::BlockParam(owner, _) = value.def else {
+                    continue;
+                };
+                debug_assert!(
+                    reachable.get(owner.0 as usize).copied().unwrap_or(false),
+                    "reachable block {:?} uses {:?}, a block parameter owned by unreachable block {:?}",
+                    block.id,
+                    operand,
+                    owner,
+                );
+            }
+        }
     }
 }
 
@@ -2494,7 +2526,7 @@ impl FunctionOptimization for CopyPropagation {
                 };
                 let result = ValueId(index as u32);
                 if matches!(function.values[index].def, ValueDef::BlockParam(_, _))
-                    && can_substitute(function, source, result)
+                    && can_eliminate_identity_block_param(function, source, result)
                 {
                     alias[index] = source;
                     added = true;
@@ -2577,6 +2609,34 @@ impl FunctionOptimization for CopyPropagation {
         }
 
         changed
+    }
+}
+
+/// Returns whether an identity block parameter can be replaced globally by its
+/// incoming SSA value without making a later CFG rewrite invalidate dominance.
+///
+/// A block parameter owned by an intermediate predecessor is only available after
+/// entering that predecessor. Copying it into a successor is valid while that
+/// predecessor remains on every path, but `ControlFlowCleanup` may subsequently
+/// thread the predecessor away. The replacement would then leave uses referring
+/// to a value defined in an unreachable block. Entry parameters are stable because
+/// the entry block is never bypassed; instruction results are handled by the normal
+/// substitution/type checks below.
+fn can_eliminate_identity_block_param(
+    function: &Function,
+    source: ValueId,
+    result: ValueId,
+) -> bool {
+    if !can_substitute(function, source, result) {
+        return false;
+    }
+
+    let Some(source_value) = function.value(source) else {
+        return false;
+    };
+    match source_value.def {
+        ValueDef::BlockParam(owner, _) => owner == function.entry,
+        ValueDef::InstResult(_, _) | ValueDef::CaptureParam(_) => true,
     }
 }
 
@@ -3050,6 +3110,71 @@ mod typed_object_tests {
 
         let _ = AutoMemoization.optimize_program(&mut program);
         assert_eq!(program.functions[id.0 as usize].memoization, MemoizationKind::None);
+    }
+
+
+    #[test]
+    fn copy_propagation_does_not_leave_block_param_from_threaded_bridge() {
+        let mut program = Program::new();
+        let module = program.add_module("copy_cfg", 0);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "bridge_phi",
+            FunctionKind::Closure,
+            vec![Type::Bool, Type::Num, Type::Num],
+            Type::Num,
+        );
+
+        let condition = builder.param(0);
+        let left_value = builder.param(1);
+        let right_value = builder.param(2);
+        let left = builder.new_block(&[]);
+        let right = builder.new_block(&[]);
+        let bridge = builder.new_block(&[Type::Num]);
+        let join = builder.new_block(&[Type::Num]);
+
+        builder.branch(condition, left, vec![], right, vec![]);
+
+        builder.position_at(left);
+        builder.jump(bridge, vec![left_value]);
+
+        builder.position_at(right);
+        builder.jump(bridge, vec![right_value]);
+
+        builder.position_at(bridge);
+        let bridge_param = builder.block_param(bridge, 0);
+        builder.jump(join, vec![bridge_param]);
+
+        builder.position_at(join);
+        let join_param = builder.block_param(join, 0);
+        builder.ret(join_param);
+
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+
+        // The bridge parameter has conflicting incoming values, while the join
+        // parameter has the bridge parameter as its single incoming value. The old
+        // copy propagation pass globally rewrote `join_param -> bridge_param`; CFG
+        // cleanup then threaded `bridge` away and left the return using a value
+        // defined in an unreachable block.
+        let _ = CopyPropagation.optimize_function(function);
+        assert!(ControlFlowCleanup.optimize_function(function));
+
+        let join_block = function.block(join).expect("join block must remain live");
+        let return_inst = *join_block.insts.last().expect("join block must terminate");
+        let returned = match function.node(return_inst).map(|node| &node.kind) {
+            Some(Inst::Return(value)) => *value,
+            other => panic!("expected Return in join block, got {other:?}"),
+        };
+
+        assert_eq!(returned, join_param);
+        assert_ne!(returned, bridge_param);
+        assert!(matches!(
+            function.value(returned).map(|value| value.def),
+            Some(ValueDef::BlockParam(owner, _)) if owner == join
+        ));
+        crate::napalm_ir::verify_function(function).unwrap();
     }
 
 }

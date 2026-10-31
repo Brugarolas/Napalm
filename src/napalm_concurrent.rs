@@ -416,7 +416,11 @@ fn build_worker_vm<'a>(
     let mut vm = Interpreter::with_host(program, host)
         .map_err(|error| format!("failed to initialize concurrent VM: {}", error.message))?;
     install_vm_builtins(&mut vm, manifest);
-    vm.set_concurrent_worker(true);
+    vm.set_concurrent_worker(true)
+        .map_err(|error| format!(
+            "failed to initialize concurrent worker code bindings: {}",
+            error.message
+        ))?;
     vm.set_shared_jit_profile(shared_jit_profile);
     vm.set_shared_jit_repository(shared_jit_repository, worker_id);
     Ok(vm)
