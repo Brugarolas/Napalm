@@ -288,8 +288,9 @@ pub enum TraceHeapKind {
 /// Stable JIT-visible sidecar for one Napalm heap handle.
 ///
 /// `address` is the moving MMTk object address and is rewritten by GC through the
-/// existing precise handle slot. `data` points only at stable external allocations
-/// (Box/Vec/Arc payloads), never into the moving GC object. `len` is normally the
+/// existing precise handle slot. `data` points at external allocations or inline
+/// Map values; the latter are refreshed by the GC copy callback. Data pointers
+/// are valid only until the next safepoint. `len` is normally the
 /// logical collection/string length; for Closure it stores the immutable prepared
 /// function index while `data` points at the capture array and packed metadata stores
 /// the capture count. `receiver_class` is the immutable semantic class key (zero

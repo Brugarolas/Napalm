@@ -158,6 +158,7 @@ fn run() -> u8 {
 
     if env::var_os("NAPALM_JIT_STATS").is_some() || env::var_os("NAPALM_JIT_STATS").is_some() {
         eprintln!("Napalm JIT stats: {:#?}", interpreter.jit_stats());
+        eprintln!("Napalm whole-function JIT stats: {:#?}", interpreter.whole_function_jit_stats());
     }
     if env::var_os("NAPALM_GC_STATS").is_some() || env::var_os("NAPALM_GC_STATS").is_some() {
         eprintln!("Napalm GC stats: {:#?}", interpreter.gc_statistics());

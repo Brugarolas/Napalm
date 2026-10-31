@@ -272,6 +272,10 @@ pub struct Descriptor {
     /// Deferred language finalizer, executed only by Mutator::run_finalizers.
     /// Its rooted argument may be retained to resurrect the object. Runs once.
     pub finalizer: Option<fn(&mut Mutator, &RootFrame)>,
+    /// Refresh native sidecars after copying a payload, before publishing its
+    /// forwarding pointer. Runs at STW on the winning copy worker. Must not
+    /// allocate, inspect children, or retain references into the payload.
+    pub after_move: Option<unsafe fn(Object)>,
 }
 
 #[repr(C, align(16))]
@@ -771,6 +775,27 @@ impl Mutator {
         descriptor: &'static Descriptor,
         payload_bytes: usize,
     ) -> Object {
+        unsafe { self.allocate_impl::<true>(descriptor, payload_bytes) }
+    }
+
+    /// Allocate a payload that the caller completely initializes immediately.
+    /// # Safety
+    /// The caller must initialize every field read by tracing/cleanup before
+    /// any safepoint or publication. Other requirements match `allocate`.
+    pub unsafe fn allocate_uninitialized(
+        &mut self,
+        descriptor: &'static Descriptor,
+        payload_bytes: usize,
+    ) -> Object {
+        unsafe { self.allocate_impl::<false>(descriptor, payload_bytes) }
+    }
+
+    #[inline(always)]
+    unsafe fn allocate_impl<const ZERO: bool>(
+        &mut self,
+        descriptor: &'static Descriptor,
+        payload_bytes: usize,
+    ) -> Object {
         self.safepoint();
         let external = self.gc.counters.external_bytes.load(Ordering::Relaxed);
         let baseline = self.gc.external_at_gc.load(Ordering::Relaxed);
@@ -822,7 +847,7 @@ impl Mutator {
         assert!(!address.is_zero(), "MMTk returned a null allocation");
         let object = Object(ObjectReference::from_raw_address(address).unwrap());
         unsafe {
-            ptr::write_bytes(address.to_mut_ptr::<u8>(), 0, bytes);
+            if ZERO { ptr::write_bytes(address.to_mut_ptr::<u8>(), 0, bytes); }
             ptr::write(
                 address.to_mut_ptr::<Header>(),
                 Header {
@@ -1233,7 +1258,7 @@ impl ObjectModel<Binding> for Model {
         Some(Self::copy(from, semantics, context))
     }
 
-    fn copy_to(from: ObjectReference, _to: ObjectReference, region: Address) -> Address {
+    fn copy_to(from: ObjectReference, to: ObjectReference, region: Address) -> Address {
         let bytes = Self::get_current_size(from);
         // Forwarding is claimed by MMTk. The reserved forwarding word may be
         // concurrently inspected, so never copy it as ordinary payload bytes.
@@ -1244,6 +1269,9 @@ impl ObjectModel<Binding> for Model {
                 (region + WORD).to_mut_ptr::<u8>(),
                 bytes - WORD,
             );
+            if let Some(callback) = Object(to).header().descriptor.after_move {
+                callback(Object(to));
+            }
         }
         region + bytes
     }

@@ -1267,6 +1267,14 @@ impl BuiltinHost {
 }
 
 impl Host for BuiltinHost {
+    fn standard_identity_method(&self, primitive: PrimitiveId, name: &str, arity: u8) -> bool {
+        matches!(
+            (self.manifest.implementation(primitive), name, arity),
+            (Some(BuiltinPrimitive::ObjectEq), "==", 1)
+                | (Some(BuiltinPrimitive::ObjectNe), "!=", 1)
+        )
+    }
+
     /// Tell the tracing JIT which primitive bindings have the exact stock Napalm
     /// numeric semantics that it is allowed to inline.  The JIT must not
     /// specialize merely by method name because embedders may replace primitive

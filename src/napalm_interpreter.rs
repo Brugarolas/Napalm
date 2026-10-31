@@ -1476,51 +1476,14 @@ impl MapDictionary {
     }
 }
 
-const SMALL_MAP_POOL_MAX_FIELDS: usize = 4;
-const SMALL_MAP_POOL_LOCAL_BATCH: usize = 32;
-const SMALL_MAP_POOL_GLOBAL_LIMIT_PER_CLASS: usize = 2048;
-
-struct SmallMapBufferPool {
-    buckets: [Mutex<Vec<Vec<Value>>>; SMALL_MAP_POOL_MAX_FIELDS],
-}
-
-impl SmallMapBufferPool {
-    fn new() -> Self {
-        Self {
-            buckets: std::array::from_fn(|_| Mutex::new(Vec::new())),
-        }
-    }
-
-    fn recycle(&self, mut values: Vec<Value>) {
-        let capacity = values.capacity();
-        if capacity == 0 || capacity > SMALL_MAP_POOL_MAX_FIELDS {
-            return;
-        }
-        values.clear();
-        // Cleanup may run on several GC workers. Pooling is opportunistic: never
-        // lengthen an STW pause waiting for another worker that is recycling the
-        // same capacity class. Contended buffers simply fall back to normal free.
-        let Some(mut bucket) = self.buckets[capacity - 1].try_lock() else {
-            return;
-        };
-        if bucket.len() < SMALL_MAP_POOL_GLOBAL_LIMIT_PER_CLASS {
-            bucket.push(values);
-        }
-    }
-}
-
-static SMALL_MAP_BUFFER_POOL: OnceLock<SmallMapBufferPool> = OnceLock::new();
-
-#[inline]
-fn small_map_buffer_pool() -> &'static SmallMapBufferPool {
-    SMALL_MAP_BUFFER_POOL.get_or_init(SmallMapBufferPool::new)
-}
+const SMALL_MAP_INLINE_FIELDS: usize = 4;
+type MapValues = smallvec::SmallVec<[Value; SMALL_MAP_INLINE_FIELDS]>;
 
 #[derive(Debug)]
 enum NapalmMapStorage {
     /// Object-like fast representation. The shape owns immutable shared string
     /// keys while values are stored densely by slot.
-    Shaped { shape: u32, values: Vec<Value> },
+    Shaped { shape: u32, values: MapValues },
     /// General Napalm Map semantics for arbitrary key types and highly dynamic maps.
     Dictionary(MapDictionary),
 }
@@ -1535,7 +1498,7 @@ impl Default for NapalmMap {
         Self {
             storage: NapalmMapStorage::Shaped {
                 shape: 0,
-                values: Vec::new(),
+                values: MapValues::new(),
             },
         }
     }
@@ -1543,20 +1506,8 @@ impl Default for NapalmMap {
 
 impl NapalmMap {
     #[inline]
-    fn with_shaped_buffer(shape: u32, values: Vec<Value>) -> Self {
+    fn with_shaped_buffer(shape: u32, values: MapValues) -> Self {
         Self { storage: NapalmMapStorage::Shaped { shape, values } }
-    }
-
-    #[inline]
-    fn take_recyclable_small_buffer(&mut self) -> Option<Vec<Value>> {
-        let NapalmMapStorage::Shaped { values, .. } = &mut self.storage else {
-            return None;
-        };
-        let capacity = values.capacity();
-        if capacity == 0 || capacity > SMALL_MAP_POOL_MAX_FIELDS {
-            return None;
-        }
-        Some(std::mem::take(values))
     }
 
     #[inline(always)]
@@ -1579,7 +1530,7 @@ impl NapalmMap {
     fn external_bytes(&self) -> usize {
         match &self.storage {
             NapalmMapStorage::Shaped { values, .. } => {
-                values.capacity() * std::mem::size_of::<Value>()
+                if values.spilled() { values.capacity() * std::mem::size_of::<Value>() } else { 0 }
             }
             NapalmMapStorage::Dictionary(entries) => {
                 entries.external_bytes()
@@ -2571,17 +2522,19 @@ unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 
 unsafe fn cleanup_managed_object(object: GcObject) {
     let managed = unsafe { managed_object_mut(object) };
-    // Small object-like Maps keep their dense values in a stable external Vec so
-    // JIT sidecars remain valid across moving collections. Recycle that backing
-    // allocation rather than freeing/reallocating it for the next short-lived
-    // literal. The managed object and stable handle themselves still die normally.
-    if let HeapObject::Map(map) = &mut managed.object {
-        if let Some(values) = map.take_recyclable_small_buffer() {
-            small_map_buffer_pool().recycle(values);
-        }
-    }
     handles().release(managed.handle);
     unsafe { std::ptr::drop_in_place(managed) };
+}
+
+unsafe fn refresh_moved_map(object: GcObject) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Map(map) = &managed.object {
+        if let NapalmMapStorage::Shaped { values, .. } = &map.storage {
+            if !values.spilled() {
+                handles().entry(managed.handle).data.store(values.as_ptr() as usize, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 macro_rules! gc_descriptor {
@@ -2591,6 +2544,7 @@ macro_rules! gc_descriptor {
             trace: $trace,
             cleanup: Some(cleanup_managed_object),
             finalizer: None,
+            after_move: Some(refresh_moved_map),
         };
     };
 }
@@ -2725,6 +2679,14 @@ impl AllocationRootBuffer {
         let roots = unsafe { &mut *self.handles.get() };
         roots.clear();
         collect_heap_object_handles(object, roots);
+    }
+
+    #[inline]
+    fn prepare_values(&self, values: &[Value]) {
+        // Same stop-the-world ownership protocol as prepare().
+        let roots = unsafe { &mut *self.handles.get() };
+        roots.clear();
+        for &value in values { push_value_handle(value, roots); }
     }
 
     #[inline]
@@ -2905,9 +2867,6 @@ struct Heap {
     /// Recycled stable handles are pulled from the global Treiber stack in small
     /// batches, amortizing the CAS/generation traffic on allocation-heavy code.
     recycled_handles: Vec<u32>,
-    /// Per-mutator small shaped-map buffers. GC workers return dead buffers to a
-    /// bounded global pool; the mutator refills these local buckets in batches.
-    small_map_buffers: [Vec<Vec<Value>>; SMALL_MAP_POOL_MAX_FIELDS],
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
     #[cfg(test)]
@@ -2954,7 +2913,6 @@ impl Default for Heap {
             stack_owner: Value::NULL,
             map_shapes: MapShapeTable::default(),
             recycled_handles: Vec::with_capacity(HANDLE_RECYCLE_BATCH),
-            small_map_buffers: std::array::from_fn(|_| Vec::new()),
             contract_class_ids: Vec::new(),
             #[cfg(test)]
             allocations: Vec::new(),
@@ -2967,15 +2925,48 @@ impl Drop for Heap {
         for handle in self.recycled_handles.drain(..) {
             self.handle_table.return_unused(handle);
         }
-        for bucket in &mut self.small_map_buffers {
-            for values in bucket.drain(..) {
-                small_map_buffer_pool().recycle(values);
-            }
-        }
+
     }
 }
 
 impl Heap {
+    /// The common small-literal path has a known descriptor/class and no native
+    /// buffer. Avoid the general HeapObject classification and external accounting.
+    fn alloc_inline_map(&mut self, shape: u32, values: MapValues) -> Value {
+        debug_assert!(!values.spilled());
+        self.allocation_roots.prepare_values(&values);
+        let handle = self.allocate_handle_fast();
+        let object = unsafe {
+            self.mutator.allocate_uninitialized(&GC_MAP, std::mem::size_of::<ManagedObject>())
+        };
+        let class = ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64);
+        unsafe {
+            object.payload().cast::<ManagedObject>().write(ManagedObject {
+                contracts: None,
+                handle,
+                receiver_class: Some(class),
+                object: HeapObject::Map(NapalmMap::with_shaped_buffer(shape, values)),
+            });
+        }
+        let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else { unreachable!() };
+        let (_, values) = map.shaped().unwrap();
+        let entry = self.handle_table.entry(handle);
+        entry.address.store(object.address(), Ordering::Relaxed);
+        entry.receiver_class.store(class.0, Ordering::Relaxed);
+        entry.data.store(values.as_ptr() as usize, Ordering::Relaxed);
+        entry.len.store(values.len(), Ordering::Relaxed);
+        entry.promise_value.store(0, Ordering::Relaxed);
+        entry.kind.store(TraceHeapKind::Map as u32
+            | (shape << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT), Ordering::Release);
+        self.handle_table.live.fetch_add(1, Ordering::Relaxed);
+        self.allocation_roots.clear();
+        self.remember_stack_owner();
+        let value = Value::from_heap(handle);
+        #[cfg(test)]
+        self.allocations.push(value);
+        value
+    }
+
     #[inline]
     fn allocate_handle_fast(&mut self) -> u32 {
         if let Some(handle) = self.recycled_handles.pop() {
@@ -2990,33 +2981,6 @@ impl Heap {
         }
     }
 
-    fn take_small_map_buffer(&mut self, capacity: usize) -> (Vec<Value>, bool) {
-        debug_assert!((1..=SMALL_MAP_POOL_MAX_FIELDS).contains(&capacity));
-        let local = &mut self.small_map_buffers[capacity - 1];
-        if let Some(mut values) = local.pop() {
-            values.clear();
-            return (values, true);
-        }
-
-        let pool = small_map_buffer_pool();
-        let mut global = pool.buckets[capacity - 1].lock();
-        let available = global.len().min(SMALL_MAP_POOL_LOCAL_BATCH);
-        if available != 0 {
-            for _ in 1..available {
-                if let Some(values) = global.pop() {
-                    local.push(values);
-                }
-            }
-            if let Some(mut values) = global.pop() {
-                drop(global);
-                values.clear();
-                return (values, true);
-            }
-        }
-        drop(global);
-        (Vec::with_capacity(capacity), false)
-    }
-
     #[inline]
     fn alloc(&mut self, object: HeapObject) -> Value {
         // Protect references which currently live only in the Rust-side object
@@ -3029,7 +2993,7 @@ impl Heap {
         let external = external_bytes_for(&object);
         let gc_object = unsafe {
             self.mutator
-                .allocate(descriptor, std::mem::size_of::<ManagedObject>())
+                .allocate_uninitialized(descriptor, std::mem::size_of::<ManagedObject>())
         };
         unsafe {
             std::ptr::write(
@@ -3213,7 +3177,7 @@ impl Heap {
         pairs: [(Value, Value); N],
         site: &mut SmallMapAllocationSite,
     ) -> Result<Value, RuntimeError> {
-        debug_assert!(N != 0 && N <= SMALL_MAP_POOL_MAX_FIELDS);
+        debug_assert!(N != 0 && N <= SMALL_MAP_INLINE_FIELDS);
         site.allocations = site.allocations.wrapping_add(1);
 
         if site.initialized && !site.disabled && site.field_count as usize == N {
@@ -3238,7 +3202,7 @@ impl Heap {
             if matches {
                 let value_count = site.value_count as usize;
                 debug_assert!(value_count <= N);
-                let (mut values, reused) = self.take_small_map_buffer(N);
+                let mut values = MapValues::new();
                 values.resize(value_count, Value::NULL);
                 for (index, (_, value)) in pairs.iter().enumerate() {
                     let slot = site.slots[index] as usize;
@@ -3246,13 +3210,7 @@ impl Heap {
                     unsafe { *values.get_unchecked_mut(slot) = *value; }
                 }
                 site.specialized_allocations = site.specialized_allocations.wrapping_add(1);
-                if reused {
-                    site.recycled_buffer_hits = site.recycled_buffer_hits.wrapping_add(1);
-                }
-                return Ok(self.alloc(HeapObject::Map(NapalmMap::with_shaped_buffer(
-                    site.shape,
-                    values,
-                ))));
+                return Ok(self.alloc_inline_map(site.shape, values));
             }
 
             site.polymorphic_misses = site.polymorphic_misses.saturating_add(1);
@@ -3261,14 +3219,13 @@ impl Heap {
             }
         }
 
-        // Cold or polymorphic path. Pre-size from the small-buffer recycler so the
-        // first shape build still avoids allocator churn after a nursery cycle.
-        let (values, reused) = self.take_small_map_buffer(N);
-        let mut map = NapalmMap::with_shaped_buffer(0, values);
+        // Small literals keep values inside the managed object, including while
+        // learning their shape. Larger maps spill only when they grow.
+        let mut map = NapalmMap::default();
         let mut cacheable = !site.disabled;
-        let mut key_handles = [0u32; SMALL_MAP_POOL_MAX_FIELDS];
-        let mut key_generations = [0u64; SMALL_MAP_POOL_MAX_FIELDS];
-        let mut slots = [0u16; SMALL_MAP_POOL_MAX_FIELDS];
+        let mut key_handles = [0u32; SMALL_MAP_INLINE_FIELDS];
+        let mut key_generations = [0u64; SMALL_MAP_INLINE_FIELDS];
+        let mut slots = [0u16; SMALL_MAP_INLINE_FIELDS];
 
         for (index, (key_value, value)) in pairs.iter().copied().enumerate() {
             match self.identity(key_value) {
@@ -3285,9 +3242,6 @@ impl Heap {
             }
         }
 
-        if reused {
-            site.recycled_buffer_hits = site.recycled_buffer_hits.wrapping_add(1);
-        }
         if cacheable && !site.initialized {
             if let NapalmMapStorage::Shaped { shape, values } = &map.storage {
                 site.initialized = true;
@@ -4337,6 +4291,8 @@ impl HostContext<'_> {
 
 pub trait Host {
     fn standard_numeric_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
+    /// Opt in only for the stock bitwise Object ==/!= implementation.
+    fn standard_identity_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
         &mut self,
         _context: &mut HostContext<'_>,
@@ -5856,12 +5812,11 @@ struct SmallMapAllocationSite {
     value_count: u8,
     polymorphic_misses: u8,
     shape: u32,
-    key_handles: [u32; SMALL_MAP_POOL_MAX_FIELDS],
-    key_generations: [u64; SMALL_MAP_POOL_MAX_FIELDS],
-    slots: [u16; SMALL_MAP_POOL_MAX_FIELDS],
+    key_handles: [u32; SMALL_MAP_INLINE_FIELDS],
+    key_generations: [u64; SMALL_MAP_INLINE_FIELDS],
+    slots: [u16; SMALL_MAP_INLINE_FIELDS],
     allocations: u32,
     specialized_allocations: u32,
-    recycled_buffer_hits: u32,
 }
 
 impl Default for SmallMapAllocationSite {
@@ -5874,12 +5829,11 @@ impl Default for SmallMapAllocationSite {
             value_count: 0,
             polymorphic_misses: 0,
             shape: 0,
-            key_handles: [0; SMALL_MAP_POOL_MAX_FIELDS],
-            key_generations: [0; SMALL_MAP_POOL_MAX_FIELDS],
-            slots: [0; SMALL_MAP_POOL_MAX_FIELDS],
+            key_handles: [0; SMALL_MAP_INLINE_FIELDS],
+            key_generations: [0; SMALL_MAP_INLINE_FIELDS],
+            slots: [0; SMALL_MAP_INLINE_FIELDS],
             allocations: 0,
             specialized_allocations: 0,
-            recycled_buffer_hits: 0,
         }
     }
 }
@@ -14976,7 +14930,7 @@ impl TraceRuntime for Interpreter<'_> {
         let fused = prepared.ops.get(index)?;
         let field_count = fused.c as usize;
         if field_count == 0
-            || field_count > SMALL_MAP_POOL_MAX_FIELDS
+            || field_count > SMALL_MAP_INLINE_FIELDS
             || fused.next as usize != index + 1 + field_count
             || fused.args_offset as usize + field_count * 2 > prepared.call_args.len()
             || fused.cache as usize >= prepared.small_map_literal_sites.len()
@@ -16208,22 +16162,6 @@ mod tests {
     }
 
     #[test]
-    fn small_map_buffer_pool_retains_external_storage_without_values() {
-        let pool = SmallMapBufferPool::new();
-        let mut values = Vec::with_capacity(2);
-        values.push(Value::from_num(1.0));
-        values.push(Value::from_num(2.0));
-        let allocation = values.as_ptr();
-
-        pool.recycle(values);
-        let mut bucket = pool.buckets[1].lock();
-        let recycled = bucket.pop().expect("two-slot buffer should be pooled");
-        assert!(recycled.is_empty());
-        assert_eq!(recycled.capacity(), 2);
-        assert_eq!(recycled.as_ptr(), allocation);
-    }
-
-    #[test]
     fn recursive_memo_table_stays_enabled_under_initial_misses() {
         let mut table = MemoTable::new(MemoizationKind::Recursive, 0);
         for value in 0..512u64 {
@@ -16928,6 +16866,7 @@ var result = Runner.run()
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
+    include!("tests/napalm_function_jit_tests.rs");
     include!("tests/napalm_collections_tests.rs");
 
     #[test]
@@ -18760,15 +18699,18 @@ var result = CallLoop.run()
         use crate::napalm_gc::{Descriptor, Field, TraceLayout, RAW_CODEC};
         static LEAF: Descriptor = Descriptor {
             name: "test.leaf", trace: TraceLayout::Leaf, cleanup: None, finalizer: None,
+            after_move: None,
         };
         static FIELDS: [Field; 1] = [Field { offset: 0, codec: &RAW_CODEC }];
         static PARENT: Descriptor = Descriptor {
             name: "test.parent", trace: TraceLayout::Fields(&FIELDS), cleanup: None, finalizer: None,
+            after_move: None,
         };
         static CLEANED: AtomicUsize = AtomicUsize::new(0);
         unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.resource", trace: TraceLayout::Leaf, cleanup: Some(cleanup), finalizer: None,
+            after_move: None,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -18831,11 +18773,12 @@ var result = CallLoop.run()
         }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.finalizable", trace: TraceLayout::Leaf,
-            cleanup: Some(cleanup), finalizer: Some(finalize),
+            cleanup: Some(cleanup), finalizer: Some(finalize), after_move: None,
         };
         static ARRAY: Descriptor = Descriptor {
             name: "test.large", trace: TraceLayout::Words { offset: 0, codec: &RAW_CODEC },
             cleanup: None, finalizer: None,
+            after_move: None,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
