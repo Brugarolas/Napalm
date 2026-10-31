@@ -40,6 +40,8 @@ pub(crate) struct WholeFunctionJitStats {
     pub native_direct_calls: u64,
     /// Self-recursive calls executed through the lightweight GC-visible native ABI.
     pub native_recursive_calls: u64,
+    /// Bounded self-call sites expanded in the generated function body.
+    pub inlined_recursive_sites: u64,
     pub baseline_direct_calls: u64,
 }
 
@@ -153,10 +155,7 @@ impl WholeFunctionJit {
         let mut profiled_map_sig = module.make_signature();
         profiled_map_sig.params.push(AbiParam::new(pointer)); // vm
         profiled_map_sig.params.push(AbiParam::new(types::I32)); // shape
-        profiled_map_sig.params.push(AbiParam::new(types::I32)); // value_count
-        profiled_map_sig.params.push(AbiParam::new(types::I32)); // field_count
-        profiled_map_sig.params.push(AbiParam::new(types::I64)); // packed slots
-        profiled_map_sig.params.push(AbiParam::new(pointer)); // compact source values
+        profiled_map_sig.params.push(AbiParam::new(pointer)); // initialized InlineMapValues
         profiled_map_sig.returns.push(AbiParam::new(types::I64));
         let profiled_small_map_id = module
             .declare_function(
@@ -170,10 +169,7 @@ impl WholeFunctionJit {
         profiled_map_commit_sig.params.push(AbiParam::new(pointer)); // vm
         profiled_map_commit_sig.params.push(AbiParam::new(types::I64)); // reserved object address
         profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // shape
-        profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // value_count
-        profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // field_count
-        profiled_map_commit_sig.params.push(AbiParam::new(types::I64)); // packed slots
-        profiled_map_commit_sig.params.push(AbiParam::new(pointer)); // compact source values
+        profiled_map_commit_sig.params.push(AbiParam::new(pointer)); // initialized InlineMapValues
         profiled_map_commit_sig.returns.push(AbiParam::new(types::I64));
         let profiled_small_map_commit_id = module
             .declare_function(
@@ -306,6 +302,12 @@ impl WholeFunctionJit {
 
         let native_recursive_safe =
             native_recursive_body_safe(function_index, function, bytecode, identity_sites);
+        // In the replay-safe subset, AllocMap is the only operation that can
+        // collect. Failed nested guards unwind before entering a runtime helper.
+        let recursive_needs_roots = !native_recursive_safe || reachable.iter().enumerate().any(|(i, &live)| {
+            live && bytecode.chunk.code[function.original_ops[i].raw_pc as usize].opcode()
+                == Some(Opcode::AllocMap)
+        });
         if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
             eprintln!(
                 "[napalm-wfjit] {:?}: native recursion={native_recursive_safe}, tlab={}, registers={}",
@@ -354,6 +356,37 @@ impl WholeFunctionJit {
             let profiled_small_map_commit_ref =
                 self.module.declare_func_in_func(profiled_small_map_commit_module_id, b.func);
 
+            // Expand one recursion level for small replay-safe bodies. Child
+            // registers and leaf branches become visible to the optimizer.
+            // Separate return/bailout edges preserve shadow-frame unwinding.
+            let mut regions = vec![(blocks, abort, None)];
+            let mut inline_calls = vec![None; function.ops.len()];
+            let self_calls: Vec<_> = function.ops.iter().enumerate().filter_map(|(i, op)| {
+                (reachable[i] && op.x == function_index
+                    && bytecode.chunk.code[function.original_ops[i].raw_pc as usize].opcode()
+                        == Some(Opcode::CallDirect)).then_some(i)
+            }).collect();
+            let live_ops = reachable.iter().filter(|&&live| live).count();
+            if native_recursive_safe && self_calls.len() <= 4
+                && live_ops * (self_calls.len() + 1) <= 192
+            {
+                for index in self_calls {
+                    let child_blocks: Vec<_> = function.ops.iter().map(|_| {
+                        let block = b.create_block();
+                        b.append_block_param(block, pointer);
+                        b.append_block_param(block, pointer);
+                        block
+                    }).collect();
+                    let resume = b.create_block();
+                    b.append_block_param(resume, types::I64);
+                    inline_calls[index] = Some((child_blocks[0], resume));
+                    regions.push((child_blocks, b.create_block(), Some(resume)));
+                    self.stats.inlined_recursive_sites += 1;
+                }
+            }
+
+            for (region_index, (blocks, abort, return_to)) in regions.iter().enumerate() {
+            let abort = *abort;
             for index in 0..function.ops.len() {
                 b.switch_to_block(blocks[index]);
                 if !reachable[index] {
@@ -425,7 +458,11 @@ impl WholeFunctionJit {
                     }
                     Opcode::Return => {
                         let value = load_reg(&mut b, regs, op.a);
-                        b.ins().return_(&[value]);
+                        if let Some(target) = return_to {
+                            b.ins().jump(*target, &[BlockArg::Value(value)]);
+                        } else {
+                            b.ins().return_(&[value]);
+                        }
                     }
                     Opcode::INeg | Opcode::IBitNot => {
                         let x = load_i32(&mut b, regs, op.b);
@@ -559,7 +596,8 @@ impl WholeFunctionJit {
                     {
                         let value = emit_native_self_call(
                             &mut b, self_ref, vm, regs, function_index,
-                            function, index, abort,
+                            function, index, recursive_needs_roots,
+                            if region_index == 0 { inline_calls[index] } else { None }, abort,
                         );
                         store_reg(&mut b, regs, op.a, value);
                         let target = op.next as usize;
@@ -627,7 +665,12 @@ impl WholeFunctionJit {
 
             b.switch_to_block(abort);
             let bailout = b.ins().iconst(types::I64, WFJIT_BAILOUT as i64);
-            b.ins().return_(&[bailout]);
+            if let Some(target) = return_to {
+                b.ins().jump(*target, &[BlockArg::Value(bailout)]);
+            } else {
+                b.ins().return_(&[bailout]);
+            }
+            }
             b.seal_all_blocks();
             b.finalize(target_config);
         }
@@ -1359,32 +1402,17 @@ fn emit_native_self_call(
     function_index: u32,
     function: &PreparedFunction,
     index: usize,
+    needs_roots: bool,
+    inline_region: Option<(cranelift::prelude::Block, cranelift::prelude::Block)>,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let op = function.ops[index];
     let map = function.gc_map_by_op[index];
     let flags = MemFlagsData::trusted();
-    let top = b.create_block();
-    let nested = b.create_block();
-    let ready = b.create_block();
-    let hot_regs = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, hot_registers) as i32);
-    let is_top = b.ins().icmp(IntCC::Equal, regs, hot_regs);
-    let root_map = b.ins().iconst(types::I32, map as i64);
-    b.ins().brif(is_top, top, &[], nested, &[]);
-    b.switch_to_block(top);
-    let frame = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, hot_frame) as i32);
-    b.ins().store(flags, root_map, frame, offset_of!(Frame, root_map) as i32);
-    let pc = b.ins().iconst(types::I32, index as i64);
-    b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
-    b.ins().jump(ready, &[]);
-    b.switch_to_block(nested);
-    let parent = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, native_shadow_top) as i32);
-    b.ins().store(flags, root_map, parent, offset_of!(NativeShadowFrame, root_map) as i32);
-    b.ins().jump(ready, &[]);
-    b.switch_to_block(ready);
+    let call_abort = if needs_roots { abort } else { b.create_block() };
+    if needs_roots {
+        emit_native_root_map_update(b, vm, regs, map, index as u32);
+    }
 
     // Option<Box<T>> has the nullable-pointer ABI. A native entry always owns
     // a live JIT; its box and compiled code cannot be replaced while active.
@@ -1393,7 +1421,7 @@ fn emit_native_self_call(
     let depth = b.ins().load(types::I32, flags, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     let allowed = b.ins().icmp_imm(IntCC::UnsignedLessThan, depth, MAX_NATIVE_CALL_DEPTH as i64);
     let call_block = b.create_block();
-    b.ins().brif(allowed, call_block, &[], abort, &[]);
+    b.ins().brif(allowed, call_block, &[], call_abort, &[]);
     b.switch_to_block(call_block);
 
     // Size storage for this function's actual register count, rather than
@@ -1414,20 +1442,25 @@ fn emit_native_self_call(
         store_reg(b, child_regs, destination as u8, value);
     }
 
-    let shadow_slot = b.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
-    let shadow = b.ins().stack_addr(types::I64, shadow_slot, 0);
-    let previous = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, native_shadow_top) as i32);
-    b.ins().store(flags, previous, shadow, offset_of!(NativeShadowFrame, previous) as i32);
-    b.ins().store(flags, child_regs, shadow, offset_of!(NativeShadowFrame, registers) as i32);
-    let function_id = b.ins().iconst(types::I32, function_index as i64);
-    b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
-    let entry_map = b.ins().iconst(types::I32, function.entry_gc_map as i64);
-    b.ins().store(flags, entry_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
-    let register_count = b.ins().iconst(types::I16, count as i64);
-    b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
-    b.ins().store(flags, shadow, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+    let previous = if needs_roots {
+        let shadow_slot = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
+        let shadow = b.ins().stack_addr(types::I64, shadow_slot, 0);
+        let previous = b.ins().load(types::I64, flags, vm,
+            offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+        b.ins().store(flags, previous, shadow, offset_of!(NativeShadowFrame, previous) as i32);
+        b.ins().store(flags, child_regs, shadow, offset_of!(NativeShadowFrame, registers) as i32);
+        let function_id = b.ins().iconst(types::I32, function_index as i64);
+        b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
+        let entry_map = b.ins().iconst(types::I32, function.entry_gc_map as i64);
+        b.ins().store(flags, entry_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
+        let register_count = b.ins().iconst(types::I16, count as i64);
+        b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
+        b.ins().store(flags, shadow, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+        Some(previous)
+    } else {
+        None
+    };
     let child_depth = b.ins().iadd_imm(depth, 1);
     b.ins().store(flags, child_depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     for counter in [offset_of!(WholeFunctionJitStats, native_entries),
@@ -1438,13 +1471,39 @@ fn emit_native_self_call(
         b.ins().store(flags, next, jit, offset);
     }
 
-    let call = b.ins().call(callee, &[vm, child_regs]);
-    let value = b.inst_results(call)[0];
-    b.ins().store(flags, previous, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+    let value = if let Some((entry, resume)) = inline_region {
+        b.ins().jump(entry, &[BlockArg::Value(vm), BlockArg::Value(child_regs)]);
+        b.switch_to_block(resume);
+        b.block_params(resume)[0]
+    } else {
+        let call = b.ins().call(callee, &[vm, child_regs]);
+        b.inst_results(call)[0]
+    };
+    if let Some(previous) = previous {
+        b.ins().store(flags, previous, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+    }
     b.ins().store(flags, depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
     let done = b.create_block();
-    b.ins().brif(failed, abort, &[], done, &[]);
+    b.ins().brif(failed, call_abort, &[], done, &[]);
+    if !needs_roots {
+        // A read-only recursion chain cannot collect. Publish the replay PC
+        // only if it fails, and only when unwinding to the ordinary VM frame.
+        b.switch_to_block(call_abort);
+        let hot_regs = b.ins().load(types::I64, flags, vm,
+            offset_of!(Interpreter<'static>, hot_registers) as i32);
+        let is_top = b.ins().icmp(IntCC::Equal, regs, hot_regs);
+        let top = b.create_block();
+        b.ins().brif(is_top, top, &[], abort, &[]);
+        b.switch_to_block(top);
+        let frame = b.ins().load(types::I64, flags, vm,
+            offset_of!(Interpreter<'static>, hot_frame) as i32);
+        let root_map = b.ins().iconst(types::I32, map as i64);
+        b.ins().store(flags, root_map, frame, offset_of!(Frame, root_map) as i32);
+        let pc = b.ins().iconst(types::I32, index as i64);
+        b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
+        b.ins().jump(abort, &[]);
+    }
     b.switch_to_block(done);
     value
 }
@@ -1590,25 +1649,29 @@ fn emit_profiled_small_map_alloc(
 
     let storage = b.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
-        (field_count.max(1) * std::mem::size_of::<RegisterWord>()) as u32,
+        std::mem::size_of::<InlineMapValues>() as u32,
         3,
     ));
     let values = b.ins().stack_addr(types::I64, storage, 0);
     let flags = MemFlagsData::trusted();
-    for i in 0..field_count {
-        let value = load_reg(b, regs, site.value_regs[i]);
-        b.ins().store(flags, value, values, (i * 8) as i32);
-    }
-
-    let mut packed_slots = 0u64;
-    for i in 0..field_count {
-        packed_slots |= (site.slots[i] as u64) << (i * 16);
+    // Materialize the final slot order once in generated code. The site has
+    // already validated every slot; neither helper needs to unpack/check it
+    // again for every node. Initialize padding and unused fields as well.
+    let zero = b.ins().iconst(types::I64, 0);
+    b.ins().store(flags, zero, values, offset_of!(InlineMapValues, len) as i32);
+    let len = b.ins().iconst(types::I8, site.value_count as i64);
+    b.ins().store(flags, len, values, offset_of!(InlineMapValues, len) as i32);
+    let null = b.ins().iconst(types::I64, TAG_NULL as i64);
+    for slot in 0..SMALL_MAP_INLINE_FIELDS {
+        // Duplicate literal keys retain their last value without duplicate
+        // runtime stores. All initializer expressions have already executed.
+        let value = (0..field_count).rfind(|&i| site.slots[i] as usize == slot)
+            .map_or(null, |i| load_reg(b, regs, site.value_regs[i]));
+        b.ins().store(flags, value, values,
+            (offset_of!(InlineMapValues, values) + slot * 8) as i32);
     }
 
     let shape = b.ins().iconst(types::I32, site.shape as i64);
-    let value_count = b.ins().iconst(types::I32, site.value_count as i64);
-    let fields = b.ins().iconst(types::I32, site.field_count as i64);
-    let slots = b.ins().iconst(types::I64, packed_slots as i64);
 
     let value = if let Some(fast) = fast_alloc {
         debug_assert!(fast.alignment.is_power_of_two());
@@ -1653,7 +1716,7 @@ fn emit_profiled_small_map_alloc(
         b.ins().store(flags, committed_cursor, cursor_ptr, 0);
         let call = b.ins().call(
             commit_helper,
-            &[vm, reserved, shape, value_count, fields, slots, values],
+            &[vm, reserved, shape, values],
         );
         let committed = b.inst_results(call)[0];
         b.ins().jump(done_block, &[BlockArg::Value(committed)]);
@@ -1661,7 +1724,7 @@ fn emit_profiled_small_map_alloc(
         b.switch_to_block(slow_block);
         let call = b
             .ins()
-            .call(slow_helper, &[vm, shape, value_count, fields, slots, values]);
+            .call(slow_helper, &[vm, shape, values]);
         let allocated = b.inst_results(call)[0];
         b.ins().jump(done_block, &[BlockArg::Value(allocated)]);
 
@@ -1674,7 +1737,7 @@ fn emit_profiled_small_map_alloc(
     } else {
         let call = b
             .ins()
-            .call(slow_helper, &[vm, shape, value_count, fields, slots, values]);
+            .call(slow_helper, &[vm, shape, values]);
         b.inst_results(call)[0]
     };
 
@@ -1918,33 +1981,20 @@ unsafe extern "C" fn napalm_wfjit_profiled_small_map_commit(
     vm: *mut c_void,
     reserved_address: u64,
     shape: u32,
-    value_count: u32,
-    field_count: u32,
-    packed_slots: u64,
-    source_values: *const RegisterWord,
+    source_values: *const InlineMapValues,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
     if vm.run_state != RunState::Running
         || reserved_address == 0
         || source_values.is_null()
-        || field_count == 0
-        || field_count as usize > SMALL_MAP_INLINE_FIELDS
-        || value_count == 0
-        || value_count as usize > SMALL_MAP_INLINE_FIELDS
     {
         return WFJIT_BAILOUT;
     }
 
-    let mut values = InlineMapValues::new();
-    values.resize(value_count as usize, Value::NULL);
-    for index in 0..field_count as usize {
-        let slot = ((packed_slots >> (index * 16)) & 0xffff) as usize;
-        if slot >= value_count as usize {
-            return WFJIT_BAILOUT;
-        }
-        let value = Value::from_word(unsafe { *source_values.add(index) });
-        unsafe { *values.get_unchecked_mut(slot) = value; }
-    }
+    // The generated caller initializes the complete repr(C), fixed-capacity
+    // value array using a compile-time validated allocation-site layout.
+    let values = unsafe { source_values.read() };
+    debug_assert!(values.len() > 0 && values.len() <= SMALL_MAP_INLINE_FIELDS);
 
     unsafe {
         vm.heap
@@ -1956,32 +2006,17 @@ unsafe extern "C" fn napalm_wfjit_profiled_small_map_commit(
 unsafe extern "C" fn napalm_wfjit_profiled_small_map(
     vm: *mut c_void,
     shape: u32,
-    value_count: u32,
-    field_count: u32,
-    packed_slots: u64,
-    source_values: *const RegisterWord,
+    source_values: *const InlineMapValues,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
     if vm.run_state != RunState::Running
         || source_values.is_null()
-        || field_count == 0
-        || field_count as usize > SMALL_MAP_INLINE_FIELDS
-        || value_count == 0
-        || value_count as usize > SMALL_MAP_INLINE_FIELDS
     {
         return WFJIT_BAILOUT;
     }
 
-    let mut values = InlineMapValues::new();
-    values.resize(value_count as usize, Value::NULL);
-    for index in 0..field_count as usize {
-        let slot = ((packed_slots >> (index * 16)) & 0xffff) as usize;
-        if slot >= value_count as usize {
-            return WFJIT_BAILOUT;
-        }
-        let value = Value::from_word(unsafe { *source_values.add(index) });
-        unsafe { *values.get_unchecked_mut(slot) = value; }
-    }
+    let values = unsafe { source_values.read() };
+    debug_assert!(values.len() > 0 && values.len() <= SMALL_MAP_INLINE_FIELDS);
 
     vm.heap.alloc_inline_map(shape, values).raw_bits()
 }

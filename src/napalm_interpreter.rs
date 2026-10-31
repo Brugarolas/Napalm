@@ -1831,6 +1831,60 @@ enum PromiseWaiter {
         promise: Value,
         timer: EventId,
     },
+    /// One input edge for Promise.all(). The aggregate Promise keeps the result
+    /// buffer and remaining-count in its own pending state.
+    All {
+        promise: Value,
+        index: usize,
+    },
+    /// One input edge for Promise.any(). Rejections/cancellations are collected
+    /// by input position so the final AggregateError preserves source order.
+    Any {
+        promise: Value,
+        index: usize,
+    },
+    /// One input edge for Promise.race(). The first delivered outcome wins.
+    Race {
+        promise: Value,
+    },
+}
+
+#[derive(Debug)]
+enum PromiseAggregate {
+    All {
+        remaining: usize,
+        values: Vec<Value>,
+    },
+    Any {
+        remaining: usize,
+        errors: Vec<Value>,
+    },
+}
+
+impl PromiseAggregate {
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        match self {
+            Self::All { values, .. } => values.capacity() * std::mem::size_of::<Value>(),
+            Self::Any { errors, .. } => errors.capacity() * std::mem::size_of::<Value>(),
+        }
+    }
+
+    #[inline]
+    fn visit_values(&self, mut visit: impl FnMut(Value)) {
+        match self {
+            Self::All { values, .. } => {
+                for &value in values {
+                    visit(value);
+                }
+            }
+            Self::Any { errors, .. } => {
+                for &value in errors {
+                    visit(value);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1859,7 +1913,10 @@ impl RuntimeEvent {
                 match waiter {
                     PromiseWaiter::Resume { fiber_object, .. } => visit(fiber_object),
                     PromiseWaiter::Forward { promise }
-                    | PromiseWaiter::IntervalTick { promise, .. } => visit(promise),
+                    | PromiseWaiter::IntervalTick { promise, .. }
+                    | PromiseWaiter::All { promise, .. }
+                    | PromiseWaiter::Any { promise, .. }
+                    | PromiseWaiter::Race { promise } => visit(promise),
                 }
             }
             RuntimeEvent::TimerFire { promise, callback, .. } => {
@@ -1876,6 +1933,7 @@ enum PromiseState {
     Pending {
         producer: Option<Value>,
         waiters: Vec<PromiseWaiter>,
+        aggregate: Option<PromiseAggregate>,
         cancel: Option<CancelHandle>,
         cancel_requested: bool,
     },
@@ -2685,15 +2743,21 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let HeapObject::Promise { state } = &managed.object else { return; };
     // SAFETY: GC invokes custom tracing only while all mutators are stopped.
     match unsafe { state.get() } {
-        PromiseState::Pending { producer, waiters, .. } => {
+        PromiseState::Pending { producer, waiters, aggregate, .. } => {
             if let Some(value) = producer {
                 visit_value(*value, visitor);
+            }
+            if let Some(aggregate) = aggregate {
+                aggregate.visit_values(|value| visit_value(value, visitor));
             }
             for waiter in waiters {
                 match *waiter {
                     PromiseWaiter::Resume { fiber_object, .. } => visit_value(fiber_object, visitor),
                     PromiseWaiter::Forward { promise }
-                    | PromiseWaiter::IntervalTick { promise, .. } => visit_value(promise, visitor),
+                    | PromiseWaiter::IntervalTick { promise, .. }
+                    | PromiseWaiter::All { promise, .. }
+                    | PromiseWaiter::Any { promise, .. }
+                    | PromiseWaiter::Race { promise } => visit_value(promise, visitor),
                 }
             }
         }
@@ -2816,6 +2880,25 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
 }
 
 #[inline]
+fn pending_promise_external_bytes(
+    waiters: &Vec<PromiseWaiter>,
+    aggregate: &Option<PromiseAggregate>,
+) -> usize {
+    waiters.capacity() * std::mem::size_of::<PromiseWaiter>()
+        + aggregate.as_ref().map_or(0, PromiseAggregate::external_bytes)
+}
+
+#[inline]
+fn promise_state_external_bytes(state: &PromiseState) -> usize {
+    match state {
+        PromiseState::Pending { waiters, aggregate, .. } => {
+            pending_promise_external_bytes(waiters, aggregate)
+        }
+        PromiseState::Fulfilled(_) | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => 0,
+    }
+}
+
+#[inline]
 fn external_bytes_for(object: &HeapObject) -> usize {
     match object {
         HeapObject::String(bytes) => bytes.len(),
@@ -2842,11 +2925,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::Headers(_) => 0,
         HeapObject::Promise { state } => {
             // SAFETY: this is queried by the owning mutator.
-            match unsafe { state.get() } {
-                PromiseState::Pending { waiters, .. } =>
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                PromiseState::Fulfilled(_) | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => 0,
-            }
+            promise_state_external_bytes(unsafe { state.get() })
         }
         HeapObject::AsyncTaskObject { state, .. } | HeapObject::FiberObject { state, .. } => {
             // SAFETY: this is queried by the owning mutator before publication or
@@ -3017,13 +3096,19 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::Promise { state } => {
             // SAFETY: allocation root collection runs on the owning mutator.
             match unsafe { state.get() } {
-                PromiseState::Pending { producer, waiters, .. } => {
+                PromiseState::Pending { producer, waiters, aggregate, .. } => {
                     if let Some(value) = producer { push_value_handle(*value, roots); }
+                    if let Some(aggregate) = aggregate {
+                        aggregate.visit_values(|value| push_value_handle(value, roots));
+                    }
                     for waiter in waiters {
                         match *waiter {
                             PromiseWaiter::Resume { fiber_object, .. } => push_value_handle(fiber_object, roots),
                             PromiseWaiter::Forward { promise }
-                            | PromiseWaiter::IntervalTick { promise, .. } => push_value_handle(promise, roots),
+                            | PromiseWaiter::IntervalTick { promise, .. }
+                            | PromiseWaiter::All { promise, .. }
+                            | PromiseWaiter::Any { promise, .. }
+                            | PromiseWaiter::Race { promise } => push_value_handle(promise, roots),
                         }
                     }
                 }
@@ -3186,7 +3271,6 @@ impl Heap {
             Ordering::Release,
         );
         self.handle_table.live.fetch_add(1, Ordering::Relaxed);
-        self.remember_stack_owner();
         let value = Value::from_heap(handle);
         #[cfg(test)]
         self.allocations.push(value);
@@ -3204,6 +3288,10 @@ impl Heap {
         };
         let value = self.initialize_inline_map_object(object, handle, shape, values);
         self.allocation_roots.clear();
+        // Only the allocating slow path can collect and clear the fiber's
+        // remembered bit. A reserved TLAB commit cannot safepoint, so it inherits
+        // the barrier established at the last VM/GC boundary.
+        self.remember_stack_owner();
         value
     }
 
@@ -5675,6 +5763,9 @@ pub enum NativeBuiltin {
     FiberIsDone,
     PromiseResolve,
     PromiseReject,
+    PromiseAll,
+    PromiseAny,
+    PromiseRace,
     PromiseCancel,
     PromiseIsPending,
     PromiseIsFulfilled,
@@ -8535,6 +8626,7 @@ impl<'p> Interpreter<'p> {
         let promise = self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         });
@@ -8977,6 +9069,266 @@ impl<'p> Interpreter<'p> {
             });
         }
         Ok(())
+    }
+
+    /// Attach one aggregate reaction to an input. Non-Promise values are treated
+    /// exactly like Promise.resolve(value), while already-settled Promises still
+    /// deliver through the microtask queue instead of re-entering aggregate code.
+    fn attach_promise_combinator_waiter(
+        &mut self,
+        source: Value,
+        waiter: PromiseWaiter,
+    ) -> Result<(), RuntimeError> {
+        let Some(cell) = (match self.heap.get(source) {
+            Some(HeapObject::Promise { state }) => Some(state.clone()),
+            _ => None,
+        }) else {
+            self.event_loop.enqueue_microtask(RuntimeEvent::PromiseWaiter {
+                promise: source,
+                waiter,
+                outcome: PromiseOutcome::Fulfilled(source),
+            });
+            return Ok(());
+        };
+
+        let outcome = match unsafe { cell.get_mut() } {
+            PromiseState::Pending { waiters, aggregate, .. } => {
+                self.heap.remember_owner(source);
+                waiters.push(waiter);
+                self.heap
+                    .set_external_bytes(source, pending_promise_external_bytes(waiters, aggregate));
+                return Ok(());
+            }
+            PromiseState::Fulfilled(value) => PromiseOutcome::Fulfilled(*value),
+            PromiseState::Rejected(value) => PromiseOutcome::Rejected(*value),
+            PromiseState::Cancelled(value) => PromiseOutcome::Cancelled(*value),
+        };
+
+        self.event_loop.enqueue_microtask(RuntimeEvent::PromiseWaiter {
+            promise: source,
+            waiter,
+            outcome,
+        });
+        Ok(())
+    }
+
+    fn promise_input_list(&self, input: Value, method: &str) -> Result<Vec<Value>, RuntimeError> {
+        match self.heap.get(input) {
+            Some(HeapObject::List(values)) => Ok(values.clone()),
+            _ => Err(RuntimeError::new(format!(
+                "TypeError: Promise.{method} expects an Array"
+            ))),
+        }
+    }
+
+    fn promise_all(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "all")?;
+        if inputs.is_empty() {
+            let values = self.allocate_list(Vec::new());
+            let values_root = self.add_root(values);
+            let promise = self.allocate_promise(PromiseState::Fulfilled(values));
+            self.release_root(values_root);
+            return Ok(promise);
+        }
+
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            aggregate: Some(PromiseAggregate::All {
+                remaining: inputs.len(),
+                values: vec![Value::NULL; inputs.len()],
+            }),
+            cancel: None,
+            cancel_requested: false,
+        });
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().enumerate().try_for_each(|(index, source)| {
+            self.attach_promise_combinator_waiter(
+                source,
+                PromiseWaiter::All { promise, index },
+            )
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn promise_any(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "any")?;
+        if inputs.is_empty() {
+            let reason = self.allocate_promise_any_aggregate_error(Vec::new())?;
+            let reason_root = self.add_root(reason);
+            let promise = self.allocate_promise(PromiseState::Rejected(reason));
+            self.release_root(reason_root);
+            return Ok(promise);
+        }
+
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            aggregate: Some(PromiseAggregate::Any {
+                remaining: inputs.len(),
+                errors: vec![Value::NULL; inputs.len()],
+            }),
+            cancel: None,
+            cancel_requested: false,
+        });
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().enumerate().try_for_each(|(index, source)| {
+            self.attach_promise_combinator_waiter(
+                source,
+                PromiseWaiter::Any { promise, index },
+            )
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn promise_race(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "race")?;
+        let promise = self.allocate_pending_promise();
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().try_for_each(|source| {
+            self.attach_promise_combinator_waiter(source, PromiseWaiter::Race { promise })
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn allocate_promise_any_aggregate_error(
+        &mut self,
+        errors: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let errors = self.allocate_list(errors);
+        let errors_root = self.add_root(errors);
+        let error = self.allocate_map();
+        let error_root = self.add_root(error);
+
+        let name_key = self.allocate_string("name");
+        let name_key_root = self.add_root(name_key);
+        let name = self.allocate_string("AggregateError");
+        let name_root = self.add_root(name);
+        let message_key = self.allocate_string("message");
+        let message_key_root = self.add_root(message_key);
+        let message = self.allocate_string("All promises were rejected");
+        let message_root = self.add_root(message);
+        let errors_key = self.allocate_string("errors");
+        let errors_key_root = self.add_root(errors_key);
+
+        let result = self
+            .map_set(error, name_key, name)
+            .and_then(|_| self.map_set(error, message_key, message))
+            .and_then(|_| self.map_set(error, errors_key, errors));
+
+        self.release_root(errors_key_root);
+        self.release_root(message_root);
+        self.release_root(message_key_root);
+        self.release_root(name_root);
+        self.release_root(name_key_root);
+        self.release_root(error_root);
+        self.release_root(errors_root);
+        result?;
+        Ok(error)
+    }
+
+    fn handle_promise_all_input(
+        &mut self,
+        promise: Value,
+        index: usize,
+        outcome: PromiseOutcome,
+    ) {
+        match outcome {
+            PromiseOutcome::Rejected(reason) => {
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(reason));
+                return;
+            }
+            PromiseOutcome::Cancelled(reason) => {
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                return;
+            }
+            PromiseOutcome::Fulfilled(value) => {
+                self.heap.remember_if_reference(promise, value);
+                let values = {
+                    let Ok(cell) = self.promise_cell(promise) else { return; };
+                    let PromiseState::Pending { aggregate, .. } = unsafe { cell.get_mut() } else {
+                        return;
+                    };
+                    let Some(PromiseAggregate::All { remaining, values }) = aggregate.as_mut() else {
+                        return;
+                    };
+                    if *remaining == 0 || index >= values.len() {
+                        return;
+                    }
+                    values[index] = value;
+                    *remaining -= 1;
+                    if *remaining != 0 {
+                        return;
+                    }
+                    values.clone()
+                };
+
+                let promise_root = self.add_root(promise);
+                let values = self.allocate_list(values);
+                let values_root = self.add_root(values);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(values));
+                self.release_root(values_root);
+                self.release_root(promise_root);
+            }
+        }
+    }
+
+    fn handle_promise_any_input(
+        &mut self,
+        promise: Value,
+        index: usize,
+        outcome: PromiseOutcome,
+    ) {
+        if let PromiseOutcome::Fulfilled(value) = outcome {
+            let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(value));
+            return;
+        }
+
+        let reason = outcome.value();
+        self.heap.remember_if_reference(promise, reason);
+        let errors = {
+            let Ok(cell) = self.promise_cell(promise) else { return; };
+            let PromiseState::Pending { aggregate, .. } = unsafe { cell.get_mut() } else {
+                return;
+            };
+            let Some(PromiseAggregate::Any { remaining, errors }) = aggregate.as_mut() else {
+                return;
+            };
+            if *remaining == 0 || index >= errors.len() {
+                return;
+            }
+            errors[index] = reason;
+            *remaining -= 1;
+            if *remaining != 0 {
+                return;
+            }
+            errors.clone()
+        };
+
+        let promise_root = self.add_root(promise);
+        match self.allocate_promise_any_aggregate_error(errors) {
+            Ok(error) => {
+                let error_root = self.add_root(error);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(error));
+                self.release_root(error_root);
+            }
+            Err(error) => self.fail(error),
+        }
+        self.release_root(promise_root);
+    }
+
+    #[inline]
+    fn handle_promise_race_input(&mut self, promise: Value, outcome: PromiseOutcome) {
+        let _ = self.settle_promise_outcome(promise, outcome);
     }
 
     fn set_promise_cancel_handle(
@@ -9431,6 +9783,7 @@ impl<'p> Interpreter<'p> {
         let promise = self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         });
@@ -10594,6 +10947,7 @@ impl<'p> Interpreter<'p> {
         self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         })
@@ -10657,13 +11011,11 @@ impl<'p> Interpreter<'p> {
     ) -> Result<(), RuntimeError> {
         let cell = self.promise_cell(tick)?;
         match unsafe { cell.get_mut() } {
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.heap.remember_owner(tick);
                 waiters.push(PromiseWaiter::IntervalTick { promise: interval, timer });
-                self.heap.set_external_bytes(
-                    tick,
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                );
+                self.heap
+                    .set_external_bytes(tick, pending_promise_external_bytes(waiters, aggregate));
                 Ok(())
             }
             PromiseState::Fulfilled(value) => {
@@ -10744,6 +11096,15 @@ impl<'p> Interpreter<'p> {
             }
             PromiseWaiter::IntervalTick { promise: interval, timer } => {
                 self.handle_interval_tick(interval, timer, outcome);
+            }
+            PromiseWaiter::All { promise: aggregate, index } => {
+                self.handle_promise_all_input(aggregate, index, outcome);
+            }
+            PromiseWaiter::Any { promise: aggregate, index } => {
+                self.handle_promise_any_input(aggregate, index, outcome);
+            }
+            PromiseWaiter::Race { promise: aggregate } => {
+                self.handle_promise_race_input(aggregate, outcome);
             }
         }
     }
@@ -10860,13 +11221,11 @@ impl<'p> Interpreter<'p> {
             PromiseState::Cancelled(reason) => {
                 self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(*reason))
             }
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.heap.remember_owner(value);
                 waiters.push(PromiseWaiter::Forward { promise });
-                self.heap.set_external_bytes(
-                    value,
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                );
+                self.heap
+                    .set_external_bytes(value, pending_promise_external_bytes(waiters, aggregate));
 
                 // Replace the completed task as the outer Promise's dependency.
                 // This keeps the adopted inner Promise alive until forwarding fires.
@@ -10927,7 +11286,7 @@ impl<'p> Interpreter<'p> {
             PromiseState::Cancelled(reason) => {
                 self.fail_awaited_promise(op, *reason, true);
             }
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.mark_gc_point(op);
                 unsafe { self.advance(op); }
                 self.flush_hot_pc();
@@ -10936,8 +11295,8 @@ impl<'p> Interpreter<'p> {
                 let fiber_object = self.fiber(current).object;
                 self.heap.remember_owner(promise);
                 waiters.push(PromiseWaiter::Resume { fiber: current, fiber_object, dst });
-                let external = waiters.capacity() * std::mem::size_of::<PromiseWaiter>();
-                self.heap.set_external_bytes(promise, external);
+                self.heap
+                    .set_external_bytes(promise, pending_promise_external_bytes(waiters, aggregate));
 
                 // The suspended execution object may already be mature while the
                 // Promise is young. The Promise becomes an outgoing edge of the
@@ -12461,6 +12820,22 @@ impl Interpreter<'_> {
                 self.mark_gc_point(op);
                 self.maybe_collect();
                 let promise = self.allocate_promise(PromiseState::Rejected(reason));
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::PromiseAll | NativeBuiltin::PromiseAny | NativeBuiltin::PromiseRace => {
+                let input = arg(0);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let result = match native {
+                    NativeBuiltin::PromiseAll => self.promise_all(input),
+                    NativeBuiltin::PromiseAny => self.promise_any(input),
+                    NativeBuiltin::PromiseRace => self.promise_race(input),
+                    _ => unreachable!(),
+                };
+                let promise = match result {
+                    Ok(promise) => promise,
+                    Err(error) => self.allocate_rejected_promise_message(error.message),
+                };
                 unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
             }
             NativeBuiltin::PromiseCancel => {
@@ -19601,6 +19976,101 @@ var work = TimerTest.work()
 var first = work.cancel()
 var second = work.cancel()
 var result = first && !second && work.isCancelled ? 42 : -1
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn promise_all_preserves_input_order_and_accepts_plain_values() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var delayed = Timer.delay(0) { return 10 }
+    var immediate = Promise.resolve(20)
+    var values = await Promise.all([delayed, immediate, 3])
+    return values[0] * 100 + values[1] * 10 + values[2]
+  }
+}
+var result = await PromiseTest.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 1203.0);
+    }
+
+    #[test]
+    fn promise_any_returns_first_fulfillment_and_collects_rejections() {
+        let source = r#"
+class PromiseTest {
+  static async firstFulfilled() {
+    return await Promise.any([
+      Promise.reject("first"),
+      Promise.resolve(42),
+      Promise.reject("third")
+    ])
+  }
+
+  static async allRejected() {
+    try {
+      await Promise.any([Promise.reject("first"), Promise.reject("second")])
+      return -1
+    } catch (error) {
+      if (error.name != "AggregateError") { return -2 }
+      if (error.errors.length != 2) { return -3 }
+      if (error.errors[0] != "first") { return -4 }
+      if (error.errors[1] != "second") { return -5 }
+      return 8
+    }
+  }
+}
+var first = await PromiseTest.firstFulfilled()
+var second = await PromiseTest.allRejected()
+var result = first + second
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 50.0);
+    }
+
+    #[test]
+    fn promise_race_uses_first_settled_input_and_empty_race_stays_pending() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var winner = await Promise.race([Promise.resolve(11), Promise.resolve(22)])
+    var empty = Promise.race([])
+    return winner + (empty.isPending ? 31 : -100)
+  }
+}
+var result = await PromiseTest.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn promise_all_empty_fulfills_with_empty_array_and_any_empty_rejects() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var empty = await Promise.all([])
+    if (empty.length != 0) { return -1 }
+    try {
+      await Promise.any([])
+      return -2
+    } catch (error) {
+      return error.name == "AggregateError" && error.errors.length == 0 ? 42 : -3
+    }
+  }
+}
+var result = await PromiseTest.run()
 "#;
         let (program, entry, manifest) = compile_napalm_module(source);
         let mut vm = source_vm(&program, &manifest);

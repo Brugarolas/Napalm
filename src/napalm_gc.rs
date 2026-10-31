@@ -1442,6 +1442,9 @@ impl vm::VMBinding for Binding {
     type VMMemorySlice = ReferenceSlice;
     const MIN_ALIGNMENT: usize = WORD;
     const MAX_ALIGNMENT: usize = MAX_ALIGNMENT;
+    // Precise descriptor tracing never reads alignment gaps. MMTk's default
+    // debug fill (0xab) otherwise disables fixed_fast_allocation_info entirely.
+    const ALIGNMENT_VALUE: u8 = 0;
     const USE_ALLOCATION_OFFSET: bool = false;
     const ALLOC_END_ALIGNMENT: usize = WORD;
 }
