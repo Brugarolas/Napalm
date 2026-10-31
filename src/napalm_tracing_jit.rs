@@ -9598,7 +9598,7 @@ struct LoopKey {
     location: TraceLocation,
 }
 
-/// Cross-worker hotness aggregation used by isolated concurrent Interpreters.
+/// Cross-VM hotness aggregation used by the owner and isolated concurrent Interpreters.
 ///
 /// Only monotonic heat is shared. Compiled traces, retry state, blacklists,
 /// side-exit feedback and every VM-specific value remain private to each
@@ -9932,7 +9932,7 @@ impl SharedTraceSlot {
     }
 }
 
-/// Shared cold-tier repository used by all isolated concurrent workers.
+/// Shared cold-tier repository used by the owner VM and all isolated concurrent workers.
 ///
 /// Phase 4 adds a dedicated Cranelift compiler thread and immutable published
 /// machine code. Worker Interpreters never share Napalm managed values: each
@@ -9942,7 +9942,9 @@ impl SharedTraceSlot {
 pub(crate) struct SharedJitRepository {
     slots: Mutex<HashMap<SharedRepositoryKey, Arc<SharedTraceSlot>>>,
     next_id: AtomicU32,
-    compiler: Option<SharedNativeCompiler>,
+    /// Created only on the first portable shared compilation. Programs that merely
+    /// declare concurrent functions pay no compiler-thread startup cost.
+    compiler: Mutex<Option<Arc<SharedNativeCompiler>>>,
 }
 
 impl Default for SharedJitRepository {
@@ -9956,7 +9958,7 @@ impl SharedJitRepository {
         Self {
             slots: Mutex::new(HashMap::default()),
             next_id: AtomicU32::new(0),
-            compiler: SharedNativeCompiler::new(),
+            compiler: Mutex::new(None),
         }
     }
 
@@ -10026,10 +10028,17 @@ impl SharedJitRepository {
         trace: &Trace,
         options: &TracingJitOptions,
     ) -> Result<SharedCodeImage, String> {
-        self.compiler
-            .as_ref()
-            .ok_or_else(|| "shared native compiler could not be started".to_owned())?
-            .compile(trace.clone(), options.clone())
+        let compiler = {
+            let mut compiler = self.compiler.lock();
+            if compiler.is_none() {
+                *compiler = SharedNativeCompiler::new().map(Arc::new);
+            }
+            compiler
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "shared native compiler could not be started".to_owned())?
+        };
+        compiler.compile(trace.clone(), options.clone())
     }
 
     #[cfg(test)]

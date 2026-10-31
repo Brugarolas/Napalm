@@ -6563,6 +6563,11 @@ impl MemoTable {
 
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
+    /// Shared trace heat/code domain for this immutable program. It exists only
+    /// when the program contains concurrent entrypoints, allowing the parent VM's
+    /// warm-up traces to be adopted directly by isolated workers.
+    shared_jit_profile: Option<Arc<SharedJitProfile>>,
+    shared_jit_repository: Option<Arc<SharedJitRepository>>,
     /// Whole-function Cranelift tier for hot call/recursion-heavy functions.
     /// Auto-memoized functions are permanently excluded by the tier itself.
     whole_function_jit: Option<Box<WholeFunctionJit>>,
@@ -6647,6 +6652,10 @@ pub struct Interpreter<'p> {
     persistent_roots: Arc<HandleRootSet>,
     _persistent_root_registration: GcRootRegistration,
     gc_enabled: bool,
+    /// Main/standalone VMs perform one final exhaustive collection. Concurrent
+    /// workers skip it because they share the process collector and are joined
+    /// before the owning VM performs the single final collection.
+    collect_full_on_drop: bool,
     /// Amortizes the cross-thread collection-request poll in allocation-free loops.
     gc_backedge_poll: u8,
     last_gc_collections: u64,
@@ -6757,16 +6766,34 @@ impl Drop for Interpreter<'_> {
             self.native_shadow_top.is_null(),
             "dropping Interpreter with an active whole-function JIT shadow frame"
         );
-        // Remove every VM-owned strong root and force a full collection while
-        // the mutator and its native resources are still alive. Managed fibers
-        // and closures are self-contained (Arc/Box-backed), so externally rooted
-        // objects may survive this VM; this collection primarily releases the
-        // ordinary VM-owned heap promptly and recycles stable handle IDs.
+
+        // Concurrent workers attach mutators to the same process-wide collector.
+        // Shutdown must happen before this VM requests its final collection; otherwise
+        // sleeping worker mutators cannot rendezvous and ConcurrentRuntime::drop() is
+        // never reached because Interpreter::drop() runs before field destruction.
+        // Mark the owner mutator Native while joining: a worker may itself reach a GC
+        // safepoint while unwinding, and a Running owner blocked in join() would then
+        // deadlock that rendezvous in the opposite direction.
+        if let Some(mut concurrent) = self.concurrent.take() {
+            unsafe {
+                self.heap.mutator.with_native(move || {
+                    concurrent.shutdown();
+                    drop(concurrent);
+                });
+            }
+        }
+
+        // Remove every VM-owned strong root while its mutator is still attached.
+        // Worker VMs deliberately skip an exhaustive collection: after their roots
+        // disappear and their mutators detach, the owning main VM performs one global
+        // full collection instead of creating an N-worker shutdown collection storm.
         self.persistent_roots.replace(Vec::new());
         self.roots.clear();
         self.heap.clear_stack_owner();
         self.heap.allocation_roots.clear();
-        self.heap.collect_full();
+        if self.collect_full_on_drop {
+            self.heap.collect_full();
+        }
     }
 }
 
@@ -6979,7 +7006,20 @@ impl<'p> Interpreter<'p> {
         ))));
         init_roots.push(cancelled_error);
         let last_gc_collections = heap.collection_count();
-        let jit = Box::new(TracingJit::default());
+        let concurrency_capable = program.functions.iter().any(|function| function.is_concurrent);
+        let shared_jit_profile = concurrency_capable
+            .then(|| Arc::new(SharedJitProfile::new(program)));
+        let shared_jit_repository = concurrency_capable
+            .then(|| Arc::new(SharedJitRepository::new()));
+        let mut jit = Box::new(TracingJit::default());
+        if let Some(profile) = shared_jit_profile.as_ref() {
+            jit.set_shared_profile(Some(profile.clone()));
+        }
+        if let Some(repository) = shared_jit_repository.as_ref() {
+            // The parent VM participates in the same repository as workers. Worker
+            // IDs are dense from zero; u32::MAX is reserved here for the owner VM.
+            jit.set_shared_repository(Some(repository.clone()), u32::MAX);
+        }
         let jit_entry_threshold = jit.options().hot_entry_threshold;
         let whole_function_jit = WholeFunctionJit::new(
             prepared.functions.len(),
@@ -7005,6 +7045,8 @@ impl<'p> Interpreter<'p> {
         let (external_wake_tx, external_wake_rx) = mpsc::channel();
         Ok(Self {
             jit: Some(jit),
+            shared_jit_profile,
+            shared_jit_repository,
             whole_function_jit,
             native_shadow_top: std::ptr::null_mut(),
             jit_entry_threshold,
@@ -7055,6 +7097,7 @@ impl<'p> Interpreter<'p> {
             persistent_roots: init_roots,
             _persistent_root_registration: persistent_root_registration,
             gc_enabled: true,
+            collect_full_on_drop: true,
             gc_backedge_poll: 0,
             last_gc_collections,
             hot_frame: std::ptr::null_mut(),
@@ -7080,6 +7123,7 @@ impl<'p> Interpreter<'p> {
 
     pub(crate) fn set_concurrent_worker(&mut self, worker: bool) -> Result<(), RuntimeError> {
         self.is_concurrent_worker = worker;
+        self.collect_full_on_drop = !worker;
         if !worker {
             return Ok(());
         }
@@ -7161,6 +7205,7 @@ impl<'p> Interpreter<'p> {
     }
 
     pub(crate) fn set_shared_jit_profile(&mut self, profile: Arc<SharedJitProfile>) {
+        self.shared_jit_profile = Some(profile.clone());
         if let Some(jit) = self.jit.as_mut() {
             jit.set_shared_profile(Some(profile));
         }
@@ -7171,6 +7216,7 @@ impl<'p> Interpreter<'p> {
         repository: Arc<SharedJitRepository>,
         worker_id: u32,
     ) {
+        self.shared_jit_repository = Some(repository.clone());
         if let Some(jit) = self.jit.as_mut() {
             jit.set_shared_repository(Some(repository), worker_id);
         }
@@ -10520,10 +10566,20 @@ impl<'p> Interpreter<'p> {
             let manifest = self.concurrent_manifest.clone().ok_or_else(|| RuntimeError::new(
                 "concurrent runtime requires the stock builtin manifest to be installed",
             ))?;
+            let shared_jit_profile = self.shared_jit_profile.clone().ok_or_else(|| {
+                RuntimeError::new("concurrent program is missing its shared JIT profile")
+            })?;
+            let shared_jit_repository = self.shared_jit_repository.clone().ok_or_else(|| {
+                RuntimeError::new("concurrent program is missing its shared JIT repository")
+            })?;
+            let jit_options = self.jit.as_ref().map(|jit| jit.options().clone());
             self.concurrent = Some(ConcurrentRuntime::new(
                 self.program.clone(),
                 manifest,
                 self.external_wake_tx.clone(),
+                jit_options,
+                shared_jit_profile,
+                shared_jit_repository,
             )?);
         }
 
