@@ -17,7 +17,10 @@ use cranelift::prelude::{AbiParam, FloatCC, InstBuilder, IntCC, MemFlagsData, ty
 use std::ffi::c_void;
 use std::mem::offset_of;
 
-use crate::napalm_tracing_jit::{TRACE_HEAP_KIND_MASK, TRACE_HEAP_METADATA_SHIFT};
+use crate::napalm_gc::FastAllocationInfo as GcFastAllocationInfo;
+use crate::napalm_tracing_jit::{
+    TRACE_HEAP_DATA_RELATIVE_MASK, TRACE_HEAP_KIND_MASK, TRACE_HEAP_METADATA_SHIFT,
+};
 
 const MIN_WHOLE_FUNCTION_HOTNESS: u32 = 128;
 const MAX_WHOLE_FUNCTION_OPS: usize = 4096;
@@ -69,6 +72,8 @@ pub(super) struct WholeFunctionJit {
     small_map_literal: cranelift::module::FuncId,
     native_self_call: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
+    profiled_small_map: cranelift::module::FuncId,
+    profiled_small_map_commit: cranelift::module::FuncId,
     slots: Vec<FunctionSlot>,
     threshold: u32,
     active_depth: u32,
@@ -96,6 +101,14 @@ impl WholeFunctionJit {
         builder.symbol(
             "napalm_wfjit_small_map_literal_regs",
             napalm_wfjit_small_map_literal_regs as *const u8,
+        );
+        builder.symbol(
+            "napalm_wfjit_profiled_small_map",
+            napalm_wfjit_profiled_small_map as *const u8,
+        );
+        builder.symbol(
+            "napalm_wfjit_profiled_small_map_commit",
+            napalm_wfjit_profiled_small_map_commit as *const u8,
         );
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
@@ -137,6 +150,39 @@ impl WholeFunctionJit {
             )
             .map_err(|e| format!("cannot declare register-based small-map helper: {e}"))?;
 
+        let mut profiled_map_sig = module.make_signature();
+        profiled_map_sig.params.push(AbiParam::new(pointer)); // vm
+        profiled_map_sig.params.push(AbiParam::new(types::I32)); // shape
+        profiled_map_sig.params.push(AbiParam::new(types::I32)); // value_count
+        profiled_map_sig.params.push(AbiParam::new(types::I32)); // field_count
+        profiled_map_sig.params.push(AbiParam::new(types::I64)); // packed slots
+        profiled_map_sig.params.push(AbiParam::new(pointer)); // compact source values
+        profiled_map_sig.returns.push(AbiParam::new(types::I64));
+        let profiled_small_map_id = module
+            .declare_function(
+                "napalm_wfjit_profiled_small_map",
+                Linkage::Import,
+                &profiled_map_sig,
+            )
+            .map_err(|e| format!("cannot declare profiled small-map helper: {e}"))?;
+
+        let mut profiled_map_commit_sig = module.make_signature();
+        profiled_map_commit_sig.params.push(AbiParam::new(pointer)); // vm
+        profiled_map_commit_sig.params.push(AbiParam::new(types::I64)); // reserved object address
+        profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // shape
+        profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // value_count
+        profiled_map_commit_sig.params.push(AbiParam::new(types::I32)); // field_count
+        profiled_map_commit_sig.params.push(AbiParam::new(types::I64)); // packed slots
+        profiled_map_commit_sig.params.push(AbiParam::new(pointer)); // compact source values
+        profiled_map_commit_sig.returns.push(AbiParam::new(types::I64));
+        let profiled_small_map_commit_id = module
+            .declare_function(
+                "napalm_wfjit_profiled_small_map_commit",
+                Linkage::Import,
+                &profiled_map_commit_sig,
+            )
+            .map_err(|e| format!("cannot declare profiled small-map commit helper: {e}"))?;
+
         let context = module.make_context();
         let function_context = FunctionBuilderContext::new();
         let result = Self {
@@ -148,6 +194,8 @@ impl WholeFunctionJit {
             small_map_literal: small_map_id,
             native_self_call: native_self_call_id,
             small_map_literal_regs: small_map_regs_id,
+            profiled_small_map: profiled_small_map_id,
+            profiled_small_map_commit: profiled_small_map_commit_id,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
             threshold: if entry_threshold == 0 { u32::MAX } else { entry_threshold.saturating_mul(2).max(MIN_WHOLE_FUNCTION_HOTNESS) },
             active_depth: 0,
@@ -189,6 +237,7 @@ impl WholeFunctionJit {
         constants: &[RegisterWord],
         expected_method_epoch: u64,
         identity_sites: &[Option<NativeIdentitySite>],
+        small_map_fast_alloc: Option<GcFastAllocationInfo>,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
         if function.memoization.enabled()
@@ -258,13 +307,20 @@ impl WholeFunctionJit {
         let native_recursive_safe =
             native_recursive_body_safe(function_index, function, bytecode, identity_sites);
         if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
-            eprintln!("[napalm-wfjit] {:?}: native recursion={native_recursive_safe}, registers={}", function.id, function.frame.general_register_count);
+            eprintln!(
+                "[napalm-wfjit] {:?}: native recursion={native_recursive_safe}, tlab={}, registers={}",
+                function.id,
+                small_map_fast_alloc.is_some(),
+                function.frame.general_register_count,
+            );
         }
         let runtime_module_id = self.runtime_op;
         let direct_module_id = self.direct_call;
         let small_map_module_id = self.small_map_literal;
         let native_self_module_id = self.native_self_call;
         let small_map_regs_module_id = self.small_map_literal_regs;
+        let profiled_small_map_module_id = self.profiled_small_map;
+        let profiled_small_map_commit_module_id = self.profiled_small_map_commit;
 
         {
             let target_config = self.module.target_config();
@@ -293,6 +349,10 @@ impl WholeFunctionJit {
             let self_ref = self.module.declare_func_in_func(func_id, b.func);
             let small_map_regs_ref =
                 self.module.declare_func_in_func(small_map_regs_module_id, b.func);
+            let profiled_small_map_ref =
+                self.module.declare_func_in_func(profiled_small_map_module_id, b.func);
+            let profiled_small_map_commit_ref =
+                self.module.declare_func_in_func(profiled_small_map_commit_module_id, b.func);
 
             for index in 0..function.ops.len() {
                 b.switch_to_block(blocks[index]);
@@ -453,15 +513,42 @@ impl WholeFunctionJit {
                             && prepared_op.c <= 4
                             && prepared_op.next > index as u32 + 1 =>
                     {
-                        let value = call_native_value_helper(
-                            &mut b,
-                            small_map_regs_ref,
-                            vm,
-                            function_index,
-                            index as u32,
-                            regs,
-                            abort,
-                        );
+                        let value = if native_recursive_safe {
+                            if let Some(site) = native_profiled_small_map_site(function, index) {
+                                emit_profiled_small_map_alloc(
+                                    &mut b,
+                                    profiled_small_map_ref,
+                                    profiled_small_map_commit_ref,
+                                    vm,
+                                    regs,
+                                    function,
+                                    index,
+                                    &site,
+                                    small_map_fast_alloc,
+                                    abort,
+                                )
+                            } else {
+                                call_native_value_helper(
+                                    &mut b,
+                                    small_map_regs_ref,
+                                    vm,
+                                    function_index,
+                                    index as u32,
+                                    regs,
+                                    abort,
+                                )
+                            }
+                        } else {
+                            call_native_value_helper(
+                                &mut b,
+                                small_map_regs_ref,
+                                vm,
+                                function_index,
+                                index as u32,
+                                regs,
+                                abort,
+                            )
+                        };
                         store_reg(&mut b, regs, op.a, value);
                         let target = prepared_op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
@@ -910,12 +997,20 @@ fn emit_map_property_fast_path(
 
     b.switch_to_block(kind_ok);
     let shape = b.ins().ushr_imm_u(metadata, TRACE_HEAP_METADATA_SHIFT as i64);
-    let data = b.ins().load(
+    let encoded_data = b.ins().load(
         types::I64,
         MemFlagsData::trusted(),
         entry,
         offset_of!(TraceHeapEntry, data) as i32,
     );
+    // A successful shaped-Map PIC can only target the fixed inline representation.
+    // `data` is therefore a tagged owner-relative offset, never an external pointer.
+    let offset_mask = b.ins().iconst(
+        types::I64,
+        !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64,
+    );
+    let relative_offset = b.ins().band(encoded_data, offset_mask);
+    let data = b.ins().iadd(address, relative_offset);
 
     let mut check_block = kind_ok;
     for (entry_index, cached) in pic.entries.iter().enumerate() {
@@ -1354,6 +1449,244 @@ fn emit_native_self_call(
     value
 }
 
+
+#[derive(Clone, Copy)]
+struct NativeProfiledSmallMapSite {
+    shape: u32,
+    value_count: u8,
+    field_count: u8,
+    key_regs: [u8; SMALL_MAP_INLINE_FIELDS],
+    value_regs: [u8; SMALL_MAP_INLINE_FIELDS],
+    key_words: [u64; SMALL_MAP_INLINE_FIELDS],
+    slots: [u16; SMALL_MAP_INLINE_FIELDS],
+}
+
+fn native_profiled_small_map_site(
+    function: &PreparedFunction,
+    index: usize,
+) -> Option<NativeProfiledSmallMapSite> {
+    let op = *function.ops.get(index)?;
+    let field_count = op.c as usize;
+    if field_count == 0 || field_count > SMALL_MAP_INLINE_FIELDS {
+        return None;
+    }
+    if function.gc_map_by_op.get(index).copied()? == NO_INDEX {
+        return None;
+    }
+    let site = function.small_map_literal_sites.get(op.cache as usize)?;
+    if !site.initialized
+        || site.disabled
+        || !site.stable_program_keys
+        || site.field_count as usize != field_count
+        || site.value_count as usize > SMALL_MAP_INLINE_FIELDS
+    {
+        return None;
+    }
+
+    let mut result = NativeProfiledSmallMapSite {
+        shape: site.shape,
+        value_count: site.value_count,
+        field_count: site.field_count,
+        key_regs: [0; SMALL_MAP_INLINE_FIELDS],
+        value_regs: [0; SMALL_MAP_INLINE_FIELDS],
+        key_words: [0; SMALL_MAP_INLINE_FIELDS],
+        slots: site.slots,
+    };
+    let offset = op.args_offset as usize;
+    for i in 0..field_count {
+        result.key_regs[i] = function.call_args.get(offset + i * 2)?.0;
+        result.value_regs[i] = function.call_args.get(offset + i * 2 + 1)?.0;
+        result.key_words[i] = Value::from_heap(site.key_handles[i]).raw_bits();
+        if result.slots[i] as usize >= site.value_count as usize {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn emit_native_root_map_update(
+    b: &mut FunctionBuilder<'_>,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    root_map: u32,
+    op_index: u32,
+) {
+    let flags = MemFlagsData::trusted();
+    let top = b.create_block();
+    let nested = b.create_block();
+    let ready = b.create_block();
+    let hot_regs = b.ins().load(
+        types::I64,
+        flags,
+        vm,
+        offset_of!(Interpreter<'static>, hot_registers) as i32,
+    );
+    let is_top = b.ins().icmp(IntCC::Equal, regs, hot_regs);
+    b.ins().brif(is_top, top, &[], nested, &[]);
+
+    b.switch_to_block(top);
+    let frame = b.ins().load(
+        types::I64,
+        flags,
+        vm,
+        offset_of!(Interpreter<'static>, hot_frame) as i32,
+    );
+    let root = b.ins().iconst(types::I32, root_map as i64);
+    b.ins().store(flags, root, frame, offset_of!(Frame, root_map) as i32);
+    let pc = b.ins().iconst(types::I32, op_index as i64);
+    b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
+    b.ins().jump(ready, &[]);
+
+    b.switch_to_block(nested);
+    let shadow = b.ins().load(
+        types::I64,
+        flags,
+        vm,
+        offset_of!(Interpreter<'static>, native_shadow_top) as i32,
+    );
+    let root = b.ins().iconst(types::I32, root_map as i64);
+    b.ins().store(flags, root, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
+    b.ins().jump(ready, &[]);
+
+    b.switch_to_block(ready);
+    b.seal_block(top);
+    b.seal_block(nested);
+    b.seal_block(ready);
+}
+
+fn emit_profiled_small_map_alloc(
+    b: &mut FunctionBuilder<'_>,
+    slow_helper: cranelift::codegen::ir::FuncRef,
+    commit_helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    function: &PreparedFunction,
+    index: usize,
+    site: &NativeProfiledSmallMapSite,
+    fast_alloc: Option<GcFastAllocationInfo>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let field_count = site.field_count as usize;
+
+    // Program-string handles cannot be recycled. Guard their exact tagged words
+    // so a polymorphic/dynamic-key fused site safely bails to the baseline path.
+    for i in 0..field_count {
+        let actual = load_reg(b, regs, site.key_regs[i]);
+        let expected = b.ins().iconst(types::I64, site.key_words[i] as i64);
+        let matches = b.ins().icmp(IntCC::Equal, actual, expected);
+        let ok = b.create_block();
+        b.ins().brif(matches, ok, &[], abort, &[]);
+        b.switch_to_block(ok);
+        b.seal_block(ok);
+    }
+
+    emit_native_root_map_update(
+        b,
+        vm,
+        regs,
+        function.gc_map_by_op[index],
+        index as u32,
+    );
+
+    let storage = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (field_count.max(1) * std::mem::size_of::<RegisterWord>()) as u32,
+        3,
+    ));
+    let values = b.ins().stack_addr(types::I64, storage, 0);
+    let flags = MemFlagsData::trusted();
+    for i in 0..field_count {
+        let value = load_reg(b, regs, site.value_regs[i]);
+        b.ins().store(flags, value, values, (i * 8) as i32);
+    }
+
+    let mut packed_slots = 0u64;
+    for i in 0..field_count {
+        packed_slots |= (site.slots[i] as u64) << (i * 16);
+    }
+
+    let shape = b.ins().iconst(types::I32, site.shape as i64);
+    let value_count = b.ins().iconst(types::I32, site.value_count as i64);
+    let fields = b.ins().iconst(types::I32, site.field_count as i64);
+    let slots = b.ins().iconst(types::I64, packed_slots as i64);
+
+    let value = if let Some(fast) = fast_alloc {
+        debug_assert!(fast.alignment.is_power_of_two());
+        debug_assert!(fast.bytes > 0);
+
+        let fast_block = b.create_block();
+        let slow_block = b.create_block();
+        let commit_block = b.create_block();
+        let done_block = b.create_block();
+        b.append_block_param(commit_block, types::I64); // reserved object address
+        b.append_block_param(done_block, types::I64); // tagged Napalm result
+
+        // Load the current Immix TLAB state directly. MMTk's precise-stress mode
+        // deliberately makes the limit fail this check, so it naturally reaches
+        // the ordinary allocation helper. A concurrent collection request may
+        // wait until this finite TLAB is exhausted; no GC can inspect the mutator
+        // until it subsequently enters a safepoint/slow path.
+        b.ins().jump(fast_block, &[]);
+        b.switch_to_block(fast_block);
+        let cursor_ptr = b.ins().iconst(types::I64, fast.cursor as usize as i64);
+        let limit_ptr = b.ins().iconst(types::I64, fast.limit as usize as i64);
+        let cursor = b.ins().load(types::I64, flags, cursor_ptr, 0);
+        let limit = b.ins().load(types::I64, flags, limit_ptr, 0);
+        let biased = b.ins().iadd_imm(cursor, (fast.alignment - 1) as i64);
+        let align_mask = b.ins().iconst(types::I64, -(fast.alignment as i64));
+        let aligned = b.ins().band(biased, align_mask);
+        let new_cursor = b.ins().iadd_imm(aligned, fast.bytes as i64);
+        let fits = b
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, new_cursor, limit);
+        b.ins().brif(
+            fits,
+            commit_block,
+            &[BlockArg::Value(aligned)],
+            slow_block,
+            &[],
+        );
+
+        b.switch_to_block(commit_block);
+        let reserved = b.block_params(commit_block)[0];
+        let committed_cursor = b.ins().iadd_imm(reserved, fast.bytes as i64);
+        b.ins().store(flags, committed_cursor, cursor_ptr, 0);
+        let call = b.ins().call(
+            commit_helper,
+            &[vm, reserved, shape, value_count, fields, slots, values],
+        );
+        let committed = b.inst_results(call)[0];
+        b.ins().jump(done_block, &[BlockArg::Value(committed)]);
+
+        b.switch_to_block(slow_block);
+        let call = b
+            .ins()
+            .call(slow_helper, &[vm, shape, value_count, fields, slots, values]);
+        let allocated = b.inst_results(call)[0];
+        b.ins().jump(done_block, &[BlockArg::Value(allocated)]);
+
+        b.seal_block(fast_block);
+        b.seal_block(commit_block);
+        b.seal_block(slow_block);
+        b.seal_block(done_block);
+        b.switch_to_block(done_block);
+        b.block_params(done_block)[0]
+    } else {
+        let call = b
+            .ins()
+            .call(slow_helper, &[vm, shape, value_count, fields, slots, values]);
+        b.inst_results(call)[0]
+    };
+
+    let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
+    let ok = b.create_block();
+    b.append_block_param(ok, types::I64);
+    b.ins().brif(failed, abort, &[], ok, &[BlockArg::Value(value)]);
+    b.seal_block(ok);
+    b.switch_to_block(ok);
+    b.block_params(ok)[0]
+}
+
 fn call_native_value_helper(
     b: &mut FunctionBuilder<'_>,
     helper: cranelift::codegen::ir::FuncRef,
@@ -1396,12 +1729,21 @@ pub(super) unsafe fn try_direct_call(
     }
 
     if unsafe { (*jit_ptr).note_call(target) } {
+        let small_map_fast_alloc = vm.heap.inline_map_fast_allocation_info();
         let identity_sites = native_identity_sites(vm, target);
         let prepared = vm.prepared.functions.as_ptr().add(target as usize);
         let bytecode = &vm.program.functions[target as usize] as *const BytecodeFunction;
         let constants = &vm.resolved_constants[target as usize] as *const Vec<RegisterWord>;
         if let Err(error) = unsafe {
-            (*jit_ptr).compile(target, &*prepared, &*bytecode, &*constants, vm.method_epoch, &identity_sites)
+            (*jit_ptr).compile(
+                target,
+                &*prepared,
+                &*bytecode,
+                &*constants,
+                vm.method_epoch,
+                &identity_sites,
+                small_map_fast_alloc,
+            )
         } {
             unsafe { (*jit_ptr).reject(target); }
             if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
@@ -1570,6 +1912,78 @@ fn allocate_prepared_small_map_literal_from_regs<const N: usize>(
     }
 
     vm.heap.alloc_map_from_site(pairs, unsafe { &mut *site })
+}
+
+unsafe extern "C" fn napalm_wfjit_profiled_small_map_commit(
+    vm: *mut c_void,
+    reserved_address: u64,
+    shape: u32,
+    value_count: u32,
+    field_count: u32,
+    packed_slots: u64,
+    source_values: *const RegisterWord,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running
+        || reserved_address == 0
+        || source_values.is_null()
+        || field_count == 0
+        || field_count as usize > SMALL_MAP_INLINE_FIELDS
+        || value_count == 0
+        || value_count as usize > SMALL_MAP_INLINE_FIELDS
+    {
+        return WFJIT_BAILOUT;
+    }
+
+    let mut values = InlineMapValues::new();
+    values.resize(value_count as usize, Value::NULL);
+    for index in 0..field_count as usize {
+        let slot = ((packed_slots >> (index * 16)) & 0xffff) as usize;
+        if slot >= value_count as usize {
+            return WFJIT_BAILOUT;
+        }
+        let value = Value::from_word(unsafe { *source_values.add(index) });
+        unsafe { *values.get_unchecked_mut(slot) = value; }
+    }
+
+    unsafe {
+        vm.heap
+            .alloc_inline_map_reserved(reserved_address as usize, shape, values)
+            .raw_bits()
+    }
+}
+
+unsafe extern "C" fn napalm_wfjit_profiled_small_map(
+    vm: *mut c_void,
+    shape: u32,
+    value_count: u32,
+    field_count: u32,
+    packed_slots: u64,
+    source_values: *const RegisterWord,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running
+        || source_values.is_null()
+        || field_count == 0
+        || field_count as usize > SMALL_MAP_INLINE_FIELDS
+        || value_count == 0
+        || value_count as usize > SMALL_MAP_INLINE_FIELDS
+    {
+        return WFJIT_BAILOUT;
+    }
+
+    let mut values = InlineMapValues::new();
+    values.resize(value_count as usize, Value::NULL);
+    for index in 0..field_count as usize {
+        let slot = ((packed_slots >> (index * 16)) & 0xffff) as usize;
+        if slot >= value_count as usize {
+            return WFJIT_BAILOUT;
+        }
+        let value = Value::from_word(unsafe { *source_values.add(index) });
+        unsafe { *values.get_unchecked_mut(slot) = value; }
+    }
+
+    vm.heap.alloc_inline_map(shape, values).raw_bits()
 }
 
 unsafe extern "C" fn napalm_wfjit_small_map_literal_regs(

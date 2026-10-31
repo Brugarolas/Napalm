@@ -259,6 +259,13 @@ pub const TRACE_HEAP_METADATA_SHIFT: u32 = 8;
 pub const TRACE_HEAP_METADATA_MAX: u32 = 0x00ff_ffff;
 pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
 
+/// `TraceHeapEntry::data` normally stores a stable external pointer. Shaped Maps
+/// keep their dense values inside the moving GC object, so they store a byte
+/// offset from `TraceHeapEntry::address` tagged with this low bit instead.
+/// Managed payloads and `Value` arrays are word-aligned, leaving bit zero free.
+pub const TRACE_HEAP_DATA_RELATIVE_BIT: usize = 1;
+pub const TRACE_HEAP_DATA_RELATIVE_MASK: usize = TRACE_HEAP_DATA_RELATIVE_BIT;
+
 /// Promise state is packed into the high metadata bits of TraceHeapEntry::kind.
 pub const TRACE_PROMISE_PENDING: u32 = 1;
 pub const TRACE_PROMISE_FULFILLED: u32 = 2;
@@ -288,9 +295,10 @@ pub enum TraceHeapKind {
 /// Stable JIT-visible sidecar for one Napalm heap handle.
 ///
 /// `address` is the moving MMTk object address and is rewritten by GC through the
-/// existing precise handle slot. `data` points at external allocations or inline
-/// Map values; the latter are refreshed by the GC copy callback. Data pointers
-/// are valid only until the next safepoint. `len` is normally the
+/// existing precise handle slot. `data` normally points at stable external storage;
+/// shaped Maps instead store a tagged byte offset from `address`, so generated code
+/// reconstructs the interior pointer after every move without a GC patch callback.
+/// Resolved data pointers are valid only until the next safepoint. `len` is normally the
 /// logical collection/string length; for Closure it stores the immutable prepared
 /// function index while `data` points at the capture array and packed metadata stores
 /// the capture count. `receiver_class` is the immutable semantic class key (zero
@@ -309,7 +317,10 @@ pub struct TraceHeapEntry {
     pub(crate) receiver_class: AtomicU64,
     pub(crate) data: AtomicUsize,
     pub(crate) len: AtomicUsize,
-    /// Settled Promise payload. Promise state itself is packed in `kind` metadata.
+    /// Settled Promise payload. For non-Promise objects with `has_contract != 0`,
+    /// this word is reused by the interpreter as a stable thin pointer to the
+    /// sidecar-owned structural-contract vector. Generated code only reads this
+    /// field after proving Promise kind, so the representations cannot alias.
     pub(crate) promise_value: AtomicU64,
 }
 
@@ -8050,6 +8061,20 @@ impl CraneliftLoweringState<'_, '_> {
         value
     }
 
+    /// Resolve a shaped-Map dense-value pointer. Inline maps encode `data` as a
+    /// tagged byte offset from the current GC object address; dictionary maps never
+    /// reach shaped native operations. This avoids storing interior pointers that
+    /// become stale when StickyImmix moves the owner.
+    fn heap_entry_map_data(&mut self, entry: Value, owner_address: Value) -> Value {
+        let encoded = self.heap_entry_data(entry);
+        let offset_mask = self.builder.ins().iconst(
+            self.pointer_type,
+            !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64,
+        );
+        let offset = self.builder.ins().band(encoded, offset_mask);
+        self.builder.ins().iadd(owner_address, offset)
+    }
+
     fn heap_entry_len(&mut self, entry: Value) -> Value {
         if let Some(&value) = self.heap_len.get(&entry) {
             return value;
@@ -9346,7 +9371,7 @@ impl CraneliftLoweringState<'_, '_> {
 
             HeapMapGetShaped { map, key, expected_key, shape, slot, exit } => {
                 let tagged_key = self.lower_value(*key)?;
-                let (entry, _, metadata) =
+                let (entry, owner_address, metadata) =
                     self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_map_shape_once(*map, metadata, *shape, *exit)?;
                 self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
@@ -9359,7 +9384,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let result = if let Some(value) = self.forwarded_heap_load(location) {
                     value
                 } else {
-                    let data = self.heap_entry_data(entry);
+                    let data = self.heap_entry_map_data(entry, owner_address);
                     let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                     let address = self.heap_element_address(data, index);
                     let value = self.builder.ins().load(
@@ -9377,7 +9402,7 @@ impl CraneliftLoweringState<'_, '_> {
             HeapMapGetPic { map, key, expected_key, entries, exit } => {
                 debug_assert!(!entries.is_empty() && entries.len() <= 4);
                 let tagged_key = self.lower_value(*key)?;
-                let (entry, _, metadata) =
+                let (entry, owner_address, metadata) =
                     self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
 
@@ -9403,7 +9428,7 @@ impl CraneliftLoweringState<'_, '_> {
                 // the shape match proves both property existence and dense bounds.
                 // Keep this load out of single-slot forwarding: the physical slot
                 // is chosen dynamically and may differ between family members.
-                let data = self.heap_entry_data(entry);
+                let data = self.heap_entry_map_data(entry, owner_address);
                 let address = self.heap_element_address(data, selected_slot);
                 let value = self.builder.ins().load(
                     types::I64,
@@ -9426,7 +9451,7 @@ impl CraneliftLoweringState<'_, '_> {
                 self.guard_string_bytes_once(*key, tagged_key, expected_key, *exit)?;
                 // Exact shape identity also proves this existing dense slot is in
                 // range. Shaped native stores never append/remove properties.
-                let data = self.heap_entry_data(entry);
+                let data = self.heap_entry_map_data(entry, owner_address);
                 let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;

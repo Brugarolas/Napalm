@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use simd_json::prelude::*;
 use crate::napalm_gc::{
     Collector as GcCollector, Config as GcConfig, Descriptor as GcDescriptor, Mutator as GcMutator,
-    Object as GcObject, RootProvider as GcRootProvider, RootRegistration as GcRootRegistration,
+    Object as GcObject,
+    RootProvider as GcRootProvider, RootRegistration as GcRootRegistration,
     RootVisitor as GcRootVisitor, Slot as GcSlot, TraceLayout as GcTraceLayout,
     RAW_CODEC as GC_RAW_CODEC,
 };
@@ -1477,15 +1478,120 @@ impl MapDictionary {
 }
 
 const SMALL_MAP_INLINE_FIELDS: usize = 4;
-type MapValues = smallvec::SmallVec<[Value; SMALL_MAP_INLINE_FIELDS]>;
+
+/// Fixed-capacity storage for the hot object-like Map representation.
+///
+/// Unlike `SmallVec`, this type can never allocate or spill. Maps that outgrow
+/// four dense properties are promoted to dictionary storage before the fifth
+/// value is inserted. Keeping the array physically inside `NapalmMap` makes the
+/// common `{ a, b }` / `{ left, right }` case a single managed allocation.
+#[repr(C)]
+#[derive(Clone, Debug)]
+struct InlineMapValues {
+    len: u8,
+    _padding: [u8; 7],
+    values: [Value; SMALL_MAP_INLINE_FIELDS],
+}
+
+impl InlineMapValues {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            len: 0,
+            _padding: [0; 7],
+            values: [Value::NULL; SMALL_MAP_INLINE_FIELDS],
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize { self.len as usize }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool { self.len == 0 }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[Value] {
+        &self.values[..self.len()]
+    }
+
+    #[inline(always)]
+    fn as_ptr(&self) -> *const Value {
+        self.values.as_ptr()
+    }
+
+    #[inline(always)]
+    fn iter(&self) -> std::slice::Iter<'_, Value> {
+        self.as_slice().iter()
+    }
+
+    #[inline(always)]
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, Value> {
+        let len = self.len();
+        self.values[..len].iter_mut()
+    }
+
+    #[inline(always)]
+    fn get(&self, index: usize) -> Option<&Value> {
+        self.as_slice().get(index)
+    }
+
+    #[inline(always)]
+    unsafe fn get_unchecked(&self, index: usize) -> &Value {
+        unsafe { self.as_slice().get_unchecked(index) }
+    }
+
+    #[inline(always)]
+    unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
+        debug_assert!(index < self.len());
+        unsafe { self.values.get_unchecked_mut(index) }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: Value) {
+        let index = self.len();
+        assert!(index < SMALL_MAP_INLINE_FIELDS, "inline Map storage overflow");
+        self.values[index] = value;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn resize(&mut self, new_len: usize, value: Value) {
+        assert!(new_len <= SMALL_MAP_INLINE_FIELDS, "inline Map storage overflow");
+        let old_len = self.len();
+        if new_len > old_len {
+            self.values[old_len..new_len].fill(value);
+        } else if new_len < old_len {
+            self.values[new_len..old_len].fill(Value::NULL);
+        }
+        self.len = new_len as u8;
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        let len = self.len();
+        self.values[..len].fill(Value::NULL);
+        self.len = 0;
+    }
+}
+
+impl<'a> IntoIterator for &'a InlineMapValues {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
 
 #[derive(Debug)]
 enum NapalmMapStorage {
     /// Object-like fast representation. The shape owns immutable shared string
-    /// keys while values are stored densely by slot.
-    Shaped { shape: u32, values: MapValues },
+    /// keys while all values live physically inside the managed object.
+    Shaped { shape: u32, values: InlineMapValues },
     /// General Napalm Map semantics for arbitrary key types and highly dynamic maps.
-    Dictionary(MapDictionary),
+    /// Box this cold representation so it does not inflate every small object.
+    Dictionary(Box<MapDictionary>),
 }
 
 #[derive(Debug)]
@@ -1498,7 +1604,7 @@ impl Default for NapalmMap {
         Self {
             storage: NapalmMapStorage::Shaped {
                 shape: 0,
-                values: MapValues::new(),
+                values: InlineMapValues::new(),
             },
         }
     }
@@ -1506,7 +1612,7 @@ impl Default for NapalmMap {
 
 impl NapalmMap {
     #[inline]
-    fn with_shaped_buffer(shape: u32, values: MapValues) -> Self {
+    fn with_shaped_buffer(shape: u32, values: InlineMapValues) -> Self {
         Self { storage: NapalmMapStorage::Shaped { shape, values } }
     }
 
@@ -1529,11 +1635,9 @@ impl NapalmMap {
     #[inline]
     fn external_bytes(&self) -> usize {
         match &self.storage {
-            NapalmMapStorage::Shaped { values, .. } => {
-                if values.spilled() { values.capacity() * std::mem::size_of::<Value>() } else { 0 }
-            }
+            NapalmMapStorage::Shaped { .. } => 0,
             NapalmMapStorage::Dictionary(entries) => {
-                entries.external_bytes()
+                std::mem::size_of::<MapDictionary>() + entries.external_bytes()
             }
         }
     }
@@ -1567,15 +1671,17 @@ impl NapalmMap {
                     unsafe { *values.get_unchecked_mut(slot as usize) = value; }
                     return Some(slot);
                 }
-                if let Some((next_shape, slot)) = shapes.transition_with_contract(
-                    *shape,
-                    bytes.clone(),
-                    ShapeSlotContract::default(),
-                ) {
-                    debug_assert_eq!(slot as usize, values.len());
-                    values.push(value);
-                    *shape = next_shape;
-                    return Some(slot);
+                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                    if let Some((next_shape, slot)) = shapes.transition_with_contract(
+                        *shape,
+                        bytes.clone(),
+                        ShapeSlotContract::default(),
+                    ) {
+                        debug_assert_eq!(slot as usize, values.len());
+                        values.push(value);
+                        *shape = next_shape;
+                        return Some(slot);
+                    }
                 }
             }
             self.promote_to_dictionary(shapes);
@@ -1591,7 +1697,7 @@ impl NapalmMap {
     fn promote_to_dictionary(&mut self, shapes: &MapShapeTable) {
         let old = std::mem::replace(
             &mut self.storage,
-            NapalmMapStorage::Dictionary(MapDictionary::default()),
+            NapalmMapStorage::Dictionary(Box::new(MapDictionary::default())),
         );
         match old {
             NapalmMapStorage::Dictionary(entries) => {
@@ -1602,10 +1708,10 @@ impl NapalmMap {
                 debug_assert_eq!(keys.len(), values.len());
                 let mut entries = MapDictionary::default();
                 entries.reserve(values.len());
-                for (key, value) in keys.iter().cloned().zip(values.into_iter()) {
+                for (key, value) in keys.iter().cloned().zip(values.as_slice().iter().copied()) {
                     entries.insert(MapKey::String(key), value);
                 }
-                self.storage = NapalmMapStorage::Dictionary(entries);
+                self.storage = NapalmMapStorage::Dictionary(Box::new(entries));
             }
         }
     }
@@ -1884,7 +1990,7 @@ enum HeapObject {
     Promise {
         state: Arc<PromiseCell>,
     },
-    Response(NapalmResponse),
+    Response(Box<NapalmResponse>),
     Headers(NapalmHeaders),
     /// Scheduler-owned execution context for an async function. It deliberately
     /// reuses FiberState's frame/register storage without being a Napalm Fiber.
@@ -1923,6 +2029,19 @@ const FREE_HANDLE_NONE: u32 = 0;
 const HANDLE_RECYCLE_BATCH: usize = 32;
 
 type HandleEntry = TraceHeapEntry;
+
+#[inline(always)]
+fn encode_inline_heap_data(object_address: usize, data_address: usize) -> usize {
+    let offset = data_address
+        .checked_sub(object_address)
+        .expect("inline heap data must live inside its owner");
+    debug_assert_eq!(
+        offset & crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK,
+        0,
+        "inline heap data offset must preserve the relative-pointer tag bit",
+    );
+    offset | crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_BIT
+}
 
 struct HandleTable {
     chunks: Box<[AtomicPtr<HandleEntry>]>,
@@ -2078,6 +2197,42 @@ impl HandleTable {
         }
     }
 
+    /// Reserve a contiguous range of never-published handles with one atomic CAS.
+    /// Unused handles are kept in the mutator-local cache and returned to the
+    /// ordinary free list when the Heap is dropped, so batching cannot leak IDs.
+    fn take_fresh_batch(&self, out: &mut Vec<u32>, max: usize) -> usize {
+        let requested = max.min(HANDLE_RECYCLE_BATCH);
+        if requested == 0 {
+            return 0;
+        }
+        let capacity = (MAX_HANDLE_CHUNKS * HANDLE_CHUNK_SIZE) as u32;
+
+        loop {
+            let first = self.next.load(Ordering::Relaxed);
+            assert!(first < capacity, "Napalm heap handle space exhausted");
+            let count = requested.min((capacity - first) as usize);
+            let next = first + count as u32;
+            if self
+                .next
+                .compare_exchange_weak(first, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+
+            out.reserve(count);
+            // Push in reverse order so pop() returns monotonically increasing
+            // handles. This keeps sidecar chunk access spatially local.
+            for handle in (first..next).rev() {
+                let entry = self.entry(handle);
+                debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
+                debug_assert_eq!(entry.next_free.load(Ordering::Relaxed), FREE_HANDLE_NONE);
+                out.push(handle);
+            }
+            return count;
+        }
+    }
+
     fn allocate_handle(&self) -> u32 {
         loop {
             let head = self.free_head.load(Ordering::Acquire);
@@ -2110,26 +2265,84 @@ impl HandleTable {
     }
 
     #[inline(always)]
-    fn publish(&self, handle: u32, object: GcObject, heap_object: &HeapObject) {
-        let entry = self.entry(handle);
-        entry.address.store(object.address(), Ordering::Relaxed);
-        Self::refresh_entry(entry, heap_object);
-        self.live.fetch_add(1, Ordering::Relaxed);
+    fn contracts(&self, handle: u32) -> Option<&'static Vec<Type>> {
+        let entry = self.existing_entry(handle)?;
+        if entry.has_contract.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let pointer = entry.promise_value.load(Ordering::Acquire) as usize as *const Vec<Type>;
+        if pointer.is_null() {
+            return None;
+        }
+        Some(unsafe { &*pointer })
     }
 
     #[inline(always)]
-    fn refresh(&self, handle: u32, object: &HeapObject) {
-        if let Some(entry) = self.existing_entry(handle) {
-            Self::refresh_entry(entry, object);
+    fn contract_contains(&self, handle: u32, ty: &Type) -> bool {
+        self.contracts(handle)
+            .is_some_and(|contracts| contracts.contains(ty))
+    }
+
+    fn stage_contract(&self, handle: u32, ty: Type) {
+        let entry = self.entry(handle);
+        if entry.has_contract.load(Ordering::Acquire) != 0 {
+            let pointer = entry.promise_value.load(Ordering::Acquire) as usize as *mut Vec<Type>;
+            debug_assert!(!pointer.is_null());
+            let contracts = unsafe { &mut *pointer };
+            if !contracts.contains(&ty) {
+                contracts.push(ty);
+            }
+            return;
+        }
+
+        let pointer = Box::into_raw(Box::new(vec![ty]));
+        debug_assert_eq!(entry.promise_value.load(Ordering::Relaxed), 0);
+        // Installation publishes has_contract only after shape/type metadata has
+        // been refreshed. Until then this staged pointer is mutator-private.
+        entry.promise_value.store(pointer as usize as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn cloned_contracts(&self, handle: u32) -> Vec<Type> {
+        self.contracts(handle).cloned().unwrap_or_default()
+    }
+
+    #[inline(always)]
+    unsafe fn drop_contracts(entry: &HandleEntry) {
+        if entry.has_contract.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        let pointer = entry.promise_value.swap(0, Ordering::AcqRel) as usize as *mut Vec<Type>;
+        if !pointer.is_null() {
+            unsafe { drop(Box::from_raw(pointer)); }
         }
     }
 
     #[inline(always)]
-    fn refresh_entry(entry: &HandleEntry, object: &HeapObject) {
+    fn publish(&self, handle: u32, object: GcObject, heap_object: &HeapObject) {
+        let entry = self.entry(handle);
+        entry.address.store(object.address(), Ordering::Relaxed);
+        Self::refresh_entry(entry, object.address(), heap_object);
+        self.live.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn refresh(&self, handle: u32, owner: GcObject, object: &HeapObject) {
+        if let Some(entry) = self.existing_entry(handle) {
+            Self::refresh_entry(entry, owner.address(), object);
+        }
+    }
+
+    #[inline(always)]
+    fn refresh_entry(entry: &HandleEntry, object_address: usize, object: &HeapObject) {
         entry.receiver_class.store(
             heap_object_receiver_class(object).map_or(0, |class| class.0),
             Ordering::Relaxed,
         );
+        // For non-Promise objects this auxiliary word may hold a staged or
+        // published structural-contract pointer. Preserve it across sidecar
+        // refreshes; Promise refreshes overwrite the word with settlement data.
+        let contract_pointer = entry.promise_value.load(Ordering::Relaxed);
         let mut promise_value = 0u64;
         let (kind, data, len, metadata) = match object {
             HeapObject::String(bytes) => (
@@ -2147,7 +2360,7 @@ impl HandleTable {
             HeapObject::Map(map) => match &map.storage {
                 NapalmMapStorage::Shaped { shape, values } => (
                     TraceHeapKind::Map,
-                    values.as_ptr() as usize,
+                    encode_inline_heap_data(object_address, values.as_slice().as_ptr() as usize),
                     values.len(),
                     *shape,
                 ),
@@ -2203,7 +2416,18 @@ impl HandleTable {
         };
         entry.data.store(data, Ordering::Relaxed);
         entry.len.store(len, Ordering::Relaxed);
-        entry.promise_value.store(promise_value, Ordering::Relaxed);
+        if matches!(kind, TraceHeapKind::Promise) {
+            debug_assert_eq!(
+                entry.has_contract.load(Ordering::Relaxed),
+                0,
+                "Promise sidecar payload cannot alias structural-contract storage",
+            );
+            entry.promise_value.store(promise_value, Ordering::Relaxed);
+        } else if contract_pointer != 0 {
+            entry.promise_value.store(contract_pointer, Ordering::Relaxed);
+        } else {
+            entry.promise_value.store(0, Ordering::Relaxed);
+        }
         debug_assert!(metadata <= crate::napalm_tracing_jit::TRACE_HEAP_METADATA_MAX);
         let packed_kind = (kind as u32)
             | (metadata << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT);
@@ -2246,6 +2470,7 @@ impl HandleTable {
 
     fn release(&self, handle: u32) {
         let entry = self.entry(handle);
+        unsafe { Self::drop_contracts(entry); }
         entry.clear_jit_view();
         entry.address.store(0, Ordering::Relaxed);
         self.live.fetch_sub(1, Ordering::Relaxed);
@@ -2281,9 +2506,7 @@ fn handles() -> &'static HandleTable {
 
 #[repr(C)]
 struct ManagedObject {
-    contracts: Option<Box<Vec<Type>>>,
     handle: u32,
-    receiver_class: Option<ReceiverClass>,
     object: HeapObject,
 }
 
@@ -2526,16 +2749,6 @@ unsafe fn cleanup_managed_object(object: GcObject) {
     unsafe { std::ptr::drop_in_place(managed) };
 }
 
-unsafe fn refresh_moved_map(object: GcObject) {
-    let managed = unsafe { managed_object(object) };
-    if let HeapObject::Map(map) = &managed.object {
-        if let NapalmMapStorage::Shaped { values, .. } = &map.storage {
-            if !values.spilled() {
-                handles().entry(managed.handle).data.store(values.as_ptr() as usize, Ordering::Relaxed);
-            }
-        }
-    }
-}
 
 macro_rules! gc_descriptor {
     ($name:ident, $label:literal, $trace:expr) => {
@@ -2544,7 +2757,7 @@ macro_rules! gc_descriptor {
             trace: $trace,
             cleanup: Some(cleanup_managed_object),
             finalizer: None,
-            after_move: Some(refresh_moved_map),
+            after_move: None,
         };
     };
 }
@@ -2617,7 +2830,8 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
         HeapObject::Response(response) => {
-            response.body.capacity()
+            std::mem::size_of::<NapalmResponse>()
+                + response.body.capacity()
                 + response.status_text.len()
                 + response.url.len()
                 + response.content_type.as_ref().map_or(0, |value| value.len())
@@ -2930,41 +3144,89 @@ impl Drop for Heap {
 }
 
 impl Heap {
-    /// The common small-literal path has a known descriptor/class and no native
-    /// buffer. Avoid the general HeapObject classification and external accounting.
-    fn alloc_inline_map(&mut self, shape: u32, values: MapValues) -> Value {
-        debug_assert!(!values.spilled());
-        self.allocation_roots.prepare_values(&values);
-        let handle = self.allocate_handle_fast();
-        let object = unsafe {
-            self.mutator.allocate_uninitialized(&GC_MAP, std::mem::size_of::<ManagedObject>())
-        };
+    #[inline]
+    fn inline_map_fast_allocation_info(
+        &mut self,
+    ) -> Option<crate::napalm_gc::FastAllocationInfo> {
+        self.mutator
+            .fixed_fast_allocation_info::<{ std::mem::size_of::<ManagedObject>() }>()
+    }
+
+    #[inline(always)]
+    fn initialize_inline_map_object(
+        &mut self,
+        object: GcObject,
+        handle: u32,
+        shape: u32,
+        values: InlineMapValues,
+    ) -> Value {
         let class = ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64);
         unsafe {
             object.payload().cast::<ManagedObject>().write(ManagedObject {
-                contracts: None,
                 handle,
-                receiver_class: Some(class),
                 object: HeapObject::Map(NapalmMap::with_shaped_buffer(shape, values)),
             });
         }
-        let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else { unreachable!() };
+        let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
+            unreachable!()
+        };
         let (_, values) = map.shaped().unwrap();
         let entry = self.handle_table.entry(handle);
         entry.address.store(object.address(), Ordering::Relaxed);
         entry.receiver_class.store(class.0, Ordering::Relaxed);
-        entry.data.store(values.as_ptr() as usize, Ordering::Relaxed);
+        entry.data.store(
+            encode_inline_heap_data(object.address(), values.as_ptr() as usize),
+            Ordering::Relaxed,
+        );
         entry.len.store(values.len(), Ordering::Relaxed);
         entry.promise_value.store(0, Ordering::Relaxed);
-        entry.kind.store(TraceHeapKind::Map as u32
-            | (shape << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT), Ordering::Release);
+        entry.kind.store(
+            TraceHeapKind::Map as u32
+                | (shape << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT),
+            Ordering::Release,
+        );
         self.handle_table.live.fetch_add(1, Ordering::Relaxed);
-        self.allocation_roots.clear();
         self.remember_stack_owner();
         let value = Value::from_heap(handle);
         #[cfg(test)]
         self.allocations.push(value);
         value
+    }
+
+    /// The common small-literal path has a known descriptor/class and no native
+    /// buffer. Avoid the general HeapObject classification and external accounting.
+    fn alloc_inline_map(&mut self, shape: u32, values: InlineMapValues) -> Value {
+        self.allocation_roots.prepare_values(values.as_slice());
+        let handle = self.allocate_handle_fast();
+        let object = unsafe {
+            self.mutator
+                .allocate_fixed_uninitialized::<{ std::mem::size_of::<ManagedObject>() }>(&GC_MAP)
+        };
+        let value = self.initialize_inline_map_object(object, handle, shape, values);
+        self.allocation_roots.clear();
+        value
+    }
+
+    /// Publish a small shaped Map into an Immix TLAB range already reserved by
+    /// generated WFJIT code. This path cannot safepoint or allocate managed memory.
+    ///
+    /// # Safety
+    /// `address` must be a range reserved from this heap's current default Immix
+    /// bump pointer with the exact size returned by
+    /// `inline_map_fast_allocation_info`.
+    unsafe fn alloc_inline_map_reserved(
+        &mut self,
+        address: usize,
+        shape: u32,
+        values: InlineMapValues,
+    ) -> Value {
+        let handle = self.allocate_handle_fast();
+        let object = unsafe {
+            self.mutator.finish_fast_fixed_uninitialized::<
+                { std::mem::size_of::<ManagedObject>() },
+            >(&GC_MAP, address)
+        };
+        self.initialize_inline_map_object(object, handle, shape, values)
     }
 
     #[inline]
@@ -2975,10 +3237,14 @@ impl Heap {
         self.handle_table
             .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
         if let Some(handle) = self.recycled_handles.pop() {
-            handle
-        } else {
-            self.handle_table.allocate_handle()
+            return handle;
         }
+
+        self.handle_table
+            .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
+        self.recycled_handles
+            .pop()
+            .expect("fresh handle reservation returned an empty batch")
     }
 
     #[inline]
@@ -2988,20 +3254,19 @@ impl Heap {
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
         let handle = self.allocate_handle_fast();
-        let receiver_class = heap_object_receiver_class(&object);
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
         let gc_object = unsafe {
             self.mutator
-                .allocate_uninitialized(descriptor, std::mem::size_of::<ManagedObject>())
+                .allocate_fixed_uninitialized::<{ std::mem::size_of::<ManagedObject>() }>(
+                    descriptor,
+                )
         };
         unsafe {
             std::ptr::write(
                 gc_object.payload().cast::<ManagedObject>(),
                 ManagedObject {
-                    contracts: None,
                     handle,
-                    receiver_class,
                     object,
                 },
             );
@@ -3202,7 +3467,7 @@ impl Heap {
             if matches {
                 let value_count = site.value_count as usize;
                 debug_assert!(value_count <= N);
-                let mut values = MapValues::new();
+                let mut values = InlineMapValues::new();
                 values.resize(value_count, Value::NULL);
                 for (index, (_, value)) in pairs.iter().enumerate() {
                     let slot = site.slots[index] as usize;
@@ -3340,7 +3605,8 @@ impl Heap {
         let Some(object) = self.object(owner) else {
             return ShapeSlotContract::default();
         };
-        let Some(contracts) = &unsafe { managed_object(object) }.contracts else {
+        let handle = unsafe { managed_object(object) }.handle;
+        let Some(contracts) = self.handle_table.contracts(handle) else {
             return ShapeSlotContract::default();
         };
         let mut result = ShapeSlotContract::default();
@@ -3416,18 +3682,20 @@ impl Heap {
                     return Ok(false);
                 }
 
-                if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
-                    *shape,
-                    bytes.clone(),
-                    new_slot_contract.clone(),
-                ) {
-                    debug_assert_eq!(slot as usize, values.len());
-                    values.push(item);
-                    *shape = next_shape;
-                    if let Some(cache) = cache.as_deref_mut() {
-                        cache.insert(next_shape, slot);
+                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                    if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
+                        *shape,
+                        bytes.clone(),
+                        new_slot_contract.clone(),
+                    ) {
+                        debug_assert_eq!(slot as usize, values.len());
+                        values.push(item);
+                        *shape = next_shape;
+                        if let Some(cache) = cache.as_deref_mut() {
+                            cache.insert(next_shape, slot);
+                        }
+                        return Ok(true);
                     }
-                    return Ok(true);
                 }
             }
 
@@ -3539,17 +3807,19 @@ impl Heap {
                     return Ok(false);
                 }
 
-                let key = MapStringKey::from_napalm(bytes);
-                if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
-                    *shape,
-                    key,
-                    new_string_slot_contract.clone().unwrap_or_default(),
-                ) {
-                    debug_assert_eq!(slot as usize, values.len());
-                    values.push(item);
-                    *shape = next_shape;
-                    cache.insert(next_shape, slot);
-                    return Ok(true);
+                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                    let key = MapStringKey::from_napalm(bytes);
+                    if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
+                        *shape,
+                        key,
+                        new_string_slot_contract.clone().unwrap_or_default(),
+                    ) {
+                        debug_assert_eq!(slot as usize, values.len());
+                        values.push(item);
+                        *shape = next_shape;
+                        cache.insert(next_shape, slot);
+                        return Ok(true);
+                    }
                 }
 
                 // Shape budget exhausted: keep the already-created key for the
@@ -3675,9 +3945,9 @@ impl Heap {
     #[inline(always)]
     fn refresh_jit_view(&self, value: Value) {
         let Some(handle) = value.heap_handle() else { return; };
-        if let Some(object) = self.get(value) {
-            self.handle_table.refresh(handle, object);
-        }
+        let Some(owner) = self.object(value) else { return; };
+        let object = unsafe { &managed_object(owner).object };
+        self.handle_table.refresh(handle, owner, object);
     }
 
     #[inline(always)]
@@ -9230,7 +9500,7 @@ impl<'p> Interpreter<'p> {
             .map(|(name, value)| (Arc::<str>::from(name), Arc::<str>::from(value)))
             .collect::<Vec<_>>()
             .into();
-        self.heap.alloc(HeapObject::Response(NapalmResponse {
+        self.heap.alloc(HeapObject::Response(Box::new(NapalmResponse {
             status: response.status,
             status_text: Arc::<str>::from(response.status_text),
             url: Arc::<str>::from(response.url),
@@ -9241,7 +9511,7 @@ impl<'p> Interpreter<'p> {
             body: response.body,
             body_used: false,
             decoded: None,
-        }))
+        })))
     }
 
     fn response_headers_object(&mut self, response_value: Value) -> Result<Value, RuntimeError> {
@@ -16162,6 +16432,40 @@ mod tests {
     }
 
     #[test]
+    fn fresh_handle_batch_reserves_monotonic_ids_with_one_global_reservation() {
+        let table = HandleTable::new();
+        let mut batch = Vec::new();
+        assert_eq!(
+            table.take_fresh_batch(&mut batch, HANDLE_RECYCLE_BATCH),
+            HANDLE_RECYCLE_BATCH
+        );
+        let mut popped = Vec::new();
+        while let Some(handle) = batch.pop() {
+            popped.push(handle);
+        }
+        assert_eq!(
+            popped,
+            (0..HANDLE_RECYCLE_BATCH as u32).collect::<Vec<_>>()
+        );
+        for handle in popped {
+            table.return_unused(handle);
+        }
+    }
+
+    #[test]
+    fn structural_contracts_live_in_handle_sidecar() {
+        let table = HandleTable::new();
+        let handle = table.allocate_handle();
+        table.stage_contract(handle, Type::Map);
+        table.entry(handle).has_contract.store(1, Ordering::Release);
+        assert!(table.contract_contains(handle, &Type::Map));
+        assert_eq!(table.contracts(handle).map(Vec::len), Some(1));
+        unsafe { HandleTable::drop_contracts(table.entry(handle)); }
+        assert!(table.contracts(handle).is_none());
+        table.return_unused(handle);
+    }
+
+    #[test]
     fn recursive_memo_table_stays_enabled_under_initial_misses() {
         let mut table = MemoTable::new(MemoizationKind::Recursive, 0);
         for value in 0..512u64 {
@@ -16275,7 +16579,7 @@ mod tests {
         assert_eq!(first.raw_bits(), second.raw_bits());
         assert!(matches!(
             vm.heap.get(response),
-            Some(HeapObject::Response(NapalmResponse { body_used: true, .. }))
+            Some(HeapObject::Response(response)) if response.body_used
         ));
         // Explicit Body methods retain JavaScript's one-consumption rule even
         // though Napalm keeps the decoded value for subsequent `.data` reads.
@@ -16285,6 +16589,63 @@ mod tests {
         let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"answer"[..])));
         assert_eq!(vm.heap.map_get_encoded(first, &key).unwrap().as_num(), Some(42.0));
         vm.release_root(response_root);
+    }
+
+    #[test]
+    fn inline_map_sidecar_uses_gc_relative_dense_storage() {
+        let entry = HandleEntry::new(FREE_HANDLE_NONE);
+        let mut values = InlineMapValues::new();
+        values.push(Value::from_num(1.0));
+        values.push(Value::from_num(2.0));
+        let managed = ManagedObject {
+            handle: 0,
+            object: HeapObject::Map(NapalmMap::with_shaped_buffer(7, values)),
+        };
+        let base = (&managed as *const ManagedObject) as usize;
+        HandleTable::refresh_entry(&entry, base, &managed.object);
+
+        let encoded = entry.data.load(Ordering::Relaxed);
+        assert_ne!(
+            encoded & crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK,
+            0,
+        );
+        let offset = encoded & !crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK;
+        let expected = match &managed.object {
+            HeapObject::Map(map) => map.shaped().unwrap().1.as_ptr() as usize,
+            _ => unreachable!(),
+        };
+        assert_eq!(base + offset, expected);
+        assert_eq!(entry.len.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            entry.kind.load(Ordering::Acquire) >> crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT,
+            7,
+        );
+    }
+
+    #[test]
+    fn shaped_map_promotes_before_inline_storage_can_spill() {
+        let mut shapes = MapShapeTable::default();
+        let mut map = NapalmMap::default();
+        for index in 0..SMALL_MAP_INLINE_FIELDS {
+            let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(
+                format!("k{index}").into_bytes(),
+            )));
+            assert_eq!(
+                map.insert_unpublished(&mut shapes, key, Value::from_num(index as f64)),
+                Some(index as u16),
+            );
+        }
+        assert!(matches!(map.storage, NapalmMapStorage::Shaped { .. }));
+
+        let fifth = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"fifth"[..])));
+        assert_eq!(
+            map.insert_unpublished(&mut shapes, fifth, Value::from_num(5.0)),
+            None,
+        );
+        assert!(matches!(
+            map.storage,
+            NapalmMapStorage::Dictionary(ref entries) if entries.len() == SMALL_MAP_INLINE_FIELDS + 1
+        ));
     }
 
     #[test]
@@ -16298,7 +16659,7 @@ mod tests {
             reference_indices: Arc::from(vec![0u16]),
         };
 
-        HandleTable::refresh_entry(&entry, &closure);
+        HandleTable::refresh_entry(&entry, 0x1000, &closure);
 
         let packed = entry.kind.load(Ordering::Acquire);
         assert_eq!(

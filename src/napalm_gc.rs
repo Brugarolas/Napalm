@@ -376,6 +376,9 @@ pub struct Collector {
     keep_roots: Mutex<Vec<Arc<RootStorage>>>,
     keep_providers: Mutex<Vec<Arc<dyn RootProvider>>>,
     external_at_gc: AtomicUsize,
+    /// Monotonic epoch bumped whenever native/external ownership changes.
+    /// Mutators use it to avoid re-reading external-byte counters on every small allocation.
+    external_epoch: AtomicU64,
     counters: Counters,
 }
 struct Tracked {
@@ -480,6 +483,7 @@ impl Collector {
             keep_roots: Mutex::new(Vec::new()),
             keep_providers: Mutex::new(Vec::new()),
             external_at_gc: AtomicUsize::new(0),
+            external_epoch: AtomicU64::new(1),
             counters: Counters::default(),
         };
         assert!(GC.set(collector).is_ok());
@@ -525,6 +529,9 @@ impl Collector {
             pointer,
             local_bytes: 0,
             local_barriers: 0,
+            // Force one initial pressure check; subsequent allocations pay only
+            // one epoch load until external ownership actually changes.
+            seen_external_epoch: 0,
             native: Cell::new(false),
             max_non_los: self
                 .mmtk
@@ -617,9 +624,23 @@ pub struct Mutator {
     pointer: NonNull<mmtk::Mutator<Binding>>,
     local_bytes: u64,
     local_barriers: u64,
+    seen_external_epoch: u64,
     native: Cell<bool>,
     max_non_los: usize,
     _not_send: PhantomData<Rc<()>>,
+}
+
+/// VM-side metadata for MMTk's documented bump-pointer allocation fast path.
+///
+/// `cursor` and `limit` point directly at the current mutator's Immix
+/// `BumpPointer`. They are thread-affine and remain stable for the lifetime of
+/// this `Mutator`; MMTk slow paths may change the values stored in those words.
+#[derive(Clone, Copy, Debug)]
+pub struct FastAllocationInfo {
+    pub cursor: *mut usize,
+    pub limit: *mut usize,
+    pub bytes: usize,
+    pub alignment: usize,
 }
 
 impl Mutator {
@@ -764,6 +785,126 @@ impl Mutator {
             .fetch_add(std::mem::take(&mut self.local_barriers), Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    fn maybe_collect_for_external_pressure(&mut self) {
+        let threshold = self.gc.config.external_gc_threshold;
+        if threshold == 0 {
+            return;
+        }
+        let epoch = self.gc.external_epoch.load(Ordering::Relaxed);
+        if epoch == self.seen_external_epoch {
+            return;
+        }
+        self.seen_external_epoch = epoch;
+        let external = self.gc.counters.external_bytes.load(Ordering::Relaxed);
+        let baseline = self.gc.external_at_gc.load(Ordering::Relaxed);
+        if external.saturating_sub(baseline) >= threshold {
+            // Native buffers can dwarf their small GC owners. Nursery-only
+            // collections would never reclaim dead mature buffer owners.
+            self.collect_full();
+            self.seen_external_epoch = self.gc.external_epoch.load(Ordering::Relaxed);
+        }
+    }
+
+    /// Return direct pointers to the default Immix allocator's current TLAB
+    /// cursor and limit for a fixed-size allocation. Generated code may use
+    /// these pointers for the same bump-pointer fast path implemented by
+    /// `ImmixAllocator::alloc`; when the range does not fit it must fall back to
+    /// the ordinary allocating helper.
+    ///
+    /// This intentionally uses the typed allocator API already used by
+    /// `allocate_fixed_uninitialized`, rather than depending on MMTk layout
+    /// offsets or `AllocatorInfo`.
+    #[inline]
+    pub fn fixed_fast_allocation_info<const PAYLOAD_BYTES: usize>(&mut self) -> Option<FastAllocationInfo> {
+        let bytes = size_of::<Header>()
+            .checked_add(PAYLOAD_BYTES)?
+            .checked_add(WORD - 1)?
+            & !(WORD - 1);
+        if bytes > self.max_non_los
+            || !MAX_ALIGNMENT.is_power_of_two()
+            || <Binding as vm::VMBinding>::ALIGNMENT_VALUE != 0
+            || <Binding as vm::VMBinding>::USE_ALLOCATION_OFFSET
+        {
+            return None;
+        }
+
+        let context = unsafe { self.pointer.as_mut() };
+        let allocator = unsafe {
+            context.allocator_impl_mut_for_semantic::<ImmixAllocator<Binding>>(
+                AllocationSemantics::Default,
+            )
+        };
+
+        // MMTk's Address is repr(transparent) over usize and BumpPointer keeps
+        // cursor/limit as stable fields in the thread-affine Immix allocator.
+        debug_assert_eq!(size_of::<Address>(), size_of::<usize>());
+        debug_assert_eq!(align_of::<Address>(), align_of::<usize>());
+        let cursor = std::ptr::addr_of_mut!(allocator.bump_pointer.cursor).cast::<usize>();
+        let limit = std::ptr::addr_of_mut!(allocator.bump_pointer.limit).cast::<usize>();
+
+        Some(FastAllocationInfo {
+            cursor,
+            limit,
+            bytes,
+            alignment: MAX_ALIGNMENT,
+        })
+    }
+
+    /// Complete a fixed-size allocation whose raw address has already been
+    /// reserved by generated code from this mutator's Immix TLAB. This function
+    /// performs no allocation and no safepoint.
+    ///
+    /// # Safety
+    /// `address` must be the exact aligned object start reserved from this
+    /// mutator's current default Immix bump pointer, and the caller must reserve
+    /// exactly the byte count returned by `fixed_fast_allocation_info`. No
+    /// safepoint may occur between advancing the cursor and this call.
+    #[inline(always)]
+    pub unsafe fn finish_fast_fixed_uninitialized<const PAYLOAD_BYTES: usize>(
+        &mut self,
+        descriptor: &'static Descriptor,
+        address: usize,
+    ) -> Object {
+        self.check_running();
+        let bytes = size_of::<Header>()
+            .checked_add(PAYLOAD_BYTES)
+            .and_then(|n| n.checked_add(WORD - 1))
+            .expect("allocation size overflow")
+            & !(WORD - 1);
+        debug_assert!(bytes <= self.max_non_los);
+        debug_assert!(address != 0);
+        debug_assert!(address.is_multiple_of(MAX_ALIGNMENT));
+
+        let raw = unsafe { Address::from_usize(address) };
+        let object = Object(
+            ObjectReference::from_raw_address(raw).expect("null fast-path allocation"),
+        );
+        unsafe {
+            ptr::write(
+                raw.to_mut_ptr::<Header>(),
+                Header {
+                    forwarding: AtomicUsize::new(0),
+                    bytes,
+                    payload_bytes: PAYLOAD_BYTES,
+                    descriptor,
+                    external_bytes: AtomicUsize::new(0),
+                },
+            );
+        }
+
+        let context = unsafe { self.pointer.as_mut() };
+        mm::post_alloc(context, object.0, bytes, AllocationSemantics::Default);
+        if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
+            unsafe { &mut *self.record.tracked.get() }.push(Tracked {
+                object,
+                finalized: false,
+            });
+        }
+        self.local_bytes = self.local_bytes.saturating_add(bytes as u64);
+        object
+    }
+
     /// Allocates a zeroed payload and publishes a fully initialized header.
     /// # Safety
     /// All existing live objects must be rooted before this call. Custom layouts
@@ -790,6 +931,99 @@ impl Mutator {
         unsafe { self.allocate_impl::<false>(descriptor, payload_bytes) }
     }
 
+    /// Fixed-size, uninitialized allocation fast path for VM payloads whose
+    /// descriptor/layout and payload size are compile-time constants.
+    ///
+    /// This keeps the same MMTk allocation/post-allocation protocol as
+    /// `allocate_uninitialized`, but removes repeated runtime layout validation,
+    /// LOS selection and size arithmetic from the hot path. The concrete Immix
+    /// allocator still owns its bump-pointer/hole slow paths.
+    ///
+    /// # Safety
+    /// `PAYLOAD_BYTES` must exactly match the initialized payload type and the
+    /// descriptor must be valid for that payload. All existing live references
+    /// must already be rooted. The caller must fully initialize the payload before
+    /// any further safepoint or publication.
+    #[inline(always)]
+    pub unsafe fn allocate_fixed_uninitialized<const PAYLOAD_BYTES: usize>(
+        &mut self,
+        descriptor: &'static Descriptor,
+    ) -> Object {
+        self.safepoint();
+        self.maybe_collect_for_external_pressure();
+
+        let bytes = size_of::<Header>()
+            .checked_add(PAYLOAD_BYTES)
+            .and_then(|n| n.checked_add(WORD - 1))
+            .expect("allocation size overflow")
+            & !(WORD - 1);
+
+        // The fixed path is intended for compact VM objects. Keep correctness if
+        // a caller instantiates it for a payload that crosses the LOS threshold.
+        if bytes > self.max_non_los {
+            return unsafe { self.allocate_impl::<false>(descriptor, PAYLOAD_BYTES) };
+        }
+
+        #[cfg(debug_assertions)]
+        match &descriptor.trace {
+            TraceLayout::Fields(fields) => {
+                for field in *fields {
+                    debug_assert!(field.offset.is_multiple_of(WORD));
+                    debug_assert!(
+                        field
+                            .offset
+                            .checked_add(WORD)
+                            .is_some_and(|n| n <= PAYLOAD_BYTES)
+                    );
+                }
+            }
+            TraceLayout::Words { offset, .. } => {
+                debug_assert!(offset.is_multiple_of(WORD) && *offset <= PAYLOAD_BYTES);
+                debug_assert!((PAYLOAD_BYTES - offset).is_multiple_of(WORD));
+            }
+            _ => {}
+        }
+
+        let context = unsafe { self.pointer.as_mut() };
+        let address = unsafe {
+            context
+                .allocator_impl_mut_for_semantic::<ImmixAllocator<Binding>>(
+                    AllocationSemantics::Default,
+                )
+                .alloc(bytes, MAX_ALIGNMENT, 0)
+        };
+        debug_assert!(!address.is_zero(), "MMTk returned a null allocation");
+        let object = Object(ObjectReference::from_raw_address(address).unwrap());
+        unsafe {
+            ptr::write(
+                address.to_mut_ptr::<Header>(),
+                Header {
+                    forwarding: AtomicUsize::new(0),
+                    bytes,
+                    payload_bytes: PAYLOAD_BYTES,
+                    descriptor,
+                    external_bytes: AtomicUsize::new(0),
+                },
+            );
+        }
+        mm::post_alloc(
+            context,
+            object.0,
+            bytes,
+            AllocationSemantics::Default,
+        );
+        if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
+            // SAFETY: only this thread mutates its record while Running. GC
+            // drains the vector only after all Running mutators have parked.
+            unsafe { &mut *self.record.tracked.get() }.push(Tracked {
+                object,
+                finalized: false,
+            });
+        }
+        self.local_bytes = self.local_bytes.saturating_add(bytes as u64);
+        object
+    }
+
     #[inline(always)]
     unsafe fn allocate_impl<const ZERO: bool>(
         &mut self,
@@ -797,15 +1031,7 @@ impl Mutator {
         payload_bytes: usize,
     ) -> Object {
         self.safepoint();
-        let external = self.gc.counters.external_bytes.load(Ordering::Relaxed);
-        let baseline = self.gc.external_at_gc.load(Ordering::Relaxed);
-        if self.gc.config.external_gc_threshold != 0
-            && external.saturating_sub(baseline) >= self.gc.config.external_gc_threshold
-        {
-            // Native buffers can dwarf their small GC owners. Nursery-only
-            // collections would never reclaim dead mature buffer owners.
-            self.collect_full();
-        }
+        self.maybe_collect_for_external_pressure();
         match &descriptor.trace {
             TraceLayout::Fields(fields) => {
                 for field in *fields {
@@ -961,6 +1187,9 @@ impl Mutator {
                 .counters
                 .external_bytes
                 .fetch_sub(old - bytes, Ordering::Relaxed);
+        }
+        if bytes != old {
+            self.gc.external_epoch.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

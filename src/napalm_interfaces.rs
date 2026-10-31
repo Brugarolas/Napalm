@@ -1,5 +1,6 @@
 //! Persistent structural contracts. Plans are validated before installation;
-//! contracts contain no managed references and move/die with their owner in GC.
+//! contracts contain no managed references and live in the stable handle sidecar.
+//! Handle reclamation drops the sidecar vector together with the managed owner.
 use super::*;
 
 pub(super) const TYPE_ERROR: &str = "Structural type error: ";
@@ -10,19 +11,17 @@ fn mismatch(path: &str, expected: &Type) -> RuntimeError {
 
 impl Heap {
     pub(super) fn has_contract(&self, value: Value) -> bool {
-        self.object(value)
-            .is_some_and(|o| unsafe { managed_object(o) }.contracts.is_some())
+        value
+            .heap_handle()
+            .is_some_and(|handle| self.handle_table.contracts(handle).is_some())
     }
 
     pub(super) fn interface_matches(&self, value: Value, expected: &Type) -> bool {
         // A speculative guard may expose Interface-typed SSA values only when
         // a permanent contract already exists, not merely a matching shape.
-        self.object(value).is_some_and(|object| {
-            unsafe { managed_object(object) }
-                .contracts
-                .as_ref()
-                .is_some_and(|contracts| contracts.contains(expected))
-        })
+        value
+            .heap_handle()
+            .is_some_and(|handle| self.handle_table.contract_contains(handle, expected))
     }
 
     fn plan_contract(
@@ -190,10 +189,7 @@ impl Heap {
             };
             let (handle, shape, already_installed) = {
                 let managed = unsafe { managed_object(object) };
-                let installed = managed
-                    .contracts
-                    .as_ref()
-                    .is_some_and(|contracts| contracts.contains(&ty));
+                let installed = self.handle_table.contract_contains(managed.handle, &ty);
                 let shape = match &managed.object {
                     HeapObject::Map(map) => map.shaped().map(|(shape, _)| shape),
                     _ => None,
@@ -213,10 +209,7 @@ impl Heap {
             });
             let object = self.object(value).expect("validated contract owner");
             let managed = unsafe { managed_object_mut(object) };
-            managed
-                .contracts
-                .get_or_insert_with(|| Box::new(Vec::new()))
-                .push(ty);
+            self.handle_table.stage_contract(handle, ty);
             if let HeapObject::Map(map) = &mut managed.object {
                 match typed_shape {
                     Some(Some(typed_shape)) => {
@@ -232,11 +225,11 @@ impl Heap {
             // Contract installation changes both write validity and, for maps,
             // the shape id carrying immutable slot type facts. Publish both to
             // already-compiled/native tracing code before returning.
+            self.handle_table.refresh(handle, object, &managed.object);
             handles()
                 .entry(handle)
                 .has_contract
-                .store(1, Ordering::Relaxed);
-            self.handle_table.refresh(handle, &managed.object);
+                .store(1, Ordering::Release);
             let bytes = external_bytes_for(&managed.object);
             self.set_external_bytes(value, bytes);
         }
@@ -323,11 +316,8 @@ impl Heap {
                 _ => None,
             }
         });
-        let contracts = unsafe { managed_object(object) }
-            .contracts
-            .as_ref()
-            .map(|contracts| contracts.as_ref().clone())
-            .unwrap_or_default();
+        let handle = unsafe { managed_object(object) }.handle;
+        let contracts = self.handle_table.cloned_contracts(handle);
         if contracts.is_empty() {
             return Ok(());
         }
@@ -396,7 +386,8 @@ impl Heap {
             return Ok(());
         };
         let mut plan = Vec::new();
-        let Some(contracts) = &unsafe { managed_object(object) }.contracts else {
+        let handle = unsafe { managed_object(object) }.handle;
+        let Some(contracts) = self.handle_table.contracts(handle) else {
             return Ok(());
         };
         for contract in contracts.iter() {
