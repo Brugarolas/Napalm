@@ -52,6 +52,7 @@ ui_id!(UiThemeId);
 ui_id!(UiStyleSheetId);
 ui_id!(UiStyleRuleId);
 ui_id!(UiStyleTokenId);
+ui_id!(UiStaticStyleId);
 ui_id!(UiResourceId);
 ui_id!(UiAnimationId);
 ui_id!(UiCanvasProgramId);
@@ -79,6 +80,8 @@ pub struct UiProgram {
     pub themes: Vec<UiTheme>,
     pub style_sheets: Vec<UiStyleSheet>,
     pub style_tokens: Vec<UiStyleToken>,
+    /// Canonical, pre-resolved static style patches produced by the UI optimizer.
+    pub static_styles: Vec<UiStaticStyle>,
     pub resources: Vec<UiResource>,
     pub animations: Vec<UiAnimation>,
     pub canvas_programs: Vec<UiCanvasProgram>,
@@ -270,6 +273,9 @@ pub struct UiBinding {
     pub equality: UiEqualityPolicy,
     pub scheduling: UiBindingScheduling,
     pub flags: UiBindingFlags,
+    /// Optional compile-time value discovered by lowering/WIR constant propagation.
+    /// UI passes consume this without evaluating arbitrary WIR themselves.
+    pub constant: Option<UiConstantValue>,
     pub source: SourceSpan,
 }
 
@@ -341,6 +347,53 @@ pub enum UiValueType {
     Node,
     List(Box<UiValueType>),
     Any,
+}
+
+/// Backend-neutral constants that may be attached to a `UiBinding` after WIR
+/// constant propagation. Keeping these in UI IR lets structural/style passes fold
+/// conditions without embedding or re-interpreting WIR.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiConstantValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(StringId),
+    Color(UiColorRef),
+    Background(UiBackground),
+    Length(UiLength),
+    Padding(UiPadding),
+    Border(UiBorder),
+    Shadow(UiShadow),
+    Radius(UiRadius),
+    Transform(UiTransform),
+    Font(UiFont),
+    Resource(UiResourceId),
+    Theme(UiThemeId),
+    Node(UiNodeId),
+    Runtime(UiRuntimeValue),
+}
+
+impl UiConstantValue {
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            Self::Runtime(UiRuntimeValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_runtime(&self) -> Option<UiRuntimeValue> {
+        match self {
+            Self::Null => Some(UiRuntimeValue::Null),
+            Self::Bool(value) => Some(UiRuntimeValue::Bool(*value)),
+            Self::Number(value) => Some(UiRuntimeValue::Number(*value)),
+            Self::String(value) => Some(UiRuntimeValue::String(*value)),
+            Self::Runtime(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1256,6 +1309,9 @@ pub struct UiComponentInstanceNode {
     pub component: UiComponentId,
     pub props: Vec<(UiPropertyId, UiBindingId)>,
     pub slots: Vec<(UiSlotId, UiNodeId)>,
+    /// Stable fingerprint of constant props/slots, populated by
+    /// `ComponentSpecialization`. Backends may cache a specialized widget tree.
+    pub specialization_key: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1289,8 +1345,18 @@ pub struct UiForEachNode {
     pub item_local: UiLocalId,
     pub index_local: UiLocalId,
     pub key_function: Option<FuncId>,
+    /// Canonical reconciliation policy selected by `KeyedLoopCanonicalization`.
+    pub key_strategy: UiLoopKeyStrategy,
     pub template: UiNodeId,
     pub empty: Option<UiNodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum UiLoopKeyStrategy {
+    Explicit(FuncId),
+    TemplateKey,
+    #[default]
+    Index,
 }
 
 #[derive(Clone, Debug)]
@@ -1486,7 +1552,7 @@ impl Default for UiTransform {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiTextFormat {
     pub width: UiValue<UiLength>,
     pub height: UiValue<UiLength>,
@@ -1976,7 +2042,7 @@ pub enum UiA11yAction {
 // Resources
 // =============================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiResource {
     pub id: UiResourceId,
     pub name: Option<StringId>,
@@ -1995,7 +2061,7 @@ pub enum UiResourceKind {
     Binary,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiResourceSource {
     Path(StringId),
     Url(StringId),
@@ -2105,6 +2171,8 @@ pub struct UiStyleToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiStyleLiteral {
+    /// Alias to another token. `ResolveStaticTokens` flattens alias chains.
+    Token(UiStyleTokenId),
     Bool(bool),
     Number(f64),
     String(StringId),
@@ -2122,6 +2190,9 @@ pub enum UiStyleLiteral {
 pub struct UiStyleSheet {
     pub id: UiStyleSheetId,
     pub name: Option<StringId>,
+    /// Component that owns binding IDs referenced by declarations. `None` marks
+    /// a reusable/global sheet whose declarations must be binding-free.
+    pub owner: Option<UiComponentId>,
     pub rules: Vec<UiStyleRule>,
 }
 
@@ -2273,19 +2344,37 @@ pub enum UiWidgetTag {
     Custom,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiNodeStyle {
     pub inline: UiStylePatch,
+    /// Fully static cascade result. Dynamic pseudo/media rules remain below.
+    pub resolved_static: Option<UiStaticStyleId>,
+    /// Static transition declarations selected by the precomputed cascade.
+    pub static_transitions: Vec<UiTransition>,
+    /// Structurally matched rules that still require runtime pseudo/media checks.
+    pub dynamic_rules: Vec<UiStyleRuleRef>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UiStyleRuleRef {
+    pub sheet: UiStyleSheetId,
+    pub rule: UiStyleRuleId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiStaticStyle {
+    pub id: UiStaticStyleId,
+    pub patch: UiStylePatch,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiStylePatch {
     pub common: UiCommonStylePatch,
     pub text: UiTextStylePatch,
     pub widget: Option<UiWidgetStylePatch>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiCommonStylePatch {
     pub background: Option<UiOptionalStyleValue<UiBackground>>,
     pub foreground: Option<UiValue<UiColorRef>>,
@@ -2297,7 +2386,7 @@ pub struct UiCommonStylePatch {
     pub snap: Option<UiValue<bool>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTextStylePatch {
     pub color: Option<UiOptionalStyleValue<UiColorRef>>,
     pub font: Option<UiValue<UiFont>>,
@@ -2315,7 +2404,7 @@ pub enum UiOptionalStyleValue<T> {
     Value(UiValue<T>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiWidgetStylePatch {
     Application(UiApplicationStylePatch),
     Container(UiContainerStylePatch),
@@ -2340,13 +2429,13 @@ pub enum UiWidgetStylePatch {
     Markdown(UiMarkdownStylePatch),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiApplicationStylePatch {
     pub background_color: Option<UiValue<UiColorRef>>,
     pub text_color: Option<UiValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiContainerStylePatch {
     pub text_color: Option<UiOptionalStyleValue<UiColorRef>>,
     pub background: Option<UiOptionalStyleValue<UiBackground>>,
@@ -2356,13 +2445,13 @@ pub struct UiContainerStylePatch {
 }
 
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiFloatStylePatch {
     pub shadow: Option<UiValue<UiShadow>>,
     pub shadow_border_radius: Option<UiValue<UiRadius>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiButtonStylePatch {
     pub background: Option<UiOptionalStyleValue<UiBackground>>,
     pub text_color: Option<UiValue<UiColorRef>>,
@@ -2371,7 +2460,7 @@ pub struct UiButtonStylePatch {
     pub snap: Option<UiValue<bool>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiCheckboxStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub icon_color: Option<UiValue<UiColorRef>>,
@@ -2379,7 +2468,7 @@ pub struct UiCheckboxStylePatch {
     pub text_color: Option<UiOptionalStyleValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiRadioStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub dot_color: Option<UiValue<UiColorRef>>,
@@ -2388,7 +2477,7 @@ pub struct UiRadioStylePatch {
     pub text_color: Option<UiOptionalStyleValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTogglerStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub background_border_width: Option<UiValue<f32>>,
@@ -2401,12 +2490,12 @@ pub struct UiTogglerStylePatch {
     pub padding_ratio: Option<UiValue<f32>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTextWidgetStylePatch {
     pub color: Option<UiOptionalStyleValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTextInputStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub border: Option<UiValue<UiBorder>>,
@@ -2416,7 +2505,7 @@ pub struct UiTextInputStylePatch {
     pub selection: Option<UiValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTextEditorStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub border: Option<UiValue<UiBorder>>,
@@ -2425,7 +2514,7 @@ pub struct UiTextEditorStylePatch {
     pub selection: Option<UiValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiPickListStylePatch {
     pub text_color: Option<UiValue<UiColorRef>>,
     pub placeholder_color: Option<UiValue<UiColorRef>>,
@@ -2434,7 +2523,7 @@ pub struct UiPickListStylePatch {
     pub border: Option<UiValue<UiBorder>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiMenuStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub border: Option<UiValue<UiBorder>>,
@@ -2444,13 +2533,13 @@ pub struct UiMenuStylePatch {
     pub shadow: Option<UiValue<UiShadow>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiSliderStylePatch {
     pub rail: Option<UiSliderRailStyle>,
     pub handle: Option<UiSliderHandleStyle>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiSliderRailStyle {
     pub filled: UiValue<UiBackground>,
     pub unfilled: UiValue<UiBackground>,
@@ -2458,7 +2547,7 @@ pub struct UiSliderRailStyle {
     pub border: UiValue<UiBorder>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiSliderHandleStyle {
     pub shape: UiValue<UiSliderHandleShape>,
     pub background: UiValue<UiBackground>,
@@ -2472,7 +2561,7 @@ pub enum UiSliderHandleShape {
     Rectangle { width: f32, radius: UiRadius },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiScrollableStylePatch {
     pub container: Option<UiContainerStylePatch>,
     pub vertical_rail: Option<UiScrollRailStyle>,
@@ -2481,34 +2570,34 @@ pub struct UiScrollableStylePatch {
     pub auto_scroll: Option<UiAutoScrollStyle>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiScrollRailStyle {
     pub background: Option<UiValue<UiBackground>>,
     pub border: UiValue<UiBorder>,
     pub scroller: UiScrollerStyle,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiScrollerStyle {
     pub background: UiValue<UiBackground>,
     pub border: UiValue<UiBorder>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiAutoScrollStyle {
     pub background: UiValue<UiBackground>,
     pub border: UiValue<UiBorder>,
     pub shadow: UiValue<UiShadow>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiProgressBarStylePatch {
     pub background: Option<UiValue<UiBackground>>,
     pub bar: Option<UiValue<UiBackground>>,
     pub border: Option<UiValue<UiBorder>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiRuleStylePatch {
     pub color: Option<UiValue<UiColorRef>>,
     pub radius: Option<UiValue<UiRadius>>,
@@ -2524,43 +2613,43 @@ pub enum UiRuleFillMode {
     AsymmetricPadding { start: f32, end: f32 },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiSvgStylePatch {
     pub color: Option<UiOptionalStyleValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiPaneGridStylePatch {
     pub hovered_region: Option<UiPaneRegionStyle>,
     pub picked_split: Option<UiPaneLineStyle>,
     pub hovered_split: Option<UiPaneLineStyle>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiPaneRegionStyle {
     pub background: UiValue<UiBackground>,
     pub border: UiValue<UiBorder>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiPaneLineStyle {
     pub color: UiValue<UiColorRef>,
     pub width: UiValue<f32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiTableStylePatch {
     pub separator_x: Option<UiValue<UiBackground>>,
     pub separator_y: Option<UiValue<UiBackground>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiQrCodeStylePatch {
     pub cell: Option<UiValue<UiColorRef>>,
     pub background: Option<UiValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiMarkdownStylePatch {
     pub font: Option<UiValue<UiFont>>,
     pub inline_code_background: Option<UiValue<UiBackground>>,
@@ -2571,7 +2660,7 @@ pub struct UiMarkdownStylePatch {
     pub link_color: Option<UiValue<UiColorRef>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiTransition {
     pub property: UiAnimatableProperty,
     pub duration_ms: u32,
@@ -2733,7 +2822,7 @@ pub enum UiAnimationTrigger {
     Mount,
     Unmount,
     State(UiPseudoClass),
-    Binding(UiBindingId),
+    Binding { component: UiComponentId, binding: UiBindingId },
     Event(UiEventKind),
 }
 
@@ -2746,18 +2835,18 @@ pub struct UiAnimationTrack {
 
 #[derive(Clone, Debug)]
 pub enum UiAnimationTarget {
-    Node(UiNodeId),
+    Node { component: UiComponentId, node: UiNodeId },
     Selector(UiSelector),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiKeyframe {
     pub offset: f32,
     pub value: UiAnimatedValue,
     pub easing: Option<UiEasing>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiAnimatedValue {
     Number(f32),
     Color(UiColor),
@@ -3047,6 +3136,18 @@ impl UiProgram {
             }
         }
 
+        for sheet in &self.style_sheets {
+            if let Some(owner) = sheet.owner {
+                if self.component(owner).is_none() {
+                    errors.push(UiVerifyError {
+                        component: Some(owner),
+                        node: None,
+                        message: format!("style sheet {:?} has invalid owner {owner:?}", sheet.id),
+                    });
+                }
+            }
+        }
+
         for (index, resource) in self.resources.iter().enumerate() {
             if resource.id.0 as usize != index {
                 errors.push(UiVerifyError {
@@ -3068,6 +3169,43 @@ impl UiProgram {
                     message: format!("style-token arena index {index} does not match {:?}", token.id),
                 });
             }
+            if let UiStyleLiteral::Token(target) = &token.value {
+                if self.style_tokens.get(target.0 as usize).is_none() {
+                    errors.push(UiVerifyError {
+                        component: None,
+                        node: None,
+                        message: format!("style token {:?} references invalid token {target:?}", token.id),
+                    });
+                }
+            }
+        }
+
+        for (index, style) in self.static_styles.iter().enumerate() {
+            if style.id.0 as usize != index {
+                errors.push(UiVerifyError {
+                    component: None,
+                    node: None,
+                    message: format!("static-style arena index {index} does not match {:?}", style.id),
+                });
+            }
+        }
+
+        for token in &self.style_tokens {
+            let mut seen = std::collections::HashSet::new();
+            let mut current = token.id;
+            loop {
+                if !seen.insert(current) {
+                    errors.push(UiVerifyError {
+                        component: None,
+                        node: None,
+                        message: format!("style token alias cycle reaches {current:?}"),
+                    });
+                    break;
+                }
+                let Some(entry) = self.style_tokens.get(current.0 as usize) else { break; };
+                let UiStyleLiteral::Token(next) = &entry.value else { break; };
+                current = *next;
+            }
         }
 
         for (index, animation) in self.animations.iter().enumerate() {
@@ -3077,6 +3215,38 @@ impl UiProgram {
                     node: None,
                     message: format!("animation arena index {index} does not match {:?}", animation.id),
                 });
+            }
+            if let UiAnimationTrigger::Binding { component, binding } = &animation.trigger {
+                match self.component(*component) {
+                    Some(owner) if owner.binding(*binding).is_some() => {}
+                    Some(_) => errors.push(UiVerifyError {
+                        component: Some(*component),
+                        node: None,
+                        message: format!("animation {:?} references invalid binding {binding:?}", animation.id),
+                    }),
+                    None => errors.push(UiVerifyError {
+                        component: Some(*component),
+                        node: None,
+                        message: format!("animation {:?} references invalid component {component:?}", animation.id),
+                    }),
+                }
+            }
+            for track in &animation.tracks {
+                if let UiAnimationTarget::Node { component, node } = &track.target {
+                    match self.component(*component) {
+                        Some(owner) if owner.node(*node).is_some() => {}
+                        Some(_) => errors.push(UiVerifyError {
+                            component: Some(*component),
+                            node: Some(*node),
+                            message: format!("animation {:?} references invalid node {node:?}", animation.id),
+                        }),
+                        None => errors.push(UiVerifyError {
+                            component: Some(*component),
+                            node: Some(*node),
+                            message: format!("animation {:?} references invalid component {component:?}", animation.id),
+                        }),
+                    }
+                }
             }
         }
 
@@ -3119,12 +3289,18 @@ impl UiProgram {
 
         for theme in &self.themes {
             for &sheet in &theme.style_sheets {
-                if self.style_sheets.get(sheet.0 as usize).is_none() {
-                    errors.push(UiVerifyError {
+                match self.style_sheets.get(sheet.0 as usize) {
+                    None => errors.push(UiVerifyError {
                         component: None,
                         node: None,
                         message: format!("theme {:?} references invalid style sheet {sheet:?}", theme.id),
-                    });
+                    }),
+                    Some(sheet_ir) if sheet_ir.owner.is_some() => errors.push(UiVerifyError {
+                        component: sheet_ir.owner,
+                        node: None,
+                        message: format!("theme {:?} references component-owned style sheet {sheet:?}", theme.id),
+                    }),
+                    Some(_) => {}
                 }
             }
         }
@@ -3160,6 +3336,11 @@ impl UiProgram {
     #[inline]
     pub fn resource(&self, id: UiResourceId) -> Option<&UiResource> {
         self.resources.get(id.0 as usize).filter(|resource| resource.id == id)
+    }
+
+    #[inline]
+    pub fn static_style(&self, id: UiStaticStyleId) -> Option<&UiStaticStyle> {
+        self.static_styles.get(id.0 as usize).filter(|style| style.id == id)
     }
 }
 
@@ -3267,6 +3448,22 @@ fn verify_component(program: &UiProgram, component: &UiComponent, errors: &mut V
             }
         }
 
+        if let Some(style) = node.style.resolved_static {
+            if program.static_style(style).is_none() {
+                fail(errors, Some(node.id), format!("invalid resolved static style {style:?}"));
+            }
+        }
+        for rule_ref in &node.style.dynamic_rules {
+            let valid = program
+                .style_sheets
+                .get(rule_ref.sheet.0 as usize)
+                .and_then(|sheet| sheet.rules.get(rule_ref.rule.0 as usize))
+                .is_some_and(|rule| rule.id == rule_ref.rule);
+            if !valid {
+                fail(errors, Some(node.id), format!("invalid dynamic style rule {:?}:{:?}", rule_ref.sheet, rule_ref.rule));
+            }
+        }
+
         for &handler in &node.handlers {
             if component.handler(handler).is_none() {
                 fail(errors, Some(node.id), format!("invalid handler {handler:?}"));
@@ -3296,6 +3493,18 @@ fn verify_component(program: &UiProgram, component: &UiComponent, errors: &mut V
             );
         }
         verify_dependencies(component, &binding.dependencies, errors);
+        match binding.constant.as_ref() {
+            Some(UiConstantValue::Node(node)) if component.node(*node).is_none() => {
+                fail(errors, Some(*node), format!("binding {:?} has invalid constant node {node:?}", binding.id));
+            }
+            Some(UiConstantValue::Resource(resource)) if program.resource(*resource).is_none() => {
+                fail(errors, None, format!("binding {:?} has invalid constant resource {resource:?}", binding.id));
+            }
+            Some(UiConstantValue::Theme(theme)) if program.theme(*theme).is_none() => {
+                fail(errors, None, format!("binding {:?} has invalid constant theme {theme:?}", binding.id));
+            }
+            _ => {}
+        }
     }
 
     for computed in &component.computed {
@@ -3313,8 +3522,19 @@ fn verify_component(program: &UiProgram, component: &UiComponent, errors: &mut V
     }
 
     for &sheet in &component.style_sheets {
-        if program.style_sheets.get(sheet.0 as usize).is_none() {
-            fail(errors, None, format!("invalid style sheet {sheet:?}"));
+        match program.style_sheets.get(sheet.0 as usize) {
+            None => fail(errors, None, format!("invalid style sheet {sheet:?}")),
+            Some(sheet_ir) if sheet_ir.owner.is_some_and(|owner| owner != component.id) => {
+                fail(
+                    errors,
+                    None,
+                    format!(
+                        "style sheet {sheet:?} belongs to {:?}, not {:?}",
+                        sheet_ir.owner, component.id
+                    ),
+                );
+            }
+            Some(_) => {}
         }
     }
 }
@@ -3624,7 +3844,20 @@ fn verify_node_kind(
             }
         }
         UiNodeKind::Portal(portal) => {
-            push_node_ref_error(component, node.id, portal.content, "portal content", errors)
+            push_node_ref_error(component, node.id, portal.content, "portal content", errors);
+            if let UiPortalTarget::Window(window) = &portal.target {
+                if component
+                    .windows
+                    .get(window.0 as usize)
+                    .is_none_or(|candidate| candidate.id != *window)
+                {
+                    errors.push(UiVerifyError {
+                        component: Some(component.id),
+                        node: Some(node.id),
+                        message: format!("invalid portal target window {window:?}"),
+                    });
+                }
+            }
         }
         _ => {}
     }

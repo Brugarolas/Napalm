@@ -58,6 +58,8 @@ mod collection_ops;
 #[path = "napalm_interfaces.rs"]
 mod interfaces;
 use self::interfaces::h_bind_interface;
+#[path = "napalm_native.rs"]
+mod native_decorators;
 #[path = "napalm_function_jit.rs"]
 mod function_jit;
 use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
@@ -1902,6 +1904,10 @@ enum RuntimeEvent {
     ReactiveWatcher {
         callback: Value,
     },
+    NativeDecoratorFire {
+        state: Value,
+        token: u64,
+    },
 }
 
 impl RuntimeEvent {
@@ -1924,6 +1930,7 @@ impl RuntimeEvent {
                 if let Some(callback) = callback { visit(callback); }
             }
             RuntimeEvent::ReactiveWatcher { callback } => visit(callback),
+            RuntimeEvent::NativeDecoratorFire { state, .. } => visit(state),
         }
     }
 }
@@ -2066,6 +2073,8 @@ enum HeapObject {
     ModuleObject {
         module_slot: u32,
     },
+    /// Native decorator sidecar captured by decorator wrapper closures.
+    NativeDecorator(Box<native_decorators::NativeDecorator>),
 }
 
 // -----------------------------------------------------------------------------
@@ -2626,6 +2635,17 @@ fn visit_word(word: RegisterWord, visitor: &mut dyn FnMut(GcSlot)) {
     visit_value(Value::from_word(word), visitor);
 }
 
+unsafe fn trace_native_decorator(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::NativeDecorator(decorator) = &managed.object {
+        let visitor = std::cell::RefCell::new(visitor);
+        decorator.visit_references(
+            |value| visit_value(value, &mut **visitor.borrow_mut()),
+            |handle| visit_handle(handle, &mut **visitor.borrow_mut()),
+        );
+    }
+}
+
 unsafe fn trace_list(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
     if let HeapObject::List(values) = &managed.object {
@@ -2883,6 +2903,7 @@ gc_descriptor!(GC_PROMISE, "Napalm.Promise", GcTraceLayout::Custom(trace_promise
 gc_descriptor!(GC_RESPONSE, "Napalm.Response", GcTraceLayout::Custom(trace_response));
 gc_descriptor!(GC_ASYNC_TASK, "Napalm.AsyncTask", GcTraceLayout::Custom(trace_async_task));
 gc_descriptor!(GC_FIBER, "Napalm.Fiber", GcTraceLayout::Custom(trace_fiber));
+gc_descriptor!(GC_NATIVE_DECORATOR, "Napalm.NativeDecorator", GcTraceLayout::Custom(trace_native_decorator));
 
 #[inline(always)]
 fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
@@ -2910,6 +2931,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::AsyncTaskObject { .. } => &GC_ASYNC_TASK,
         HeapObject::FiberObject { .. } => &GC_FIBER,
         HeapObject::ModuleObject { .. } => &GC_MODULE,
+        HeapObject::NativeDecorator(_) => &GC_NATIVE_DECORATOR,
     }
 }
 
@@ -2966,6 +2988,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
             // while it has exclusive VM access. GC workers never call this helper.
             fiber_state_external_bytes(unsafe { state.get() })
         }
+        HeapObject::NativeDecorator(decorator) => decorator.external_bytes(),
         _ => 0,
     }
 }
@@ -3089,6 +3112,13 @@ fn collect_fiber_state_handles(
 
 fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
     match object {
+        HeapObject::NativeDecorator(decorator) => {
+            let roots = std::cell::RefCell::new(roots);
+            decorator.visit_references(
+                |value| push_value_handle(value, &mut roots.borrow_mut()),
+                |handle| roots.borrow_mut().push(handle),
+            );
+        }
         HeapObject::Proxy { target, handler } => {
             push_value_handle(*target, roots);
             push_value_handle(*handler, roots);
@@ -4220,6 +4250,26 @@ pub struct HostContext<'a> {
 }
 
 impl HostContext<'_> {
+    pub(crate) fn check_decorator_value(&self, value: Value, kind: &str) -> Result<Value, RuntimeError> {
+        let valid = match kind {
+            "class" => value.is_null() || matches!(self.heap.get(value), Some(HeapObject::ClassObject { .. })),
+            "function" => value.is_null() || matches!(self.heap.get(value), Some(HeapObject::Closure { .. })),
+            "decorator" => match self.heap.get(value) {
+                Some(HeapObject::Closure { .. }) => true,
+                Some(HeapObject::BuiltinClass { builtin }) => builtin.is_native_decorator(),
+                Some(HeapObject::NativeDecorator(decorator)) => decorator.is_configured(),
+                _ => false,
+            },
+            "initializer" => matches!(self.heap.get(value), Some(HeapObject::Closure { .. })),
+            _ => return Err(RuntimeError::new("invalid internal decorator validation kind")),
+        };
+        if valid {
+            Ok(value)
+        } else {
+            Err(RuntimeError::new(format!("invalid {kind} decorator value")))
+        }
+    }
+
     /// Keep `value` alive across subsequent HostContext allocations. Scalars are
     /// returned in a zero-cost guard with no collector registration.
     pub fn root(&mut self, value: Value) -> HostRoot {
@@ -4688,6 +4738,7 @@ impl HostContext<'_> {
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
+            Some(HeapObject::NativeDecorator(_)) => "<decorator>".into(),
             Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
             None => "<dead object>".to_owned(),
         }
@@ -5854,6 +5905,12 @@ pub enum NativeBuiltin {
     SystemOs,
     SystemArch,
     SystemGc,
+    DecoratorBuiltinCall(BuiltinId),
+    DecoratorApply,
+    DecoratorEnter,
+    DecoratorRun,
+    DecoratorStore,
+    DecoratorStoreList,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -5884,9 +5941,11 @@ pub enum BuiltinClass {
     /// Heap-backed JavaScript-style transparent proxy. Appended so Set and all
     /// previous receiver-class numeric identities remain stable.
     Proxy,
+    /// Configured native decorator factory result such as `debounce(100)`.
+    NativeDecorator,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 22;
+const BUILTIN_CLASS_COUNT: usize = 23;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -5912,6 +5971,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64),
         HeapObject::Proxy { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Proxy as u64),
+        HeapObject::NativeDecorator(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::NativeDecorator as u64),
         HeapObject::MapEntry { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapEntry as u64),
         HeapObject::MapKeys { .. } =>
@@ -6418,6 +6479,12 @@ struct FiberState {
     async_promise: Option<Value>,
     /// Promise whose settlement will make this execution runnable again.
     awaiting_promise: Option<Value>,
+    /// Raw bytecode pc of the pending `await`, used to locate a `try` handler
+    /// when the awaited Promise rejects.
+    await_raw_pc: u32,
+    /// The awaited Promise rejected inside a `try`; `error` holds the reason to
+    /// throw at the await site when this execution is scheduled again.
+    throw_on_resume: bool,
     /// Active dependency collectors for computed properties and watchers. Most
     /// fibers keep this empty; field handlers only inspect a single VM boolean
     /// unless reactive evaluation is actually running.
@@ -6441,6 +6508,8 @@ impl FiberState {
             suspend_dst: None,
             async_promise: None,
             awaiting_promise: None,
+            await_raw_pc: NO_INDEX,
+            throw_on_resume: false,
             reactive_stack: Vec::with_capacity(4),
             last_value: Value::NULL,
             error: Value::NULL,
@@ -6647,6 +6716,8 @@ pub struct Interpreter<'p> {
     /// Microtasks and timer deadlines. Runtime events hold managed Values and are
     /// therefore included in both active and persistent GC root snapshots.
     event_loop: NapalmEventLoop<RuntimeEvent>,
+    /// Prepared function indexes of the per-arity native decorator wrappers.
+    native_decorator_wrappers: Vec<u32>,
     /// Reactive support is opt-in per VM. Ordinary programs keep this false, so
     /// field loads/stores pay only one well-predicted branch and keep their native
     /// JIT fast paths. Registration invalidates old field-specialized traces once.
@@ -7113,6 +7184,7 @@ impl<'p> Interpreter<'p> {
             free_fibers: Vec::new(),
             ready_async: VecDeque::new(),
             event_loop: NapalmEventLoop::default(),
+            native_decorator_wrappers: Vec::new(),
             reactive_enabled,
             reactive_tracking_active: false,
             reactive_dependents: FastMap::default(),
@@ -8056,12 +8128,20 @@ impl<'p> Interpreter<'p> {
         &self,
         op: &PreparedOp,
     ) -> Option<(usize, PreparedExceptionHandler)> {
-        let fiber = self.fiber(self.current_fiber);
+        self.find_structured_handler_in(self.current_fiber, op.raw_pc)
+    }
+
+    fn find_structured_handler_in(
+        &self,
+        fiber: u32,
+        raw_pc: u32,
+    ) -> Option<(usize, PreparedExceptionHandler)> {
+        let fiber = self.fiber(fiber);
         if fiber.frames.is_empty() {
             return None;
         }
 
-        let mut probe_pc = op.raw_pc;
+        let mut probe_pc = raw_pc;
         for depth in (0..fiber.frames.len()).rev() {
             let frame = &fiber.frames[depth];
             let function = &self.prepared.functions[frame.function as usize];
@@ -8094,7 +8174,18 @@ impl<'p> Interpreter<'p> {
         thrown: Option<Value>,
         runtime_error: Option<RuntimeError>,
     ) -> bool {
-        let Some((target_depth, handler)) = self.find_structured_handler(op) else {
+        self.unwind_to_structured_handler_at(op.raw_pc, thrown, runtime_error)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unwind_to_structured_handler_at(
+        &mut self,
+        raw_pc: u32,
+        thrown: Option<Value>,
+        runtime_error: Option<RuntimeError>,
+    ) -> bool {
+        let Some((target_depth, handler)) = self.find_structured_handler_in(self.current_fiber, raw_pc) else {
             return false;
         };
 
@@ -8685,7 +8776,18 @@ impl<'p> Interpreter<'p> {
             let state = self.fiber_mut(id);
             state.status = FiberStatus::Running;
             state.awaiting_promise = None;
+            let rejection = std::mem::take(&mut state.throw_on_resume)
+                .then(|| (std::mem::replace(&mut state.error, Value::NULL), state.await_raw_pc));
             self.refresh_hot_frame();
+            if let Some((reason, raw_pc)) = rejection {
+                if !self.unwind_to_structured_handler_at(raw_pc, Some(reason), None) {
+                    self.fail_execution_from_promise(id, reason, false);
+                    if self.run_state == RunState::Failed {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             self.run_state = RunState::Running;
             return true;
         }
@@ -9181,9 +9283,23 @@ impl<'p> Interpreter<'p> {
                 let state = unsafe { cell.get() };
                 state.object == fiber_object && state.awaiting_promise == Some(promise)
             });
-        if valid {
-            self.reject_execution(fiber, reason);
+        if !valid {
+            return;
         }
+        let raw_pc = self.fiber(fiber).await_raw_pc;
+        if raw_pc != NO_INDEX && self.find_structured_handler_in(fiber, raw_pc).is_some() {
+            // Resume the execution by throwing at its `await`, so `try` can catch it.
+            self.heap.remember_if_reference(fiber_object, reason);
+            let state = self.fiber_mut(fiber);
+            state.error = reason;
+            state.throw_on_resume = true;
+            state.awaiting_promise = None;
+            state.suspend_dst = None;
+            state.status = FiberStatus::Ready;
+            self.ready_async.push_back(fiber);
+            return;
+        }
+        self.reject_execution(fiber, reason);
     }
 
     fn cancel_promise_waiter(
@@ -10417,6 +10533,9 @@ impl<'p> Interpreter<'p> {
             Some(HeapObject::FiberObject { .. }) | Some(HeapObject::AsyncTaskObject { .. }) => {
                 return Err(RuntimeError::new("Fibers/tasks cannot cross a concurrent boundary"));
             }
+            Some(HeapObject::NativeDecorator(_)) => {
+                return Err(RuntimeError::new("native decorators cannot cross a concurrent boundary"));
+            }
             Some(HeapObject::Response(_)) | Some(HeapObject::Headers(_)) => {
                 return Err(RuntimeError::new("HTTP Response/Headers objects cannot cross a concurrent boundary"));
             }
@@ -11319,6 +11438,9 @@ impl<'p> Interpreter<'p> {
             RuntimeEvent::PromiseWaiter { promise, waiter, outcome } => {
                 self.deliver_promise_waiter(promise, waiter, outcome);
             }
+            RuntimeEvent::NativeDecoratorFire { state, token } => {
+                self.fire_native_decorator(state, token, fired.id);
+            }
             RuntimeEvent::ReactiveWatcher { callback } => {
                 let Some(identity) = self.heap.identity(callback) else { return; };
                 let should_run = self
@@ -11486,7 +11608,10 @@ impl<'p> Interpreter<'p> {
                 self.advance(op);
             },
             PromiseState::Rejected(reason) => {
-                self.fail_awaited_promise(op, *reason, false);
+                let reason = *reason;
+                if !self.raise_value_exception(op, reason) {
+                    self.fail_awaited_promise(op, reason, false);
+                }
             }
             PromiseState::Cancelled(reason) => {
                 self.fail_awaited_promise(op, *reason, true);
@@ -11510,6 +11635,7 @@ impl<'p> Interpreter<'p> {
                 let state = self.fiber_mut(current);
                 state.status = FiberStatus::Suspended;
                 state.awaiting_promise = Some(promise);
+                state.await_raw_pc = op.raw_pc;
                 state.suspend_dst = Some(dst);
 
                 if !self.schedule_next_ready() {
@@ -13154,6 +13280,12 @@ impl Interpreter<'_> {
                     Err(error) => self.fail_at(op, error.message),
                 }
             }
+            NativeBuiltin::DecoratorBuiltinCall(builtin) => self.native_decorator_builtin_call(op, builtin, args),
+            NativeBuiltin::DecoratorApply => self.native_decorator_apply(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorEnter => self.native_decorator_enter(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorRun => self.native_decorator_run(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorStore => self.native_decorator_store(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorStoreList => self.native_decorator_store_list(op, Value::from_word(receiver), arg(0), arg(1)),
             NativeBuiltin::FetchCall => {
                 let request = self.parse_fetch_request(
                     arg(0),
@@ -13968,6 +14100,38 @@ impl Interpreter<'_> {
         self.run_state = RunState::Suspended;
     }
 
+    /// An uncaught throw inside an async task rejects the task's Promise instead
+    /// of terminating the VM, mirroring `finish_fiber` for normal returns.
+    fn reject_current_async_task(&mut self, current: u32, promise: Value, error: Value) {
+        self.reactive_finish_watcher_task(current);
+        {
+            self.heap.remember_if_reference(self.fiber(current).object, error);
+            let task = self.fiber_mut(current);
+            task.status = FiberStatus::Failed;
+            task.error = error;
+            task.awaiting_promise = None;
+            task.suspend_dst = None;
+            task.frames.clear();
+            task.memo_keys.clear();
+            task.register_top = 0;
+        }
+        if let Err(error) = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(error)) {
+            self.fail_terminal(error);
+            return;
+        }
+        if self.run_state == RunState::Failed || self.schedule_next_ready() {
+            return;
+        }
+        self.switch_current_fiber(0);
+        if self.fiber(0).status == FiberStatus::Done {
+            self.run_state = RunState::Returned;
+        } else {
+            self.result = self.fiber(0).awaiting_promise.unwrap_or(Value::NULL);
+            self.run_state = RunState::Suspended;
+        }
+        self.clear_hot_frame();
+    }
+
     fn abort_current_fiber(&mut self, op: &PreparedOp, error: Value) {
         let current = self.current_fiber;
         if current == 0 {
@@ -13989,6 +14153,10 @@ impl Interpreter<'_> {
         self.fiber_mut(current).suspend_dst = None;
         let link = self.fiber_mut(current).link.take();
         let Some(link) = link else {
+            if let Some(promise) = self.fiber(current).async_promise {
+                self.reject_current_async_task(current, promise, error);
+                return;
+            }
             self.fail_terminal(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
             return;
         };
@@ -15765,6 +15933,7 @@ impl Interpreter<'_> {
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module:{}>", self.program.metadata.string(self.modules[*module_slot as usize].name).unwrap_or("module")),
             Some(HeapObject::Cell(_)) => "<cell>".into(),
+            Some(HeapObject::NativeDecorator(_)) => "<decorator>".into(),
             None => "<invalid value>".into(),
         }
     }

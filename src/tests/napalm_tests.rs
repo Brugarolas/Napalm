@@ -42,6 +42,421 @@ fn napalm_destructuring_rejects_invalid_patterns_and_const_writes() {
 }
 
 #[test]
+fn napalm_decorators_apply_bottom_up_and_run_initializers() {
+    run_napalm(
+        r#"
+        const events = []
+        function mark(tag) {
+            return function (value, context) {
+                events.add(tag + ":" + context.kind + ":" + context.name)
+                context.addInitializer(() => events.add("init:" + tag + ":" + context.name))
+                return function (name) { return value(name) + "[" + tag + "]" }
+            }
+        }
+        @mark("top")
+        @mark("bottom")
+        function greet(name) { return "hi " + name }
+        const result = [greet("napalm"), events]
+    "#,
+        "[hi napalm[bottom][top], [bottom:function:greet, top:function:greet, init:bottom:greet, init:top:greet]]",
+    );
+}
+
+#[test]
+fn napalm_decorators_support_class_replacement_and_null_passthrough() {
+    run_napalm(
+        r#"
+        const events = []
+        class Wrapped {
+            value;
+            constructor() { this.value = "Sample:wrapped"; }
+        }
+        function keep(value, context) {
+            events.add("keep:" + context.kind + ":" + context.name)
+            context.addInitializer(() => events.add("init:" + context.name))
+            return null
+        }
+        function replace(value, context) {
+            return Wrapped
+        }
+        @keep
+        @replace
+        class Sample {
+            value;
+            constructor() { this.value = "original"; }
+        }
+        const instance = new Sample()
+        const result = [instance.value, events]
+    "#,
+        "[Sample:wrapped, [keep:class:Sample, init:Sample]]",
+    );
+}
+
+#[test]
+fn napalm_decorators_report_runtime_contract_errors() {
+    run_napalm(
+        r#"
+        let messages = []
+        function badResult(value, context) { return 1 }
+        let callback = () => null
+        function delayed(value, context) {
+            callback = context.addInitializer
+            return null
+        }
+        try {
+            @badResult
+            function nope() { return 1 }
+        } catch (e) {
+            messages.add(e)
+        }
+        @delayed
+        function ok() { return 2 }
+        try {
+            callback(() => 1)
+        } catch (e) {
+            messages.add(e)
+        }
+        const result = messages.count
+    "#,
+        "2",
+    );
+}
+
+#[test]
+fn napalm_decorators_example_covers_members_and_gc() {
+    run_napalm_checked(include_str!("..\\..\\scripts\\decorators.napalm"), "decorators-ok", true);
+}
+
+#[test]
+fn native_decorators_executable_example() {
+    run_napalm(include_str!("..\\..\\scripts\\native_decorators.napalm"), "native-decorators-ok");
+}
+
+#[test]
+fn native_decorators_cache_null_errors_and_full_argument_keys() {
+    run_napalm(r#"
+        let calls = 0;
+        @memoize
+        function empty(value) { calls++; return null; }
+        empty(1); empty(1);
+        @memoize
+        function pair(a, b) { calls++; return a + b; }
+        const values = [pair(1, 2), pair(2, 1), pair(1, 2), pair(0, -0), pair(-0, 0)];
+        let failures = 0;
+        @memoize
+        function retry(value) {
+            failures++;
+            if (failures === 1) throw "retry";
+            return value;
+        }
+        try { retry(5); } catch (error) {}
+        const retried = [retry(5), retry(5)];
+        const result = [calls, values, failures, retried];
+    "#, "[4, [3, 3, 3, 0, 0], 2, [5, 5]]");
+}
+
+#[test]
+fn native_decorators_cache_managed_arguments_results_and_recursive_calls() {
+    run_napalm(r#"
+        let calls = 0;
+        @memoize
+        function fib(value) {
+            calls++;
+            if (value < 2) return value;
+            return fib(value - 1) + fib(value - 2);
+        }
+        const answer = fib(20);
+        let objects = 0;
+        @memoize
+        function make(key) { objects++; return {key, values: [objects]}; }
+        let key: any = {name: "alive"};
+        const cached = make(key);
+        System.gc();
+        const again = make(key);
+        again.values.add(2);
+        key = null;
+        System.gc();
+        const result = [answer, calls, objects, cached.key.name, cached.values];
+    "#, "[6765, 21, 1, alive, [1, 2]]");
+}
+
+#[test]
+fn native_decorators_validate_durations_options_and_targets() {
+    run_napalm(r#"
+        let errors = 0;
+        try { @delay(-1) function bad() {} } catch (error) { errors++; }
+        try { @delay(0 / 0) function bad() {} } catch (error) { errors++; }
+        try { @debounce("slow") function bad() {} } catch (error) { errors++; }
+        try { @debounce(1, {leading: 1}) function bad() {} } catch (error) { errors++; }
+        try { @debounce(1, {trailing: "yes"}) function bad() {} } catch (error) { errors++; }
+        try { @debounce(1, {maxWait: -1}) function bad() {} } catch (error) { errors++; }
+        try { @throttle(1, {leading: false, trailing: false}) function bad() {} } catch (error) { errors++; }
+        try { @memoizeExpiring(-1) function bad() {} } catch (error) { errors++; }
+        try { @memoize class Bad {} } catch (error) { errors++; }
+        try { class Bad { @once value = 1; } } catch (error) { errors++; }
+        const result = errors;
+    "#, "10");
+}
+
+#[test]
+fn native_decorators_debounce_throttle_edges_and_async_adoption() {
+    run_napalm(r#"
+        let calls = 0;
+        @debounce(15, {leading: true, trailing: true})
+        function single(value) { calls++; return value; }
+        const first = single(1);
+        await first;
+        await Timer.delay(50);
+        const singleCalls = calls;
+        const next = [single(2), single(3), single(4)];
+        const both = await Promise.all(next);
+        await Timer.delay(50);
+        @throttle(15, {leading: false})
+        async function trailing(value) {
+            await Timer.delay(1);
+            return value * 2;
+        }
+        const pending = [trailing(2), trailing(4)];
+        const adopted = await Promise.all(pending);
+        let errors = 0;
+        @debounce(1)
+        function fail() { throw "failure"; }
+        try { await fail(); } catch (error) { errors++; }
+        const result = [singleCalls, calls, both, adopted, errors];
+    "#, "[1, 3, [2, 4, 4], [8, 8], 1]");
+}
+
+#[test]
+fn native_decorators_expiry_is_per_key_and_does_not_refresh_on_hit() {
+    run_napalm(r#"
+        let calls = 0;
+        @memoizeExpiring(200)
+        function value(key) { calls++; return calls; }
+        const first = value("a");
+        await Timer.delay(100);
+        const second = value("a");
+        const other = value("b");
+        await Timer.delay(130);
+        const expired = value("a");
+        const stillLive = value("b");
+        const result = [first, second, other, expired, stillLive, calls];
+    "#, "[1, 1, 2, 3, 2, 3]");
+}
+
+#[test]
+fn native_decorators_preserve_arity_stacking_and_rejected_promises() {
+    run_napalm(r#"
+        let calls = 0;
+        @memoize
+        function wide(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p) {
+            calls++;
+            return a + p;
+        }
+        const values = [wide(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16),
+            wide(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)];
+        let delayedCalls = 0;
+        @once
+        @delay(1)
+        function initialized(value) {
+            delayedCalls++;
+            return value;
+        }
+        const delayed = await Promise.all([initialized(4), initialized(9)]);
+        let rejectedCalls = 0;
+        @memoize
+        async function rejected(value) {
+            rejectedCalls++;
+            throw value;
+        }
+        let errors = 0;
+        try { await rejected("error"); } catch (error) { errors++; }
+        try { await rejected("error"); } catch (error) { errors++; }
+        const result = [wide.arity, calls, values, delayed, delayedCalls, rejectedCalls, errors];
+    "#, "[16, 1, [17, 17], [4, 4], 1, 1, 2]");
+}
+
+#[test]
+fn native_decorators_scheduled_arguments_remain_rooted_without_the_wrapper() {
+    run_napalm(r#"
+        let pending: any = null;
+        {
+            @delay(10)
+            function temporary(object) {
+                System.gc();
+                return object.value;
+            }
+            pending = temporary({value: ["retained", 42]});
+        }
+        System.gc();
+        const result = await pending;
+    "#, "[retained, 42]");
+}
+
+#[test]
+fn native_decorators_zero_ttl_null_once_and_primitive_key_types() {
+    run_napalm(r#"
+        let nullCalls = 0;
+        @once
+        function empty() { nullCalls++; return null; }
+        empty(); empty();
+        let ttlCalls = 0;
+        @memoizeExpiring(0)
+        function fresh() { ttlCalls++; return ttlCalls; }
+        const freshValues = [fresh(), fresh()];
+        let keyCalls = 0;
+        @memoize
+        function identify(value) { keyCalls++; return keyCalls; }
+        const values = [identify(1), identify("1"), identify(true), identify(null),
+            identify(1), identify("1"), identify(true), identify(null)];
+        const result = [nullCalls, ttlCalls, freshValues, keyCalls, values];
+    "#, "[1, 2, [1, 2], 4, [1, 2, 3, 4, 1, 2, 3, 4]]");
+}
+
+#[test]
+fn napalm_decorators_static_accessors_overloads_and_super() {
+    run_napalm(r#"
+        function method(value, context) {
+            return (receiver, amount) => value(receiver, amount) + 10;
+        }
+        function getter(value, context) { return (receiver) => value(receiver) + 1; }
+        function setter(value, context) { return (receiver, amount) => value(receiver, amount * 2); }
+        function keep(value, context) { return null; }
+        class Base {
+            @method
+            compute(amount) { return amount + 1; }
+        }
+        class Child extends Base {
+            @method
+            compute(amount) { return super.compute(amount) + 1; }
+        }
+        class Statics {
+            static amount = 3;
+            @getter
+            static get value() { return Statics.amount; }
+            @setter
+            static set value(amount) { Statics.amount = amount; }
+            @keep
+            empty;
+            @keep
+            static missing;
+            @keep
+            compute() { return 7; }
+            @method
+            compute(amount) { return amount; }
+        }
+        const first = Statics.value;
+        Statics.value = 5;
+        const object = new Statics();
+        const result = [new Child().compute(1), first, Statics.value,
+            object.empty, Statics.missing, object.compute(), object.compute(2)];
+    "#, "[23, 4, 11, null, null, 7, 12]");
+}
+
+#[test]
+fn napalm_decorators_member_errors_and_initializer_lifetime() {
+    run_napalm(r#"
+        function bad(value, context) { return 42; }
+        function badInitializer(value, context) { context.addInitializer(() => null); }
+        let delayed = (callback) => null;
+        function capture(value, context) {
+            delayed = context.addInitializer;
+            return null;
+        }
+        let errors = 0;
+        try { class Bad { @bad method() {} } } catch (e) { errors++; }
+        try { class Bad { @bad field = 1; } } catch (e) { errors++; }
+        try { class Bad { @badInitializer get field() { return 1; } } } catch (e) { errors++; }
+        class Valid { @capture field = 2; }
+        try { delayed((receiver) => null); } catch (e) { errors++; }
+        const first = new Valid();
+        const second = new Valid();
+        const result = [errors, first.field, second.field];
+    "#, "[4, 2, 2]");
+}
+
+#[test]
+fn napalm_decorators_local_factories_and_async_methods() {
+    run_napalm(r#"
+        let object: any = null;
+        {
+            const offset = 10;
+            const namespace = {
+                decorate: (value, context) => (receiver, amount) => value(receiver, amount) + offset
+            };
+            class Local {
+                @namespace.decorate
+                compute(amount) { return amount + 1; }
+            }
+            object = new Local();
+        }
+        function asyncDecorator(value, context) {
+            return async (receiver, amount) => (await value(receiver, amount)) + 1;
+        }
+        class AsyncExample {
+            amount = 5;
+            @asyncDecorator
+            async compute(amount) {
+                await Timer.delay(0);
+                return this.amount + amount;
+            }
+        }
+        const result = [object.compute(2), await new AsyncExample().compute(3)];
+    "#, "[13, 9]");
+}
+
+#[test]
+fn napalm_decorators_throwing_decorator_closes_initializer_registration() {
+    run_napalm(r#"
+        let delayed = (callback) => null;
+        let runs = 0;
+        function fail(value, context) {
+            delayed = context.addInitializer;
+            context.addInitializer((receiver) => runs++);
+            throw "failed decorator";
+        }
+        let errors = 0;
+        try { class Invalid { @fail field; } } catch (e) { errors++; }
+        try { delayed((receiver) => runs++); } catch (e) { errors++; }
+        const result = [errors, runs];
+    "#, "[2, 0]");
+}
+
+#[test]
+fn napalm_decorators_exports_preserve_public_names() {
+    let parsed = crate::napalm_front_main::parse("exports.napalm", r#"
+        function keep(value, context) { return null; }
+        @keep
+        export default function () { return 1; }
+        @keep
+        export class Example {
+            @keep
+            value = 1;
+        }
+    "#);
+    assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
+    let exports = parsed.module.exports.unwrap();
+    let public: Vec<_> = exports.iter().map(|(_, name)| name.value.as_str()).collect();
+    assert_eq!(public, ["default", "Example"]);
+}
+
+#[test]
+fn napalm_decorators_reject_unsupported_member_targets() {
+    for source in [
+        "class Bad { @dec constructor() {} }",
+        "class Bad { @dec static {} }",
+        "class Bad { @dec abstract method(); }",
+        "class Bad { @dec declare field; }",
+        "class Bad { @dec foreign method(); }",
+        "class Bad { @dec computed value() { return 1; } }",
+        "class Bad { @dec watch value() {} }",
+        "class Bad { @dec operator +(value) { return value; } }",
+    ] {
+        let parsed = crate::napalm_front_main::parse("invalid-decorator.napalm", source);
+        assert!(parsed.has_errors(), "accepted unsupported decorator target: {source}");
+    }
+}
+
+#[test]
 fn napalm_spread_and_destructuring_use_dedicated_bytecode() {
     use crate::napalm_bytecode::{Decoder, Opcode};
     let source = "const [a, ...rest] = [1, ...[2, 3]]; const {x, ...other} = {...{x: 4, y: 5}}; const f = (x) => x; const result = f(...[a]);";

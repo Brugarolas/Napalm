@@ -1,0 +1,143 @@
+// Run: cargo run -- scripts\decorators.napalm
+// Member decorators use an explicit receiver, preserving Napalm's lexical this.
+let checks = 0;
+function check(actual, expected, label) {
+    if (actual !== expected) {
+        throw `${label}: expected ${expected}, got ${actual}`;
+    }
+    checks++;
+}
+
+const events = [];
+function suffix(tag) {
+    events.add(`evaluate:${tag}`);
+    return function (value, context) {
+        check(context.kind, "function", "function kind");
+        check(context.name, "greet", "function name");
+        events.add(`apply:${tag}`);
+        context.addInitializer(() => events.add(`initialize:${tag}`));
+        return (name) => value(name) + tag;
+    };
+}
+
+@suffix("A")
+@suffix("B")
+function greet(name) { return `Hello ${name}:`; }
+
+check(greet("Napalm"), "Hello Napalm:BA", "stacked function replacements");
+check(events.toString(), "[evaluate:A, evaluate:B, apply:B, apply:A, initialize:B, initialize:A]",
+    "evaluation, application and initializer order");
+
+let classInitializers = 0;
+function register(value, context) {
+    check(context.kind, "class", "class kind");
+    check(context.name, "Counter", "class name");
+    context.addInitializer(() => classInitializers++);
+    return null;
+}
+
+let instanceInitializers = 0;
+let staticInitializers = 0;
+function traced(value, context) {
+    check(context.kind, "method", "method kind");
+    check(context.private, false, "public member");
+    context.addInitializer((receiver) => {
+        if (context.static) {
+            staticInitializers++;
+        } else {
+            instanceInitializers++;
+            receiver.ready = true;
+        }
+    });
+    return (receiver, amount) => value(receiver, amount) + 1;
+}
+
+function transform(scale, offset) {
+    return function (value, context) {
+        check(context.kind, "field", "field kind");
+        check(value, null, "field decorator value");
+        context.addInitializer((receiver) => {
+            if (context.static) {
+                check(receiver.limit, 21, "static field initialized before extra initializer");
+            } else {
+                check(receiver.count, 12, "instance field initialized before extra initializer");
+            }
+        });
+        return (receiver, initialValue) => initialValue * scale + offset;
+    };
+}
+
+function readPlus(value, context) {
+    check(context.kind, "getter", "getter kind");
+    check(context.static, false, "instance getter");
+    return (receiver) => value(receiver) + 100;
+}
+
+function writeDouble(value, context) {
+    check(context.kind, "setter", "setter kind");
+    return (receiver, next) => value(receiver, next * 2);
+}
+
+@register
+class Counter {
+    ready;
+
+    @transform(2, 0)
+    @transform(1, 2)
+    count = 5;
+
+    @transform(3, 0)
+    static limit = 7;
+
+    @traced
+    add(amount) { return this.count + amount; }
+
+    @traced
+    static plus(amount) { return Counter.limit + amount; }
+
+    @readPlus
+    get doubled() { return this.count * 2; }
+
+    @writeDouble
+    set doubled(value) { this.count = value; }
+}
+
+check(classInitializers, 1, "class initializer runs once");
+check(staticInitializers, 1, "static method initializer runs once");
+check(instanceInitializers, 0, "instance initializers wait for construction");
+check(Counter.limit, 21, "static field transformation");
+check(Counter.plus(2), 24, "static method replacement");
+
+const first = new Counter();
+const second = new Counter();
+check(instanceInitializers, 2, "method initializer runs for every instance");
+check(first.ready, true, "member initializer receives the instance");
+check(first.count, 12, "stacked field transforms run top-down");
+check(second.count, 12, "field transforms run for every instance");
+check(first.add(3), 16, "method replacement preserves receiver");
+check(first.doubled, 124, "getter replacement");
+first.doubled = 4;
+check(first.count, 8, "setter replacement");
+check(second.count, 12, "instances remain independent");
+
+class Replacement { message = "replacement"; }
+function replaceClass(value, context) { return Replacement; }
+@replaceClass
+class Original { message = "original"; }
+check(new Original().message, "replacement", "class replacement");
+
+function keep(value, context) { return null; }
+@keep
+function identity(value) { return value; }
+check(identity(42), 42, "null preserves the original function");
+
+// The wrapper continues to work through hot dispatch and moving collections.
+let total = 0;
+for (let i = 0; i < 100; i++) {
+    if (i % 10 === 0) System.gc();
+    total += second.add(i);
+}
+check(total, 6250, "decorated method in a hot loop with GC");
+
+System.print(`Decorators: ${checks} checks passed`);
+const result = "decorators-ok";

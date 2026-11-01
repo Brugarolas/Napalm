@@ -478,14 +478,25 @@ pub enum BuiltinId {
     /// JavaScript-style transparent object interception. Appended so existing
     /// builtin IDs (notably Set) remain stable across the Proxy addition.
     Proxy = 20,
+    /// Native Rust decorators. Their module bindings use hidden names (see
+    /// `binding_name`) so user declarations named `memoize`, `delay`, ... keep
+    /// working and simply shadow the core decorator.
+    Memoize = 21,
+    Once = 22,
+    MemoizeExpiring = 23,
+    Delay = 24,
+    Debounce = 25,
+    Throttle = 26,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 27] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
         Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set, Self::Proxy,
+        Self::Memoize, Self::Once, Self::MemoizeExpiring, Self::Delay, Self::Debounce,
+        Self::Throttle,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -503,7 +514,32 @@ impl BuiltinId {
             Self::Reactive => "__Reactive",
             Self::Set => "Set",
             Self::Proxy => "Proxy",
+            Self::Memoize => "memoize",
+            Self::Once => "once",
+            Self::MemoizeExpiring => "memoizeExpiring",
+            Self::Delay => "delay",
+            Self::Debounce => "debounce",
+            Self::Throttle => "throttle",
         }
+    }
+    /// Module-layout key reserving this builtin. Native decorators use a hidden
+    /// key; `lower_name` falls back to it only when no user binding exists.
+    #[inline] pub const fn binding_name(self) -> &'static str {
+        match self {
+            Self::Memoize => "<native:memoize>",
+            Self::Once => "<native:once>",
+            Self::MemoizeExpiring => "<native:memoizeExpiring>",
+            Self::Delay => "<native:delay>",
+            Self::Debounce => "<native:debounce>",
+            Self::Throttle => "<native:throttle>",
+            _ => self.name(),
+        }
+    }
+    #[inline] pub const fn is_native_decorator(self) -> bool {
+        matches!(
+            self,
+            Self::Memoize | Self::Once | Self::MemoizeExpiring | Self::Delay | Self::Debounce | Self::Throttle
+        )
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
 }

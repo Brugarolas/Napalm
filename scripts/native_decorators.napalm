@@ -1,0 +1,187 @@
+// Run: cargo run -- scripts\native_decorators.napalm
+// All durations are milliseconds. Failed checks throw.
+let checks = 0;
+function check(actual, expected, label) {
+    if (actual !== expected) {
+        throw `${label}: expected ${expected}, got ${actual}`;
+    }
+    checks++;
+}
+
+let memoCalls = 0;
+@memoize
+function sum(a, b) {
+    memoCalls++;
+    return a + b;
+}
+check(sum(2, 3), 5, "memoize result");
+check(sum(2, 3), 5, "memoize cache hit");
+check(sum(3, 2), 5, "all arguments participate in the key");
+check(memoCalls, 2, "memoize invocation count");
+
+let stringCalls = 0;
+@memoize
+function size(text) {
+    stringCalls++;
+    return text.count;
+}
+check(size("Napalm"), 6, "string key");
+check(size(`${"Nap"}alm`), 6, "equal string content");
+check(stringCalls, 1, "strings are keyed by content");
+
+let objectCalls = 0;
+@memoize
+function read(object) {
+    objectCalls++;
+    return object.value;
+}
+const original = {value: 7};
+check(read(original), 7, "object key");
+original.value = 8;
+check(read(original), 7, "object identity remains cached after mutation");
+check(read({value: 8}), 8, "different object has a different key");
+check(objectCalls, 2, "object identity invocation count");
+
+let onceCalls = 0;
+@once
+function initialize(value) {
+    onceCalls++;
+    return [value];
+}
+check(initialize(11)[0], 11, "once first result");
+check(initialize(99)[0], 11, "once retains the first successful result");
+check(onceCalls, 1, "once invocation count");
+
+let attempts = 0;
+@once
+function retry() {
+    attempts++;
+    if (attempts === 1) throw "try again";
+    return 42;
+}
+let rejected = 0;
+try { retry(); } catch (error) { rejected++; }
+check(retry(), 42, "synchronous exceptions are not cached");
+check(retry(), 42, "successful retry is cached");
+check(attempts, 2, "once retries after a synchronous exception");
+check(rejected, 1, "original synchronous error propagates");
+
+let expiringCalls = 0;
+@memoizeExpiring(30)
+function expiring(value) {
+    expiringCalls++;
+    return value * expiringCalls;
+}
+check(expiring(4), 4, "expiring first result");
+check(expiring(4), 4, "unexpired cache hit");
+await Timer.delay(80);
+check(expiring(4), 8, "TTL is measured in milliseconds");
+
+let delayedCalls = 0;
+@delay(20)
+function delayed(value) {
+    delayedCalls++;
+    return value * 2;
+}
+const delayedFirst = delayed(3);
+const delayedSecond = delayed(4);
+check(delayedCalls, 0, "delay does not execute inline");
+check(delayedFirst.isPending, true, "delay returns a pending Promise");
+check((await Promise.all([delayedFirst, delayedSecond])).toString(), "[6, 8]",
+    "delay schedules every call independently");
+check(delayedCalls, 2, "delay invocation count");
+
+let debouncedCalls = 0;
+@debounce(20)
+function save(value) {
+    debouncedCalls++;
+    return value * 10;
+}
+const saveFirst = save(1);
+const saveSecond = save(2);
+const saveThird = save(3);
+check(debouncedCalls, 0, "debounce defaults to the trailing edge");
+check((await Promise.all([saveFirst, saveSecond, saveThird])).toString(), "[30, 30, 30]",
+    "debounced calls share the last arguments and result");
+check(debouncedCalls, 1, "debounce coalesces a burst");
+
+let leadingCalls = 0;
+@debounce(30, {leading: true, trailing: false})
+function leading(value) {
+    leadingCalls++;
+    return value;
+}
+const leadingFirst = leading(1);
+const leadingSecond = leading(2);
+check((await Promise.all([leadingFirst, leadingSecond])).toString(), "[1, 1]",
+    "leading-only debounce shares its leading result");
+check(leadingCalls, 1, "leading-only debounce suppresses repeats");
+await Timer.delay(80);
+check(await leading(3), 3, "a new burst can invoke the leading edge again");
+
+let throttledCalls = 0;
+@throttle(30)
+function update(value) {
+    throttledCalls++;
+    return value;
+}
+const throttleFirst = update(1);
+const throttleSecond = update(2);
+const throttleThird = update(3);
+check((await Promise.all([throttleFirst, throttleSecond, throttleThird])).toString(), "[1, 3, 3]",
+    "throttle defaults to leading and trailing edges");
+check(throttledCalls, 2, "throttle invokes at most twice for this burst");
+
+let memberCalls = 0;
+class Counter {
+    value;
+    constructor(value) { this.value = value; }
+
+    @memoize
+    add(amount) {
+        memberCalls++;
+        return this.value + amount;
+    }
+
+    @once
+    initial(amount) { return this.value + amount; }
+
+    @debounce(20)
+    save(amount) { return this.value + amount; }
+}
+const first = new Counter(10);
+const second = new Counter(100);
+check(first.add(1), 11, "memoized method preserves its receiver");
+check(second.add(1), 101, "memoized methods distinguish receivers");
+check(first.add(1), 11, "memoized method cache hit");
+check(memberCalls, 2, "memoized member invocation count");
+check(first.initial(2), 12, "once method first receiver");
+check(second.initial(3), 103, "once state is per receiver");
+check(first.initial(9), 12, "once method retains its first result");
+check((await Promise.all([first.save(1), first.save(2), second.save(3)])).toString(),
+    "[12, 12, 103]", "debounce groups members per receiver");
+
+let asyncCalls = 0;
+@memoize
+async function asyncValue(value) {
+    asyncCalls++;
+    await Timer.delay(1);
+    return value * 2;
+}
+const asyncFirst = asyncValue(6);
+const asyncSecond = asyncValue(6);
+check((await Promise.all([asyncFirst, asyncSecond])).toString(), "[12, 12]",
+    "memoize also caches Promise results");
+check(asyncCalls, 1, "async work runs only once");
+
+@delay(1)
+function failLater() { throw "delayed failure"; }
+let delayedErrors = 0;
+try { await failLater(); } catch (error) { delayedErrors++; }
+check(delayedErrors, 1, "scheduled exceptions reject the returned Promise");
+
+System.gc();
+check(sum(2, 3), 5, "cached entries survive GC");
+check(initialize(0)[0], 11, "cached managed results survive GC");
+System.print(`Native decorators: ${checks} checks passed`);
+const result = "native-decorators-ok";

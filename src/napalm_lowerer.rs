@@ -1403,7 +1403,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .into_iter()
             .filter_map(|builtin| {
                 self.module_layout
-                    .get(builtin.name())
+                    .get(builtin.binding_name())
                     .map(|slot| BuiltinBinding { slot, builtin })
             })
             .collect();
@@ -1489,7 +1489,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         for builtin in BuiltinId::ALL {
             self.module_layout
                 .slots
-                .insert(builtin.name().to_owned(), ModuleSlot(next));
+                .insert(builtin.binding_name().to_owned(), ModuleSlot(next));
             next += 1;
         }
 
@@ -4008,7 +4008,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
         if let Some(slot) = self.context.module_layout.get(&name.value) {
             if self.context.is_concurrent
-                && !BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value)
+                && !BuiltinId::ALL.iter().any(|builtin| builtin.binding_name() == name.value)
                 && !self.context.worker_function_names.contains(&name.value)
             {
                 self.error(
@@ -4031,6 +4031,20 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 },
                 ty,
             );
+        }
+        if let Some(builtin) = BuiltinId::ALL
+            .into_iter()
+            .find(|builtin| builtin.is_native_decorator() && builtin.name() == name.value)
+        {
+            if let Some(slot) = self.context.module_layout.get(builtin.binding_name()) {
+                return self.builder.emit1(
+                    Inst::LoadModuleVar {
+                        module: self.context.module,
+                        slot,
+                    },
+                    Type::Top,
+                );
+            }
         }
         self.error(
             "NAPALM-L018",
@@ -5212,7 +5226,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
                     let _ = self.builder.invoke(receiver, setter, vec![value]);
                 } else if let Some(slot) = self.context.module_layout.get(&name.value) {
-                    if BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value) {
+                    if BuiltinId::ALL.iter().any(|builtin| builtin.binding_name() == name.value) {
                         self.error(
                             "NAPALM-L038",
                             format!("cannot assign to core global '{}'", name.value),
@@ -7393,6 +7407,9 @@ class Child is Parent {
         let module = parse_typescript(source);
         let mut program = ir::Program::new();
         let manifest = crate::napalm_builtin::install_hir_builtins(&mut program);
+        // Builtins (e.g. native decorator wrappers) may install closures of
+        // their own; only count the ones produced by lowering this module.
+        let builtin_functions = program.functions.len();
         let output = lower_module(&mut program, "comprehensions.napalm", source, "comprehensions", &module);
         assert!(!output.has_errors(), "{:#?}", output.diagnostics);
         for function in &program.functions {
@@ -7401,7 +7418,7 @@ class Child is Parent {
 
         // A comprehension lowers directly to iterator/ListAppend control flow;
         // it does not synthesize callback closures or map/filter intermediates.
-        let closure_count = program.functions.iter()
+        let closure_count = program.functions[builtin_functions..].iter()
             .filter(|function| matches!(function.kind, FunctionKind::Closure))
             .count();
         // The source-declared `run` function is itself one closure; the

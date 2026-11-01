@@ -165,6 +165,7 @@ struct Parser<'a> {
     /// the corresponding FunctionBody is assembled. This keeps the existing AST
     /// parameter representation compact while preserving TypeScript annotations.
     parameter_types: HashMap<Span, TypeAnnotation>,
+    synthetic_span: usize,
 }
 
 fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
@@ -440,6 +441,7 @@ impl<'a> Parser<'a> {
             immutable: HashSet::default(),
             parameter_patterns: HashMap::default(),
             parameter_types: HashMap::default(),
+            synthetic_span: source.len() + 1,
         }
     }
     fn peek(&self) -> Tok {
@@ -539,6 +541,9 @@ impl<'a> Parser<'a> {
     fn declaration(&mut self, module: bool) -> Result<Vec<Stmt>> {
         self.lines();
         let start = self.peek().span.start;
+        if self.at("@") {
+            return self.decorated_declaration(module);
+        }
         let exported = self.eat("export");
         if exported && !module {
             return self.error("exports are only allowed at module scope");
@@ -641,6 +646,9 @@ impl<'a> Parser<'a> {
         }
 
         let default_export = exported && self.eat("default");
+        if self.at("@") {
+            return self.error("place decorators before `export`");
+        }
         if default_export
             && !self.at("class")
             && !self.at("abstract")
@@ -883,7 +891,9 @@ impl<'a> Parser<'a> {
                     _ => None,
                 };
                 if let Some(name) = name {
-                    if name.value.starts_with("<destructure:") || name.value.starts_with("<pattern") {
+                    if name.value.starts_with("<destructure:") || name.value.starts_with("<pattern")
+                        || name.value.starts_with("<decorator:")
+                    {
                         continue;
                     }
                     self.exports.push((
@@ -898,6 +908,88 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(std::mem::take(&mut out))
+    }
+
+    fn decorated_declaration(&mut self, module: bool) -> Result<Vec<Stmt>> {
+        let start = self.peek().span.start;
+        let decorators = self.decorators()?;
+        let declaration_start = self.pos;
+        if self.eat("export") {
+            self.eat("default");
+        }
+        self.eat("abstract");
+        self.eat("foreign");
+        self.eat("async");
+        self.eat("concurrent");
+        let supported = self.at("class") || self.at("function");
+        self.pos = declaration_start;
+        if !supported {
+            return self.error("decorators are only supported on function and class declarations");
+        }
+        let declaration = self.declaration(module)?;
+        let declared = declaration.iter().find(|stmt| matches!(stmt.kind, StmtKind::Class(_)))
+            .or_else(|| declaration.iter().find(|stmt| matches!(&stmt.kind,
+                StmtKind::Variable { initializer: Some(Expr {
+                    kind: ExprKind::Closure(_) | ExprKind::AsyncClosure(_) | ExprKind::ConcurrentClosure(_), ..
+                }), .. })));
+        let Some(first) = declared else {
+            return self.error("a decorated declaration must have a runtime body");
+        };
+        let (name, kind) = match &first.kind {
+            StmtKind::Class(class) => (class.name.clone(), "class"),
+            StmtKind::Variable { name, .. } => (name.clone(), "function"),
+            _ => return self.error("expected a function or class declaration"),
+        };
+        let span = self.end(start);
+        let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: span };
+        let initializers = ast.ident("initializers");
+        let current = ast.ident("value");
+        let mut out = vec![ast.variable(&initializers, Expr::new(ExprKind::List(Vec::new()), span))];
+        let mut saved = Vec::new();
+        for decorator in decorators {
+            let binding = ast.ident("decorator");
+            out.push(ast.variable(&binding, decorator));
+            saved.push(binding);
+        }
+        out.extend(declaration);
+        out.push(ast.variable(&current, ast.read(&name)));
+        for decorator in saved.into_iter().rev() {
+            let application = ast.application(ast.read(&decorator), ast.read(&current),
+                ast.read(&initializers), &name.value, kind, None);
+            out.push(ast.assign(&current, application));
+        }
+        out.push(ast.assign(&name, ast.read(&current)));
+        out.push(ast.run_initializers(ast.read(&initializers), None));
+        Ok(out)
+    }
+
+    fn decorators(&mut self) -> Result<Vec<Expr>> {
+        let mut decorators = Vec::new();
+        while self.eat("@") {
+            let start = self.tokens[self.pos - 1].span.start;
+            self.lines();
+            // Only member/call expressions belong to the decorator grammar.
+            let mut decorator = Expr::new(ExprKind::Name(self.ident()?), self.end(start));
+            loop {
+                if self.eat(".") {
+                    let name = self.ident()?;
+                    decorator = Expr::new(ExprKind::Invoke(InvokeExpr {
+                        receiver: Some(Box::new(decorator)),
+                        name,
+                        args: Vec::new(),
+                        syntax: InvokeSyntax::Getter,
+                    }), self.end(start));
+                } else if self.at("(") {
+                    let args = self.args()?;
+                    decorator = self.append_chain_call(decorator, args, false, self.end(start));
+                } else {
+                    break;
+                }
+            }
+            decorators.push(decorator);
+            self.lines();
+        }
+        Ok(decorators)
     }
     fn next_text(&self) -> &'a str {
         self.nth_text(1)
@@ -3123,12 +3215,14 @@ impl<'a> Parser<'a> {
                 parts.push(StringPart::Bytes(self.decode(segment, i)?));
                 let close = interpolation_end(bytes, i + 2, 1).ok_or(())?;
                 let mut nested = Parser::new(self.source, i + 2, close, self.arena);
+                nested.synthetic_span = self.synthetic_span;
                 nested.lines();
                 let value = nested.expr(0);
                 nested.lines();
                 if nested.peek().kind != Kind::Eof {
                     let _: Result<()> = nested.error("unexpected tokens in template expression");
                 }
+                self.synthetic_span = nested.synthetic_span;
                 self.immutable.extend(nested.immutable);
                 self.diagnostics.extend(nested.diagnostics);
                 parts.push(StringPart::Expression(value?));
@@ -3264,9 +3358,18 @@ impl<'a> Parser<'a> {
         // initialized instance.
         let mut watch_initializers = Vec::new();
         let mut static_initializers = Vec::new();
+        let mut member_decorations = Vec::new();
+        let mut decorator_arguments = Vec::new();
+        let mut method_initializers = Vec::new();
+        let mut static_method_initializers = Vec::new();
+        let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: name.span };
+        let decorator_payload = ast.ident("payload");
+        let decorator_parameter = ast.ident("payloadParameter");
         let mut constructor = None;
         while !self.at("}") && self.peek().kind != Kind::Eof {
             let member_start = self.peek().span.start;
+            let decorators = self.decorators()?;
+            let decorated = !decorators.is_empty();
             let mut is_static = false;
             let mut foreign = false;
             let mut async_ = false;
@@ -3301,6 +3404,9 @@ impl<'a> Parser<'a> {
             // ES/TypeScript static initialization blocks map naturally to the
             // synthetic class initializer already used for static field values.
             if is_static && self.at("{") {
+                if decorated {
+                    return self.error("static blocks cannot be decorated");
+                }
                 if explicit_function || foreign || async_ || type_only_member {
                     return self.error("a static block cannot be foreign, async, abstract or declare");
                 }
@@ -3315,6 +3421,9 @@ impl<'a> Parser<'a> {
             // so interpreter inline caches and the tracing JIT see an ordinary
             // virtual call rather than a second dispatch mechanism.
             if self.eat("operator") {
+                if decorated {
+                    return self.error("operator overloads cannot be decorated");
+                }
                 if explicit_function {
                     return self.error("`function` cannot prefix an operator overload");
                 }
@@ -3385,6 +3494,9 @@ impl<'a> Parser<'a> {
                 None
             };
             if let Some(is_computed) = reactive_member {
+                if decorated {
+                    return self.error("computed properties and watchers cannot be decorated");
+                }
                 if explicit_function {
                     return self.error("`function` cannot prefix a computed property or watcher");
                 }
@@ -3469,6 +3581,9 @@ impl<'a> Parser<'a> {
                     return self.error("parameter properties are only valid on constructors");
                 }
                 if type_only_member || (!foreign && !self.at("{")) {
+                    if decorated {
+                        return self.error("decorated members require a concrete implementation");
+                    }
                     if is_constructor {
                         return self.error("a constructor must have an implementation");
                     }
@@ -3503,7 +3618,7 @@ impl<'a> Parser<'a> {
                 if is_constructor {
                     constructor = Some(methods.len());
                 }
-                methods.push(MethodDecl {
+                let mut method = MethodDecl {
                     signature,
                     is_async: async_,
                     is_static,
@@ -3512,7 +3627,26 @@ impl<'a> Parser<'a> {
                     attributes: Vec::new(),
                     body,
                     span: self.end(member_start),
-                });
+                };
+                if decorated {
+                    if is_constructor || foreign {
+                        return self.error("constructors and foreign methods cannot be decorated");
+                    }
+                    if method.body.as_ref().is_some_and(|body| body.params.len() >= MAX_PARAMETERS) {
+                        return self.error("decorated methods accept at most 15 arguments plus the receiver");
+                    }
+                    let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: method.span };
+                    let (wrapper, extra) = ast.decorate_method(&mut method, decorators,
+                        &decorator_parameter, &mut decorator_arguments, &mut fields,
+                        &mut member_decorations);
+                    methods.push(wrapper);
+                    if is_static {
+                        static_method_initializers.push(extra);
+                    } else {
+                        method_initializers.push(extra);
+                    }
+                }
+                methods.push(method);
             } else {
                 if explicit_function || access.is_some() || async_ || foreign || is_constructor {
                     return self.error("expected a method parameter list");
@@ -3526,9 +3660,23 @@ impl<'a> Parser<'a> {
                 };
                 self.boundary()?;
                 if type_only_member {
+                    if decorated {
+                        return self.error("decorated fields cannot be abstract or declare");
+                    }
                     self.separators();
                     continue;
                 }
+                let mut extra = None;
+                let initializer = if decorated {
+                    let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: member.span };
+                    let (value, callbacks) = ast.decorate_field(&member, is_static, initializer, decorators,
+                        &decorator_parameter, &mut decorator_arguments, &mut fields,
+                        &mut member_decorations);
+                    extra = Some(callbacks);
+                    Some(value)
+                } else {
+                    initializer
+                };
                 fields.push(ClassFieldDecl {
                     storage: class_storage_ident(&member, is_static),
                     annotation,
@@ -3551,10 +3699,18 @@ impl<'a> Parser<'a> {
                         initializers.push(assignment);
                     }
                 }
+                if let Some(extra) = extra {
+                    if is_static {
+                        static_initializers.push(extra);
+                    } else {
+                        initializers.push(extra);
+                    }
+                }
             }
             self.separators();
         }
         self.expect("}")?;
+        initializers.splice(0..0, method_initializers);
         if !initializers.is_empty() || !parameter_initializers.is_empty() || !watch_initializers.is_empty() {
             if constructor.is_none() {
                 constructor = Some(methods.len());
@@ -3650,6 +3806,18 @@ impl<'a> Parser<'a> {
             kind: StmtKind::Class(class),
             span: self.end(start),
         }];
+        member_decorations.extend(static_method_initializers);
+        if !member_decorations.is_empty() {
+            let span = self.end(start);
+            let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: span };
+            let decorate = ast.ident("decorateMembers");
+            out.insert(0, ast.variable(&decorator_payload, Expr::new(ExprKind::List(decorator_arguments), span)));
+            let StmtKind::Class(class) = &mut out[1].kind else { unreachable!() };
+            class.methods.push(ast.method(decorate.clone(), vec![decorator_parameter],
+                member_decorations, true));
+            out.push(ast.expression(invoke(ast.read(&name), &decorate.value,
+                vec![ast.read(&decorator_payload)], span)));
+        }
         if has_static_init {
             out.push(Stmt {
                 kind: StmtKind::Expression(invoke(
@@ -4127,6 +4295,340 @@ fn rewrite_enum_member_references(
         | ExprKind::StaticField(_)
         | ExprKind::This
         | ExprKind::Super(_) => {}
+    }
+}
+
+struct DecoratorAst<'a> {
+    next_span: &'a mut usize,
+    anchor: Span,
+}
+
+impl DecoratorAst<'_> {
+    fn method(&mut self, name: Ident, params: Vec<Ident>, statements: Vec<Stmt>, is_static: bool) -> MethodDecl {
+        let span = self.span();
+        MethodDecl {
+            signature: MethodSignatureAst::Method { name, params: params.clone() },
+            is_async: false,
+            is_static,
+            is_foreign: false,
+            is_constructor: false,
+            attributes: Vec::new(),
+            body: Some(FunctionBody {
+                param_types: vec![None; params.len()],
+                params,
+                kind: FunctionBodyKind::Statements(statements),
+                span,
+            }),
+            span,
+        }
+    }
+
+    fn static_read(&self, name: &Ident) -> Expr {
+        Expr::new(ExprKind::StaticField(name.clone()), self.anchor)
+    }
+
+    fn store_static(&self, name: &Ident, value: Expr) -> Stmt {
+        self.expression(Expr::new(ExprKind::Assign {
+            target: Box::new(self.static_read(name)),
+            value: Box::new(value),
+        }, self.anchor))
+    }
+
+    fn state_field(&mut self, role: &str, fields: &mut Vec<ClassFieldDecl>) -> Ident {
+        let mut name = self.ident(role);
+        name.value = format!("__{}", name.value);
+        fields.push(ClassFieldDecl {
+            storage: name.clone(), annotation: None, initializer: None, is_static: true,
+        });
+        name
+    }
+
+    fn save_decorators(&self, decorators: Vec<Expr>, payload: &Ident, arguments: &mut Vec<Expr>) -> Vec<Expr> {
+        decorators.into_iter().map(|decorator| {
+            let index = arguments.len();
+            arguments.push(decorator);
+            Expr::new(ExprKind::Subscript {
+                receiver: Box::new(self.read(payload)),
+                args: vec![Expr::new(ExprKind::Number(index as f64), self.anchor)],
+            }, self.anchor)
+        }).collect()
+    }
+
+    fn decorate_method(&mut self, original: &mut MethodDecl, decorators: Vec<Expr>,
+        payload: &Ident, arguments: &mut Vec<Expr>, fields: &mut Vec<ClassFieldDecl>,
+        setup: &mut Vec<Stmt>) -> (MethodDecl, Stmt)
+    {
+        let signature = original.signature.clone();
+        let (public, kind) = match &signature {
+            MethodSignatureAst::Method { name, .. } => (name.clone(), "method"),
+            MethodSignatureAst::Getter { name } => (name.clone(), "getter"),
+            MethodSignatureAst::Setter { name, .. } => (name.clone(), "setter"),
+            _ => unreachable!("only named members reach decorator synthesis"),
+        };
+        let hidden = self.ident("originalMethod");
+        match &mut original.signature {
+            MethodSignatureAst::Method { name, .. }
+            | MethodSignatureAst::Getter { name }
+            | MethodSignatureAst::Setter { name, .. } => *name = hidden.clone(),
+            _ => unreachable!(),
+        }
+        let receiver = self.ident("methodReceiver");
+        let params = original.body.as_ref().expect("concrete method").params.clone();
+        let call_args: Vec<_> = params.iter().map(|param| self.read(param)).collect();
+        let original_call = match kind {
+            "getter" => Expr::new(ExprKind::Invoke(InvokeExpr {
+                receiver: Some(Box::new(self.read(&receiver))), name: hidden.clone(),
+                args: Vec::new(), syntax: InvokeSyntax::Getter,
+            }), self.anchor),
+            "setter" => Expr::new(ExprKind::Assign {
+                target: Box::new(Expr::new(ExprKind::Invoke(InvokeExpr {
+                    receiver: Some(Box::new(self.read(&receiver))), name: hidden.clone(),
+                    args: Vec::new(), syntax: InvokeSyntax::Getter,
+                }), self.anchor)),
+                value: Box::new(call_args[0].clone()),
+            }, self.anchor),
+            _ => invoke(self.read(&receiver), &hidden.value, call_args, self.anchor),
+        };
+        let mut adapter_params = vec![receiver];
+        adapter_params.extend(params.clone());
+        let adapter = self.closure(adapter_params, vec![Stmt {
+            kind: StmtKind::Return(Some(original_call)), span: self.anchor,
+        }]);
+        let callable = self.state_field("methodValue", fields);
+        let queue = self.state_field("methodInitializers", fields);
+        setup.push(self.store_static(&callable, adapter));
+        setup.push(self.store_static(&queue, Expr::new(ExprKind::List(Vec::new()), self.anchor)));
+        let saved = self.save_decorators(decorators, payload, arguments);
+        for decorator in saved.into_iter().rev() {
+            let application = self.application(decorator, self.static_read(&callable),
+                self.static_read(&queue), &public.value, kind, Some(original.is_static));
+            setup.push(self.store_static(&callable, application));
+        }
+        let mut wrapper_args = vec![Expr::new(ExprKind::This, self.anchor)];
+        wrapper_args.extend(params.iter().map(|param| self.read(param)));
+        let call = invoke(self.static_read(&callable), "call", wrapper_args, self.anchor);
+        let mut wrapper = self.method(public, params, vec![Stmt {
+            kind: StmtKind::Return(Some(call)), span: self.anchor,
+        }], original.is_static);
+        wrapper.signature = signature;
+        let extra = self.run_initializers(self.static_read(&queue), Some(Expr::new(ExprKind::This, self.anchor)));
+        (wrapper, extra)
+    }
+
+    fn decorate_field(&mut self, member: &Ident, is_static: bool, initializer: Option<Expr>,
+        decorators: Vec<Expr>, payload: &Ident, arguments: &mut Vec<Expr>,
+        fields: &mut Vec<ClassFieldDecl>, setup: &mut Vec<Stmt>) -> (Expr, Stmt)
+    {
+        let transformers = self.state_field("fieldTransformers", fields);
+        let queue = self.state_field("fieldInitializers", fields);
+        setup.push(self.store_static(&transformers, Expr::new(ExprKind::List(Vec::new()), self.anchor)));
+        setup.push(self.store_static(&queue, Expr::new(ExprKind::List(Vec::new()), self.anchor)));
+        let saved = self.save_decorators(decorators, payload, arguments);
+        for decorator in saved.into_iter().rev() {
+            let replacement = self.ident("fieldReplacement");
+            let application = self.application(decorator, Expr::new(ExprKind::Null, self.anchor),
+                self.static_read(&queue), &member.value, "field", Some(is_static));
+            setup.push(self.variable(&replacement, application));
+            setup.push(Stmt {
+                kind: StmtKind::If {
+                    condition: self.read(&replacement),
+                    then_branch: Box::new(self.expression(invoke(self.static_read(&transformers),
+                        "unshift", vec![self.read(&replacement)], self.anchor))),
+                    else_branch: None,
+                },
+                span: self.anchor,
+            });
+        }
+        let receiver = self.ident("fieldReceiver");
+        let value = self.ident("fieldValue");
+        let callback = self.ident("fieldTransformer");
+        let pipeline = vec![
+            Stmt {
+                kind: StmtKind::For {
+                    name: callback.clone(),
+                    iterable: self.static_read(&transformers),
+                    body: Box::new(self.assign(&value, invoke(self.read(&callback), "call",
+                        vec![self.read(&receiver), self.read(&value)], self.anchor))),
+                },
+                span: self.anchor,
+            },
+            Stmt { kind: StmtKind::Return(Some(self.read(&value))), span: self.anchor },
+        ];
+        let helper = self.closure(vec![receiver, value], pipeline);
+        let value = invoke(helper, "call", vec![Expr::new(ExprKind::This, self.anchor),
+            initializer.unwrap_or_else(|| Expr::new(ExprKind::Null, self.anchor))], self.anchor);
+        let extra = self.run_initializers(self.static_read(&queue), Some(Expr::new(ExprKind::This, self.anchor)));
+        (value, extra)
+    }
+
+    fn span(&mut self) -> Span {
+        // Binding and closure analyses use spans as identities. Synthetic nodes
+        // need distinct IDs; executable expressions retain the source anchor.
+        let span = Span::empty(*self.next_span);
+        *self.next_span += 1;
+        span
+    }
+
+    fn ident(&mut self, role: &str) -> Ident {
+        let span = self.span();
+        Spanned::new(format!("<decorator:{role}:{}>", span.start), span)
+    }
+
+    fn read(&self, name: &Ident) -> Expr {
+        Expr::new(ExprKind::Name(name.clone()), self.anchor)
+    }
+
+    fn string(&self, value: &str) -> Expr {
+        Expr::new(ExprKind::String(value.as_bytes().to_vec()), self.anchor)
+    }
+
+    fn expression(&self, expr: Expr) -> Stmt {
+        Stmt { kind: StmtKind::Expression(expr), span: self.anchor }
+    }
+
+    fn variable(&self, name: &Ident, value: Expr) -> Stmt {
+        Stmt {
+            kind: StmtKind::Variable {
+                name: name.clone(),
+                annotation: None,
+                initializer: Some(value),
+            },
+            span: self.anchor,
+        }
+    }
+
+    fn assign(&self, name: &Ident, value: Expr) -> Stmt {
+        self.expression(Expr::new(ExprKind::Assign {
+            target: Box::new(self.read(name)),
+            value: Box::new(value),
+        }, self.anchor))
+    }
+
+    fn closure(&mut self, params: Vec<Ident>, statements: Vec<Stmt>) -> Expr {
+        let span = self.span();
+        Expr::new(ExprKind::Closure(FunctionBody {
+            param_types: vec![None; params.len()],
+            params,
+            kind: FunctionBodyKind::Statements(statements),
+            span,
+        }), self.anchor)
+    }
+
+    fn check(&self, value: Expr, kind: &str) -> Expr {
+        let system = Spanned::new("System".into(), self.anchor);
+        invoke(self.read(&system), "__checkDecorator", vec![value, self.string(kind)], self.anchor)
+    }
+
+    fn reject_if(&self, condition: Expr, message: &str) -> Stmt {
+        Stmt {
+            kind: StmtKind::If {
+                condition,
+                then_branch: Box::new(Stmt { kind: StmtKind::Throw(self.string(message)), span: self.anchor }),
+                else_branch: None,
+            },
+            span: self.anchor,
+        }
+    }
+
+    fn application(&mut self, decorator: Expr, current: Expr, initializers: Expr,
+        name: &str, kind: &str, is_static: Option<bool>) -> Expr
+    {
+        let value = self.ident("target");
+        let callback = self.ident("callback");
+        let queue = self.ident("queue");
+        let active = self.ident("active");
+        let initializer = self.ident("callbackInitializer");
+        let span = self.anchor;
+        let replacement = self.ident("replacement");
+        let initializer_body = vec![
+            self.reject_if(Expr::new(ExprKind::Unary {
+                operator: UnaryOp::Not,
+                operand: Box::new(self.read(&active)),
+            }, span), "addInitializer cannot be called after the decorator has finished"),
+            self.expression(self.check(self.read(&initializer), "initializer")),
+            self.reject_if(Expr::new(ExprKind::Binary {
+                left: Box::new(Expr::new(ExprKind::Invoke(InvokeExpr {
+                    receiver: Some(Box::new(self.read(&initializer))),
+                    name: Spanned::new("arity".into(), span),
+                    args: Vec::new(),
+                    syntax: InvokeSyntax::Getter,
+                }), span)),
+                operator: BinaryOp::NotEqual,
+                right: Box::new(Expr::new(ExprKind::Number(if is_static.is_some() { 1.0 } else { 0.0 }), span)),
+            }, span), "a decorator initializer has the wrong receiver/argument count"),
+            self.expression(invoke(self.read(&queue), "add", vec![self.read(&initializer)], span)),
+        ];
+        let add_initializer = self.closure(vec![initializer], initializer_body);
+        let mut entries: Vec<_> =
+            [("kind", self.string(kind)),
+             ("name", self.string(name)),
+             ("addInitializer", add_initializer)]
+                .into_iter().map(|(key, value)| MapEntry {
+                    key: self.string(key), value, span, spread: false,
+                }).collect();
+        if let Some(is_static) = is_static {
+            for (key, value) in [("static", is_static), ("private", false)] {
+                entries.push(MapEntry {
+                    key: self.string(key), value: Expr::new(ExprKind::Bool(value), span), span, spread: false,
+                });
+            }
+        }
+        let context = Expr::new(ExprKind::Map(entries), span);
+        let invocation = invoke(self.check(self.read(&callback), "decorator"), "call",
+            vec![self.read(&value), context], span);
+        let checked = self.check(self.read(&replacement), if kind == "class" { "class" } else { "function" });
+        let return_value = Expr::new(ExprKind::Conditional {
+            condition: Box::new(checked),
+            then_expr: Box::new(self.read(&replacement)),
+            else_expr: Box::new(self.read(&value)),
+        }, span);
+        let close = self.assign(&active, Expr::new(ExprKind::Bool(false), span));
+        let body = vec![
+            self.variable(&active, Expr::new(ExprKind::Bool(true), span)),
+            Stmt {
+                kind: StmtKind::Variable {
+                    name: replacement.clone(),
+                    annotation: Some(TypeAnnotation::new(TypeAnnotationKind::Any, span)),
+                    initializer: Some(Expr::new(ExprKind::Null, span)),
+                },
+                span,
+            },
+            Stmt {
+                kind: StmtKind::Try {
+                    body: Box::new(self.assign(&replacement, invocation)),
+                    catch: None,
+                    finally_branch: Some(Box::new(close)),
+                },
+                span,
+            },
+            Stmt { kind: StmtKind::Return(Some(return_value)), span },
+        ];
+        let helper = self.closure(vec![value, callback, queue], body);
+        invoke(helper, "call", vec![current, decorator, initializers], span)
+    }
+
+    fn run_initializers(&mut self, queue: Expr, receiver: Option<Expr>) -> Stmt {
+        let list = self.ident("initializerList");
+        let callback = self.ident("initializer");
+        let target = self.ident("initializerReceiver");
+        let span = self.anchor;
+        let args = receiver.as_ref().map_or_else(Vec::new, |_| vec![self.read(&target)]);
+        let body = Stmt {
+            kind: StmtKind::For {
+                name: callback.clone(),
+                iterable: self.read(&list),
+                body: Box::new(self.expression(invoke(self.read(&callback), "call", args, span))),
+            },
+            span,
+        };
+        let mut params = vec![list];
+        let mut args = vec![queue];
+        if let Some(receiver) = receiver {
+            params.push(target);
+            args.push(receiver);
+        }
+        let helper = self.closure(params, vec![body]);
+        self.expression(invoke(helper, "call", args, span))
     }
 }
 
