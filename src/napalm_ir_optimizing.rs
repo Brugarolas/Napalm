@@ -18,6 +18,9 @@ use crate::napalm_ir_optimizer::{
 #[path = "typed_object_specialization.rs"]
 mod typed_object_specialization;
 pub use typed_object_specialization::TypedObjectSpecialization;
+#[path = "shared_constant_literals.rs"]
+mod shared_constant_literals;
+pub use shared_constant_literals::SharedConstantLiterals;
 
 /// Interpreter-oriented WIR optimization pipeline.
 ///
@@ -32,6 +35,7 @@ pub fn optimization_passes() -> Optimize {
     Optimize::new()
         .with_function_pass(InterpreterOptimizationBundle::default())
         .with_program_finalizer(AutoMemoization::default())
+        .with_program_finalizer(SharedConstantLiterals::default())
 }
 
 /// Optimize independent WIR functions concurrently using one optimizer instance
@@ -117,6 +121,8 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
     // whole-program call graph and therefore runs once after all workers join.
     let mut memoization = AutoMemoization::default();
     let _ = memoization.optimize_program(program);
+    // Literal sharing needs the direct call graph produced by memoization.
+    let _ = SharedConstantLiterals.optimize_program(program);
 }
 
 /// Static auto-memoization for scalar-key pure functions.

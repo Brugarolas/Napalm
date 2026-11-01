@@ -11,6 +11,40 @@ fn whole_function_program(source: &str) -> (BytecodeProgram, FuncId, BuiltinMani
 }
 
 #[test]
+fn napalm_whole_function_tiering_avoids_redundant_recursive_entry_traces() {
+    let (program, entry, manifest) = whole_function_program(r#"
+        function make(depth) {
+            if (depth > 0) return {left: make(depth - 1), right: make(depth - 1)};
+            return {left: null, right: null};
+        }
+        function count(node) {
+            if (node.left == null) return 1;
+            return 1 + count(node.left) + count(node.right);
+        }
+        const result = count(make(10));
+    "#);
+    for threshold in [0, 64, 96] {
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_entry_threshold: threshold,
+            ..Default::default()
+        }));
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 2047.0);
+        let stats = vm.whole_function_jit_stats().unwrap();
+        assert_eq!(stats.compiled_functions, if threshold == 0 { 0 } else { 2 }, "{stats:?}");
+        let traces = vm.jit_stats().unwrap();
+        assert_eq!(traces.entry_traces_compiled, 0, "{traces:?}");
+        if threshold == 0 {
+            assert_eq!(stats.compile_attempts, 0, "{stats:?}");
+        } else {
+            assert!(stats.native_recursive_calls > 1000, "{stats:?}");
+        }
+        assert!(vm.native_shadow_top.is_null());
+    }
+}
+
+#[test]
 fn napalm_whole_function_trees_survive_gc_and_shape_bailouts() {
     let (program, entry, manifest) = whole_function_program(r#"
         function make(depth) {
@@ -67,7 +101,7 @@ fn napalm_whole_function_identity_guards_preserve_other_equality() {
     "#);
     let mut vm = source_vm(&program, &manifest);
     vm.run_module(entry).unwrap();
-    let value = *vm.modules.last().unwrap().variables.last().unwrap();
+    let value = last_source_variable(&vm);
     assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[800, 1, 0, 1, 0, 0]");
     assert!(vm.whole_function_jit_stats().unwrap().compiled_functions > 0);
 }
@@ -92,7 +126,7 @@ fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
         let mut vm = source_vm(&program, &manifest);
         if !native { vm.set_jit_options(None); }
         vm.run_module(entry).unwrap();
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[301, 161, 0x]");
         assert!(vm.native_shadow_top.is_null());
         if native { assert!(vm.whole_function_jit_stats().unwrap().native_recursive_calls > 0); }
@@ -139,7 +173,7 @@ fn napalm_whole_function_read_only_recursion_replays_deep_and_changed_shapes() {
         let mut vm = source_vm(&program, &manifest);
         if !native { vm.set_jit_options(None); }
         vm.run_module(entry).unwrap();
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[2100, 301, 4]");
         assert!(vm.native_shadow_top.is_null());
         if native {
@@ -170,7 +204,7 @@ fn napalm_whole_function_literal_slots_preserve_duplicates_and_dynamic_keys() {
         let mut vm = source_vm(&program, &manifest);
         if !native { vm.set_jit_options(None); }
         vm.run_module(entry).unwrap();
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[377250, 12, 13, null]");
         if native { assert!(vm.whole_function_jit_stats().unwrap().compiled_functions > 0); }
     }

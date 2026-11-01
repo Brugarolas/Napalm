@@ -8,7 +8,7 @@ fn run_class_source(source: &str, expected: &str) {
             ..Default::default()
         }));
         vm.run_module(entry).unwrap();
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         let context = HostContext { heap: &mut vm.heap };
         assert_eq!(context.format_value(value), expected, "jit={jit_enabled}");
     }

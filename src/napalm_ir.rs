@@ -554,6 +554,24 @@ pub struct ModuleInfo {
     /// Synchronous top-level functions that may be referenced by isolated
     /// concurrent workers without transferring the owning module's data state.
     pub worker_function_bindings: Vec<WorkerFunctionBinding>,
+    /// Trailing slots appended by whole-program optimizations (for example
+    /// shared constant literals). They follow every source-visible binding.
+    pub hidden_variable_count: u32,
+}
+
+impl ModuleInfo {
+    /// Number of leading slots that belong to source-level bindings.
+    pub fn source_variable_count(&self) -> u32 {
+        self.variable_count - self.hidden_variable_count
+    }
+
+    /// Reserve a trailing optimizer-owned slot.
+    pub fn add_hidden_slot(&mut self) -> ModuleSlot {
+        let slot = ModuleSlot(self.variable_count);
+        self.variable_count = self.variable_count.checked_add(1).expect("module slot overflow");
+        self.hidden_variable_count += 1;
+        slot
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2321,6 +2339,7 @@ impl Program {
             exports: Vec::new(),
             builtin_bindings: Vec::new(),
             worker_function_bindings: Vec::new(),
+            hidden_variable_count: 0,
         };
         let index = self.modules.len();
         self.modules.push(info);

@@ -160,7 +160,7 @@ fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
                     .collect::<Vec<_>>()
             )
         });
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         if enabled && require_native {
             assert!(vm.jit_stats().unwrap().native_entries > 0, "new collection opcodes never reached native code: {:?}", vm.jit_stats());
             assert!(vm.jit_stats().unwrap().native_budget_exits > 0, "collection loops must honor the native watchdog");

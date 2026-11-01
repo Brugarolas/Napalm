@@ -22,9 +22,9 @@ use crate::napalm_tracing_jit::{
     TRACE_HEAP_DATA_RELATIVE_MASK, TRACE_HEAP_KIND_MASK, TRACE_HEAP_METADATA_SHIFT,
 };
 
-const MIN_WHOLE_FUNCTION_HOTNESS: u32 = 128;
-const MAX_WHOLE_FUNCTION_OPS: usize = 4096;
-const MAX_NATIVE_CALL_DEPTH: u32 = 256;
+const MIN_WHOLE_FUNCTION_HOTNESS: u32 = 64;
+const MAX_WHOLE_FUNCTION_OPS: usize = 8192;
+const MAX_NATIVE_CALL_DEPTH: u32 = 512;
 const WFJIT_BAILOUT: u64 = TAG_BASE;
 
 pub(super) type WholeFunctionEntry = unsafe extern "C" fn(*mut c_void, *mut RegisterWord) -> u64;
@@ -193,7 +193,10 @@ impl WholeFunctionJit {
             profiled_small_map: profiled_small_map_id,
             profiled_small_map_commit: profiled_small_map_commit_id,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
-            threshold: if entry_threshold == 0 { u32::MAX } else { entry_threshold.saturating_mul(2).max(MIN_WHOLE_FUNCTION_HOTNESS) },
+            // Direct-call tiering runs before the callee's entry hook. Matching
+            // its threshold avoids compiling an entry trace just before a whole
+            // function supersedes it; rejected/deferred functions can still trace.
+            threshold: if entry_threshold == 0 { u32::MAX } else { entry_threshold.max(MIN_WHOLE_FUNCTION_HOTNESS) },
             active_depth: 0,
             stats: WholeFunctionJitStats::default(),
         };

@@ -2248,7 +2248,10 @@ impl HandleTable {
                 let entry = self.entry(handle);
                 entry.next_free.store(FREE_HANDLE_NONE, Ordering::Relaxed);
                 debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
-                self.generation_entry(handle).fetch_add(1, Ordering::Relaxed);
+                // The successful CAS made this handle exclusively ours, so a
+                // plain load+store is enough; concurrent readers only load.
+                let generation = self.generation_entry(handle);
+                generation.store(generation.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                 out.push(handle);
             }
             return count;
@@ -2527,17 +2530,35 @@ impl HandleTable {
     }
 
     fn release(&self, handle: u32) {
-        let entry = self.entry(handle);
-        unsafe { Self::drop_contracts(entry); }
-        entry.clear_jit_view();
-        entry.address.store(0, Ordering::Relaxed);
-        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.release_batch(&[handle]);
+    }
+
+    /// Releases dead handles after GC cleanup: their entries are cleared and
+    /// linked into one local chain, which is spliced onto the free list with a
+    /// single CAS, and `live` is adjusted once for the whole batch.
+    fn release_batch(&self, dead: &[u32]) {
+        let Some((&first, _)) = dead.split_first() else {
+            return;
+        };
+        let mut previous: Option<&HandleEntry> = None;
+        for &handle in dead {
+            let entry = self.entry(handle);
+            unsafe { Self::drop_contracts(entry); }
+            entry.clear_jit_view();
+            entry.address.store(0, Ordering::Relaxed);
+            if let Some(previous) = previous {
+                previous.next_free.store(handle + 1, Ordering::Relaxed);
+            }
+            previous = Some(entry);
+        }
+        let last = previous.unwrap();
+        self.live.fetch_sub(dead.len(), Ordering::Relaxed);
         loop {
             let head = self.free_head.load(Ordering::Acquire);
-            entry.next_free.store(head, Ordering::Relaxed);
+            last.next_free.store(head, Ordering::Relaxed);
             if self
                 .free_head
-                .compare_exchange_weak(head, handle + 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(head, first + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -2556,6 +2577,14 @@ impl HandleTable {
 }
 
 static HANDLE_TABLE: OnceLock<HandleTable> = OnceLock::new();
+
+/// Id resolver for the GC's handle-log sweep: the handle slot is traced, so a
+/// live object's entry already holds its post-copy address.
+fn resolve_handle_address(handle: u32) -> usize {
+    handles()
+        .existing_entry(handle)
+        .map_or(0, |entry| entry.address.load(Ordering::Relaxed))
+}
 
 #[inline(always)]
 fn handles() -> &'static HandleTable {
@@ -2807,10 +2836,15 @@ unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     unsafe { trace_fiber_state(state.get(), trace_metadata, visitor) };
 }
 
+/// Managed descriptors are `id_swept`: the GC calls this for each dead object
+/// and then returns all dead handles at once through `release_swept_handles`.
 unsafe fn cleanup_managed_object(object: GcObject) {
     let managed = unsafe { managed_object_mut(object) };
-    handles().release(managed.handle);
     unsafe { std::ptr::drop_in_place(managed) };
+}
+
+fn release_swept_handles(dead: &[u32]) {
+    handles().release_batch(dead);
 }
 
 
@@ -2821,7 +2855,7 @@ macro_rules! gc_descriptor {
             trace: $trace,
             cleanup: Some(cleanup_managed_object),
             finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: true,
         };
     };
 }
@@ -3163,8 +3197,8 @@ struct Heap {
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
     map_shapes: MapShapeTable,
-    /// Recycled stable handles are pulled from the global Treiber stack in small
-    /// batches, amortizing the CAS/generation traffic on allocation-heavy code.
+    /// Scratch buffer for pulling stable handles from the global table in small
+    /// batches; they are then appended to the mutator's swept handle log.
     recycled_handles: Vec<u32>,
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
@@ -3200,6 +3234,10 @@ impl Default for Heap {
         let collector = GcCollector::initialize(napalm_gc_config());
         let handle_table = handles();
         let mut mutator = collector.attach();
+        mutator.set_id_sweeper(crate::napalm_gc::IdSweeper {
+            resolve: resolve_handle_address,
+            release: release_swept_handles,
+        });
         let allocation_roots = Arc::new(AllocationRootBuffer::new());
         let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
         let allocation_root_registration = mutator.register_roots(provider);
@@ -3221,10 +3259,9 @@ impl Default for Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        for handle in self.recycled_handles.drain(..) {
+        for handle in self.mutator.take_unconsumed_ids() {
             self.handle_table.return_unused(handle);
         }
-
     }
 }
 
@@ -3319,19 +3356,29 @@ impl Heap {
 
     #[inline]
     fn allocate_handle_fast(&mut self) -> u32 {
-        if let Some(handle) = self.recycled_handles.pop() {
+        if let Some(handle) = self.mutator.take_logged_id() {
             return handle;
         }
-        self.handle_table
-            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        if let Some(handle) = self.recycled_handles.pop() {
-            return handle;
-        }
+        self.refill_handle_cache()
+    }
 
-        self.handle_table
-            .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        self.recycled_handles
-            .pop()
+    /// Managed objects are reclaimed by sweeping the consumed prefix of the
+    /// mutator's handle log, so every handle must enter through that log.
+    #[cold]
+    fn refill_handle_cache(&mut self) -> u32 {
+        debug_assert!(self.recycled_handles.is_empty());
+        if self
+            .handle_table
+            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH)
+            == 0
+        {
+            self.handle_table
+                .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
+        }
+        // Batches are stacked for pop(); the log is consumed front to back.
+        self.mutator.log_ids(self.recycled_handles.drain(..).rev());
+        self.mutator
+            .take_logged_id()
             .expect("fresh handle reservation returned an empty batch")
     }
 
@@ -16969,7 +17016,7 @@ mod tests {
 
     fn simple_program(chunk: crate::napalm_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new() });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new(), hidden_variable_count: 0 });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
@@ -17818,8 +17865,15 @@ var result = Runner.run()
         ))
     }
 
+    /// Last source-level binding of the entry module, skipping optimizer-owned
+    /// hidden slots such as shared constant literals.
+    fn last_source_variable(vm: &Interpreter<'_>) -> Value {
+        let info = vm.program.metadata.modules.last().unwrap();
+        vm.modules.last().unwrap().variables[info.source_variable_count() as usize - 1]
+    }
+
     fn source_result(vm: &Interpreter<'_>) -> f64 {
-        vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
+        last_source_variable(vm).as_num().unwrap()
     }
 
     #[test]
@@ -17920,6 +17974,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
+    include!("tests/napalm_shared_literal_tests.rs");
     include!("tests/napalm_collections_tests.rs");
 
     #[test]
@@ -18403,7 +18458,7 @@ let result = r1 + r2 + r3 + r4 + r5;
             let (program, entry, manifest) = compile_napalm_module(&format!("var result = {expression}\n"));
             let mut vm = source_vm(&program, &manifest);
             vm.run_module(entry).unwrap();
-            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let value = last_source_variable(&vm);
             let context = HostContext { heap: &mut vm.heap };
             assert_eq!(context.format_value(value), expected, "{expression}");
         }
@@ -18537,7 +18592,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
             }
@@ -18615,7 +18670,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
             }
@@ -18669,7 +18724,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18742,7 +18797,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18806,7 +18861,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 let error = vm.run_module(entry).err().expect(expression);
                 assert!(error.message.contains(expected), "{expression}, jit={jit_enabled}: {error:?}");
-                let matrix = *vm.modules.last().unwrap().variables.last().unwrap();
+                let matrix = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(matrix), "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]");
             }
@@ -18861,7 +18916,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18924,7 +18979,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                     vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                     let error = vm.run_module(entry).err().expect(expression);
                     assert!(error.message.contains(expected), "{expression}{suffix}, jit={jit_enabled}: {error:?}");
-                    let data = *vm.modules.last().unwrap().variables.last().unwrap();
+                    let data = last_source_variable(&vm);
                     let context = HostContext { heap: &mut vm.heap };
                     assert_eq!(context.map_len(data), Some(4));
                     let HeapObject::Map(map) = context.heap.get(data).unwrap() else { panic!("expected Map") };
@@ -19026,7 +19081,7 @@ let result = r1 + r2 + r3 + r4 + r5;
                     ..Default::default()
                 }));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -19752,18 +19807,18 @@ var result = CallLoop.run()
         use crate::napalm_gc::{Descriptor, Field, TraceLayout, RAW_CODEC};
         static LEAF: Descriptor = Descriptor {
             name: "test.leaf", trace: TraceLayout::Leaf, cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         static FIELDS: [Field; 1] = [Field { offset: 0, codec: &RAW_CODEC }];
         static PARENT: Descriptor = Descriptor {
             name: "test.parent", trace: TraceLayout::Fields(&FIELDS), cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         static CLEANED: AtomicUsize = AtomicUsize::new(0);
         unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.resource", trace: TraceLayout::Leaf, cleanup: Some(cleanup), finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -19826,12 +19881,12 @@ var result = CallLoop.run()
         }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.finalizable", trace: TraceLayout::Leaf,
-            cleanup: Some(cleanup), finalizer: Some(finalize), after_move: None,
+            cleanup: Some(cleanup), finalizer: Some(finalize), after_move: None, id_swept: false,
         };
         static ARRAY: Descriptor = Descriptor {
             name: "test.large", trace: TraceLayout::Words { offset: 0, codec: &RAW_CODEC },
             cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -19925,6 +19980,49 @@ var result = CallLoop.run()
             assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
             vm.release_root(root);
         }
+    }
+
+    #[test]
+    fn handle_log_sweep_reclaims_dead_objects_and_keeps_survivors() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let string = |vm: &mut Interpreter, text: String| {
+            vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(text.as_bytes()))))
+        };
+        let identity = |value: Value| {
+            let handle = value.heap_handle().unwrap();
+            (handle, handles().generation(handle).unwrap())
+        };
+        let kept = string(&mut vm, "kept".into());
+        let kept_root = vm.add_root(kept);
+        let kept_identity = identity(kept);
+        // Span several handle-log refills so consumed and cached ids coexist.
+        let dead: Vec<_> = (0..HANDLE_RECYCLE_BATCH * 3 + 5)
+            .map(|i| identity(string(&mut vm, format!("dead{i}"))))
+            .collect();
+        vm.heap.mutator.collect();
+        // Recycling bumps the generation, so a concurrent test reusing a
+        // released handle cannot make this identity match again.
+        for &(handle, generation) in &dead {
+            assert!(!handles().identity_matches(handle, generation), "dead handle {handle} was not reclaimed");
+        }
+        assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
+        // The survivor now lives in the mature id list, which full collections sweep.
+        let late = string(&mut vm, "late".into());
+        let late_root = vm.add_root(late);
+        for _ in 0..2 {
+            vm.collect_garbage();
+            assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
+            assert!(matches!(vm.heap.get(kept), Some(HeapObject::String(text)) if &text[..] == b"kept"));
+            assert!(matches!(vm.heap.get(late), Some(HeapObject::String(text)) if &text[..] == b"late"));
+        }
+        vm.release_root(kept_root);
+        vm.collect_garbage();
+        assert!(!handles().identity_matches(kept_identity.0, kept_identity.1), "dead mature handle was not reclaimed");
+        vm.release_root(late_root);
     }
 
     #[test]
@@ -20451,7 +20549,7 @@ var result = first + "|" + second + "|" + third + "|" + fourth + "|" + explicit 
             let mut vm = source_vm(&program, &manifest);
             vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
             vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
-            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let value = last_source_variable(&vm);
             let context = HostContext { heap: &mut vm.heap };
             assert_eq!(
                 context.format_value(value),
