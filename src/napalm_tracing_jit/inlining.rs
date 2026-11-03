@@ -109,10 +109,34 @@ impl TraceRecorder<'_> {
                     let descriptor = callee.chunk.type_guards.get(inst.x as usize)
                         .ok_or(RecordingAbort::UnsupportedCall)?;
                     let value = scalar(inst.b, TraceRep::Tagged)?;
-                    if builder.proven_type(value) != Some(&descriptor.expected) {
+                    // Pure class checks (`Instance<C>`) depend only on the receiver
+                    // class: a class guard replays them, and a failure replays the
+                    // caller's call before any callee effect.
+                    let observed = words[inst.b as usize];
+                    if builder.proven_type(value) != Some(&descriptor.expected)
+                        && let Some(word) = observed
+                        && runtime.trace_value_satisfies_pure_type(word, &descriptor.expected)
+                        && let Some(class) = runtime.trace_receiver_class(word)
+                    {
+                        let guarded = builder.emit1(
+                            TraceInst::GuardClass { value, classes: vec![class], exit },
+                            TraceType::Any,
+                            TraceRep::Tagged,
+                        );
+                        builder.set_proven_type(guarded, descriptor.expected.clone());
+                        guarded
+                    } else if builder.proven_type(value) == Some(&descriptor.expected) {
+                        value
+                    } else {
+                        if jit_events_enabled() {
+                            eprintln!(
+                                "[napalm-jit] inline {target:?} stops at BindInterface {:?} (operand proven {:?})",
+                                descriptor.expected,
+                                builder.proven_type(value)
+                            );
+                        }
                         return Err(RecordingAbort::UnsupportedCall);
                     }
-                    value
                 }
                 BindInterface => {
                     let descriptor = callee.chunk.type_guards.get(inst.x as usize)
@@ -373,7 +397,15 @@ impl TraceRecorder<'_> {
                     builder.trace_mut().stats.devirtualized_calls += class.is_some() as usize;
                     return Ok(ExpectedStep::Inlined { next: TraceLocation::new(op.location.function, op.next_pc), callee: target, steps: count });
                 }
-                _ => return Err(RecordingAbort::UnsupportedCall),
+                _ => {
+                    if jit_events_enabled() {
+                        eprintln!(
+                            "[napalm-jit] inline {target:?} stops at {:?} (pc {})",
+                            inst.opcode, inst.location.pc.0
+                        );
+                    }
+                    return Err(RecordingAbort::UnsupportedCall);
+                }
             };
             registers[inst.a as usize] = Some(value);
             words[inst.a as usize] = word;

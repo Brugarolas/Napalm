@@ -5115,6 +5115,13 @@ pub trait Host {
         _name: &str,
         _arity: u8,
     ) -> Option<crate::napalm_tracing_jit::TraceListMethod> { None }
+    /// Opt in only for the stock Map `[]` / `[]=` implementations.
+    fn standard_map_method(
+        &self,
+        _primitive: PrimitiveId,
+        _name: &str,
+        _arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> { None }
     /// Opt in only for the stock bitwise Object ==/!= implementation.
     fn standard_identity_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
@@ -18051,6 +18058,31 @@ impl TraceRuntime for Interpreter<'_> {
         let signature = self.program.metadata.method(cache.method)?;
         let name = self.program.metadata.string(signature.name).unwrap_or("");
         self.host.standard_list_method(primitive, name, signature.arity)
+    }
+
+    fn trace_standard_map_method(
+        &self,
+        function: FuncId,
+        cache: u32,
+    ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> {
+        let function = self.program.function(function)?;
+        let cache = function.chunk.inline_caches.get(cache as usize)?;
+        if cache.home_class.is_some() {
+            return None;
+        }
+        let Some(CallTarget::Primitive(primitive)) =
+            self.builtin_methods[BuiltinClass::Map as usize][cache.method.0 as usize]
+        else {
+            return None;
+        };
+        let signature = self.program.metadata.method(cache.method)?;
+        let name = self.program.metadata.string(signature.name).unwrap_or("");
+        self.host.standard_map_method(primitive, name, signature.arity)
+    }
+
+    fn trace_value_satisfies_pure_type(&self, value: RegisterWord, ty: &Type) -> bool {
+        // Instance checks never install a contract (see enforce_runtime_type).
+        matches!(ty, Type::Instance(_)) && self.type_matches(value, ty)
     }
 
     fn trace_fulfilled_promise(

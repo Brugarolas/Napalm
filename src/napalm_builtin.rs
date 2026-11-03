@@ -1481,6 +1481,21 @@ impl Host for BuiltinHost {
         }
     }
 
+    fn standard_map_method(
+        &self,
+        primitive: PrimitiveId,
+        name: &str,
+        arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> {
+        use crate::napalm_tracing_jit::TraceMapMethod;
+        use BuiltinPrimitive::*;
+        match (self.manifest.implementation(primitive), name, arity) {
+            (Some(MapSubscript), "[]", 1) => Some(TraceMapMethod::Subscript),
+            (Some(MapSubscriptSet), "[]=", 2) => Some(TraceMapMethod::SubscriptSet),
+            _ => None,
+        }
+    }
+
     fn call_primitive(
         &mut self,
         context: &mut HostContext<'_>,

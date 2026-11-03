@@ -42,4 +42,20 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] } # Fast JSON parsing using SIMD
 mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
+llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C API
 #rusqlite = { version = "0.41.1", features = ["bundled", "uuid", "chrono", "vtab", "array"] } # SQLite database library for Rust
+
+# Safe Rust bindings to the LLVM C API (LLVM trace tier).
+# Windows: the official LLVM release libraries use the static CRT (/MT) plus
+# rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the
+# LLVM-C.dll C-API instead and copies it next to the executables.
+[target.'cfg(windows)'.dependencies]
+inkwell = { version = "0.11.0", features = ["llvm23-1-no-llvm-linking"], optional = true }
+[target.'cfg(not(windows))'.dependencies]
+inkwell = { version = "0.11.0", features = ["llvm23-1-prefer-dynamic"], optional = true }
+
+[features]
+default = ["llvm-jit"]
+# Second trace tier: hot Cranelift traces are recompiled by LLVM (O3, host CPU).
+# Build with `--no-default-features` on machines without an LLVM 23 install.
+llvm-jit = ["dep:inkwell", "dep:llvm-sys"]

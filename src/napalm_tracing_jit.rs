@@ -54,6 +54,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 mod inlining;
+#[cfg(feature = "llvm-jit")]
+mod llvm;
 #[cfg(test)]
 #[path = "tests/heap_proof_tests.rs"]
 mod heap_proof_tests;
@@ -409,7 +411,14 @@ pub struct TraceActivation {
     /// used only by the manager's anti-thrashing policy and is not architectural
     /// VM state.
     pub native_iterations: u32,
+    /// Nonzero while upgraded (LLVM) code waits to be installed. The native
+    /// dispatcher checks it on every trace link and yields to the manager, so
+    /// trace trees that never leave the dispatcher still pick up the new tier.
+    pub tier_up_pending: *const u32,
 }
+
+/// Default `tier_up_pending` target when no upgraded tier exists.
+static NO_TIER_UP_PENDING: AtomicU32 = AtomicU32::new(0);
 
 impl TraceActivation {
     pub fn new(inputs: TraceActivationInputs) -> Self {
@@ -440,6 +449,7 @@ impl TraceActivation {
             exit_id: u32::MAX,
             result_code: TRACE_RESULT_CONTINUE,
             native_iterations: 0,
+            tier_up_pending: NO_TIER_UP_PENDING.as_ptr() as *const u32,
         }
     }
 
@@ -466,6 +476,24 @@ pub struct TraceActivationInputs {
 pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation, *const u32) -> u32;
 pub type NativeDispatcherFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
 pub type RuntimeTraceFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32) -> u32;
+
+/// For executables: call once at startup. Background LLVM compiler workers are
+/// then detached (not joined) when a VM is dropped, so program exit never waits
+/// for an in-flight optimization. Pair with [`finish_process`].
+pub fn use_fast_process_exit() {
+    #[cfg(feature = "llvm-jit")]
+    llvm::set_detached_shutdown(true);
+}
+
+/// For executables: call with the exit code after the VM has been dropped. When
+/// LLVM was loaded, the process terminates right here without LLVM teardown;
+/// otherwise the code is returned for a normal exit.
+pub fn finish_process(code: u8) -> u8 {
+    #[cfg(feature = "llvm-jit")]
+    return llvm::finish_process(code);
+    #[cfg(not(feature = "llvm-jit"))]
+    code
+}
 
 #[inline]
 unsafe fn invoke_native_trace(compiled: &CompiledTrace, activation: &mut TraceActivation) -> u32 {
@@ -559,6 +587,16 @@ pub enum TraceListMethod {
     Subscript,
 }
 
+/// Stock Map subscript methods whose existing-key fast path a trace replays
+/// natively through the map's hidden shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceMapMethod {
+    /// `map[key]` with one key.
+    Subscript,
+    /// `map[key] = value` with one key (returns `value`).
+    SubscriptSet,
+}
+
 pub trait TraceRuntime {
     type RuntimeError: Error + Send + Sync + 'static;
 
@@ -571,6 +609,15 @@ pub trait TraceRuntime {
     /// Which stock List method an Invoke site resolves to for List receivers
     /// under the current method tables, if any.
     fn trace_standard_list_method(&self, _function: FuncId, _cache: u32) -> Option<TraceListMethod> { None }
+
+    /// Which stock Map subscript method an Invoke site resolves to for Map
+    /// receivers under the current method tables, if any.
+    fn trace_standard_map_method(&self, _function: FuncId, _cache: u32) -> Option<TraceMapMethod> { None }
+
+    /// Whether an observed value satisfies a *pure* type check (one that installs
+    /// no persistent contract), e.g. `Instance<C>`. Such checks depend only on the
+    /// value's receiver class, so a class guard can replay them natively.
+    fn trace_value_satisfies_pure_type(&self, _value: RegisterWord, _ty: &Type) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
 
@@ -904,13 +951,44 @@ pub struct TracingJitOptions {
     /// Reject the generic full-state runtime fallback for unsupported opcodes.
     /// Explicitly whitelisted non-GC leaf operations use a small internal budget.
     pub no_runtime_calls_in_native_trace: bool,
+
+    /// Second native tier. A Cranelift trace whose native visits (entries plus
+    /// completed native loop iterations) reach this count is recompiled from its
+    /// already optimized Trace IR by LLVM and its entry is swapped in place.
+    /// Zero disables the LLVM tier (always zero without the `llvm-jit` feature).
+    pub llvm_hot_threshold: u32,
+    /// Compile LLVM traces on the background compiler thread. When false the
+    /// manager blocks until the LLVM code is installed (deterministic; tests).
+    pub llvm_background_compile: bool,
+    /// LLVM new-pass-manager pipeline run over each trace module.
+    pub llvm_pass_pipeline: String,
+    /// Enable LLVM's SLP vectorizer (`NAPALM_LLVM_SLP=1`). Off by default: on
+    /// trace loops it tends to pack independent loop-carried chains into one
+    /// vector op, coupling a cheap induction to a long latency chain.
+    pub llvm_slp_vectorize: bool,
+    /// Print the generated and the optimized LLVM IR.
+    pub llvm_dump_ir: bool,
+}
+
+impl TracingJitOptions {
+    /// Env overrides for the LLVM tier: `NAPALM_NO_LLVM`, `NAPALM_LLVM_THRESHOLD=<n>`,
+    /// `NAPALM_LLVM_SYNC`, `NAPALM_LLVM_DUMP`, `NAPALM_LLVM_PASSES=<pipeline>`.
+    fn default_llvm_hot_threshold() -> u32 {
+        if !cfg!(feature = "llvm-jit") || std::env::var_os("NAPALM_NO_LLVM").is_some() {
+            return 0;
+        }
+        std::env::var("NAPALM_LLVM_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(100)
+    }
 }
 
 impl Default for TracingJitOptions {
     fn default() -> Self {
         Self {
-            hot_loop_threshold: 64,
-            hot_entry_threshold: 64,
+            hot_loop_threshold: 10,
+            hot_entry_threshold: 10,
             min_entry_trace_bytecodes: 6,
             max_trace_steps: 4096,
             max_failures_before_blacklist: 8,
@@ -921,7 +999,8 @@ impl Default for TracingJitOptions {
 
             optimize_trace_ir: true,
             cranelift_opt_level: NativeOptLevel::Speed,
-            cranelift_enable_verifier: cfg!(debug_assertions),
+            cranelift_enable_verifier: cfg!(debug_assertions)
+                || std::env::var_os("NAPALM_CRANELIFT_VERIFY").is_some(),
             cranelift_dump_ir: false,
             cranelift_dump_disassembly: false,
 
@@ -929,6 +1008,13 @@ impl Default for TracingJitOptions {
             // full-state fallback. A small number of non-GC leaf helpers is still
             // profitable in mixed traces because unaffected SSA values stay native.
             no_runtime_calls_in_native_trace: true,
+
+            llvm_hot_threshold: Self::default_llvm_hot_threshold(),
+            llvm_background_compile: std::env::var_os("NAPALM_LLVM_SYNC").is_none(),
+            llvm_pass_pipeline: std::env::var("NAPALM_LLVM_PASSES")
+                .unwrap_or_else(|_| "default<O3>".to_owned()),
+            llvm_slp_vectorize: std::env::var_os("NAPALM_LLVM_SLP").is_some(),
+            llvm_dump_ir: std::env::var_os("NAPALM_LLVM_DUMP").is_some(),
         }
     }
 }
@@ -997,6 +1083,15 @@ pub struct TracingJitStats {
     pub shared_repository_rebind_rejections: u64,
     /// Repository-native compilation failures which fell back to a private compile.
     pub shared_repository_shared_compile_failures: u64,
+    /// Traces queued for LLVM recompilation after reaching `llvm_hot_threshold`.
+    pub llvm_traces_requested: u64,
+    /// LLVM entries installed over their Cranelift code.
+    pub llvm_traces_installed: u64,
+    /// LLVM lowering/compilation failures (the Cranelift code stays in use).
+    pub llvm_failures: u64,
+    /// Total LLVM optimization + code generation time.
+    pub llvm_compile_micros: u64,
+    pub last_llvm_error: Option<String>,
     pub last_abort: Option<String>,
 }
 
@@ -2029,6 +2124,102 @@ impl<'a> TraceRecorder<'a> {
                     builder.set_proven_type(element, element_type);
                 }
                 element
+            }
+        };
+        self.write_gpr(builder, op.a, result);
+        Ok(true)
+    }
+
+    /// Native fast path for the stock `map[key]` / `map[key] = value` Invokes on
+    /// an existing key of a shaped Map: the same shape+slot access the MapGet /
+    /// MapSet opcodes use. Missing keys, dictionary maps, nested subscripts,
+    /// read-only or runtime-checked slots and rebound methods keep the Invoke.
+    fn record_map_invoke<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<bool, RecordingAbort> {
+        if op.opcode != Opcode::Invoke || runtime.trace_reactive_tracking_active() {
+            return Ok(false);
+        }
+        let Some(method) = runtime.trace_standard_map_method(op.location.function, op.x) else {
+            return Ok(false);
+        };
+        let arity = match method {
+            TraceMapMethod::Subscript => 1,
+            TraceMapMethod::SubscriptSet => 2,
+        };
+        if op.c as usize != arity || op.args.len() != arity {
+            return Ok(false);
+        }
+        let map_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let key_word = runtime
+            .trace_read_slot(FrameSlot::General(op.args[0]))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
+            return Ok(false);
+        };
+        if method == TraceMapMethod::SubscriptSet && (access.readonly || access.write_runtime_checked) {
+            return Ok(false);
+        }
+
+        let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let key = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+        let stored = if method == TraceMapMethod::SubscriptSet {
+            let value = self.read_gpr(builder, op.args[1].0, TraceType::Any, TraceRep::Tagged)?;
+            match &access.write_type {
+                // The slot contract is checked before any effect; a failure
+                // replays the original Invoke, which reports the type error.
+                Some(expected) => match self.guard_store_value(builder, value, expected, op.location.pc) {
+                    Some(value) => Some(value),
+                    None => return Ok(false),
+                },
+                None => Some(value),
+            }
+        } else {
+            None
+        };
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+        let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
+        let result = match stored {
+            Some(value) => {
+                builder.emit0(TraceInst::HeapMapSetShaped {
+                    map,
+                    key,
+                    value,
+                    expected_key: access.key_bytes,
+                    shape: access.shape,
+                    slot: access.slot as u32,
+                    exit,
+                });
+                value
+            }
+            None => {
+                let field_type = access.read_type.clone().unwrap_or(Type::Top);
+                let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+                let result = builder.emit1(
+                    TraceInst::HeapMapGetShaped {
+                        map,
+                        key,
+                        expected_key: access.key_bytes,
+                        shape: access.shape,
+                        slot: access.slot as u32,
+                        exit,
+                    },
+                    trace_ty,
+                    trace_rep,
+                );
+                if !matches!(field_type, Type::Top) {
+                    builder.set_proven_type(result, field_type);
+                }
+                result
             }
         };
         self.write_gpr(builder, op.a, result);
@@ -3918,6 +4109,7 @@ impl<'a> TraceRecorder<'a> {
             Invoke => {
                 if self.record_num_invoke(runtime, program, function, op, builder)?
                     || self.record_list_invoke(runtime, op, builder)?
+                    || self.record_map_invoke(runtime, op, builder)?
                     || self.record_map_property_invoke(runtime, program, function, op, builder)?
                 {
                     Ok(ExpectedStep::Exact(next))
@@ -5286,6 +5478,31 @@ impl<'a> TraceRecorder<'a> {
                     self.write_gpr(builder, op.a, result);
                     return Ok(ExpectedStep::Exact(next));
                 }
+                // Pure class checks (`Instance<C>`) install no contract and depend
+                // only on the receiver class: guard the observed class natively. A
+                // different class resumes at this binding, whose baseline handler
+                // accepts or reports it exactly as before.
+                let physical = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                if builder.proven_type(source) == Some(&descriptor.expected) {
+                    self.write_gpr(builder, op.a, source);
+                    return Ok(ExpectedStep::Exact(next));
+                }
+                if runtime.trace_value_satisfies_pure_type(physical, &descriptor.expected) {
+                    if let Some(class) = runtime.trace_receiver_class(physical) {
+                        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                        let result = builder.emit1(
+                            TraceInst::GuardClass { value: source, classes: vec![class], exit },
+                            TraceType::Any,
+                            TraceRep::Tagged,
+                        );
+                        builder.set_proven_type(result, descriptor.expected.clone());
+                        self.write_gpr(builder, op.a, result);
+                        return Ok(ExpectedStep::Exact(next));
+                    }
+                }
                 let step = self.runtime_leaf(
                     op,
                     builder,
@@ -6077,6 +6294,23 @@ struct CompiledTrace {
     /// A long streak requests a temporary cooldown in the interpreter.
     short_exit_streak: u16,
     debug_text: Option<String>,
+    /// Native visits since installation: manager entries plus completed native
+    /// loop iterations reported by side exits. Drives the LLVM tier.
+    tier_visits: u64,
+    llvm: LlvmTierState,
+}
+
+/// LLVM tier state of one installed trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlvmTierState {
+    /// Running Cranelift code, not yet hot enough.
+    Cold,
+    /// LLVM compilation requested; the ticket guards against stale results.
+    Queued { ticket: u64 },
+    /// Running LLVM code.
+    Installed,
+    /// LLVM could not compile this trace; Cranelift code stays installed.
+    Failed,
 }
 
 impl CompiledTrace {
@@ -6338,6 +6572,33 @@ impl CraneliftBackend {
             let entries = builder.block_params(linked_result)[1];
             let link_tables = builder.block_params(linked_result)[2];
             let remaining = builder.block_params(linked_result)[3];
+            // Upgraded (LLVM) code is ready: yield with the child state already
+            // materialized so the manager installs it and re-enters natively.
+            let tier_up_ptr = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, tier_up_pending) as i32,
+            );
+            let tier_up = builder.ins().load(types::I32, MemFlagsData::trusted(), tier_up_ptr, 0);
+            let keep_linking = builder.create_block();
+            builder.append_block_param(keep_linking, types::I32);
+            builder.append_block_param(keep_linking, pointer_type);
+            builder.append_block_param(keep_linking, pointer_type);
+            builder.append_block_param(keep_linking, types::I32);
+            builder.ins().brif(
+                tier_up,
+                done,
+                &[result.into(), remaining.into()],
+                keep_linking,
+                &[result.into(), entries.into(), link_tables.into(), remaining.into()],
+            );
+
+            builder.switch_to_block(keep_linking);
+            let result = builder.block_params(keep_linking)[0];
+            let entries = builder.block_params(keep_linking)[1];
+            let link_tables = builder.block_params(keep_linking)[2];
+            let remaining = builder.block_params(keep_linking)[3];
             let unlimited = builder.ins().icmp_imm(IntCC::Equal, remaining, -1);
             builder.ins().brif(
                 unlimited,
@@ -6769,6 +7030,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 native_budget_initial: self.options.native_loop_iteration_budget,
             };
 
+            state.preload_invocation_invariants();
+
             // Entry loads/constants are invariant unless represented by a LoopPhi.
             // Walk by index so lowering does not require a temporary Vec<TraceValueId>.
             for index in 0..self.trace.values.len() {
@@ -7035,6 +7298,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
             exits: self.exit_plans,
             short_exit_streak: 0,
             debug_text: disassembly.or(clif_text),
+            tier_visits: 0,
+            llvm: LlvmTierState::Cold,
         })
     }
 }
@@ -7183,6 +7448,44 @@ impl CraneliftLoweringState<'_, '_> {
         );
         self.heap_chunks_base = Some(value);
         value
+    }
+
+    /// Define every per-invocation cached value in the entry block. These caches
+    /// are path-insensitive, and their first use can sit in a conditional block
+    /// (write-barrier slow path, IsInstance heap path, cold exit stubs) that does
+    /// not dominate later uses; a lazily created definition there is invalid CLIF.
+    fn preload_invocation_invariants(&mut self) {
+        let trace = self.trace;
+        let (mut runtime, mut barrier, mut epoch) = (false, false, false);
+        for node in &trace.nodes {
+            match node.kind {
+                TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => runtime = true,
+                TraceInst::HeapStoreField { .. }
+                | TraceInst::HeapStoreCell { .. }
+                | TraceInst::HeapListSet { .. }
+                | TraceInst::HeapMapSetShaped { .. }
+                | TraceInst::HeapWriteBarrier { .. } => barrier = true,
+                TraceInst::GuardMethodEpoch { .. } => epoch = true,
+                _ => {}
+            }
+        }
+        if runtime {
+            self.execute_callee();
+        }
+        if barrier {
+            self.runtime_context();
+            self.heap_barrier_callee();
+        }
+        if epoch {
+            self.method_epoch_value();
+        }
+        let mut bindings: Vec<(u32, VmBindingKey)> =
+            self.vm_binding_slots.iter().map(|(key, slot)| (*slot, *key)).collect();
+        bindings.sort_unstable_by_key(|(slot, _)| *slot);
+        for (_, key) in bindings {
+            let _ = self.vm_binding_word(key.kind, key.raw);
+        }
+        self.heap_chunks_base();
     }
 
     #[inline(always)]
@@ -8489,7 +8792,10 @@ impl CraneliftLoweringState<'_, '_> {
         self.string_key_proofs.clear();
         self.forwarded_heap_loads.clear();
         self.forwarded_absolute_loads.clear();
+        // Reload eagerly: every invalidation point is on the trace's main path,
+        // so this definition dominates all later (possibly conditional) uses.
         self.heap_chunks_base = None;
+        self.heap_chunks_base();
     }
 
     fn validated_list_index(
@@ -10478,6 +10784,13 @@ pub struct TracingJit {
     vm_binding_table_ptrs: Vec<usize>,
     next_trace_id: u32,
     stats: TracingJitStats,
+    /// Background LLVM compiler owning every LLVM-generated function of this JIT.
+    /// Declared after `traces` so code outlives the metadata that points at it.
+    #[cfg(feature = "llvm-jit")]
+    llvm_service: Option<llvm::LlvmService>,
+    /// The service could not start (no usable LLVM); stop trying.
+    llvm_unavailable: bool,
+    llvm_next_ticket: u64,
 }
 
 impl Default for TracingJit {
@@ -10563,6 +10876,10 @@ impl TracingJit {
             vm_binding_table_ptrs: Vec::new(),
             next_trace_id: 0,
             stats: TracingJitStats::default(),
+            #[cfg(feature = "llvm-jit")]
+            llvm_service: None,
+            llvm_unavailable: false,
+            llvm_next_ticket: 1,
         }
     }
 
@@ -10677,6 +10994,195 @@ impl TracingJit {
         self.link_table_ptrs[index] = compiled.native_links.as_ptr() as usize;
         self.vm_binding_table_ptrs[index] = compiled.vm_bindings.as_ptr() as usize;
         self.traces[index] = Some(compiled);
+    }
+
+    // -------------------------------------------------------------------------
+    // LLVM tier
+    // -------------------------------------------------------------------------
+
+    /// Account native visits of `id`. Once a trace reaches `llvm_hot_threshold`,
+    /// its whole trace tree (root plus stitched side traces, which execute as one
+    /// unit through native links) is queued for LLVM recompilation.
+    fn note_native_visits(&mut self, id: TraceId, visits: u64) {
+        let threshold = self.options.llvm_hot_threshold;
+        if threshold == 0 || self.llvm_unavailable {
+            return;
+        }
+        let Some(compiled) = self.compiled_mut(id) else { return; };
+        compiled.tier_visits = compiled.tier_visits.saturating_add(visits);
+        if compiled.llvm != LlvmTierState::Cold || compiled.tier_visits < threshold as u64 {
+            return;
+        }
+        let root = compiled.root_trace;
+        let members: Vec<TraceId> = self
+            .traces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let member = TraceId(index as u32);
+                slot.as_ref()
+                    .filter(|candidate| {
+                        candidate.llvm == LlvmTierState::Cold
+                            && (member == id || candidate.root_trace == root)
+                    })
+                    .map(|_| member)
+            })
+            .collect();
+        for member in members {
+            self.request_llvm(member);
+        }
+    }
+
+    #[cfg(not(feature = "llvm-jit"))]
+    fn request_llvm(&mut self, _id: TraceId) {}
+
+    #[cfg(not(feature = "llvm-jit"))]
+    fn poll_llvm(&mut self) {}
+
+    #[cfg(feature = "llvm-jit")]
+    fn prepare_llvm_job(
+        compiled: &CompiledTrace,
+        options: &TracingJitOptions,
+        ticket: u64,
+    ) -> Result<llvm::LlvmJob, String> {
+        // LLVM code must address the relocation table already installed for this
+        // trace, slot for slot.
+        let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
+        if keys.len() != compiled.vm_binding_keys.len()
+            || keys
+                .iter()
+                .zip(compiled.vm_binding_keys.iter())
+                .any(|(lowered, installed)| lowered.kind != installed.kind)
+        {
+            return Err("VM-binding layout differs from the installed trace".to_owned());
+        }
+        // Only data is cloned here; lowering, optimization and code generation
+        // all run on the compiler workers.
+        Ok(llvm::LlvmJob {
+            trace_id: compiled.trace.id,
+            ticket,
+            symbol: format!("napalm_trace_{}_{}", compiled.trace.id.0, ticket),
+            trace: compiled.trace.clone(),
+            exits: compiled.exits.clone(),
+            binding_slots: slots,
+            native_budget: options.native_loop_iteration_budget,
+            pipeline: options.llvm_pass_pipeline.clone(),
+            slp_vectorize: options.llvm_slp_vectorize,
+            dump: options.llvm_dump_ir,
+        })
+    }
+
+    #[cfg(feature = "llvm-jit")]
+    fn request_llvm(&mut self, id: TraceId) {
+        if self.llvm_service.is_none() {
+            match llvm::LlvmService::spawn() {
+                Ok(service) => self.llvm_service = Some(service),
+                Err(error) => {
+                    self.llvm_unavailable = true;
+                    self.stats.llvm_failures = self.stats.llvm_failures.saturating_add(1);
+                    self.stats.last_llvm_error = Some(error);
+                    return;
+                }
+            }
+        }
+        let ticket = self.llvm_next_ticket;
+        self.llvm_next_ticket = self.llvm_next_ticket.wrapping_add(1);
+        let Some(compiled) = self.compiled(id) else { return; };
+        let job = Self::prepare_llvm_job(compiled, &self.options, ticket);
+        let job = job.and_then(|job| self.llvm_service.as_mut().unwrap().submit(job));
+        let Some(compiled) = self.compiled_mut(id) else { return; };
+        match job {
+            Ok(()) => {
+                compiled.llvm = LlvmTierState::Queued { ticket };
+                self.stats.llvm_traces_requested = self.stats.llvm_traces_requested.saturating_add(1);
+                if jit_events_enabled() {
+                    eprintln!("[napalm-jit] LLVM tier requested for {id:?}");
+                }
+                if !self.options.llvm_background_compile {
+                    self.wait_llvm(id, ticket);
+                }
+            }
+            Err(error) => {
+                compiled.llvm = LlvmTierState::Failed;
+                self.record_llvm_failure(id, error);
+            }
+        }
+    }
+
+    fn record_llvm_failure(&mut self, id: TraceId, error: String) {
+        self.stats.llvm_failures = self.stats.llvm_failures.saturating_add(1);
+        if jit_events_enabled() {
+            eprintln!("[napalm-jit] LLVM tier failed for {id:?}: {error}");
+        }
+        self.stats.last_llvm_error = Some(error);
+    }
+
+    /// Install finished background compilations. Only called from the Rust
+    /// manager: swapping a dense entry-table slot never affects a frame that is
+    /// already running the previous (still mapped) Cranelift code.
+    #[cfg(feature = "llvm-jit")]
+    fn poll_llvm(&mut self) {
+        let Some(service) = self.llvm_service.as_ref() else { return; };
+        // Clear before draining: a result arriving meanwhile sets it again.
+        service.clear_ready();
+        while let Some(done) = self.llvm_service.as_ref().and_then(llvm::LlvmService::try_recv) {
+            self.install_llvm(done);
+        }
+    }
+
+    #[cfg(feature = "llvm-jit")]
+    fn wait_llvm(&mut self, id: TraceId, ticket: u64) {
+        while self
+            .compiled(id)
+            .is_some_and(|compiled| compiled.llvm == LlvmTierState::Queued { ticket })
+        {
+            let Some(done) = self.llvm_service.as_ref().and_then(llvm::LlvmService::recv) else {
+                if let Some(compiled) = self.compiled_mut(id) {
+                    compiled.llvm = LlvmTierState::Failed;
+                }
+                self.record_llvm_failure(id, "LLVM compiler thread terminated".to_owned());
+                return;
+            };
+            self.install_llvm(done);
+        }
+    }
+
+    #[cfg(feature = "llvm-jit")]
+    fn install_llvm(&mut self, done: llvm::LlvmDone) {
+        if done.unavailable {
+            // LLVM could not be loaded (e.g. LLVM-C.dll missing): Cranelift only.
+            self.llvm_unavailable = true;
+        }
+        let index = done.trace.0 as usize;
+        let Some(compiled) = self.compiled_mut(done.trace) else { return; };
+        if compiled.llvm != (LlvmTierState::Queued { ticket: done.ticket }) {
+            return; // stale result for a replaced trace slot
+        }
+        match done.result {
+            Ok(code) => {
+                compiled.entry = unsafe { std::mem::transmute::<usize, NativeTraceFn>(code.address) };
+                compiled.code_ptr = code.address as *const u8;
+                compiled.llvm = LlvmTierState::Installed;
+                if let Some(text) = code.optimized_ir {
+                    compiled.debug_text = Some(text);
+                }
+                if let Some(slot) = self.entry_table.get_mut(index) {
+                    *slot = code.address;
+                }
+                self.stats.llvm_traces_installed = self.stats.llvm_traces_installed.saturating_add(1);
+                self.stats.llvm_compile_micros = self.stats.llvm_compile_micros.saturating_add(code.micros);
+                if jit_events_enabled() {
+                    eprintln!(
+                        "[napalm-jit] LLVM tier installed for {:?} ({} us)",
+                        done.trace, code.micros
+                    );
+                }
+            }
+            Err(error) => {
+                compiled.llvm = LlvmTierState::Failed;
+                self.record_llvm_failure(done.trace, error);
+            }
+        }
     }
 
     fn compile_trace(&mut self, trace: &Trace) -> Result<CompiledTrace, TracingJitError> {
@@ -10828,6 +11334,8 @@ impl TracingJit {
             _shared_repository_owner: self.shared_repository.clone(),
             short_exit_streak: 0,
             debug_text,
+            tier_visits: 0,
+            llvm: LlvmTierState::Cold,
         })
     }
 
@@ -11384,6 +11892,11 @@ impl TracingJit {
         // an exit is still unlinked, a runtime helper terminates the trace, or the
         // source program itself returns/suspends.
         loop {
+            // Tier-2: install finished LLVM code before building the activation,
+            // and count this native visit toward LLVM hotness.
+            self.poll_llvm();
+            self.note_native_visits(trace_id, 1);
+
             let inputs = runtime
                 .trace_activation_inputs()
                 .map_err(runtime_error)?;
@@ -11416,6 +11929,10 @@ impl TracingJit {
             } else {
                 self.options.native_loop_iteration_budget
             };
+            #[cfg(feature = "llvm-jit")]
+            if let Some(service) = self.llvm_service.as_ref() {
+                activation.tier_up_pending = service.ready_flag();
+            }
 
             // The dispatcher is part of the executable ownership domain. Shared
             // traces use the repository compiler's dispatcher; private traces use
@@ -11452,10 +11969,16 @@ impl TracingJit {
                 }
 
                 TRACE_RESULT_LINK => {
+                    let next = TraceId(activation.next_trace);
+                    // The dispatcher yielded with fuel left: upgraded code is
+                    // ready. Install it (top of loop) and continue natively.
+                    if activation.dispatch_links_remaining != 0 && self.compiled(next).is_some() {
+                        trace_id = next;
+                        continue;
+                    }
                     // Dispatcher fuel expired after the linked exit had already
                     // materialized the child entry state. Resume baseline at that
                     // exact trace anchor to preserve cooperative runtime/GC access.
-                    let next = TraceId(activation.next_trace);
                     let location = self
                         .compiled(next)
                         .ok_or_else(|| TracingJitError::CraneliftLowering {
@@ -11767,6 +12290,8 @@ impl TracingJit {
             .stats
             .native_iterations
             .saturating_add(activation.native_iterations as u64);
+        // Every completed native loop iteration is a visit of the loop header.
+        self.note_native_visits(trace_id, activation.native_iterations as u64);
         if budget_tracking
             && activation.native_iterations < MIN_PROFITABLE_NATIVE_ITERATIONS
             && watchdog_anchor.is_none()
