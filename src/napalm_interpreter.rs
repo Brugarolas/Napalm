@@ -45,6 +45,10 @@ use self::napalm_ffi::{
 };
 #[path = "napalm_fetch.rs"]
 mod fetch_backend;
+#[path = "napalm_http.rs"]
+mod http_backend;
+#[path = "napalm_http_vm.rs"]
+mod http_vm;
 use self::fetch_backend::{
     FetchCompletion, FetchId, FetchRequest, FetchResponse, FetchRuntime, RedirectMode,
 };
@@ -1818,6 +1822,7 @@ struct ReactiveWatcherState {
 
 #[derive(Clone, Copy, Debug)]
 enum PromiseWaiter {
+    HttpResponse { server: u64, request: u64 },
     Resume {
         fiber: u32,
         fiber_object: Value,
@@ -1917,6 +1922,7 @@ impl RuntimeEvent {
                 visit(promise);
                 visit(outcome.value());
                 match waiter {
+                    PromiseWaiter::HttpResponse { .. } => {},
                     PromiseWaiter::Resume { fiber_object, .. } => visit(fiber_object),
                     PromiseWaiter::Forward { promise }
                     | PromiseWaiter::IntervalTick { promise, .. }
@@ -2801,6 +2807,7 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
             }
             for waiter in waiters {
                 match *waiter {
+                    PromiseWaiter::HttpResponse { .. } => {},
                     PromiseWaiter::Resume { fiber_object, .. } => visit_value(fiber_object, visitor),
                     PromiseWaiter::Forward { promise }
                     | PromiseWaiter::IntervalTick { promise, .. }
@@ -3167,6 +3174,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                     }
                     for waiter in waiters {
                         match *waiter {
+                            PromiseWaiter::HttpResponse { .. } => {},
                             PromiseWaiter::Resume { fiber_object, .. } => push_value_handle(fiber_object, roots),
                             PromiseWaiter::Forward { promise }
                             | PromiseWaiter::IntervalTick { promise, .. }
@@ -5879,6 +5887,16 @@ pub enum NativeBuiltin {
     ReactiveFinishComputed,
     ReactiveAbortComputed,
     FetchCall,
+    HttpListen,
+    HttpClose,
+    HttpAddress,
+    HttpStartStream,
+    HttpStreamWrite,
+    HttpStreamEnd,
+    HttpGet,
+    HttpGetJson,
+    HttpPostJson,
+    SetTimeout,
     ResponseStatus,
     ResponseStatusText,
     ResponseOk,
@@ -6641,7 +6659,7 @@ impl MemoTable {
             self.hits = self.hits.saturating_add(1);
             return MemoProbe::Hit(entry.value);
         }
-        if self.policy == MemoizationKind::Pure
+        if !self.policy.is_recursive()
             && self.probes >= 256
             && self.hits.saturating_mul(10) < self.probes
         {
@@ -6731,6 +6749,9 @@ pub struct Interpreter<'p> {
     /// Managed Promise values never cross into the HTTP runtime.
     fetch: Option<FetchRuntime>,
     pending_fetches: FastMap<FetchId, Value>,
+    simple_fetches: FastMap<FetchId, bool>,
+    http: Option<http_backend::HttpRuntime>,
+    http_routes: FastMap<u64, Vec<http_vm::Route>>,
     /// Lazily created isolated N:M worker pool. No managed Value crosses this
     /// boundary; only ConcurrentValue snapshots do.
     concurrent: Option<ConcurrentRuntime>,
@@ -6759,8 +6780,8 @@ pub struct Interpreter<'p> {
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
     megamorphic_cache: FastMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
     profile_counters: Vec<Vec<u64>>,
-    /// Per-function scalar memo tables. Managed Values are intentionally excluded
-    /// from keys/results, so these tables require no GC root registration.
+    /// Per-function scalar-key memo tables. Proven shareable results are rooted
+    /// by both the active provider and the persistent idle snapshot.
     memo_tables: Vec<Option<MemoTable>>,
     roots: Vec<Option<Value>>,
     free_roots: Vec<u32>,
@@ -6821,6 +6842,7 @@ unsafe impl GcRootProvider for VmRootProvider {
         for &value in &vm.strings { root(value); }
         for &value in &vm.builtin_values { root(value); }
         for value in vm.roots.iter().filter_map(|slot| *slot) { root(value); }
+        vm.visit_memoized_values(&mut root);
         for class in &vm.classes {
             root(class.class_value);
             for &value in &class.static_fields { root(value); }
@@ -6872,6 +6894,7 @@ unsafe impl GcRootProvider for VmRootProvider {
 
         vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
         for &promise in vm.pending_fetches.values() { root(promise); }
+        for route in vm.http_routes.values().flatten() { root(route.handler); }
         for &promise in vm.pending_concurrent.values() { root(promise); }
         root(vm.cancelled_error);
         root(vm.result);
@@ -7192,6 +7215,9 @@ impl<'p> Interpreter<'p> {
             reactive_watchers: FastMap::default(),
             fetch: None,
             pending_fetches: FastMap::default(),
+            simple_fetches: FastMap::default(),
+            http: None,
+            http_routes: FastMap::default(),
             concurrent: None,
             pending_concurrent: FastMap::default(),
             concurrent_manifest: None,
@@ -7367,6 +7393,7 @@ impl<'p> Interpreter<'p> {
         for &value in &self.strings { push(value); }
         for &value in &self.builtin_values { push(value); }
         for value in self.roots.iter().filter_map(|slot| *slot) { push(value); }
+        self.visit_memoized_values(&mut push);
         for class in &self.classes {
             push(class.class_value);
             for &value in &class.static_fields { push(value); }
@@ -7391,6 +7418,7 @@ impl<'p> Interpreter<'p> {
         }
         self.event_loop.for_each_payload(|event| (*event).visit_values(&mut push));
         for &promise in self.pending_fetches.values() { push(promise); }
+        for route in self.http_routes.values().flatten() { push(route.handler); }
         for &promise in self.pending_concurrent.values() { push(promise); }
         push(self.cancelled_error);
         push(self.result);
@@ -8798,6 +8826,7 @@ impl<'p> Interpreter<'p> {
     /// converted into Promise settlements; their continuation edges then enter
     /// the ordinary microtask queue before another execution is selected.
     fn schedule_next_ready(&mut self) -> bool {
+        self.drain_http_requests();
         self.drain_fetch_completions();
         self.drain_concurrent_completions();
         self.drain_runtime_microtasks();
@@ -8848,9 +8877,12 @@ impl<'p> Interpreter<'p> {
     /// timer deadline arrives without polling.
     fn drive_event_loop_until_runnable(&mut self) -> bool {
         loop {
+            // Consume wake signals before queues: draining them afterwards can
+            // lose a notification arriving between queue inspection and sleep.
+            while self.external_wake_rx.try_recv().is_ok() {}
+            self.drain_http_requests();
             self.drain_fetch_completions();
             self.drain_concurrent_completions();
-            while self.external_wake_rx.try_recv().is_ok() {}
             self.drain_runtime_microtasks();
             if self.run_state == RunState::Failed {
                 return false;
@@ -8865,6 +8897,7 @@ impl<'p> Interpreter<'p> {
             }
 
             let external_pending = self.fetch.as_ref().is_some_and(FetchRuntime::has_pending)
+                || self.http.as_ref().is_some_and(http_backend::HttpRuntime::has_pending)
                 || self.concurrent.as_ref().is_some_and(ConcurrentRuntime::has_pending);
             if external_pending {
                 match self.event_loop.time_until_next() {
@@ -9029,7 +9062,8 @@ impl<'p> Interpreter<'p> {
         let cacheable = match prepared.return_kind {
             RegisterKind::Value => {
                 let value = Value::from_word(value);
-                !value.is_heap() && (value.is_null() || value.is_bool() || value.is_num())
+                value.is_null() || value.is_bool() || value.is_num()
+                    || (prepared.memoization.allows_heap_results() && value.is_heap())
             }
             RegisterKind::Int32 | RegisterKind::F64 => true,
             RegisterKind::RawPtr => false,
@@ -9037,6 +9071,18 @@ impl<'p> Interpreter<'p> {
         if !cacheable { return; }
         if let Some(Some(table)) = self.memo_tables.get_mut(function as usize) {
             table.insert(key, value);
+        }
+    }
+
+    fn visit_memoized_values(&self, visit: &mut impl FnMut(Value)) {
+        for (index, table) in self.memo_tables.iter().enumerate() {
+            // Raw numeric register words must never be interpreted as Values.
+            if !self.prepared.functions[index].memoization.allows_heap_results()
+                || self.prepared.functions[index].return_kind != RegisterKind::Value
+            { continue; }
+            if let Some(table) = table {
+                for entry in table.entries.values() { visit(Value::from_word(entry.value)); }
+            }
         }
     }
 
@@ -9753,6 +9799,7 @@ impl<'p> Interpreter<'p> {
                     return Ok(false);
                 }
                 self.pending_fetches.remove(&id);
+                self.simple_fetches.remove(&id);
                 let reason = self.cancellation_reason();
                 let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
                 Ok(true)
@@ -9793,6 +9840,13 @@ impl<'p> Interpreter<'p> {
     fn fetch_headers_from_value(&self, value: Value) -> Result<Vec<(String, String)>, RuntimeError> {
         if value.is_null() {
             return Ok(Vec::new());
+        }
+        if let Some(HeapObject::List(entries)) = self.heap.get(value) {
+            return entries.iter().map(|&entry| {
+                let Some(HeapObject::List(pair)) = self.heap.get(entry) else { return Err(RuntimeError::new("HTTP header must be [name, value]")); };
+                if pair.len() != 2 { return Err(RuntimeError::new("HTTP header must be [name, value]")); }
+                Ok((self.fetch_string(pair[0], "HTTP header name")?, self.fetch_string(pair[1], "HTTP header value")?))
+            }).collect();
         }
         if let Some(HeapObject::Headers(headers)) = self.heap.get(value) {
             let response = headers.response;
@@ -10079,6 +10133,10 @@ impl<'p> Interpreter<'p> {
     }
 
     fn start_fetch(&mut self, request: FetchRequest) -> Value {
+        self.start_fetch_mode(request, None)
+    }
+
+    fn start_fetch_mode(&mut self, request: FetchRequest, simple: Option<bool>) -> Value {
         if self.fetch.is_none() {
             match FetchRuntime::new_with_waker(self.external_wake_tx.clone()) {
                 Ok(fetch) => self.fetch = Some(fetch),
@@ -10107,11 +10165,13 @@ impl<'p> Interpreter<'p> {
         match spawned {
             Ok(id) => {
                 self.pending_fetches.insert(id, promise);
+                if let Some(json) = simple { self.simple_fetches.insert(id, json); }
                 if let Err(error) = self.set_promise_cancel_handle(promise, Some(CancelHandle::Fetch(id))) {
                     if let Some(fetch) = self.fetch.as_mut() {
                         fetch.cancel(id);
                     }
                     self.pending_fetches.remove(&id);
+                    self.simple_fetches.remove(&id);
                     let _ = self.settle_promise_outcome(
                         promise,
                         PromiseOutcome::Rejected(Value::NULL),
@@ -10140,11 +10200,17 @@ impl<'p> Interpreter<'p> {
         };
         let promise_root = self.add_root(promise);
         self.pending_fetches.remove(&completion.id);
+        let simple = self.simple_fetches.remove(&completion.id);
 
         let outcome = match completion.result {
             Ok(response) => {
-                let value = self.allocate_response(response);
-                PromiseOutcome::Fulfilled(value)
+                match simple {
+                    Some(json) => match self.http_client_response(response, json) {
+                        Ok(value) => PromiseOutcome::Fulfilled(value),
+                        Err(error) => PromiseOutcome::Rejected(self.http_string(&error.message)),
+                    },
+                    None => PromiseOutcome::Fulfilled(self.allocate_response(response)),
+                }
             }
             Err(error) => {
                 let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
@@ -11404,6 +11470,7 @@ impl<'p> Interpreter<'p> {
         outcome: PromiseOutcome,
     ) {
         match waiter {
+            PromiseWaiter::HttpResponse { server, request } => self.http_handler_finished((server, request), outcome),
             PromiseWaiter::Resume { fiber, fiber_object, dst } => match outcome {
                 PromiseOutcome::Fulfilled(value) => {
                     self.resume_promise_waiter(promise, fiber, fiber_object, dst, value)
@@ -13301,6 +13368,18 @@ impl Interpreter<'_> {
                     )),
                 };
                 unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::HttpListen | NativeBuiltin::HttpClose | NativeBuiltin::HttpAddress
+            | NativeBuiltin::HttpStartStream | NativeBuiltin::HttpStreamWrite | NativeBuiltin::HttpStreamEnd
+            | NativeBuiltin::HttpGet | NativeBuiltin::HttpGetJson | NativeBuiltin::HttpPostJson
+            | NativeBuiltin::SetTimeout => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let values: Vec<_> = args.iter().map(|word| Value::from_word(*word)).collect();
+                match self.http_native(native, &values) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
             }
             NativeBuiltin::ResponseStatus => {
                 let status = match self.heap.get(Value::from_word(receiver)) {
@@ -17249,12 +17328,14 @@ mod tests {
 
     #[test]
     fn recursive_memo_table_stays_enabled_under_initial_misses() {
-        let mut table = MemoTable::new(MemoizationKind::Recursive, 0);
-        for value in 0..512u64 {
-            let key = MemoKey { words: [value, 0, 0, 0] };
-            assert!(matches!(table.probe(key, 0), MemoProbe::Miss(_)));
+        for policy in [MemoizationKind::Recursive, MemoizationKind::RecursiveShared] {
+            let mut table = MemoTable::new(policy, 0);
+            for value in 0..512u64 {
+                let key = MemoKey { words: [value, 0, 0, 0] };
+                assert!(matches!(table.probe(key, 0), MemoProbe::Miss(_)));
+            }
+            assert!(!table.disabled);
         }
-        assert!(!table.disabled);
     }
 
     #[test]
@@ -18142,8 +18223,11 @@ let result = r1 + r2 + r3 + r4 + r5;
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
+    include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
     include!("tests/napalm_shared_literal_tests.rs");
+    include!("tests/napalm_auto_memo_tests.rs");
+    include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
 
     #[test]

@@ -50,6 +50,7 @@ System.print(twice(Answer));
 - Named/default/side-effect imports; named/default declaration exports, `export { local as public }`, and named re-exports with `from`. Only explicit exports are public.
 - `async function`, async methods/arrows, `await`, `throw`, `try`/`catch`/`finally`, plus Napalm's `defer` and `errdefer` extensions.
 - Semicolons and line-separated statements. Braced function bodies always contain statements; only expression-bodied arrows return implicitly. Napalm does not implement every ECMAScript automatic-semicolon-insertion edge case.
+- HTTP services with `listen "127.0.0.1:3000" { route "GET" ["/"] (req) => ({body: "Hello!"}); }`, async handlers, path parameters, streaming/SSE and simple HTTP clients. See [HTTP services](docs/HTTP.md) and [the server example](scripts/server.napalm).
 
 Examples are in [scripts/complete.nap](scripts/complete.nap), [scripts/module_import.nap](scripts/module_import.nap), [scripts/builtins.nap](scripts/builtins.nap) and [scripts/destructuring_spread.nap](scripts/destructuring_spread.nap).
 

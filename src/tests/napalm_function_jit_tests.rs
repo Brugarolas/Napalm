@@ -21,6 +21,9 @@ fn napalm_whole_function_tiering_avoids_redundant_recursive_entry_traces() {
             if (node.left == null) return 1;
             return 1 + count(node.left) + count(node.right);
         }
+        // Keep this a native-recursion test: observing mutation makes the
+        // producer ineligible for automatic object memoization.
+        make(1).left = null;
         const result = count(make(10));
     "#);
     for threshold in [0, 64, 96] {

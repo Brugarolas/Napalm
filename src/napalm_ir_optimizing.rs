@@ -131,13 +131,16 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
 /// `Invoke("call")` protocol, including recursion through module bindings. This
 /// pass therefore reconstructs immutable module-function bindings and a small
 /// pure call graph instead of relying on `CallDirect` alone. Runtime caching is
-/// conditional on scalar arguments/results, so `any` parameters remain safe.
+/// conditional on scalar arguments, so `any` parameters remain safe. Allocating
+/// functions additionally need the global literal-sharing analysis to prove
+/// that every map they allocate has unobservable identity and mutation.
 #[derive(Default)]
 pub struct AutoMemoization;
 
 #[derive(Clone, Debug, Default)]
 struct MemoCandidate {
     locally_pure: bool,
+    allocates: bool,
     callees: Vec<FuncId>,
 }
 
@@ -277,12 +280,13 @@ fn resolve_direct_call_callee(
 
 fn analyze_auto_memoization(program: &mut Program) -> bool {
     let module_functions = discover_module_function_bindings(program);
+    let shareable_maps = shared_constant_literals::memoizable_map_operations(program);
     let mut summaries: HashMap<FuncId, MemoCandidate> = HashMap::default();
 
     for function in &program.functions {
         summaries.insert(
             function.id,
-            analyze_memo_candidate(program, function, &module_functions),
+            analyze_memo_candidate(program, function, &module_functions, &shareable_maps),
         );
     }
 
@@ -307,12 +311,27 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
 
     let mut changed = false;
     let recursive = recursive_memo_functions(&pure, &summaries);
+    let mut allocating: HashSet<FuncId> = pure.iter().copied()
+        .filter(|id| summaries[id].allocates).collect();
+    loop {
+        let additional: Vec<_> = pure.iter().copied().filter(|id| {
+            !allocating.contains(id)
+                && summaries[id].callees.iter().any(|callee| allocating.contains(callee))
+        }).collect();
+        if additional.is_empty() { break; }
+        allocating.extend(additional);
+    }
     for function in &mut program.functions {
         let next = if pure.contains(&function.id) {
-            if recursive.contains(&function.id) {
-                MemoizationKind::Recursive
-            } else {
-                MemoizationKind::Pure
+            match (recursive.contains(&function.id), allocating.contains(&function.id)) {
+                (true, true) => MemoizationKind::RecursiveShared,
+                // Allocating purity is useful for proving recursive producers,
+                // but is not by itself a reason to cache a function. In
+                // particular, keep ordinary factories and their callers eligible
+                // for native compilation/inlining instead of installing a cache.
+                (false, true) => MemoizationKind::None,
+                (true, false) => MemoizationKind::Recursive,
+                (false, false) => MemoizationKind::Pure,
             }
         } else {
             MemoizationKind::None
@@ -397,6 +416,7 @@ fn analyze_memo_candidate(
     program: &Program,
     function: &Function,
     module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
+    shareable_maps: &HashSet<(FuncId, InstId)>,
 ) -> MemoCandidate {
     // Receiver-bearing methods and closures with captures have hidden inputs that
     // are not represented by the explicit scalar memo key. Async/concurrent code
@@ -411,10 +431,16 @@ fn analyze_memo_candidate(
     }
 
     let mut callees = Vec::new();
+    let mut allocates = false;
     for block in &function.blocks {
         for &id in &block.insts {
             let inst = &function.nodes[id.0 as usize].kind;
             match inst {
+                Inst::AllocMap | Inst::MapSet { .. }
+                    if shareable_maps.contains(&(function.id, id)) =>
+                {
+                    allocates |= matches!(inst, Inst::AllocMap);
+                }
                 Inst::Jump { .. }
                 | Inst::Branch { .. }
                 | Inst::Switch { .. }
@@ -486,7 +512,7 @@ fn analyze_memo_candidate(
 
     callees.sort_unstable_by_key(|id| id.0);
     callees.dedup();
-    MemoCandidate { locally_pure: true, callees }
+    MemoCandidate { locally_pure: true, allocates, callees }
 }
 
 fn is_scalar_pure_method(name: &str, kind: MethodKind, arity: u8) -> bool {
