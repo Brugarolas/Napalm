@@ -1483,6 +1483,50 @@ impl<'a> Parser<'a> {
             span: self.end(start),
         })
     }
+    /// `listen address { route method [paths] (req) => ...; }` is an ordinary
+    /// http.listen(address, routes) call after parsing, preserving closure scopes.
+    fn listen_expression(&mut self) -> Result<Expr> {
+        let start = self.peek().span.start;
+        self.expect("listen")?;
+        let address = self.expr(0)?;
+        self.lines();
+        self.expect("{")?;
+        self.lines();
+        let mut routes = Vec::new();
+        while !self.at("}") && self.peek().kind != Kind::Eof {
+            self.expect("route")?;
+            // Parse the method as a primary; a following [paths] is not an index.
+            let method = self.prefix()?;
+            self.lines();
+            self.expect("[")?;
+            self.lines();
+            let mut paths = Vec::new();
+            while !self.at("]") {
+                paths.push(self.expr(1)?);
+                self.lines();
+                if !self.eat(",") { break; }
+                self.lines();
+            }
+            self.expect("]")?;
+            if paths.is_empty() { return self.error("route requires at least one path"); }
+            self.lines();
+            let handler = self.expr(1)?;
+            let span = self.end(start);
+            routes.push(Expr::new(ExprKind::List(vec![method, Expr::new(ExprKind::List(paths), span), handler]), span));
+            self.boundary()?;
+            self.lines();
+        }
+        self.expect("}")?;
+        let span = self.end(start);
+        let http = Expr::new(ExprKind::Name(Spanned::new("http".into(), span)), span);
+        Ok(invoke(http, "listen", vec![address, Expr::new(ExprKind::List(routes), span)], span))
+    }
+
+    fn listen_ahead(&self) -> bool {
+        self.at("listen") && self.tokens.get(self.pos + 1)
+            .is_some_and(|token| matches!(token.kind, Kind::String | Kind::Word))
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
         if self.depth >= MAX_PARSE_DEPTH {
             return self.error("statement is nested too deeply");
@@ -1495,6 +1539,11 @@ impl<'a> Parser<'a> {
     fn statement_inner(&mut self) -> Result<Stmt> {
         self.lines();
         let start = self.peek().span.start;
+        if self.listen_ahead() {
+            let value = self.listen_expression()?;
+            self.eat(";");
+            return Ok(Stmt { span: value.span, kind: StmtKind::Expression(value) });
+        }
         if self.at("{") {
             return self.block();
         }
@@ -2776,6 +2825,9 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self) -> Result<Expr> {
+        if self.listen_ahead() {
+            return self.listen_expression();
+        }
         let start = self.peek().span.start;
         if self.at("<") {
             let saved_pos = self.pos;

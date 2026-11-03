@@ -1,4 +1,4 @@
-// src/server.napalm
+// cargo run -- scripts/server_simple.napalm
 
 print("===== HTTP =====");
 listen "0.0.0.0:3000" {
@@ -7,10 +7,10 @@ listen "0.0.0.0:3000" {
   };
 }
 
-async fn demo() {
+async function demo() {
   let r1 = await get("http://127.0.0.1:3000/");
   print(r1.status); print(r1.body);
 }
 
-setTimeout(| | { demo(); }, 500);
-//demo();
+setTimeout(() => { demo(); }, 500);
+// The listener keeps Napalm running. Stop with Ctrl+C.

@@ -38,6 +38,7 @@ function checksum(node) {
     return 1 + checksum(node.left) + checksum(node.right);
 }
 
+// @memoize
 function createTree(depth) {
     if (depth > 0) {
         var d = depth - 1;

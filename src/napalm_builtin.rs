@@ -1204,6 +1204,25 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     }
 
     install_native_decorators(program, &mut manifest);
+    for (name, arity, native) in [
+        ("listen", 2, NativeBuiltin::HttpListen),
+        ("close", 1, NativeBuiltin::HttpClose),
+        ("address", 1, NativeBuiltin::HttpAddress),
+        ("startStream", 3, NativeBuiltin::HttpStartStream),
+        ("streamWrite", 3, NativeBuiltin::HttpStreamWrite),
+        ("streamEnd", 2, NativeBuiltin::HttpStreamEnd),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Http), name, MethodKind::Method, arity, native);
+    }
+    for (id, native, arities) in [
+        (BuiltinId::HttpGet, NativeBuiltin::HttpGet, &[1, 2][..]),
+        (BuiltinId::HttpGetJson, NativeBuiltin::HttpGetJson, &[1, 2][..]),
+        (BuiltinId::HttpPostJson, NativeBuiltin::HttpPostJson, &[2, 3][..]),
+        (BuiltinId::SetTimeout, NativeBuiltin::SetTimeout, &[2][..]),
+    ] {
+        for &arity in arities { manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native); }
+    }
+    manifest.register(program, static_(BuiltinId::Print), "call", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
 
     manifest
 }

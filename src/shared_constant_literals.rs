@@ -16,6 +16,7 @@
 //! read-only whitelist disqualifies every bit the operand may be or reach.
 //! Functions whose results carry bits must only be reachable through direct
 //! calls; otherwise an unanalyzed caller could observe the shared object.
+//! The same proof is used by automatic memoization for maps with computed fields.
 
 use crate::napalm_collections::{HashMap, HashSet};
 
@@ -59,8 +60,9 @@ struct Analysis<'p> {
 }
 
 /// Candidate bits a value may *be* (`holds`) or may lead to through the
-/// fields of fresh literals (`reach`). Field reads of a shared literal return
-/// its constant scalars, so they inherit only `reach`.
+/// fields of fresh literals (`reach`). Field reads inherit only `reach`, never
+/// the identity of their receiver. Nested reads conservatively retain all
+/// reachable bits, which can reject safe code but cannot hide an escaping alias.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Taint {
     holds: u64,
@@ -122,7 +124,8 @@ pub fn share_constant_literals(program: &mut Program) -> bool {
     }
 
     let shareable = {
-        let mut analysis = Analysis::new(program, init_stores, &candidates);
+        let sites = candidates.iter().map(|candidate| (candidate.function, candidate.alloc)).collect::<Vec<_>>();
+        let mut analysis = Analysis::new(program, init_stores, &sites);
         analysis.propagate();
         let rejected = analysis.rejected_bits();
         candidates
@@ -141,6 +144,49 @@ pub fn share_constant_literals(program: &mut Program) -> bool {
         }
     }
     changed
+}
+
+/// Allocation and initialization instructions whose object identities are never
+/// observed or mutated anywhere in the closed program. Unlike literal hoisting,
+/// memoization can share maps with computed fields, including recursive children.
+pub(super) fn memoizable_map_operations(program: &Program) -> HashSet<(FuncId, InstId)> {
+    let mut allowed = HashSet::default();
+    if !program_is_eligible(program) { return allowed; }
+    let mut sites = Vec::new();
+    let mut stores_by_site = Vec::new();
+    let mut init_stores = vec![HashSet::default(); program.functions.len()];
+    for (fi, function) in program.functions.iter().enumerate() {
+        for block in &function.blocks {
+            for (pos, &id) in block.insts.iter().enumerate() {
+                let node = &function.nodes[id.0 as usize];
+                if !matches!(node.kind, Inst::AllocMap) { continue; }
+                let Some(&map) = node.results.first() else { continue; };
+                let stores = initializing_stores(function, &block.insts[pos + 1..], map);
+                init_stores[fi].extend(stores.iter().copied());
+                if sites.len() == MAX_CANDIDATES { continue; }
+                sites.push((fi, id));
+                stores_by_site.push(stores);
+            }
+        }
+    }
+    if sites.is_empty() { return allowed; }
+    let mut analysis = Analysis::new(program, init_stores, &sites);
+    analysis.propagate();
+    let rejected = analysis.rejected_bits();
+    for (bit, (&(fi, alloc), stores)) in sites.iter().zip(&stores_by_site).enumerate() {
+        if rejected & (1u64 << bit) != 0 { continue; }
+        let function = &program.functions[fi];
+        // Computed keys could invoke user-defined hashing/equality. Only literal
+        // string keys belong to the allocating-pure subset.
+        if !stores.iter().all(|&id| matches!(
+            &function.nodes[id.0 as usize].kind,
+            Inst::MapSet { key, .. }
+                if matches!(resolve_constant(function, *key), Some((Constant::String(_), _)))
+        )) { continue; }
+        allowed.insert((function.id, alloc));
+        allowed.extend(stores.iter().map(|&id| (function.id, id)));
+    }
+    allowed
 }
 
 /// Hidden module slots are initialized by the module body, which isolated
@@ -261,17 +307,17 @@ fn constant_fields(
 }
 
 impl<'p> Analysis<'p> {
-    fn new(program: &'p Program, init_stores: Vec<HashSet<InstId>>, candidates: &[Candidate]) -> Self {
+    fn new(program: &'p Program, init_stores: Vec<HashSet<InstId>>, sites: &[(usize, InstId)]) -> Self {
         let func_index = program
             .functions
             .iter()
             .enumerate()
             .map(|(index, function)| (function.id, index))
             .collect();
-        let candidate_bits = candidates
+        let candidate_bits = sites
             .iter()
             .enumerate()
-            .map(|(bit, candidate)| ((candidate.function, candidate.alloc), 1u64 << bit))
+            .map(|(bit, &site)| (site, 1u64 << bit))
             .collect();
         let taint = program
             .functions
@@ -536,17 +582,8 @@ impl<'p> Analysis<'p> {
         }
         let Some(module) = program.module(target.module) else { return false; };
         if module.exports.iter().any(|export| slots.contains(&export.slot)) {
-            let imported = program.functions.iter().any(|function| {
-                function.blocks.iter().flat_map(|block| &block.insts).any(|&id| {
-                    matches!(
-                        &function.nodes[id.0 as usize].kind,
-                        Inst::ImportModule { module_name } if *module_name == module.name
-                    )
-                })
-            });
-            if imported {
-                return false;
-            }
+            // Exported callables can also be reached by an embedding host.
+            return false;
         }
 
         for (gi, function) in program.functions.iter().enumerate() {

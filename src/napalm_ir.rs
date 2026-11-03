@@ -487,16 +487,24 @@ pub enum BuiltinId {
     Delay = 24,
     Debounce = 25,
     Throttle = 26,
+    Http = 27,
+    HttpGet = 28,
+    HttpGetJson = 29,
+    HttpPostJson = 30,
+    SetTimeout = 31,
+    Print = 32,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 33] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
         Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set, Self::Proxy,
         Self::Memoize, Self::Once, Self::MemoizeExpiring, Self::Delay, Self::Debounce,
         Self::Throttle,
+        Self::Http, Self::HttpGet, Self::HttpGetJson, Self::HttpPostJson,
+        Self::SetTimeout, Self::Print,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -520,6 +528,12 @@ impl BuiltinId {
             Self::Delay => "delay",
             Self::Debounce => "debounce",
             Self::Throttle => "throttle",
+            Self::Http => "http",
+            Self::HttpGet => "get",
+            Self::HttpGetJson => "getJSON",
+            Self::HttpPostJson => "postJSON",
+            Self::SetTimeout => "setTimeout",
+            Self::Print => "print",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden
@@ -802,8 +816,8 @@ pub enum CallConv {
 
 /// Static auto-memoization decision produced by the WIR optimizer.
 ///
-/// Runtime memoization is deliberately restricted to scalar call keys/results, so
-/// this metadata is safe to carry through bytecode without rooting managed values.
+/// Keys are always scalar. Shared-result policies additionally require a
+/// whole-program proof of unobservable object identity and GC-rooted results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MemoizationKind {
     #[default]
@@ -812,6 +826,8 @@ pub enum MemoizationKind {
     Pure,
     /// Pure for scalar arguments and recursive (directly or through a pure SCC).
     Recursive,
+    /// Recursive pure allocation with globally shareable results.
+    RecursiveShared,
 }
 
 impl MemoizationKind {
@@ -822,7 +838,12 @@ impl MemoizationKind {
 
     #[inline]
     pub const fn is_recursive(self) -> bool {
-        matches!(self, Self::Recursive)
+        matches!(self, Self::Recursive | Self::RecursiveShared)
+    }
+
+    #[inline]
+    pub const fn allows_heap_results(self) -> bool {
+        matches!(self, Self::RecursiveShared)
     }
 }
 

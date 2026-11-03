@@ -5130,6 +5130,32 @@ impl<'a> TraceRecorder<'a> {
                 let Some(descriptor) = function.chunk.type_guards.get(op.x as usize) else {
                     return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
                 };
+                // Primitive bindings only validate a value; they install no
+                // persistent heap contract. Keep them in native SSA instead of
+                // synchronizing the frame and calling the interpreter on every
+                // numeric assignment (e.g. twice per Mandelbrot iteration).
+                if matches!(descriptor.expected, Type::Top | Type::Null | Type::Bool | Type::Num) {
+                    let physical = runtime
+                        .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                        .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                    let matches = match descriptor.expected {
+                        Type::Top => true,
+                        Type::Null => physical.0 == TAG_NULL,
+                        Type::Bool => physical.0 == TAG_FALSE || physical.0 == TAG_TRUE,
+                        Type::Num => word_is_num(physical),
+                        _ => unreachable!(),
+                    };
+                    if !matches {
+                        return Err(RecordingAbort::GuardFailedWhileRecording);
+                    }
+                    let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                    // A failed guard resumes at this binding so the ordinary
+                    // checker still reports the original structural type error.
+                    let result = self.guard_store_value(builder, source, &descriptor.expected, op.location.pc)
+                        .expect("primitive bindings have native guards");
+                    self.write_gpr(builder, op.a, result);
+                    return Ok(ExpectedStep::Exact(next));
+                }
                 let step = self.runtime_leaf(
                     op,
                     builder,
