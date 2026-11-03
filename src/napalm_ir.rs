@@ -144,6 +144,10 @@ pub enum Type {
     Fiber,
     Foreign(Option<ClassId>),
     Module,
+    /// Heap-backed engine builtin instance. The optional element type carries the
+    /// source-level payload contract for Event/Emitter/Channel/Receiver and the
+    /// compiler-internal resolved value type for Promise-returning native APIs.
+    Builtin(BuiltinId, Option<Box<Type>>),
 
     // Internal location/reference type used for captured mutable variables.
     Cell(Box<Type>),
@@ -220,6 +224,7 @@ impl Type {
                 | Type::Fiber
                 | Type::Foreign(_)
                 | Type::Module
+                | Type::Builtin(_, _)
                 | Type::Cell(_)
         )
     }
@@ -253,6 +258,13 @@ impl Type {
             (Closure(None), Closure(_)) => true,
             (List(None), List(_)) => true,
             (List(Some(expected)), List(Some(actual))) => expected.accepts(actual),
+            // Builtin stream/message objects are invariant when typed because
+            // Emitter/Channel accept values as well as Event/Receiver producing
+            // them. The unparameterized form is the explicit dynamic/any form.
+            (Builtin(expected, None), Builtin(actual, _)) => expected == actual,
+            (Builtin(expected_id, Some(expected)), Builtin(actual_id, Some(actual))) => {
+                expected_id == actual_id && expected == actual
+            }
             _ => false,
         }
     }
@@ -285,6 +297,14 @@ impl Type {
         // predecessor. Keep element typing only when the contracts are identical.
         if matches!((self, other), (List(_), List(_))) {
             return List(None);
+        }
+        // Mutable typed stream/message endpoints are invariant. Merging different
+        // payload contracts must erase only the payload precision, never fabricate
+        // a wider writable contract.
+        if let (Builtin(left, _), Builtin(right, _)) = (self, other) {
+            if left == right {
+                return Builtin(*left, None);
+            }
         }
         if self.accepts(other) {
             return self.clone();
@@ -388,6 +408,8 @@ impl fmt::Debug for Type {
             Foreign(Some(class)) => write!(f, "Foreign<{class:?}>") ,
             Foreign(None) => write!(f, "Foreign<?>"),
             Module => write!(f, "Module"),
+            Builtin(id, None) => write!(f, "{}", id.name()),
+            Builtin(id, Some(ty)) => write!(f, "{}<{ty:?}>", id.name()),
             Cell(ty) => write!(f, "Cell<{ty:?}>") ,
             Int32 => write!(f, "i32"),
             F64 => write!(f, "f64"),
@@ -493,10 +515,18 @@ pub enum BuiltinId {
     HttpPostJson = 30,
     SetTimeout = 31,
     Print = 32,
+    /// Read-only subscription surface paired with Emitter.
+    Event = 33,
+    /// One-to-many native event publisher.
+    Emitter = 34,
+    /// FIFO native message sender paired with Receiver.
+    Channel = 35,
+    /// FIFO native message receiver.
+    Receiver = 36,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 37] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -505,6 +535,7 @@ impl BuiltinId {
         Self::Throttle,
         Self::Http, Self::HttpGet, Self::HttpGetJson, Self::HttpPostJson,
         Self::SetTimeout, Self::Print,
+        Self::Event, Self::Emitter, Self::Channel, Self::Receiver,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -534,6 +565,10 @@ impl BuiltinId {
             Self::HttpPostJson => "postJSON",
             Self::SetTimeout => "setTimeout",
             Self::Print => "print",
+            Self::Event => "Event",
+            Self::Emitter => "Emitter",
+            Self::Channel => "Channel",
+            Self::Receiver => "Receiver",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

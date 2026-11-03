@@ -1256,6 +1256,7 @@ fn type_may_reference(ty: &Type) -> bool {
         | Type::Fiber
         | Type::Foreign(_)
         | Type::Module
+        | Type::Builtin(_, _)
         | Type::Cell(_) => true,
         Type::Union(types) => types.iter().any(type_may_reference),
         Type::Bottom

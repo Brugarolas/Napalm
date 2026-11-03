@@ -90,6 +90,7 @@ impl ConcurrentRuntime {
         jit_options: Option<TracingJitOptions>,
         shared_jit_profile: Arc<SharedJitProfile>,
         shared_jit_repository: Arc<SharedJitRepository>,
+        shared_memo: Option<Arc<SharedMemoTables>>,
     ) -> Result<Self, RuntimeError> {
         let worker_count = std::thread::available_parallelism()
             .map(|count| count.get())
@@ -138,6 +139,7 @@ impl ConcurrentRuntime {
             let worker_jit_options = jit_options.clone();
             let worker_shared_jit_profile = shared_jit_profile.clone();
             let worker_shared_jit_repository = shared_jit_repository.clone();
+            let worker_shared_memo = shared_memo.clone();
             let spawn = thread::Builder::new()
                 .name(format!("napalm-worker-{index}"))
                 .spawn(move || {
@@ -155,6 +157,7 @@ impl ConcurrentRuntime {
                         worker_jit_options,
                         worker_shared_jit_profile,
                         worker_shared_jit_repository,
+                        worker_shared_memo,
                     );
                 });
             match spawn {
@@ -309,6 +312,7 @@ fn worker_main(
     jit_options: Option<TracingJitOptions>,
     shared_jit_profile: Arc<SharedJitProfile>,
     shared_jit_repository: Arc<SharedJitRepository>,
+    shared_memo: Option<Arc<SharedMemoTables>>,
 ) {
     let signal = &signals[index];
     // Interpreter construction verifies and prepares the complete bytecode program,
@@ -343,6 +347,7 @@ fn worker_main(
                 jit_options.clone(),
                 shared_jit_profile.clone(),
                 shared_jit_repository.clone(),
+                shared_memo.clone(),
                 index as u32,
             ));
         }
@@ -354,13 +359,15 @@ fn worker_main(
         if reset_vm {
             // Drop the failed VM before constructing its replacement. Concurrent
             // workers suppress per-VM final full collections; the process-wide
-            // collector will reclaim their unreachable objects normally.
+            // collector will reclaim their unreachable objects normally. The
+            // replacement keeps the shared memo domain, so only private L1 state is lost.
             vm = Some(build_worker_vm(
                 program.as_ref(),
                 manifest.as_ref(),
                 jit_options.clone(),
                 shared_jit_profile.clone(),
                 shared_jit_repository.clone(),
+                shared_memo.clone(),
                 index as u32,
             ));
         }
@@ -439,6 +446,7 @@ fn build_worker_vm<'a>(
     jit_options: Option<TracingJitOptions>,
     shared_jit_profile: Arc<SharedJitProfile>,
     shared_jit_repository: Arc<SharedJitRepository>,
+    shared_memo: Option<Arc<SharedMemoTables>>,
     worker_id: u32,
 ) -> Result<Interpreter<'a>, String> {
     let host = Box::new(BuiltinHost::new(manifest.clone()));
@@ -453,6 +461,9 @@ fn build_worker_vm<'a>(
         ))?;
     vm.set_shared_jit_profile(shared_jit_profile);
     vm.set_shared_jit_repository(shared_jit_repository, worker_id);
+    // Joined only after the stock manifest is sealed: results are shared on
+    // the premise that every VM in the domain dispatches builtins identically.
+    vm.set_shared_memo(shared_memo);
     Ok(vm)
 }
 

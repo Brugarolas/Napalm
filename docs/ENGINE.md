@@ -83,6 +83,15 @@ Programs with concurrent functions or `launch` are skipped, because isolated wor
 
 On `scripts/trees.napalm` the pass removes all leaf allocations: one shared leaf replaces half of the nodes. Median release time drops from about 18.4 ms to 12.4 ms.
 
+### Automatic memoization across `launch` workers
+
+Every VM keeps a private first-level memo table per auto-memoized function. When a VM first launches concurrent work, it creates one program-wide second-level domain (`src/napalm_shared_memo.rs`): a lock-free `papaya` map per memoized function, shared by that VM and all of its workers. An L1 miss consults the shared tier and adopts hits into L1; each new result is published to both tiers, with the first publisher winning.
+
+- Only VM-independent scalar results (null, booleans, numbers and raw `Int32`/`F64` words) are shared. Managed results stay private to the producing heap, so the shared tier needs no GC rooting.
+- The launching VM seeds the domain with its warm L1 results, so workers start warm.
+- Auto-memoized functions are pure over scalar operators and stock builtin dispatch, and workers install the same builtin manifest. A VM that rebinds builtins after installation leaves the domain permanently, and its later launches use a domain only its workers share.
+- The shared tier uses the same entry limits as L1. Unobserved entries are swept at most once per minute, and only when a table is full.
+
 ### Aggressive HIR mode
 
 A throughput-oriented pipeline is available for hot/AOT-style use and benchmarks. It additionally pays for global analyses such as dominator-based CSE and repeats cleanup/SROA to a bounded fixed point.

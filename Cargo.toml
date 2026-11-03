@@ -16,7 +16,7 @@ logos = "0.16" # Create ridiculously fast and easy tokenizers
 smallvec = "1.16.4" # Fast hash map
 ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
-#papaya = "0.2.5" # Concurrent hash map
+papaya = "0.2.5" # Concurrent hash map
 #small-map = "0.1.5" # Small map optimization
 smallbox = "0.8.9" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
@@ -24,7 +24,7 @@ compact_str = "0.10.0" # String drop-in replacement
 parking_lot = "0.13.0" # Concurrency primitives
 #trc = "1.2.4" # Alternative to Trc with one non-atomic counter per thread and another general atomic-counter for all threads
 #archery = "1.2.1" # Faster Arc
-triomphe = "0.1.14" # Faster Arc
+#triomphe = "0.1.14" # Faster Arc
 rclite = "0.4.2" # Optimized Rc for memory usage
 chrono = "0.4.45" # Date and time library for Rust
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
@@ -42,4 +42,4 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] } # Fast JSON parsing using SIMD
 mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
-rusqlite = { version = "0.41.1", features = ["bundled", "uuid", "chrono", "vtab", "array"] } # SQLite database library for Rust
+#rusqlite = { version = "0.41.1", features = ["bundled", "uuid", "chrono", "vtab", "array"] } # SQLite database library for Rust

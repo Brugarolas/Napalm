@@ -27,7 +27,7 @@ enum Kind {
     #[token("'", string)]
     #[token("`", string)]
     String,
-    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
+    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
     Symbol,
     Eof,
 }
@@ -278,7 +278,19 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                 Box::new(classify_variable_type(arguments[1], span))), span),
             "Set" | "ReadonlySet" if arguments.len() == 1 => TypeAnnotation::new(K::Set(
                 Some(Box::new(classify_variable_type(arguments[0], span)))), span),
-            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet" => TypeAnnotation::new(K::Never, span),
+            "Event" | "Emitter" | "Channel" | "Receiver" if arguments.len() == 1 => {
+                TypeAnnotation::new(
+                    K::BuiltinGeneric(
+                        base.to_owned(),
+                        Some(Box::new(classify_variable_type(arguments[0], span))),
+                    ),
+                    span,
+                )
+            }
+            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet"
+            | "Event" | "Emitter" | "Channel" | "Receiver" => {
+                TypeAnnotation::new(K::Never, span)
+            }
             "Record" => TypeAnnotation::new(K::Map, span),
             "Function" | "Fn" => TypeAnnotation::new(K::Closure, span),
             _ => TypeAnnotation::new(K::Named(base.to_owned()), span),
@@ -3029,11 +3041,17 @@ impl<'a> Parser<'a> {
                     let type_start = self.peek().span.start;
                     self.type_arguments()?;
                     let type_end = self.tokens[self.pos - 1].span.end;
-                    if matches!(collection_name.as_str(), "Map" | "Set") {
+                    if matches!(collection_name.as_str(), "Map" | "Set" | "Emitter" | "Channel") {
                         let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
                         let annotation = classify_variable_type(&spelling, self.end(start));
                         if matches!(annotation.kind, TypeAnnotationKind::Never) {
-                            return self.error("Map expects two type arguments; Set expects one");
+                            return self.error(match collection_name.as_str() {
+                                "Map" => "Map expects two type arguments",
+                                "Set" => "Set expects one type argument",
+                                "Emitter" => "Emitter expects one event type argument",
+                                "Channel" => "Channel expects one message type argument",
+                                _ => "invalid generic constructor",
+                            });
                         }
                         collection_annotation = Some(annotation);
                     }
@@ -4781,6 +4799,7 @@ fn invoke(receiver: Expr, name: &str, args: Vec<Expr>, span: Span) -> Expr {
 fn infix(op: &str) -> Option<(u8, BinaryOp)> {
     use BinaryOp::*;
     Some(match op {
+        "|>" => (2, Pipeline),
         "|" => (5, BitOr),
         "^" => (6, BitXor),
         "&" => (7, BitAnd),
@@ -5475,6 +5494,56 @@ mod napalm_syntax_tests {
         "#);
 
         assert!(!module.statements.is_empty());
+    }
+
+    #[test]
+    fn parses_thread_first_pipeline_operator() {
+        let module = assert_parses(r#"
+            function double(value) { return value * 2; }
+            function add(value, amount) { return value + amount; }
+
+            const direct = 21 |> double;
+            const called = 20 |> add(2);
+            const chained = 5 |> double |> add(1);
+            const conditional = true ? 10 : 20 |> double;
+        "#);
+
+        let initializer = |index: usize| -> &Expr {
+            let StmtKind::Variable { initializer: Some(initializer), .. } = &module.statements[index].kind else {
+                panic!("expected initialized variable");
+            };
+            initializer
+        };
+
+        assert!(matches!(
+            &initializer(2).kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+        assert!(matches!(
+            &initializer(3).kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+
+        let ExprKind::Binary {
+            left,
+            operator: BinaryOp::Pipeline,
+            right,
+        } = &initializer(4).kind else {
+            panic!("expected outer pipeline");
+        };
+        assert!(matches!(
+            left.kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+        assert!(matches!(right.kind, ExprKind::Invoke(_)));
+
+        let ExprKind::Conditional { else_expr, .. } = &initializer(5).kind else {
+            panic!("pipeline must bind more tightly than the conditional operator");
+        };
+        assert!(matches!(
+            else_expr.kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
     }
 
     #[test]

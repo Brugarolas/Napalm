@@ -382,6 +382,8 @@ enum RawTokenKind {
     AndAnd,
     #[token("||")]
     OrOr,
+    #[token("|>")]
+    Pipeline,
 
     #[token("(")]
     LeftParen,
@@ -483,6 +485,7 @@ pub enum TokenKind {
     ShiftRight,
     AndAnd,
     OrOr,
+    Pipeline,
     LeftParen,
     RightParen,
     LeftBracket,
@@ -562,6 +565,7 @@ impl TokenKind {
             ShiftRight => "`>>`",
             AndAnd => "`&&`",
             OrOr => "`||`",
+            Pipeline => "`|>`",
             LeftParen => "`(`",
             RightParen => "`)`",
             LeftBracket => "`[`",
@@ -745,6 +749,7 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::ShiftRight => T::ShiftRight,
         R::AndAnd => T::AndAnd,
         R::OrOr => T::OrOr,
+        R::Pipeline => T::Pipeline,
         R::LeftParen => T::LeftParen,
         R::RightParen => T::RightParen,
         R::LeftBracket => T::LeftBracket,
@@ -1042,6 +1047,9 @@ pub enum TypeAnnotationKind {
     Map,
     GenericMap(Box<TypeAnnotation>, Box<TypeAnnotation>),
     Set(Option<Box<TypeAnnotation>>),
+    /// Native generic runtime endpoint such as Event<T>, Emitter<T>, Channel<T>
+    /// or Receiver<T>. `None` is the untyped/`any` form.
+    BuiltinGeneric(String, Option<Box<TypeAnnotation>>),
     Object(Vec<InterfaceField>),
     Closure,
     Named(String),
@@ -1658,6 +1666,9 @@ pub enum UnaryOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
+    /// Thread-first pipeline. `value |> f(a)` lowers to `f(value, a)`.
+    /// This operator is syntax-owned and cannot be overloaded by user classes.
+    Pipeline,
     Power,
     Multiply,
     Divide,
@@ -3968,6 +3979,7 @@ fn infix_binding(kind: TokenKind) -> Option<(u8, u8, InfixKind)> {
     use TokenKind as T;
 
     let (bp, operation) = match kind {
+        T::Pipeline => (2, Binary(B::Pipeline)),
         T::OrOr => (3, Logical(L::Or)),
         T::AndAnd => (4, Logical(L::And)),
         T::EqualEqual => (5, Binary(B::Equal)),

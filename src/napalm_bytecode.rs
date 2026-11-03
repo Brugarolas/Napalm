@@ -2439,6 +2439,7 @@ impl BytecodeVerifier {
     fn verify_type(program: &BytecodeProgram, ty: &Type) -> Result<(), VerificationError> {
         match ty {
             Type::List(Some(element)) | Type::Cell(element) => Self::verify_type(program, element),
+            Type::Builtin(_, Some(element)) => Self::verify_type(program, element),
             Type::Interface(fields) | Type::Record(fields) => {
                 for field in fields {
                     Self::verify_type(program, &field.ty)?;

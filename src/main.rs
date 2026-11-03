@@ -35,6 +35,10 @@
 //! ```
 
 #![allow(warnings)]
+// Nightly-only branch-weight and cache hints (`std::hint::{likely, unlikely,
+// cold_path, prefetch_read, prefetch_write}`), used by the interpreter hot paths.
+#![feature(likely_unlikely)]
+#![feature(hint_prefetch)]
 
 pub mod napalm_builtin;
 pub mod napalm_collections;

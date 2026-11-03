@@ -227,6 +227,7 @@ a single character; use `\u{1f600}`, for example.
 | Functions | Declarations, `function` expressions, arrows, and bar lambdas. |
 | User objects | Classes and their instances. |
 | Async control | Promise and Fiber. |
+| Reactive/event endpoints | Event, Emitter, Channel, and Receiver. |
 | Native library | Date, Random, Proxy, Response, Headers, and FFI objects. |
 
 Assigning a list, Map, or instance to another variable copies the **reference**,
@@ -382,13 +383,15 @@ type.
 | Equality | `==`, `!=`, `===`, `!==`. |
 | Bitwise | `&`, `^`, `|`. |
 | Logical | `&&`, `||`, `??`. |
+| Pipeline | `|>`; thread-first and left-associative. |
 | Conditional | `condition ? yes : no`. |
 | Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `&&=`, `||=`, `??=`. |
 
 From highest to lowest, the parser gives precedence to member access/calls,
 updates, prefixes, exponentiation, multiplication, addition, shifts,
-comparisons, equality, `&`, `^`, `|`, `&&`, `||`/`??`, the ternary operator,
-and assignment. Use parentheses when mixing logical or nullish operators.
+comparisons, equality, `&`, `^`, `|`, `&&`, `||`/`??`, `|>`, the ternary
+operator, and assignment. Use parentheses when mixing logical, nullish,
+pipeline, or conditional expressions when the intended grouping is not obvious.
 
 Two differences are especially easy to miss:
 
@@ -451,6 +454,120 @@ System.print(object?.double(4)); // 8
 receiver and key of a compound assignment are evaluated only once.
 `?.` short-circuits on `null`; it does not protect against a missing method on a
 non-null object or turn a missing key into a valid API.
+
+### 5.5 Thread-First Pipeline `|>`
+
+The pipeline operator passes the value on its left as the **first argument** to
+the callable or call expression on its right.
+
+```napalm
+function double(value: number): number {
+    return value * 2;
+}
+
+function add(value: number, amount: number): number {
+    return value + amount;
+}
+
+System.print(21 |> double);          // double(21) -> 42
+System.print(20 |> add(2));          // add(20, 2) -> 22
+System.print(5 |> double |> add(1)); // add(double(5), 1) -> 11
+```
+
+A bare callable:
+
+```napalm
+value |> transform
+```
+
+is equivalent in result to:
+
+```napalm
+transform(value)
+```
+
+A call target keeps its existing arguments after the piped value:
+
+```napalm
+value |> transform(a, b)
+```
+
+is equivalent in result to:
+
+```napalm
+transform(value, a, b)
+```
+
+The same thread-first rule applies to method calls:
+
+```napalm
+value |> object.transform(a)
+```
+
+passes `value` as the first explicit method argument:
+
+```napalm
+object.transform(value, a)
+```
+
+Call spread is supported on the right:
+
+```napalm
+value |> transform(prefix, ...rest)
+```
+
+and behaves like `transform(value, prefix, ...rest)`, subject to the normal
+maximum of 16 expanded call arguments.
+
+Pipelines are **left-associative**:
+
+```napalm
+source
+    |> normalize
+    |> validate
+    |> encode
+```
+
+means:
+
+```napalm
+encode(validate(normalize(source)))
+```
+
+A line break may precede `|>`, which makes vertical pipelines convenient.
+
+The left input is evaluated **exactly once and before the pipeline target**.
+This is stronger than a purely textual rewrite. For example, if both
+`makeValue()` and `makeTransform()` have side effects:
+
+```napalm
+makeValue() |> makeTransform()
+```
+
+evaluates `makeValue()` first, then obtains/calls the target.
+
+`|>` binds more weakly than `||`, `??`, and the other ordinary binary
+operators, but more strongly than `?:` and assignment. Parenthesize a complete
+conditional when piping its result:
+
+```napalm
+const selected = (enabled ? primary : fallback) |> normalize;
+```
+
+The pipeline is syntax-owned and **cannot be overloaded** with `operator`.
+After frontend lowering it becomes the same ordinary call IR used by normal
+calls, so there is no separate runtime pipeline object or dispatch protocol.
+
+There is no placeholder syntax attached to `|>`. `_` remains an ordinary
+identifier. To place the piped value anywhere other than the first argument,
+use a lambda:
+
+```napalm
+value |> (x => transform(prefix, x))
+```
+
+This form is also useful when the right-hand operation needs a more complex
+expression than a simple thread-first call.
 
 ## 6. Control Flow
 
@@ -684,6 +801,8 @@ To validate a dynamic return, assign the result to an annotated variable.
 | `T[]`, `Array<T>`, `List<T>` | List of T elements. |
 | `Map<K, V>` | Map with key and value contracts. |
 | `Set<T>` | Set with an element contract. |
+| `Event<T>`, `Emitter<T>` | Typed event subscription and publication endpoints. Without `<T>`, payloads are `any`. |
+| `Channel<T>`, `Receiver<T>` | Typed FIFO send/receive endpoints. Without `<T>`, payloads are `any`. |
 | `A \| B` | Union of alternatives. |
 | `(x: T) => U`, `Function`, `Fn` | Closure value; this annotation does not validate a complete signature. |
 | Interface/alias name | Schema declared in the same module. |
@@ -1557,9 +1676,91 @@ Both computed and watch:
 - They are concrete, synchronous, parameterless instance members.
 - They do not allow the `function` prefix, decorators, `static`, `async`, or
   `foreign`.
-- They do not imply a general signals, UI, or observables library.
-- No public subscribe/unsubscribe API is exposed here; `__Reactive` functions
-  are internal support, not an application API.
+- They are dependency-tracked state derivation primitives, not explicit event
+  streams.
+- The low-level `__Reactive` functions are internal support and are not an
+  application API. Use `Event`/`Emitter` when explicit subscription and
+  publication are required.
+
+### 15.3 Event and Emitter
+
+`Emitter<T>` is Napalm's native one-to-many publication endpoint.
+Its `event` getter returns an `Event<T>` view that can subscribe but cannot
+publish. The split is deliberate: code can be given an `Event<T>` without also
+being given the capability to emit values.
+
+The generic payload is optional. Without `<T>`, payloads are `any`.
+
+```napalm
+const emitter = new Emitter<number>();
+const event: Event<number> = emitter.event;
+
+const token = event.on((value) => {
+    System.print(`value: ${value}`);
+});
+
+event.once((value) => {
+    System.print(`first emission only: ${value}`);
+});
+
+System.print(emitter.emit(10)); // number of listener deliveries queued
+System.print(emitter.emit(20));
+
+event.off(token);
+System.print(event.listenerCount);
+
+emitter.clear();
+emitter.close();
+System.print(event.closed);
+```
+
+| Member | Effect |
+| --- | --- |
+| `new Emitter<T>()` | Creates an emitter; `<T>` is optional and defaults to `any`. |
+| `emitter.event` | Read-only `Event<T>` capability sharing the same event state. |
+| `emitter.emit(value)` | Queues delivery to the current listeners and returns the number of queued deliveries. |
+| `emitter.listenerCount` | Number of currently registered listeners. |
+| `emitter.clear()` | Removes all current listeners. |
+| `emitter.close()` | Closes the emitter and prevents future publication/subscription. |
+| `event.on(callback)` | Adds a persistent listener and returns a subscription token. |
+| `event.once(callback)` | Adds a listener consumed by the first emission that observes it. |
+| `event.off(token)` | Removes the subscription represented by that token. |
+| `event.off(callback)` | Removes subscriptions using that callback. |
+| `event.listenerCount` | Number of currently registered listeners. |
+| `event.closed` | Whether the shared emitter/event state is closed. |
+
+Event delivery uses the VM's **microtask queue**. `emit()` does not invoke
+listeners inline, which prevents arbitrary listener reentrancy inside the
+publisher. Listener callbacks may take zero or one argument.
+
+`emit()` snapshots the listeners that should receive that emission. Therefore,
+calling `off()`, `clear()`, or `close()` after `emit()` does not retract
+deliveries that have already been queued.
+
+A `once()` listener is consumed by the first emission that sees it, even though
+the actual callback runs later as a microtask.
+
+A `concurrent function` is not a direct event listener. If an event should
+start parallel work, use an ordinary or async listener that explicitly performs
+`launch`.
+
+Typed event contracts are persistent runtime contracts in addition to static
+checks. Hiding a typed endpoint behind `any` does not remove its payload
+restriction:
+
+```napalm runtime-error
+const emitter = new Emitter<number>();
+const dynamic: any = emitter;
+dynamic.emit("not a number");
+```
+
+`Event<T>` and its paired `Emitter<T>` share one payload contract. Applying a
+typed `Event<T>` contract to an initially untyped event also constrains its
+paired emitter.
+
+Event/Emitter endpoints are currently **VM-local**. They can be used by
+Fibers/tasks in one Interpreter, but they cannot cross the isolated
+`launch concurrent` worker boundary.
 
 ## 16. Enums
 
@@ -2047,9 +2248,9 @@ The following can cross the boundary:
 - Nested acyclic Lists and Maps.
 - Map keys that are null, Bool, number, or string.
 
-Functions, captures, Promises, Fibers, instances/classes, Proxy, Set, Range,
-Date, Random, Response/Headers, FFI libraries/functions/pointers, and external
-objects cannot cross.
+Functions, captures, Promises, Fibers, Event/Emitter, Channel/Receiver,
+instances/classes, Proxy, Set, Range, Date, Random, Response/Headers, FFI
+libraries/functions/pointers, and external objects cannot cross.
 Neither can Maps with object keys or cyclic graphs.
 The maximum depth is 256.
 
@@ -2065,6 +2266,89 @@ performed and does not guarantee immediate interruption of a blocking native
 call.
 The number of workers and the speedup depend on the machine; five tasks do not
 imply a fivefold speedup.
+
+### 21.4 Channel and Receiver
+
+`Channel<T>` and `Receiver<T>` provide native FIFO message passing inside one
+Interpreter. `Channel<T>` owns the send capability; its `receiver` getter
+returns the receive capability.
+
+The generic payload is optional. Without `<T>`, payloads are `any`.
+
+```napalm
+const channel = new Channel<string>(64);
+const receiver: Receiver<string> = channel.receiver;
+
+System.print(channel.send("hello")); // true
+System.print(channel.send("world")); // true
+
+System.print(await receiver.receive()); // hello
+System.print(receiver.tryReceive());    // world
+
+channel.close();
+System.print(await receiver.receive()); // null
+```
+
+| Member | Effect |
+| --- | --- |
+| `new Channel<T>()` | Creates an unbounded FIFO channel. `<T>` is optional and defaults to `any`. |
+| `new Channel<T>(capacity)` | Creates a bounded channel. |
+| `channel.receiver` | Returns the paired `Receiver<T>` capability. |
+| `channel.send(value)` | Sends without blocking; returns false when closed or currently unable to accept the value. |
+| `channel.close()` | Closes the channel while preserving already-buffered values for draining. |
+| `channel.length` | Number of currently buffered messages. |
+| `channel.capacity` | Configured capacity. |
+| `channel.closed` | Whether the shared channel state is closed. |
+| `receiver.receive()` | Returns `Promise<T | null>`; waits asynchronously when no message is available. |
+| `receiver.tryReceive()` | Returns an immediately available value or null. |
+| `receiver.close()` | Closes the shared channel state. |
+| `receiver.length` | Number of currently buffered messages. |
+| `receiver.closed` | Whether the shared channel state is closed. |
+
+A bounded channel never blocks the sender. When its buffer is full,
+`send(value)` returns `false`.
+
+Capacity `0` creates a **rendezvous channel**. It has no buffer:
+`send(value)` succeeds only when a receiver is already waiting.
+
+```napalm
+const channel = new Channel<number>(0);
+const receiver = channel.receiver;
+
+const pending = receiver.receive();
+System.print(channel.send(42)); // true
+System.print(await pending);    // 42
+```
+
+`receive()` resolves immediately when a buffered value is available. Otherwise
+it remains pending until a sender supplies a value or the channel closes.
+
+Closing a channel has these semantics:
+
+1. No new sends are accepted.
+2. Already-buffered values remain available and are drained in FIFO order.
+3. Pending receivers that cannot receive a buffered value complete with `null`.
+4. After the buffer is empty, subsequent `receive()` calls resolve with `null`.
+
+The nullable result is part of the type: `Receiver<T>.receive()` has an await
+result of `T | null`, not just `T`.
+
+As with Event/Emitter, typed channel contracts survive aliases through `any`:
+
+```napalm runtime-error
+const numbers = new Channel<number>();
+const dynamic: any = numbers;
+dynamic.send("not a number");
+```
+
+`Channel<T>` and its paired `Receiver<T>` share one payload contract. Applying
+a typed contract to one side constrains the other side as well.
+
+These endpoints are currently **VM-local**. They work across cooperative tasks
+and Fibers in one Interpreter, but they do not yet cross `launch concurrent`.
+The worker boundary copies supported values into an isolated Interpreter; a
+future cross-worker channel requires transport in the concurrent runtime rather
+than sharing VM heap handles.
 
 ## 22. Fibers
 
@@ -2900,6 +3184,7 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 | A closure has dynamic this. | `this` is lexical. |
 | async means parallel CPU work. | Use launch with concurrent functions for that. |
 | Promise has then/catch/executor. | Use async/await and installed factories/combinators. |
+| EventEmitter or MessageChannel must be imported from Node/browser APIs. | Napalm provides native global Event/Emitter and Channel/Receiver endpoints. |
 | `System.clock` measures ms. | It measures seconds; timers and Date use ms. |
 | A broken contract is caught. | Contract errors are fatal. |
 
@@ -2909,7 +3194,7 @@ Do not use the following as though they were available features:
 
 - `switch`, generators, `yield` as generator syntax, regex literals,
   JSX, executable namespaces, and `const enum`.
-- `typeof`, `void` as an operator, `>>>`, and the `|>` pipeline.
+- `typeof`, `void` as an operator, and `>>>`.
 - Rest parameters and full default-initializer parameters.
 - The general comma operator and `matrix[x, y]` subscripts.
 - Namespace imports, export-star, dynamic import, and require.
@@ -3080,7 +3365,7 @@ they are engine-specific benchmarks.
 
 | File | Observed difference |
 | --- | --- |
-| [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, pipeline, uninstalled JS methods, Promise executor, and Deferred. It does not compile as a current program. |
+| [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
 | [trycatch.napalm](scripts/trycatch.napalm) | Uses `fn` declarations; the manual's exception examples use `function`. |
 | [defer.napalm](scripts/defer.napalm) | The `errdefer (error)` binding must be written with bars. |
 | [types.napalm](scripts/types.napalm) | Attempts to pass class instances to a structural-interface list. The current contract rejects that mixture; later blocks do not make fatal violations recoverable. |
@@ -3148,7 +3433,7 @@ syntax does not replace checking a `.napalm` file with the current CLI.
 Current engine, as of 02-Nov-2026, shows an impressive performance that can compete against V8 and JSC. Although there are not a lot of benchmarks right now, these are the numbers of the existing benchmarks as of today.
 
 
-| Test | Napalm performance | Node performance | Bun Performance |
+| Test | Napalm Performance | Node Performance | Bun Performance |
 | --- | --- | --- | --- |
 | `jit` | 0.198551s | 0.187731s | 0.223191s |
 | `jit_entries` | 0.002747s |  0.005001s | 0.004753s |

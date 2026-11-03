@@ -21,6 +21,9 @@ pub use typed_object_specialization::TypedObjectSpecialization;
 #[path = "shared_constant_literals.rs"]
 mod shared_constant_literals;
 pub use shared_constant_literals::SharedConstantLiterals;
+#[path = "static_type_specialization.rs"]
+mod static_type_specialization;
+pub use static_type_specialization::StaticTypeSpecialization;
 
 /// Interpreter-oriented WIR optimization pipeline.
 ///
@@ -34,6 +37,10 @@ pub fn optimization_passes() -> Optimize {
     // avoids repeatedly paying verifier cost during development.
     Optimize::new()
         .with_function_pass(InterpreterOptimizationBundle::default())
+        // Whole-program use of static types (class-hierarchy devirtualization,
+        // typed call results, validation elimination). It must precede
+        // memoization so the purity analysis sees the resolved call graph.
+        .with_program_finalizer(StaticTypeSpecialization::default())
         .with_program_finalizer(AutoMemoization::default())
         .with_program_finalizer(SharedConstantLiterals::default())
 }
@@ -117,8 +124,9 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
         });
     }
 
-    // Function-local optimization is parallel; memoization needs the finalized
-    // whole-program call graph and therefore runs once after all workers join.
+    // Function-local optimization is parallel; the whole-program passes need the
+    // finalized call graph and class hierarchy and run once after workers join.
+    let _ = StaticTypeSpecialization.optimize_program(program);
     let mut memoization = AutoMemoization::default();
     let _ = memoization.optimize_program(program);
     // Literal sharing needs the direct call graph produced by memoization.
@@ -2394,6 +2402,13 @@ fn thread_edge_once(function: &Function, incoming: &Edge, effect: crate::napalm_
     let Inst::Jump { edge: outgoing } = &node.kind else {
         return None;
     };
+    // Bypassing the block only remaps its parameters inside its own Jump. If a
+    // block it dominates also reads them (e.g. the header of `while (true)`
+    // once its constant branch has folded), the bypass would leave those reads
+    // without a definition.
+    if !block.params.is_empty() && block_params_used_elsewhere(function, block.id) {
+        return None;
+    }
 
     let mut args = outgoing.args.clone();
     for arg in &mut args {
@@ -2413,6 +2428,22 @@ fn thread_edge_once(function: &Function, incoming: &Edge, effect: crate::napalm_
         args,
         effect,
     })
+}
+
+fn block_params_used_elsewhere(function: &Function, owner: BlockId) -> bool {
+    function
+        .blocks
+        .iter()
+        .filter(|block| block.id != owner)
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|&inst| function.node(inst))
+        .any(|node| {
+            node.kind.operands().into_iter().any(|operand| {
+                function
+                    .value(operand)
+                    .is_some_and(|value| matches!(value.def, ValueDef::BlockParam(block, _) if block == owner))
+            })
+        })
 }
 
 fn compute_reachable(function: &Function) -> Vec<bool> {
