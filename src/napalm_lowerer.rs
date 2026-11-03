@@ -7712,7 +7712,7 @@ class Child is Parent {
     }
 
     #[test]
-    fn undeclared_this_property_becomes_fixed_instance_field() {
+    fn undeclared_constructor_property_becomes_public_fixed_instance_field() {
         let source = r#"
             class Counter {
                 constructor() {
@@ -7763,8 +7763,19 @@ class Child is Parent {
             }
         }
 
-        assert!(loads >= 2, "this.value reads should lower to LoadField");
-        assert!(stores >= 2, "this.value writes should lower to StoreField");
+        // Like explicit class fields, constructor properties now expose accessor
+        // methods over one fixed slot. Their bodies own the raw loads/stores;
+        // callers use normal property dispatch, including subclass overrides.
+        assert!(loads >= 1, "the property getter should load its fixed field");
+        assert!(stores >= 1, "the property setter should store its fixed field");
+        for kind in [MethodKind::Getter, MethodKind::Setter] {
+            assert!(output.program.functions.iter().flat_map(|function| &function.nodes).any(|node| {
+                let Inst::BindMethod { method, .. } = &node.kind else { return false };
+                output.program.method(*method).is_some_and(|signature| {
+                    signature.kind == kind && output.program.string(signature.name) == Some("value")
+                })
+            }), "constructor property must bind a public {kind:?}");
+        }
     }
 
     #[test]

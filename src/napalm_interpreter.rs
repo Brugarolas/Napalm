@@ -23,6 +23,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{mpsc, Arc, OnceLock};
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use simd_json::prelude::*;
@@ -1779,6 +1780,10 @@ struct HeapIdentity {
 enum ReactiveSourceKind {
     InstanceField,
     StaticField,
+    /// Synthetic source representing the observable value of one computed.
+    /// Downstream computed properties and watchers subscribe to this edge
+    /// instead of flattening all transitive field dependencies into themselves.
+    Computed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1803,7 +1808,7 @@ struct ReactiveObserverKey {
 #[derive(Debug)]
 struct ReactiveFrame {
     observer: ReactiveObserverKey,
-    dependencies: Vec<ReactiveDependency>,
+    dependencies: SmallVec<[ReactiveDependency; 8]>,
 }
 
 #[derive(Debug)]
@@ -1811,13 +1816,28 @@ struct ReactiveComputedState {
     initialized: bool,
     dirty: bool,
     evaluating: bool,
-    dependencies: Vec<ReactiveDependency>,
+    /// When true, a dirty computed must execute again even if its previously
+    /// recorded dependency versions still match. This covers first evaluation,
+    /// exceptions and writes performed during evaluation.
+    force_recompute: bool,
+    /// Runtime-owned logical cache. The frontend mirrors managed values into an
+    /// owner-scoped hidden field only as a GC anchor; getters read this native
+    /// cache directly so the anchor never participates in dependency tracking.
+    cached_value: Value,
+    /// Incremented only when the observable computed value actually changes.
+    /// Downstream observers snapshot this version, which lets them suppress work
+    /// when an upstream computed was invalidated but later re-evaluated to the
+    /// same value.
+    value_version: u64,
+    dependencies: SmallVec<[ReactiveDependency; 8]>,
+    dependency_versions: SmallVec<[u64; 8]>,
 }
 
 #[derive(Debug)]
 struct ReactiveWatcherState {
     scheduled: bool,
-    dependencies: Vec<ReactiveDependency>,
+    dependencies: SmallVec<[ReactiveDependency; 8]>,
+    dependency_versions: SmallVec<[u64; 8]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1906,9 +1926,9 @@ enum RuntimeEvent {
         callback: Option<Value>,
         interval: bool,
     },
-    ReactiveWatcher {
-        callback: Value,
-    },
+    /// One microtask drains every watcher queued during the current turn.
+    /// Individual callbacks stay rooted in `reactive_pending_watchers`.
+    ReactiveFlush,
     NativeDecoratorFire {
         state: Value,
         token: u64,
@@ -1935,7 +1955,7 @@ impl RuntimeEvent {
                 visit(promise);
                 if let Some(callback) = callback { visit(callback); }
             }
-            RuntimeEvent::ReactiveWatcher { callback } => visit(callback),
+            RuntimeEvent::ReactiveFlush => {},
             RuntimeEvent::NativeDecoratorFire { state, .. } => visit(state),
         }
     }
@@ -3008,7 +3028,11 @@ fn fiber_state_external_bytes(state: &FiberState) -> usize {
         + state.registers.capacity() * std::mem::size_of::<RegisterWord>()
         + state.reactive_stack.capacity() * std::mem::size_of::<ReactiveFrame>()
         + state.reactive_stack.iter().map(|frame| {
-            frame.dependencies.capacity() * std::mem::size_of::<ReactiveDependency>()
+            if frame.dependencies.spilled() {
+                frame.dependencies.capacity() * std::mem::size_of::<ReactiveDependency>()
+            } else {
+                0
+            }
         }).sum::<usize>()
 }
 
@@ -4166,9 +4190,15 @@ impl Heap {
     }
 
     #[inline]
-    fn safepoint(&mut self) {
-        self.mutator.safepoint();
-        self.remember_stack_owner();
+    fn safepoint(&mut self) -> bool {
+        // The FiberObject only needs to be re-logged after a collection epoch has
+        // actually completed. Keeping probable_write() off the no-GC safepoint
+        // path avoids its StickyImmix log-bit atomic on every ordinary poll.
+        let collected = self.mutator.safepoint();
+        if collected {
+            self.remember_stack_owner();
+        }
+        collected
     }
 
     fn collect_full(&mut self) {
@@ -4901,8 +4931,11 @@ struct PreparedOp {
     cache: u32,
     next: u32,
     args_offset: u32,
-    raw_pc: u32,
 }
+
+// Keep the threaded executable stream at six machine-independent 32-bit words.
+// A larger token materially reduces I/D-cache density in the baseline VM.
+const _: () = assert!(std::mem::size_of::<PreparedOp>() == 24);
 
 impl Default for PreparedOp {
     fn default() -> Self {
@@ -4916,7 +4949,6 @@ impl Default for PreparedOp {
             cache: 0,
             next: 0,
             args_offset: 0,
-            raw_pc: 0,
         }
     }
 }
@@ -5006,6 +5038,9 @@ struct PreparedFunction {
     jit_loop_headers: Vec<u8>,
     ops: Vec<PreparedOp>,
     original_ops: Vec<PreparedOp>,
+    /// Raw bytecode PC for each prepared-op index. Kept out of PreparedOp so the
+    /// executable stream stays 24 bytes/op; diagnostics/tiering pay this cold load.
+    raw_pcs: Vec<u32>,
     call_args: Vec<Reg>,
     switches: Vec<PreparedSwitch>,
     gc_maps: Vec<ReferenceMap>,
@@ -5326,7 +5361,6 @@ impl PreparedProgram {
                 cache: 0,
                 next: (index + 1) as u32,
                 args_offset: temp.args_offset,
-                raw_pc: temp.raw_pc,
             };
 
             match temp.opcode {
@@ -5530,6 +5564,7 @@ impl PreparedProgram {
                 .collect::<Vec<_>>(),
         );
         let gc_map_by_op = temps.iter().map(|temp| temp.gc_map).collect();
+        let raw_pcs = temps.iter().map(|temp| temp.raw_pc).collect();
 
         let mut memo_arg_kinds = [RegisterKind::Value; 4];
         for binding in &function.frame.parameters {
@@ -5550,6 +5585,7 @@ impl PreparedProgram {
             jit_loop_headers,
             ops,
             original_ops,
+            raw_pcs,
             call_args,
             switches,
             gc_maps,
@@ -5885,6 +5921,7 @@ pub enum NativeBuiltin {
     ReactiveUnwatch,
     ReactiveBeginComputed,
     ReactiveFinishComputed,
+    ReactiveReadComputed,
     ReactiveAbortComputed,
     FetchCall,
     HttpListen,
@@ -6145,6 +6182,11 @@ impl Default for InlineCacheState {
 impl InlineCacheState {
     #[inline(always)]
     fn probe(&self, class: ReceiverClass) -> Option<CallTarget> {
+        // Once the site becomes megamorphic, resolve_invoke_miss() owns a cache
+        // containing every subsequently observed class. Skip four dead PIC guards.
+        if self.megamorphic {
+            return None;
+        }
         // Four entries is small enough that an unrolled probe beats loop control
         // and gives the branch predictor a stable branch for each PIC position.
         if self.len > 0 {
@@ -6168,6 +6210,9 @@ impl InlineCacheState {
 
     #[inline]
     fn insert(&mut self, class: ReceiverClass, target: CallTarget) {
+        if self.megamorphic {
+            return;
+        }
         if self.probe(class).is_some() { return; }
         if (self.len as usize) < self.entries.len() {
             self.entries[self.len as usize] = IcEntry { class, target };
@@ -6741,9 +6786,20 @@ pub struct Interpreter<'p> {
     /// JIT fast paths. Registration invalidates old field-specialized traces once.
     reactive_enabled: bool,
     reactive_tracking_active: bool,
-    reactive_dependents: FastMap<ReactiveDependency, Vec<ReactiveObserverKey>>,
+    reactive_dependents: FastMap<ReactiveDependency, SmallVec<[ReactiveObserverKey; 4]>>,
+    /// Monotonic versions for ordinary reactive fields. Computed outputs keep
+    /// their own value_version in ReactiveComputedState.
+    reactive_versions: FastMap<ReactiveDependency, u64>,
     reactive_computed: FastMap<HeapIdentity, ReactiveComputedState>,
     reactive_watchers: FastMap<HeapIdentity, ReactiveWatcherState>,
+    /// Watcher notifications are coalesced into one microtask per turn. The
+    /// Values live here (rather than only as HeapIdentity keys) so queued watcher
+    /// closures remain precise GC roots until the batch is drained.
+    reactive_pending_watchers: VecDeque<Value>,
+    reactive_flush_scheduled: bool,
+    /// Reused scratch storage for transitive computed invalidation. A clean
+    /// computed enters this queue at most once before it is observed again.
+    reactive_invalidation_queue: Vec<ReactiveDependency>,
     /// HTTP is initialized lazily on the first fetch() call so ordinary Napalm
     /// programs pay no Tokio threads, reqwest client construction, or TLS setup.
     /// Managed Promise values never cross into the HTTP runtime.
@@ -6893,6 +6949,7 @@ unsafe impl GcRootProvider for VmRootProvider {
         }
 
         vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
+        for &callback in &vm.reactive_pending_watchers { root(callback); }
         for &promise in vm.pending_fetches.values() { root(promise); }
         for route in vm.http_routes.values().flatten() { root(route.handler); }
         for &promise in vm.pending_concurrent.values() { root(promise); }
@@ -7053,7 +7110,8 @@ impl<'p> Interpreter<'p> {
             let bytecode = &program.functions[function_index].chunk.code;
             for index in 0..function.ops.len() {
                 let original = function.original_ops[index];
-                let Some(opcode) = bytecode[original.raw_pc as usize].opcode() else { continue; };
+                let raw_pc = unsafe { *function.raw_pcs.get_unchecked(index) };
+                let Some(opcode) = bytecode[raw_pc as usize].opcode() else { continue; };
                 if !matches!(opcode, Opcode::LoadModuleVar | Opcode::StoreModuleVar) { continue; }
                 let module_index = original.x as usize;
                 let slot = original.y;
@@ -7211,8 +7269,12 @@ impl<'p> Interpreter<'p> {
             reactive_enabled,
             reactive_tracking_active: false,
             reactive_dependents: FastMap::default(),
+            reactive_versions: FastMap::default(),
             reactive_computed: FastMap::default(),
             reactive_watchers: FastMap::default(),
+            reactive_pending_watchers: VecDeque::new(),
+            reactive_flush_scheduled: false,
+            reactive_invalidation_queue: Vec::with_capacity(16),
             fetch: None,
             pending_fetches: FastMap::default(),
             simple_fetches: FastMap::default(),
@@ -7383,6 +7445,7 @@ impl<'p> Interpreter<'p> {
                 + self.modules.len()
                 + self.roots.len()
                 + self.event_loop.len() * 3
+                + self.reactive_pending_watchers.len()
                 + self.pending_fetches.len()
                 + self.pending_concurrent.len()
                 + 8,
@@ -7417,6 +7480,7 @@ impl<'p> Interpreter<'p> {
             }
         }
         self.event_loop.for_each_payload(|event| (*event).visit_values(&mut push));
+        for &callback in &self.reactive_pending_watchers { push(callback); }
         for &promise in self.pending_fetches.values() { push(promise); }
         for route in self.http_routes.values().flatten() { push(route.handler); }
         for &promise in self.pending_concurrent.values() { push(promise); }
@@ -7987,10 +8051,8 @@ impl<'p> Interpreter<'p> {
             (jit.enter_trace(self, TraceId(cached_trace)), None)
         } else {
             let function = (*function_ptr).id;
-            let target_raw_pc = (&(*function_ptr).original_ops)
-                .get_unchecked(target as usize)
-                .raw_pc;
-            let from = TraceLocation::new(function, BytecodePc(op.raw_pc));
+            let target_raw_pc = *(&(*function_ptr).raw_pcs).get_unchecked(target as usize);
+            let from = TraceLocation::new(function, BytecodePc(self.raw_pc_for_op(op)));
             let to = TraceLocation::new(function, BytecodePc(target_raw_pc));
             (jit.on_backedge(self, from, to), Some(to))
         };
@@ -8087,9 +8149,33 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    /// Raw bytecode PC of `op` in the current hot function.
+    ///
+    /// Ops dispatched from the prepared stream are identified exactly by their
+    /// address, even after `advance()`. Handlers and trace/WFJIT runtime helpers
+    /// may pass a stack copy instead; like `mark_gc_point`, that case relies on
+    /// `hot_pc` still naming the op, so callers must query before `advance()` or
+    /// any frame push.
+    #[inline(always)]
+    fn raw_pc_for_op(&self, op: &PreparedOp) -> u32 {
+        let prepared = self.current_prepared();
+        // Plain address arithmetic: `offset_from` would be UB for stack copies.
+        let byte_offset = (op as *const PreparedOp as usize)
+            .wrapping_sub(prepared.ops.as_ptr() as usize);
+        let index = byte_offset / std::mem::size_of::<PreparedOp>();
+        if index < prepared.ops.len() {
+            debug_assert_eq!(prepared.ops.len(), prepared.raw_pcs.len());
+            // ops and raw_pcs are built from the same temps, one entry per op.
+            return unsafe { *prepared.raw_pcs.get_unchecked(index) };
+        }
+        let index = self.hot_pc as usize;
+        debug_assert!(index < prepared.raw_pcs.len(), "detached op without a live hot_pc");
+        prepared.raw_pcs.get(index).copied().unwrap_or(NO_INDEX)
+    }
+
     #[inline(always)]
     fn current_location(&self, op: &PreparedOp) -> (FuncId, BytecodePc) {
-        (self.current_prepared().id, BytecodePc(op.raw_pc))
+        (self.current_prepared().id, BytecodePc(self.raw_pc_for_op(op)))
     }
 
     /// Attach source-level location information to a runtime error.
@@ -8156,7 +8242,7 @@ impl<'p> Interpreter<'p> {
         &self,
         op: &PreparedOp,
     ) -> Option<(usize, PreparedExceptionHandler)> {
-        self.find_structured_handler_in(self.current_fiber, op.raw_pc)
+        self.find_structured_handler_in(self.current_fiber, self.raw_pc_for_op(op))
     }
 
     fn find_structured_handler_in(
@@ -8202,7 +8288,7 @@ impl<'p> Interpreter<'p> {
         thrown: Option<Value>,
         runtime_error: Option<RuntimeError>,
     ) -> bool {
-        self.unwind_to_structured_handler_at(op.raw_pc, thrown, runtime_error)
+        self.unwind_to_structured_handler_at(self.raw_pc_for_op(op), thrown, runtime_error)
     }
 
     #[cold]
@@ -8395,13 +8481,25 @@ impl<'p> Interpreter<'p> {
     #[cold]
     #[inline(never)]
     fn fail_at(&mut self, op: &PreparedOp, message: impl Into<String>) {
-        let (function, pc) = self.current_location(op);
+        let raw_pc = self.raw_pc_for_op(op);
+        self.fail_at_raw_pc(raw_pc, message);
+    }
+
+    /// `fail_at` for paths that already advanced past an op which may be a
+    /// detached copy; the raw PC must be captured before `advance()`.
+    #[cold]
+    #[inline(never)]
+    fn fail_at_raw_pc(&mut self, raw_pc: u32, message: impl Into<String>) {
+        let function = self.current_prepared().id;
+        let pc = BytecodePc(raw_pc);
         let error = self.annotate_runtime_error_source(
             RuntimeError::new(message).at(function, pc),
             function,
             pc,
         );
-        if self.raise_runtime_exception(op, error.clone()) {
+        if !error.message.starts_with(interfaces::TYPE_ERROR)
+            && self.unwind_to_structured_handler_at(raw_pc, None, Some(error.clone()))
+        {
             return;
         }
         self.fail(error);
@@ -8965,7 +9063,7 @@ impl<'p> Interpreter<'p> {
         if let Some(observer) = reactive_observer {
             task_state.reactive_stack.push(ReactiveFrame {
                 observer,
-                dependencies: Vec::with_capacity(8),
+                dependencies: SmallVec::new(),
             });
         }
         let task = Arc::new(FiberCell::new(task_state));
@@ -9096,6 +9194,9 @@ impl<'p> Interpreter<'p> {
         args: &[RegisterWord],
         closure: Option<Value>,
     ) {
+        // `op` may be a detached copy, so resolve the caller PC before advancing
+        // and before push_frame() retargets the hot function to the callee.
+        let caller_raw_pc = self.raw_pc_for_op(op);
         self.mark_gc_point(op);
         unsafe { self.advance(op); }
         self.flush_hot_pc();
@@ -9105,14 +9206,14 @@ impl<'p> Interpreter<'p> {
             (prepared.is_concurrent, prepared.is_async)
         };
         if is_concurrent {
-            self.fail_at(op, "concurrent functions cannot be called directly; use `launch`");
+            self.fail_at_raw_pc(caller_raw_pc, "concurrent functions cannot be called directly; use `launch`");
             return;
         }
         if is_async {
             self.maybe_collect();
             match self.spawn_async_task(function, receiver, args, closure, None) {
                 Ok(promise) => unsafe { self.set_reg(op.a, promise.word()) },
-                Err(error) => self.fail_at(op, error.message),
+                Err(error) => self.fail_at_raw_pc(caller_raw_pc, error.message),
             }
             return;
         }
@@ -9128,12 +9229,12 @@ impl<'p> Interpreter<'p> {
 
         match self.push_frame(function, receiver, args, closure, Some(Reg(op.a))) {
             Ok(()) => {
-                self.current_frame_mut().caller_pc = op.raw_pc;
+                self.current_frame_mut().caller_pc = caller_raw_pc;
                 if let Some(key) = memo_key {
                     self.remember_memo_miss_for_current_frame(key);
                 }
             }
-            Err(error) => self.fail_at(op, error.message),
+            Err(error) => self.fail_at_raw_pc(caller_raw_pc, error.message),
         }
     }
 
@@ -9148,16 +9249,17 @@ impl<'p> Interpreter<'p> {
         closure: Value,
         captures: &[RegisterWord],
     ) {
+        let caller_raw_pc = self.raw_pc_for_op(op);
         self.mark_gc_point(op);
         unsafe { self.advance(op); }
         self.flush_hot_pc();
 
         if self.prepared.functions[function as usize].is_concurrent {
-            self.fail_at(op, "staged direct closure call cannot target concurrent bytecode");
+            self.fail_at_raw_pc(caller_raw_pc, "staged direct closure call cannot target concurrent bytecode");
             return;
         }
         if self.prepared.functions[function as usize].is_async {
-            self.fail_at(op, "staged direct closure call cannot target async bytecode");
+            self.fail_at_raw_pc(caller_raw_pc, "staged direct closure call cannot target async bytecode");
             return;
         }
         let memo_key = match self.probe_memoized_call(function, args) {
@@ -9172,12 +9274,12 @@ impl<'p> Interpreter<'p> {
             function, None, args, Some(closure), Some(captures), Some(Reg(op.a)),
         ) {
             Ok(()) => {
-                self.current_frame_mut().caller_pc = op.raw_pc;
+                self.current_frame_mut().caller_pc = caller_raw_pc;
                 if let Some(key) = memo_key {
                     self.remember_memo_miss_for_current_frame(key);
                 }
             }
-            Err(error) => self.fail_at(op, error.message),
+            Err(error) => self.fail_at_raw_pc(caller_raw_pc, error.message),
         }
     }
 
@@ -10962,6 +11064,17 @@ impl<'p> Interpreter<'p> {
             .collect::<Vec<_>>();
         for dependency in stale_sources {
             self.reactive_dependents.remove(&dependency);
+            self.reactive_versions.remove(&dependency);
+        }
+
+        let stale_versions = self
+            .reactive_versions
+            .keys()
+            .copied()
+            .filter(|dependency| !self.heap.identity_matches(dependency.source))
+            .collect::<Vec<_>>();
+        for dependency in stale_versions {
+            self.reactive_versions.remove(&dependency);
         }
     }
 
@@ -10974,7 +11087,13 @@ impl<'p> Interpreter<'p> {
         if old == new {
             return;
         }
+        // Stable dependencies are by far the common case. When a branch changes
+        // only part of the dependency set, preserve the edges that survived
+        // instead of tearing down and rebuilding the whole observer list.
         for dependency in old {
+            if new.contains(dependency) {
+                continue;
+            }
             let remove_key = if let Some(observers) = self.reactive_dependents.get_mut(dependency) {
                 observers.retain(|candidate| *candidate != observer);
                 observers.is_empty()
@@ -10983,14 +11102,84 @@ impl<'p> Interpreter<'p> {
             };
             if remove_key {
                 self.reactive_dependents.remove(dependency);
+                if dependency.kind != ReactiveSourceKind::Computed {
+                    self.reactive_versions.remove(dependency);
+                }
             }
         }
         for &dependency in new {
+            if old.contains(&dependency) {
+                continue;
+            }
             let observers = self.reactive_dependents.entry(dependency).or_default();
             if !observers.contains(&observer) {
                 observers.push(observer);
             }
         }
+    }
+
+    #[inline(always)]
+    fn reactive_computed_dependency(callback: HeapIdentity) -> ReactiveDependency {
+        ReactiveDependency {
+            source: callback,
+            kind: ReactiveSourceKind::Computed,
+            slot: 0,
+        }
+    }
+
+    #[inline]
+    fn reactive_dependency_version(&self, dependency: ReactiveDependency) -> u64 {
+        match dependency.kind {
+            ReactiveSourceKind::Computed => self
+                .reactive_computed
+                .get(&dependency.source)
+                .map_or(0, |state| state.value_version),
+            ReactiveSourceKind::InstanceField | ReactiveSourceKind::StaticField => self
+                .reactive_versions
+                .get(&dependency)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    fn reactive_snapshot_versions(
+        &self,
+        dependencies: &[ReactiveDependency],
+    ) -> SmallVec<[u64; 8]> {
+        dependencies
+            .iter()
+            .copied()
+            .map(|dependency| self.reactive_dependency_version(dependency))
+            .collect()
+    }
+
+    /// Return true when an observer's dependency snapshot can no longer be
+    /// trusted. A dirty upstream computed is conservatively treated as changed
+    /// until it has been refreshed. If that refresh produces the same value, its
+    /// value_version remains unchanged and downstream observers can then skip work.
+    fn reactive_dependencies_changed(
+        &self,
+        dependencies: &[ReactiveDependency],
+        versions: &[u64],
+    ) -> bool {
+        if dependencies.len() != versions.len() {
+            return true;
+        }
+        dependencies
+            .iter()
+            .copied()
+            .zip(versions.iter().copied())
+            .any(|(dependency, version)| {
+                if dependency.kind == ReactiveSourceKind::Computed
+                    && self
+                        .reactive_computed
+                        .get(&dependency.source)
+                        .is_some_and(|state| state.dirty || state.evaluating)
+                {
+                    return true;
+                }
+                self.reactive_dependency_version(dependency) != version
+            })
     }
 
     #[inline]
@@ -11000,31 +11189,135 @@ impl<'p> Interpreter<'p> {
         }
         let current = self.current_fiber;
         let stack = &mut self.fiber_mut(current).reactive_stack;
-        // Add to every active collector. If an outer watcher reads a computed
-        // which recomputes now, field reads are dependencies of both observers.
-        for frame in stack {
-            if !frame.dependencies.contains(&dependency) {
-                frame.dependencies.push(dependency);
-            }
+        // Track only the currently executing observer. Nested computed values are
+        // first-class dependency nodes, so an outer observer subscribes to the
+        // inner computed rather than duplicating all of its transitive field edges.
+        let Some(frame) = stack.last_mut() else { return; };
+        if !frame.dependencies.contains(&dependency) {
+            frame.dependencies.push(dependency);
         }
     }
 
     #[inline]
-    fn reactive_track_field(&mut self, source: Value, kind: ReactiveSourceKind, slot: u32) {
+    fn reactive_track_field(
+        &mut self,
+        source: Value,
+        kind: ReactiveSourceKind,
+        slot: u32,
+        value: Value,
+    ) {
         if !self.reactive_tracking_active {
             return;
         }
+
+        // Compiler-generated reactive callback slots are implementation details,
+        // not observable state. Their closures are registered before the hidden
+        // field stores them, so identity membership gives us a zero-metadata way
+        // to keep those loads out of user dependency graphs.
+        if let Some(identity) = self.heap.identity(value) {
+            if self.reactive_computed.contains_key(&identity)
+                || self.reactive_watchers.contains_key(&identity)
+            {
+                return;
+            }
+        }
+
         let Some(source) = self.heap.identity(source) else { return; };
         self.reactive_track_dependency(ReactiveDependency { source, kind, slot });
     }
 
-    fn reactive_replay_dependencies(&mut self, dependencies: &[ReactiveDependency]) {
-        if !self.reactive_tracking_active {
+    fn reactive_schedule_watcher(&mut self, callback: HeapIdentity) {
+        let schedule = self
+            .reactive_watchers
+            .get_mut(&callback)
+            .is_some_and(|state| {
+                if state.scheduled {
+                    false
+                } else {
+                    state.scheduled = true;
+                    true
+                }
+            });
+        if !schedule {
             return;
         }
-        for &dependency in dependencies {
-            self.reactive_track_dependency(dependency);
+
+        // The Value keeps the callback alive while it waits in the centralized
+        // batch queue. The generation is revalidated before execution.
+        self.reactive_pending_watchers
+            .push_back(Value::from_heap(callback.handle));
+        if !self.reactive_flush_scheduled {
+            self.reactive_flush_scheduled = true;
+            self.event_loop.enqueue_microtask(RuntimeEvent::ReactiveFlush);
         }
+    }
+
+    /// Propagate invalidation through the computed DAG without recomputing any
+    /// value. A computed that is already dirty is a natural batch boundary: all
+    /// downstream observers were notified by the first invalidation, so later
+    /// writes before the next read are O(1) with respect to that subgraph.
+    fn reactive_propagate_invalidations(&mut self, initial: &[ReactiveDependency]) {
+        let mut queue = std::mem::take(&mut self.reactive_invalidation_queue);
+        queue.clear();
+        queue.extend_from_slice(initial);
+
+        while let Some(dependency) = queue.pop() {
+            // Temporarily own the observer vector so propagation can mutate the
+            // rest of the runtime without cloning this list. Compact live entries
+            // in-place and reuse the same allocation when reinserting it.
+            let Some(mut observers) = self.reactive_dependents.remove(&dependency) else {
+                continue;
+            };
+            let mut live_len = 0usize;
+
+            for index in 0..observers.len() {
+                let observer = observers[index];
+                if !self.reactive_observer_alive(observer) {
+                    continue;
+                }
+                observers[live_len] = observer;
+                live_len += 1;
+
+                match observer.kind {
+                    ReactiveObserverKind::Computed => {
+                        let propagate = self
+                            .reactive_computed
+                            .get_mut(&observer.callback)
+                            .is_some_and(|state| {
+                                // Published edges describe the previous completed
+                                // evaluation. While recomputing, only dependencies
+                                // already seen by the active frame may invalidate
+                                // the in-flight result; reactive_trigger handles that
+                                // case before entering this propagation loop.
+                                if state.evaluating || state.dirty {
+                                    false
+                                } else {
+                                    state.dirty = true;
+                                    state.force_recompute = false;
+                                    true
+                                }
+                            });
+                        if propagate {
+                            queue.push(Self::reactive_computed_dependency(observer.callback));
+                        }
+                    }
+                    ReactiveObserverKind::Watcher => {
+                        self.reactive_schedule_watcher(observer.callback);
+                    }
+                }
+            }
+
+            observers.truncate(live_len);
+            if observers.is_empty() {
+                if dependency.kind != ReactiveSourceKind::Computed {
+                    self.reactive_versions.remove(&dependency);
+                }
+            } else {
+                self.reactive_dependents.insert(dependency, observers);
+            }
+        }
+
+        self.reactive_invalidation_queue = queue;
     }
 
     fn reactive_trigger(&mut self, source: Value, kind: ReactiveSourceKind, slot: u32) {
@@ -11034,10 +11327,18 @@ impl<'p> Interpreter<'p> {
         let Some(source) = self.heap.identity(source) else { return; };
         let dependency = ReactiveDependency { source, kind, slot };
 
-        // A dependency is only published into reactive_dependents after an
-        // observer finishes evaluating. Preserve invalidation for writes that
-        // happen during the very evaluation that first discovers the dependency.
-        // Watchers deliberately do not schedule themselves while running.
+        // Most fields in a reactive VM are never observed. Avoid creating version
+        // entries or touching dependency vectors for those writes. If tracking is
+        // currently active we still inspect the in-flight frame because its edge
+        // has not been published yet.
+        let has_published_observers = self.reactive_dependents.contains_key(&dependency);
+        if !has_published_observers && !self.reactive_tracking_active {
+            return;
+        }
+
+        // Dependencies discovered by a currently executing computed have not yet
+        // been published in reactive_dependents. Preserve writes that occur during
+        // that same evaluation and force the next read to execute again.
         let active_computed = self
             .fiber(self.current_fiber)
             .reactive_stack
@@ -11047,59 +11348,36 @@ impl<'p> Interpreter<'p> {
                     && frame.dependencies.contains(&dependency)
             })
             .map(|frame| frame.observer.callback)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[HeapIdentity; 4]>>();
+
+        if !has_published_observers && active_computed.is_empty() {
+            return;
+        }
+
+        // StoreField/StoreStaticField already compare old/new raw values before
+        // calling this hook, so every observed trigger is a semantically visible
+        // source version change.
+        let version = self.reactive_versions.entry(dependency).or_insert(0);
+        *version = version.wrapping_add(1).max(1);
+
+        let mut initial = SmallVec::<[ReactiveDependency; 4]>::new();
+        initial.push(dependency);
         for callback in active_computed {
-            if let Some(state) = self.reactive_computed.get_mut(&callback) {
-                state.dirty = true;
+            let propagate = self
+                .reactive_computed
+                .get_mut(&callback)
+                .is_some_and(|state| {
+                    let was_dirty = state.dirty;
+                    state.dirty = true;
+                    state.force_recompute = true;
+                    !was_dirty
+                });
+            if propagate {
+                initial.push(Self::reactive_computed_dependency(callback));
             }
         }
 
-        let Some(observers) = self.reactive_dependents.get(&dependency).cloned() else { return; };
-        let mut live = Vec::with_capacity(observers.len());
-        for observer in observers {
-            if !self.reactive_observer_alive(observer) {
-                continue;
-            }
-            live.push(observer);
-            match observer.kind {
-                ReactiveObserverKind::Computed => {
-                    if let Some(state) = self.reactive_computed.get_mut(&observer.callback) {
-                        // Published edges describe the previous successful run. While
-                        // recomputing, only dependencies already observed by the
-                        // current ReactiveFrame can invalidate this evaluation (the
-                        // active-computed pass above handles those). This avoids a
-                        // stale edge -- including an internal computed cache slot --
-                        // spuriously dirtying an otherwise up-to-date recomputation.
-                        if !state.evaluating {
-                            state.dirty = true;
-                        }
-                    }
-                }
-                ReactiveObserverKind::Watcher => {
-                    let schedule = self
-                        .reactive_watchers
-                        .get_mut(&observer.callback)
-                        .is_some_and(|state| {
-                            if state.scheduled {
-                                false
-                            } else {
-                                state.scheduled = true;
-                                true
-                            }
-                        });
-                    if schedule {
-                        let callback = Value::from_heap(observer.callback.handle);
-                        self.event_loop
-                            .enqueue_microtask(RuntimeEvent::ReactiveWatcher { callback });
-                    }
-                }
-            }
-        }
-        if live.is_empty() {
-            self.reactive_dependents.remove(&dependency);
-        } else if let Some(slot) = self.reactive_dependents.get_mut(&dependency) {
-            *slot = live;
-        }
+        self.reactive_propagate_invalidations(&initial);
     }
 
     fn reactive_register_computed(&mut self, callback: Value) -> Result<Value, RuntimeError> {
@@ -11114,7 +11392,11 @@ impl<'p> Interpreter<'p> {
             initialized: false,
             dirty: true,
             evaluating: false,
-            dependencies: Vec::new(),
+            force_recompute: true,
+            cached_value: Value::NULL,
+            value_version: 0,
+            dependencies: SmallVec::new(),
+            dependency_versions: SmallVec::new(),
         });
         Ok(callback)
     }
@@ -11127,22 +11409,12 @@ impl<'p> Interpreter<'p> {
             .identity(callback)
             .ok_or_else(|| RuntimeError::new("watch callback is not a live function"))?;
         self.enable_reactivity();
-        let schedule = {
-            let state = self.reactive_watchers.entry(identity).or_insert(ReactiveWatcherState {
-                scheduled: false,
-                dependencies: Vec::new(),
-            });
-            if state.scheduled {
-                false
-            } else {
-                state.scheduled = true;
-                true
-            }
-        };
-        if schedule {
-            self.event_loop
-                .enqueue_microtask(RuntimeEvent::ReactiveWatcher { callback });
-        }
+        self.reactive_watchers.entry(identity).or_insert(ReactiveWatcherState {
+            scheduled: false,
+            dependencies: SmallVec::new(),
+            dependency_versions: SmallVec::new(),
+        });
+        self.reactive_schedule_watcher(identity);
         Ok(callback)
     }
 
@@ -11162,38 +11434,69 @@ impl<'p> Interpreter<'p> {
             .heap
             .identity(callback)
             .ok_or_else(|| RuntimeError::new("computed callback is no longer live"))?;
-        let tracking_parent = self.reactive_tracking_active;
-        let (recompute, dependencies) = {
+
+        let (initialized, dirty, evaluating, force_recompute, dependencies_changed) = {
             let state = self
                 .reactive_computed
-                .get_mut(&identity)
+                .get(&identity)
                 .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
-            if state.evaluating {
-                return Err(RuntimeError::new("cyclic computed property evaluation"));
-            }
-            if state.initialized && !state.dirty {
-                (false, tracking_parent.then(|| state.dependencies.clone()))
-            } else {
-                state.evaluating = true;
-                // Any write observed after this point will set dirty again. The
-                // finish path preserves that bit instead of losing invalidation.
-                state.dirty = false;
-                (true, None)
-            }
+            let changed = state.initialized
+                && state.dirty
+                && !state.force_recompute
+                && self.reactive_dependencies_changed(
+                    &state.dependencies,
+                    &state.dependency_versions,
+                );
+            (
+                state.initialized,
+                state.dirty,
+                state.evaluating,
+                state.force_recompute,
+                changed,
+            )
         };
-        if let Some(dependencies) = dependencies {
-            self.reactive_replay_dependencies(&dependencies);
+
+        if evaluating {
+            return Err(RuntimeError::new("cyclic computed property evaluation"));
         }
-        if !recompute {
+
+        // The parent observes this computed as one dependency node. This happens
+        // on both cache hits and misses, exactly like tracking a computed ref.
+        if self.reactive_tracking_active {
+            self.reactive_track_dependency(Self::reactive_computed_dependency(identity));
+        }
+
+        if initialized && !dirty {
             return Ok(false);
         }
+
+        // An upstream computed may have been dirtied and then refreshed elsewhere
+        // to the same value before this computed is read. In that case every
+        // recorded dependency version still matches and this cached value remains
+        // valid; clear the speculative dirty bit without executing user code.
+        if initialized && dirty && !force_recompute && !dependencies_changed {
+            if let Some(state) = self.reactive_computed.get_mut(&identity) {
+                state.dirty = false;
+            }
+            return Ok(false);
+        }
+
+        let state = self
+            .reactive_computed
+            .get_mut(&identity)
+            .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
+        state.evaluating = true;
+        // Any write observed after this point sets dirty + force_recompute again.
+        state.dirty = false;
+        state.force_recompute = false;
+
         let observer = ReactiveObserverKey {
             kind: ReactiveObserverKind::Computed,
             callback: identity,
         };
         self.fiber_mut(self.current_fiber).reactive_stack.push(ReactiveFrame {
             observer,
-            dependencies: Vec::with_capacity(8),
+            dependencies: SmallVec::new(),
         });
         self.reactive_tracking_active = true;
         Ok(true)
@@ -11219,23 +11522,47 @@ impl<'p> Interpreter<'p> {
         }
         self.reactive_tracking_active = !self.fiber(self.current_fiber).reactive_stack.is_empty();
 
-        let old = {
+        let dependency_versions = self.reactive_snapshot_versions(&frame.dependencies);
+        let old_dependencies = {
             let state = self
                 .reactive_computed
                 .get_mut(&identity)
                 .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
-            let old = std::mem::take(&mut state.dependencies);
-            state.initialized = true;
-            state.evaluating = false;
-            // `dirty` may have been set by a dependency write during evaluation.
-            old
+            std::mem::take(&mut state.dependencies)
         };
-        self.reactive_replace_dependencies(observer, &old, &frame.dependencies);
-        self.reactive_computed
+        self.reactive_replace_dependencies(observer, &old_dependencies, &frame.dependencies);
+
+        let state = self
+            .reactive_computed
             .get_mut(&identity)
-            .expect("computed state disappeared during dependency replacement")
-            .dependencies = frame.dependencies;
+            .expect("computed state disappeared during dependency replacement");
+        let value_changed = !state.initialized || state.cached_value.raw_bits() != value.raw_bits();
+        if value_changed {
+            state.value_version = state.value_version.wrapping_add(1).max(1);
+        }
+        state.cached_value = value;
+        state.initialized = true;
+        state.evaluating = false;
+        // `dirty` and `force_recompute` may have been set by a dependency write
+        // during evaluation; intentionally preserve them here.
+        state.dependencies = frame.dependencies;
+        state.dependency_versions = dependency_versions;
         Ok(value)
+    }
+
+    fn reactive_read_computed(&self, callback: Value) -> Result<Value, RuntimeError> {
+        let identity = self
+            .heap
+            .identity(callback)
+            .ok_or_else(|| RuntimeError::new("computed callback is no longer live"))?;
+        let state = self
+            .reactive_computed
+            .get(&identity)
+            .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
+        if !state.initialized {
+            return Err(RuntimeError::new("computed value was read before evaluation"));
+        }
+        Ok(state.cached_value)
     }
 
     fn reactive_abort_computed(&mut self, callback: Value) -> Result<(), RuntimeError> {
@@ -11255,6 +11582,7 @@ impl<'p> Interpreter<'p> {
             if let Some(state) = self.reactive_computed.get_mut(&identity) {
                 state.evaluating = false;
                 state.dirty = true;
+                state.force_recompute = true;
             }
         }
         Ok(())
@@ -11280,6 +11608,7 @@ impl<'p> Interpreter<'p> {
             fiber.reactive_stack.remove(index)
         };
         let observer = frame.observer;
+        let dependency_versions = self.reactive_snapshot_versions(&frame.dependencies);
         let old = match self.reactive_watchers.get_mut(&observer.callback) {
             Some(state) => {
                 state.scheduled = false;
@@ -11290,9 +11619,62 @@ impl<'p> Interpreter<'p> {
         self.reactive_replace_dependencies(observer, &old, &frame.dependencies);
         if let Some(state) = self.reactive_watchers.get_mut(&observer.callback) {
             state.dependencies = frame.dependencies;
+            state.dependency_versions = dependency_versions;
         }
         if fiber_id == self.current_fiber {
             self.reactive_tracking_active = !self.fiber(fiber_id).reactive_stack.is_empty();
+        }
+    }
+
+    fn reactive_flush_watchers(&mut self) {
+        self.reactive_flush_scheduled = false;
+
+        // Process only the callbacks that belonged to this batch. A watcher
+        // scheduled while these tasks are being spawned is left for the next
+        // microtask, preserving turn boundaries and preventing unbounded flushes.
+        let batch_len = self.reactive_pending_watchers.len();
+        for _ in 0..batch_len {
+            // Keep the front element in the queue while spawning. The queue is a
+            // precise VM root, so task/Promise allocation can collect without the
+            // add_root()/sync_persistent_roots() traffic that each watcher used to
+            // require individually.
+            let Some(&callback) = self.reactive_pending_watchers.front() else {
+                break;
+            };
+            let Some(identity) = self.heap.identity(callback) else {
+                self.reactive_pending_watchers.pop_front();
+                continue;
+            };
+
+            let should_run = self.reactive_watchers.get(&identity).is_some_and(|state| {
+                if !state.scheduled {
+                    return false;
+                }
+                // An empty dependency list means the watcher has not run yet.
+                state.dependencies.is_empty()
+                    || self.reactive_dependencies_changed(
+                        &state.dependencies,
+                        &state.dependency_versions,
+                    )
+            });
+
+            if !should_run {
+                if let Some(state) = self.reactive_watchers.get_mut(&identity) {
+                    state.scheduled = false;
+                }
+                self.reactive_pending_watchers.pop_front();
+                continue;
+            }
+
+            let spawned = self.spawn_reactive_watcher(callback);
+            self.reactive_pending_watchers.pop_front();
+            if let Err(error) = spawned {
+                if let Some(state) = self.reactive_watchers.get_mut(&identity) {
+                    state.scheduled = false;
+                }
+                self.fail(error);
+                return;
+            }
         }
     }
 
@@ -11508,26 +11890,8 @@ impl<'p> Interpreter<'p> {
             RuntimeEvent::NativeDecoratorFire { state, token } => {
                 self.fire_native_decorator(state, token, fired.id);
             }
-            RuntimeEvent::ReactiveWatcher { callback } => {
-                let Some(identity) = self.heap.identity(callback) else { return; };
-                let should_run = self
-                    .reactive_watchers
-                    .get(&identity)
-                    .is_some_and(|state| state.scheduled);
-                if !should_run {
-                    return;
-                }
-                // The event itself was the callback root. Keep it alive while
-                // creating the Promise/task objects which take ownership next.
-                let callback_root = self.add_root(callback);
-                let spawned = self.spawn_reactive_watcher(callback);
-                self.release_root(callback_root);
-                if let Err(error) = spawned {
-                    if let Some(state) = self.reactive_watchers.get_mut(&identity) {
-                        state.scheduled = false;
-                    }
-                    self.fail(error);
-                }
+            RuntimeEvent::ReactiveFlush => {
+                self.reactive_flush_watchers();
             }
             RuntimeEvent::TimerFire { promise, callback, interval } => {
                 let still_pending = self.promise_cell(promise).ok().is_some_and(|cell| {
@@ -11684,6 +12048,7 @@ impl<'p> Interpreter<'p> {
                 self.fail_awaited_promise(op, *reason, true);
             }
             PromiseState::Pending { waiters, aggregate, .. } => {
+                let await_raw_pc = self.raw_pc_for_op(op);
                 self.mark_gc_point(op);
                 unsafe { self.advance(op); }
                 self.flush_hot_pc();
@@ -11702,7 +12067,7 @@ impl<'p> Interpreter<'p> {
                 let state = self.fiber_mut(current);
                 state.status = FiberStatus::Suspended;
                 state.awaiting_promise = Some(promise);
-                state.await_raw_pc = op.raw_pc;
+                state.await_raw_pc = await_raw_pc;
                 state.suspend_dst = Some(dst);
 
                 if !self.schedule_next_ready() {
@@ -12140,11 +12505,11 @@ impl Interpreter<'_> {
                         let bytecode = &self.program.functions[function_index as usize].chunk;
                         let result_reg = Reg(function.ops[index].a);
                         let successor_dead = |prepared_index: u32| -> bool {
-                            let Some(successor) = function.original_ops.get(prepared_index as usize) else {
+                            let Some(&successor_raw_pc) = function.raw_pcs.get(prepared_index as usize) else {
                                 return true;
                             };
                             bytecode
-                                .live_registers_at(BytecodePc(successor.raw_pc))
+                                .live_registers_at(BytecodePc(successor_raw_pc))
                                 .is_some_and(|live| !live.general_is_live(result_reg))
                         };
                         if successor_dead(branch.x) && successor_dead(branch.next) {
@@ -13341,6 +13706,12 @@ impl Interpreter<'_> {
                     Err(error) => self.fail_at(op, error.message),
                 }
             }
+            NativeBuiltin::ReactiveReadComputed => {
+                match self.reactive_read_computed(arg(0)) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
             NativeBuiltin::ReactiveAbortComputed => {
                 match self.reactive_abort_computed(arg(0)) {
                     Ok(()) => unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); },
@@ -13841,9 +14212,13 @@ impl Interpreter<'_> {
 
     #[inline]
     fn maybe_collect(&mut self) {
-        // MMTk may request a rendezvous independently of the language-level
-        // System.gc switch. Polling is extremely cheap when no GC is requested.
-        self.heap.safepoint();
+        // Most safepoints see no GC request. Return immediately in that case so
+        // the interpreter pays one request poll only: no collection-counter load,
+        // no fiber-owner barrier, and no post-GC housekeeping branches.
+        if !self.heap.safepoint() {
+            return;
+        }
+
         let collections = self.heap.collection_count();
         if collections != self.last_gc_collections {
             self.last_gc_collections = collections;
@@ -14651,7 +15026,7 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
             *hotness = hotness.saturating_add(1);
             let local_ready = *hotness >= threshold;
 
-            let raw_pc = (&(*function_ptr).original_ops).get_unchecked(index).raw_pc;
+            let raw_pc = *(&(*function_ptr).raw_pcs).get_unchecked(index);
             let shared_location = TraceLocation::new((*function_ptr).id, BytecodePc(raw_pc));
             let shared_hotness = vm
                 .jit
@@ -14717,9 +15092,11 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         // A completed prefix hands off to a runtime operation. Discover its
         // continuation without installing hooks after every numeric Invoke.
         if vm.trace_current_location() != location {
-            let current = vm.current_prepared().original_ops[vm.hot_pc as usize];
+            let current_index = vm.hot_pc as usize;
+            let current = vm.current_prepared().original_ops[current_index];
+            let raw_pc = *vm.current_prepared().raw_pcs.get_unchecked(current_index);
             let opcode = vm.program.functions[vm.hot_function_index as usize]
-                .chunk.code[current.raw_pc as usize].opcode().unwrap();
+                .chunk.code[raw_pc as usize].opcode().unwrap();
             if matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallDirect
                 | Opcode::CallClosure | Opcode::Launch | Opcode::CallPrimitive | Opcode::CallForeign | Opcode::Await)
             {
@@ -15220,7 +15597,7 @@ unsafe fn h_load_field(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x); }
+    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x,value); }
     vm.set_reg(op.a,value.word());vm.advance(op)
 }
 unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15242,7 +15619,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x); }
+    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x,value); }
     vm.return_from_frame(value.word(),None)
 }
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15275,7 +15652,7 @@ unsafe fn h_load_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}
+    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x,v);}
     vm.set_reg(op.a,v.word());vm.advance(op)
 }
 unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15290,7 +15667,7 @@ unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp)
             return;
         }
     }
-    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x);}
+    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x,v);}
     vm.return_from_frame(v.word(),None)
 }
 unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15326,6 +15703,7 @@ unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
         return;
     }
 
+    let caller_raw_pc=vm.raw_pc_for_op(op);
     vm.mark_gc_point(op);
     vm.advance(op);
     vm.flush_hot_pc();
@@ -15335,11 +15713,11 @@ unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     // Returning from ModuleBody marks the module initialized and resumes here.
     if let Err(error)=vm.push_frame_direct(body.unwrap_unchecked(),&[],None,None){
         vm.modules.get_unchecked_mut(slot as usize).initializing=false;
-        vm.fail_at(op,error.message);
+        vm.fail_at_raw_pc(caller_raw_pc,error.message);
     } else {
         // Module initialization is a real call boundary for structured
         // exception unwinding even though it has no return destination.
-        vm.current_frame_mut().caller_pc = op.raw_pc;
+        vm.current_frame_mut().caller_pc = caller_raw_pc;
     }
 }
 unsafe fn h_import_variable(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let module=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(module){Some(HeapObject::ModuleObject{module_slot})=>*module_slot,_=>{vm.fail_at(op,"ImportVariable operand is not module");return;}};let name=StringId(op.x);let index=vm.modules[slot as usize].exports.get(&name).copied();match index.and_then(|i|vm.modules[slot as usize].variables.get(i as usize).copied()){Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"imported variable name is not bound")}}
@@ -16047,11 +16425,12 @@ impl TraceRuntime for Interpreter<'_> {
         }
         let index = self.hot_pc as usize;
         let original = prepared.original_ops.get(index)?;
-        if original.raw_pc != pc.0 {
+        let original_raw_pc = *prepared.raw_pcs.get(index)?;
+        if original_raw_pc != pc.0 {
             return None;
         }
         let bytecode = self.program.function(function)?;
-        if bytecode.chunk.code.get(original.raw_pc as usize)?.opcode()? != Opcode::AllocMap {
+        if bytecode.chunk.code.get(original_raw_pc as usize)?.opcode()? != Opcode::AllocMap {
             return None;
         }
 
@@ -16067,15 +16446,17 @@ impl TraceRuntime for Interpreter<'_> {
         }
 
         for offset in 0..field_count {
-            let candidate = prepared.original_ops.get(index + 1 + offset)?;
+            let candidate_index = index + 1 + offset;
+            let candidate = prepared.original_ops.get(candidate_index)?;
+            let candidate_raw_pc = *prepared.raw_pcs.get(candidate_index)?;
             if candidate.a != original.a
-                || bytecode.chunk.code.get(candidate.raw_pc as usize)?.opcode()? != Opcode::MapSet
+                || bytecode.chunk.code.get(candidate_raw_pc as usize)?.opcode()? != Opcode::MapSet
             {
                 return None;
             }
         }
 
-        let continuation = prepared.original_ops.get(fused.next as usize)?.raw_pc;
+        let continuation = *prepared.raw_pcs.get(fused.next as usize)?;
         Some(SmallMapLiteralTraceInfo {
             field_count: field_count as u8,
             continuation: BytecodePc(continuation),
@@ -16340,7 +16721,7 @@ impl TraceRuntime for Interpreter<'_> {
         }
         let frame = self.current_frame();
         let function = &self.prepared.functions[frame.function as usize];
-        let pc = function.original_ops.get(self.hot_pc as usize).map_or(u32::MAX, |op| op.raw_pc);
+        let pc = function.raw_pcs.get(self.hot_pc as usize).copied().unwrap_or(u32::MAX);
         TraceLocation::new(function.id, BytecodePc(pc))
     }
 
@@ -16526,8 +16907,10 @@ impl TraceRuntime for Interpreter<'_> {
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
         let function = self.hot_function_index;
-        let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
-        let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
+        let op_index = self.hot_pc as usize;
+        let mut op = self.current_prepared().original_ops[op_index];
+        let raw_pc = self.current_prepared().raw_pcs[op_index];
+        let opcode = self.program.functions[function as usize].chunk.code[raw_pc as usize].opcode().unwrap();
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
             | Opcode::LoadField | Opcode::StoreField | Opcode::CallDirect
             | Opcode::MakeClosure | Opcode::CreateClass | Opcode::AllocInstance
@@ -16579,10 +16962,12 @@ impl TraceRuntime for Interpreter<'_> {
         let caller_fiber = self.current_fiber;
         let caller_depth = self.fiber(caller_fiber).frames.len();
         let caller_function = self.hot_function_index;
-        let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
+        let op_index = self.hot_pc as usize;
+        let mut op = self.current_prepared().original_ops[op_index];
+        let raw_pc = self.current_prepared().raw_pcs[op_index];
         let opcode = self.program.functions[caller_function as usize]
             .chunk
-            .code[op.raw_pc as usize]
+            .code[raw_pc as usize]
             .opcode()
             .ok_or_else(|| RuntimeError::new("trace call boundary has invalid opcode"))?;
         if opcode == Opcode::CallDirect {
@@ -16891,15 +17276,21 @@ impl Interpreter<'_> {
         let caller_depth = self.fiber(caller_fiber).frames.len();
         let caller_function = self.hot_function_index;
         let caller_id = self.current_prepared().id;
+        let op_index = self.hot_pc as usize;
         let op = *self
             .current_prepared()
             .original_ops
-            .get(self.hot_pc as usize)
+            .get(op_index)
             .ok_or_else(|| RuntimeError::new("direct trace call PC is out of bounds"))?;
+        let raw_pc = *self
+            .current_prepared()
+            .raw_pcs
+            .get(op_index)
+            .ok_or_else(|| RuntimeError::new("direct trace call PC has no raw mapping"))?;
         let opcode = self
             .program
             .function(caller_id)
-            .and_then(|function| function.chunk.code.get(op.raw_pc as usize))
+            .and_then(|function| function.chunk.code.get(raw_pc as usize))
             .and_then(|word| word.opcode())
             .ok_or_else(|| RuntimeError::new("direct trace call opcode is invalid"))?;
         if !matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::InvokeSpread | Opcode::CallClosure) {
@@ -17043,17 +17434,23 @@ impl Interpreter<'_> {
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
         let function = self.hot_function_index;
+        let op_index = self.hot_pc as usize;
         let op = *self
             .current_prepared()
             .original_ops
-            .get(self.hot_pc as usize)
+            .get(op_index)
             .ok_or_else(|| RuntimeError::new("specialized collection PC is out of bounds"))?;
+        let raw_pc = *self
+            .current_prepared()
+            .raw_pcs
+            .get(op_index)
+            .ok_or_else(|| RuntimeError::new("specialized collection PC has no raw mapping"))?;
         let function_index = self.current_function_index();
         let opcode = self
             .program
             .functions
             .get(function_index)
-            .and_then(|function| function.chunk.code.get(op.raw_pc as usize))
+            .and_then(|function| function.chunk.code.get(raw_pc as usize))
             .and_then(|word| word.opcode())
             .ok_or_else(|| RuntimeError::new("specialized collection opcode is invalid"))?;
 
@@ -20961,6 +21358,98 @@ var result = first + second + third + fourth + innerRuns * 100 + outerRuns * 10;
             }));
             vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
             assert_eq!(source_result(&vm), 244.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_nested_computed_uses_value_versions_to_skip_unchanged_parent() {
+        let source = r#"
+var innerRuns = 0;
+var outerRuns = 0;
+
+class Model {
+    x: number = 1;
+
+    computed parity(): number {
+        innerRuns = innerRuns + 1;
+        return this.x % 2;
+    }
+
+    computed outer(): number {
+        outerRuns = outerRuns + 1;
+        return this.parity * 10;
+    }
+}
+
+var model = new Model();
+var first = model.outer;
+model.x = 3;
+// Refresh the child first. Its observable value stays 1, so its value_version
+// must not change and the already-dirty parent can validate its old cache.
+var parity = model.parity;
+var second = model.outer;
+var result = first + second + parity + innerRuns * 100 + outerRuns * 10;
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 1,
+                hot_entry_threshold: 1,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
+            // 10 + 10 + 1 + 2*100 + 1*10 = 231.
+            assert_eq!(source_result(&vm), 231.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_multiple_watchers_share_one_batched_flush_and_coalesce_writes() {
+        let source = r#"
+class Model {
+    x: number = 1;
+    left: number = 0;
+    right: number = 0;
+    leftRuns: number = 0;
+    rightRuns: number = 0;
+
+    watch updateLeft() {
+        this.leftRuns = this.leftRuns + 1;
+        this.left = this.x;
+    }
+
+    watch updateRight() {
+        this.rightRuns = this.rightRuns + 1;
+        this.right = this.x * 2;
+    }
+}
+
+var model = new Model();
+var result = 0;
+Timer.microtask(function () {
+    model.x = 2;
+    model.x = 3;
+    model.x = 4;
+    Timer.microtask(function () {
+        result = model.left * 1000
+            + model.right * 100
+            + model.leftRuns * 10
+            + model.rightRuns;
+    });
+});
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 1,
+                hot_entry_threshold: 1,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
+            // Both watchers run once initially and once for the coalesced x writes.
+            assert_eq!(source_result(&vm), 4822.0, "jit={jit_enabled}");
         }
     }
 

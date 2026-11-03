@@ -1336,6 +1336,29 @@ System.print(Counter.created); // 1
 Instance field initializers run for each construction; a list declared as
 `items = []` is not shared across instances.
 Fields without initializers are usually assigned in the constructor.
+
+A direct assignment to `this.name` inside a constructor also declares a public
+instance field, so a separate `name;` declaration is optional:
+
+```napalm
+class Counter {
+    constructor(value) { this.value = value; }
+}
+const counter = new Counter(1);
+counter.value += 1;
+System.print(counter.value); // 2
+```
+
+These fields have the same storage, external access and reactive tracking as
+explicit class fields. Repeated assignments declare one field. Explicit fields
+and accessors take precedence regardless of their position in the class.
+Discovery includes constructor control-flow blocks and closures with lexical
+`this`; nested classes have their own fields. A conditional assignment still
+declares the field for every instance, with `null` until it is initialized.
+Only direct named writes (`this.name`, including compound/destructuring
+assignments) declare fields this way; reads, assignments to other objects and
+writes found only in ordinary/static methods do not declare public fields.
+
 A base class without an explicit constructor can be constructed without
 arguments.
 

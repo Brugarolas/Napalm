@@ -1014,6 +1014,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, reactive, "__unwatch", MethodKind::Method, 1, NativeBuiltin::ReactiveUnwatch);
     manifest.register_native(program, reactive, "__beginComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveBeginComputed);
     manifest.register_native(program, reactive, "__finishComputed", MethodKind::Method, 2, NativeBuiltin::ReactiveFinishComputed);
+    manifest.register_native(program, reactive, "__readComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveReadComputed);
     manifest.register_native(program, reactive, "__abortComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveAbortComputed);
 
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);

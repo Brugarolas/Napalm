@@ -163,7 +163,7 @@ fn napalm_jit_numeric_bindings_stay_native_in_mandelbrot() {
             doubled |= trace.nodes.iter().any(|node| matches!(node.kind,
                 crate::napalm_trace_ir::TraceInst::F64Binary { op: crate::napalm_ir::F64BinOp::Add, lhs, rhs } if lhs == rhs
             ));
-            assert_eq!(trace.anchor.location, TraceLocation::new(function.id, BytecodePc(function.original_ops[index].raw_pc)));
+            assert_eq!(trace.anchor.location, TraceLocation::new(function.id, BytecodePc(function.raw_pcs[index])));
             assert!(!trace.nodes.iter().any(|node| matches!(node.kind,
                 crate::napalm_trace_ir::TraceInst::Runtime { .. }
                 | crate::napalm_trace_ir::TraceInst::RuntimeCall { .. }

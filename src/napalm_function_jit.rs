@@ -257,7 +257,7 @@ impl WholeFunctionJit {
         for (index, op) in function.ops.iter().enumerate() {
             if !reachable[index] { continue; }
             let opcode = bytecode.chunk.code
-                .get(op.raw_pc as usize)
+                .get(function.raw_pcs[index] as usize)
                 .and_then(|word| word.opcode())
                 .ok_or_else(|| format!("invalid opcode at prepared op {index}"))?;
             let unsupported_invoke = opcode == Opcode::Invoke
@@ -308,7 +308,7 @@ impl WholeFunctionJit {
         // In the replay-safe subset, AllocMap is the only operation that can
         // collect. Failed nested guards unwind before entering a runtime helper.
         let recursive_needs_roots = !native_recursive_safe || reachable.iter().enumerate().any(|(i, &live)| {
-            live && bytecode.chunk.code[function.original_ops[i].raw_pc as usize].opcode()
+            live && bytecode.chunk.code[function.raw_pcs[i] as usize].opcode()
                 == Some(Opcode::AllocMap)
         });
         if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
@@ -366,7 +366,7 @@ impl WholeFunctionJit {
             let mut inline_calls = vec![None; function.ops.len()];
             let self_calls: Vec<_> = function.ops.iter().enumerate().filter_map(|(i, op)| {
                 (reachable[i] && op.x == function_index
-                    && bytecode.chunk.code[function.original_ops[i].raw_pc as usize].opcode()
+                    && bytecode.chunk.code[function.raw_pcs[i] as usize].opcode()
                         == Some(Opcode::CallDirect)).then_some(i)
             }).collect();
             let live_ops = reachable.iter().filter(|&&live| live).count();
@@ -400,7 +400,7 @@ impl WholeFunctionJit {
                 let mut regs = b.block_params(blocks[index])[1];
                 let prepared_op = function.ops[index];
                 let op = function.original_ops[index];
-                let opcode = bytecode.chunk.code[op.raw_pc as usize].opcode().unwrap();
+                let opcode = bytecode.chunk.code[function.raw_pcs[index] as usize].opcode().unwrap();
 
                 macro_rules! next {
                     () => {{
@@ -703,8 +703,9 @@ struct NativeIdentitySite {
 /// A polymorphic site (e.g. Map | Null) can still compare in native code.
 fn native_identity_sites(vm: &Interpreter<'_>, function: u32) -> Vec<Option<NativeIdentitySite>> {
     let bytecode = &vm.program.functions[function as usize];
-    vm.prepared.functions[function as usize].original_ops.iter().map(|op| {
-        if bytecode.chunk.code[op.raw_pc as usize].opcode() != Some(Opcode::Invoke) || op.c != 1 {
+    let prepared = &vm.prepared.functions[function as usize];
+    prepared.original_ops.iter().zip(&prepared.raw_pcs).map(|(op, &raw_pc)| {
+        if bytecode.chunk.code[raw_pc as usize].opcode() != Some(Opcode::Invoke) || op.c != 1 {
             return None;
         }
         let descriptor = bytecode.chunk.inline_caches.get(op.x as usize)?;
@@ -1113,7 +1114,7 @@ fn reachable_ops(function: &PreparedFunction, bytecode: &BytecodeFunction) -> Ve
         seen[index] = true;
         let prepared = function.ops[index];
         let original = function.original_ops[index];
-        match bytecode.chunk.code[original.raw_pc as usize].opcode() {
+        match bytecode.chunk.code[function.raw_pcs[index] as usize].opcode() {
             Some(Opcode::Return | Opcode::Return2 | Opcode::Trap) => {},
             Some(Opcode::Jump) => work.push(prepared.x as usize),
             Some(Opcode::JumpIfFalse | Opcode::JumpIfTrue) => {
@@ -1160,7 +1161,7 @@ fn native_recursive_body_safe(
         let Some(opcode) = bytecode
             .chunk
             .code
-            .get(op.raw_pc as usize)
+            .get(function.raw_pcs[index] as usize)
             .and_then(|word| word.opcode())
         else {
             return false;
@@ -2343,7 +2344,8 @@ unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> 
     unsafe { vm.set_pc(op_index); }
 
     let raw = unsafe { *vm.current_prepared().original_ops.get_unchecked(op_index as usize) };
-    let opcode = vm.program.functions[caller_function as usize].chunk.code[raw.raw_pc as usize]
+    let raw_pc = unsafe { *vm.current_prepared().raw_pcs.get_unchecked(op_index as usize) };
+    let opcode = vm.program.functions[caller_function as usize].chunk.code[raw_pc as usize]
         .opcode().unwrap();
 
     if opcode == Opcode::Invoke {

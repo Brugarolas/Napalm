@@ -44,5 +44,8 @@
         "cargo::build": "cargo build --release"
     },
     "author": "Andrés Brugarolas Martínez",
-    "license": "MIT"
+    "license": "MIT",
+    "dependencies": {
+        "@vue/reactivity": "^3.5.44"
+    }
 }

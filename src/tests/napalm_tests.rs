@@ -667,6 +667,118 @@ fn napalm_functions_types_closures_and_templates() {
 }
 
 #[test]
+fn napalm_constructor_properties_are_public_and_reactive() {
+    run_napalm(r#"
+        let evaluations = 0;
+        class Counter {
+            constructor(value) { this.hot = value; this.hot = value + 1; }
+            computed doubled() { evaluations++; return this.hot * 2; }
+            computed total() { return this.doubled + this.hot; }
+            increment() { this.hot++; }
+        }
+        function exercise() {
+            const counter = new Counter(1);
+            const other = new Counter(9);
+            const first = counter.total;
+            const cached = counter.total;
+            let sum = 0;
+            for (let i = 0; i < 100; i++) {
+                counter.hot = i;
+                sum += counter.total;
+            }
+            counter.increment();
+            return [first, cached, sum, counter.hot, counter.total, other.hot, evaluations];
+        }
+        const result = exercise();
+    "#, "[6, 6, 14850, 100, 300, 10, 102]");
+}
+
+#[test]
+fn napalm_constructor_properties_preserve_explicit_members_and_inheritance() {
+    run_napalm(r#"
+        class Parent {
+            constructor(value) { this.value = value; }
+            read() { return this.value; }
+        }
+        class Child extends Parent {
+            constructor(value) { super(value); this.extra = 3; }
+            total() { return this.value + this.extra; }
+        }
+        class Explicit {
+            constructor(public parameter: number) {
+                this.parameter = 2;
+                this.typed = 4;
+                this.scaled = 5;
+            }
+            typed: number;
+            storage = 0;
+            get scaled() { return this.storage; }
+            set scaled(value) { this.storage = value * 10; }
+        }
+        const child = new Child(7);
+        child.value = 8;
+        child.extra = 4;
+        const explicit = new Explicit(1);
+        explicit.scaled = 6;
+        const result = [child.read(), child.total(), explicit.parameter, explicit.typed, explicit.scaled];
+    "#, "[8, 12, 2, 4, 60]");
+}
+
+#[test]
+fn napalm_constructor_properties_follow_lexical_this_and_assignment_targets() {
+    run_napalm(r#"
+        class Example {
+            constructor(enabled) {
+                if (enabled) { this.optional = 1; }
+                for (let i = 0; i < 2; i++) { this.loopValue = i; }
+                this.fallback ??= 3;
+                [this.left, this.right] = [4, 5];
+                ({value: this.objectValue} = {value: 6});
+                const initialize = () => { this.captured = 7; };
+                initialize();
+                const text = `${this.interpolated = 8}`;
+                (this).grouped = 9;
+                class Nested { constructor() { this.nestedOnly = 10; } }
+                this.afterNested = 10;
+                try { throw 11; } catch (error) { this.caught = error; }
+                finally { this.finalized = 12; }
+            }
+        }
+        const example = new Example(false);
+        example.optional = 2;
+        let missing = false;
+        try { const value = example.nestedOnly; } catch (error) { missing = true; }
+        const result = [example.optional, new Example(false).optional, example.loopValue,
+            example.fallback, example.left, example.right, example.objectValue,
+            example.captured, example.interpolated, example.grouped, example.afterNested,
+            example.caught, example.finalized, missing];
+    "#, "[2, null, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, true]");
+}
+
+#[test]
+fn napalm_constructor_properties_do_not_publish_other_method_writes_or_reads() {
+    run_napalm(r#"
+        class Example {
+            static make() { this.staticOnly = 1; }
+            constructor(other) {
+                other.foreign = 2;
+                if (false) { const ignored = this.readOnly; }
+                this.own = 3;
+            }
+            initialize() { this.methodOnly = 4; }
+        }
+        const example = new Example({});
+        example.initialize();
+        let missing = 0;
+        try { const value = example.staticOnly; } catch (error) { missing++; }
+        try { const value = example.foreign; } catch (error) { missing++; }
+        try { const value = example.readOnly; } catch (error) { missing++; }
+        try { const value = example.methodOnly; } catch (error) { missing++; }
+        const result = [example.own, missing];
+    "#, "[3, 4]");
+}
+
+#[test]
 fn napalm_classes_constructor_inheritance_fields_accessors() {
     run_napalm(
         r#"

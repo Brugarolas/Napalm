@@ -6,8 +6,9 @@
 //! The lowering is intentionally optimized for interpreter throughput:
 //! - dead pure SSA nodes are removed before allocation;
 //! - block parameters are lowered as edge parallel copies, never as phi ops;
-//! - a global hole-aware register allocator reuses all 256 GPRs aggressively;
-//! - move/guard/block-parameter affinities bias allocation toward coalescing;
+//! - a global hole-aware priority allocator reuses all 256 GPRs aggressively;
+//! - weighted conservative coalescing removes move/guard/block-parameter copies;
+//! - interference-aware DSATUR ordering keeps hot/high-pressure values stable;
 //! - no GPR is reserved for compiler scratch state; parallel-copy cycles use
 //!   `SpecialReg::Scratch0`;
 //! - branches use fallthrough whenever the chosen code layout permits it;
@@ -27,12 +28,12 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
-use std::cmp::Reverse;
-use crate::napalm_collections::HashMap;
-use std::collections::VecDeque;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
-use bumpalo::{Bump, collections::Vec as BumpVec};
-use smallvec::{SmallVec, smallvec};
+
+use bumpalo::{collections::Vec as BumpVec, Bump};
+use smallvec::{smallvec, SmallVec};
 
 use crate::napalm_bytecode::{
     encode_bailout_reason, function_kind_uses_this, opcode_for_f64_bin,
@@ -45,6 +46,7 @@ use crate::napalm_bytecode::{
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
     TypeGuardId, GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
+use crate::napalm_collections::HashMap;
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
     Function, FunctionKind, Inst, InstId, MethodSymbol, Program, ResumeId, SiteId, SnapshotSlot,
@@ -249,7 +251,7 @@ impl fmt::Display for CompileError {
                 simultaneously_required,
             } => write!(
                 f,
-                "register pressure in {function:?} while allocating {value:?}: requires at least {simultaneously_required} GPRs but the VM exposes 256"
+                "register pressure in {function:?} while allocating {value:?}: allocator observed {simultaneously_required}-way register pressure but the VM exposes 256 GPRs"
             ),
             Self::MissingRegister { function, value } => {
                 write!(f, "no physical register assigned to {function:?}:{value:?}")
@@ -962,11 +964,6 @@ struct LiveRange {
 
 impl LiveRange {
     #[inline]
-    fn intersects(self, other: Self) -> bool {
-        self.start <= other.end && other.start <= self.end
-    }
-
-    #[inline]
     fn contains(self, position: u32) -> bool {
         self.start <= position && position <= self.end
     }
@@ -977,8 +974,8 @@ struct LiveInterval {
     value: ValueId,
     ranges: Vec<LiveRange>,
     start: u32,
-    end: u32,
     use_weight: u64,
+    use_count: u64,
 }
 
 impl LiveInterval {
@@ -987,21 +984,19 @@ impl LiveInterval {
             value,
             ranges: Vec::new(),
             start: u32::MAX,
-            end: 0,
             use_weight: 0,
+            use_count: 0,
         }
     }
 
     fn add_range(&mut self, range: LiveRange) {
         self.start = self.start.min(range.start);
-        self.end = self.end.max(range.end);
         self.ranges.push(range);
     }
 
     fn normalize(&mut self) {
         if self.ranges.is_empty() {
             self.start = u32::MAX;
-            self.end = 0;
             return;
         }
         self.ranges.sort_by_key(|range| range.start);
@@ -1016,37 +1011,11 @@ impl LiveInterval {
             merged.push(range);
         }
         self.start = merged.first().unwrap().start;
-        self.end = merged.last().unwrap().end;
         self.ranges = merged;
     }
 
     fn contains(&self, position: u32) -> bool {
         self.ranges.iter().any(|range| range.contains(position))
-    }
-
-    fn intersects(&self, other: &Self) -> bool {
-        if self.ranges.is_empty() || other.ranges.is_empty() {
-            return false;
-        }
-        if self.end < other.start || other.end < self.start {
-            return false;
-        }
-
-        let mut left = 0usize;
-        let mut right = 0usize;
-        while left < self.ranges.len() && right < other.ranges.len() {
-            let a = self.ranges[left];
-            let b = other.ranges[right];
-            if a.intersects(b) {
-                return true;
-            }
-            if a.end < b.start {
-                left += 1;
-            } else {
-                right += 1;
-            }
-        }
-        false
     }
 }
 
@@ -1125,6 +1094,7 @@ fn build_intervals(
                 intervals[index].use_weight = intervals[index]
                     .use_weight
                     .saturating_add(block_hotness(function, block_id).max(1));
+                intervals[index].use_count = intervals[index].use_count.saturating_add(1);
             }
         }
 
@@ -1298,87 +1268,587 @@ fn type_may_reference(ty: &Type) -> bool {
     }
 }
 
+#[derive(Clone, Debug)]
+struct InterferenceGraph {
+    edges: Vec<Vec<usize>>,
+}
+
+impl InterferenceGraph {
+    fn new(value_count: usize) -> Self {
+        Self {
+            edges: vec![Vec::new(); value_count],
+        }
+    }
+
+    #[inline]
+    fn interferes(&self, left: usize, right: usize) -> bool {
+        self.edges[left].binary_search(&right).is_ok()
+    }
+}
+
+/// Build exact interference from the disjoint live ranges rather than from each
+/// interval's [start, end] envelope. This preserves lifetime holes, which is
+/// especially important for SSA values that are live in only a subset of CFG
+/// successors.
+fn build_interference_graph(intervals: &[LiveInterval]) -> InterferenceGraph {
+    // Event kind 0 is a start and 1 is an end. Starts sort before ends at the
+    // same position because LiveRange endpoints are inclusive.
+    let mut events = Vec::new();
+    for (interval_index, interval) in intervals.iter().enumerate() {
+        for range in &interval.ranges {
+            events.push((range.start, 0u8, interval_index));
+            events.push((range.end, 1u8, interval_index));
+        }
+    }
+    events.sort_unstable();
+
+    let mut graph = InterferenceGraph::new(intervals.len());
+    let mut active = Vec::<usize>::new();
+
+    for (_, kind, interval_index) in events {
+        if kind == 0 {
+            for &other in &active {
+                if other == interval_index {
+                    continue;
+                }
+                graph.edges[interval_index].push(other);
+                graph.edges[other].push(interval_index);
+            }
+            active.push(interval_index);
+        } else if let Some(position) = active.iter().position(|&value| value == interval_index) {
+            active.swap_remove(position);
+        }
+    }
+
+    for edges in &mut graph.edges {
+        edges.sort_unstable();
+        edges.dedup();
+    }
+    graph
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WeightedAffinity {
+    left: usize,
+    right: usize,
+    weight: u64,
+}
+
+fn canonical_affinities(affinities: &AffinityGraph) -> Vec<WeightedAffinity> {
+    let mut combined: HashMap<(usize, usize), u64> = HashMap::default();
+    for (left, edges) in affinities.edges.iter().enumerate() {
+        for &(right, weight) in edges {
+            let right = right.0 as usize;
+            if left >= right {
+                continue;
+            }
+            let slot = combined.entry((left, right)).or_default();
+            *slot = (*slot).saturating_add(weight);
+        }
+    }
+
+    let mut out = combined
+        .into_iter()
+        .map(|((left, right), weight)| WeightedAffinity {
+            left,
+            right,
+            weight,
+        })
+        .collect::<Vec<_>>();
+    out.sort_unstable_by_key(|edge| (Reverse(edge.weight), edge.left, edge.right));
+    out
+}
+
+#[derive(Clone, Debug)]
+struct CoalescedGroups {
+    groups: Vec<Vec<usize>>,
+    value_group: Vec<usize>,
+}
+
+fn singleton_groups(intervals: &[LiveInterval]) -> CoalescedGroups {
+    let mut groups = Vec::new();
+    let mut value_group = vec![usize::MAX; intervals.len()];
+    for (value, interval) in intervals.iter().enumerate() {
+        if interval.ranges.is_empty() {
+            continue;
+        }
+        value_group[value] = groups.len();
+        groups.push(vec![value]);
+    }
+    CoalescedGroups {
+        groups,
+        value_group,
+    }
+}
+
+/// Conservatively merge affinity-related values when every member of the two
+/// groups is non-interfering. This is stronger than a one-sided register hint:
+/// successful merges guarantee the copy can disappear if the grouped coloring
+/// succeeds. Allocation automatically retries without these merges if they make
+/// the 256-register problem harder to color.
+fn coalesce_affinity_groups(
+    intervals: &[LiveInterval],
+    interference: &InterferenceGraph,
+    weighted_affinities: &[WeightedAffinity],
+) -> CoalescedGroups {
+    let mut groups = intervals
+        .iter()
+        .enumerate()
+        .map(|(value, interval)| {
+            if interval.ranges.is_empty() {
+                None
+            } else {
+                Some(vec![value])
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut value_group = intervals
+        .iter()
+        .enumerate()
+        .map(|(value, interval)| {
+            if interval.ranges.is_empty() {
+                usize::MAX
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for affinity in weighted_affinities {
+        let left_group = value_group[affinity.left];
+        let right_group = value_group[affinity.right];
+        if left_group == usize::MAX || right_group == usize::MAX || left_group == right_group {
+            continue;
+        }
+
+        let compatible = {
+            let left_members = groups[left_group].as_ref().unwrap();
+            let right_members = groups[right_group].as_ref().unwrap();
+            left_members.iter().all(|&left| {
+                right_members
+                    .iter()
+                    .all(|&right| !interference.interferes(left, right))
+            })
+        };
+        if !compatible {
+            continue;
+        }
+
+        // Keep the larger group as the destination so updating value_group stays
+        // close to union-by-size complexity without needing a separate union-find.
+        let (destination, source) = if groups[left_group].as_ref().unwrap().len()
+            >= groups[right_group].as_ref().unwrap().len()
+        {
+            (left_group, right_group)
+        } else {
+            (right_group, left_group)
+        };
+
+        let source_members = groups[source].take().unwrap();
+        for &value in &source_members {
+            value_group[value] = destination;
+        }
+        groups[destination]
+            .as_mut()
+            .unwrap()
+            .extend(source_members);
+    }
+
+    // Compact sparse group IDs so all subsequent allocator structures are dense.
+    let mut compact_groups = Vec::new();
+    let mut old_to_new = vec![usize::MAX; groups.len()];
+    for (old, group) in groups.into_iter().enumerate() {
+        let Some(group) = group else {
+            continue;
+        };
+        old_to_new[old] = compact_groups.len();
+        compact_groups.push(group);
+    }
+    for group in &mut value_group {
+        if *group != usize::MAX {
+            *group = old_to_new[*group];
+        }
+    }
+
+    CoalescedGroups {
+        groups: compact_groups,
+        value_group,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AllocationGroup {
+    members: Vec<usize>,
+    neighbors: Vec<usize>,
+    weighted_uses: u64,
+    use_count: u64,
+    live_points: u64,
+    start: u32,
+}
+
+fn build_allocation_groups(
+    intervals: &[LiveInterval],
+    interference: &InterferenceGraph,
+    coalesced: CoalescedGroups,
+) -> (Vec<AllocationGroup>, Vec<usize>) {
+    let CoalescedGroups {
+        groups,
+        value_group,
+    } = coalesced;
+    let mut out = groups
+        .into_iter()
+        .map(|members| {
+            let mut weighted_uses = 0u64;
+            let mut use_count = 0u64;
+            let mut live_points = 0u64;
+            let mut start = u32::MAX;
+            for &value in &members {
+                let interval = &intervals[value];
+                weighted_uses = weighted_uses.saturating_add(interval.use_weight);
+                use_count = use_count.saturating_add(interval.use_count);
+                live_points = live_points.saturating_add(interval.ranges.iter().fold(
+                    0u64,
+                    |total, range| {
+                        total.saturating_add(
+                            u64::from(range.end.saturating_sub(range.start)).saturating_add(1),
+                        )
+                    },
+                ));
+                start = start.min(interval.start);
+            }
+            AllocationGroup {
+                members,
+                neighbors: Vec::new(),
+                weighted_uses,
+                use_count,
+                live_points: live_points.max(1),
+                start,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (left, edges) in interference.edges.iter().enumerate() {
+        let left_group = value_group[left];
+        if left_group == usize::MAX {
+            continue;
+        }
+        for &right in edges {
+            if left >= right {
+                continue;
+            }
+            let right_group = value_group[right];
+            if right_group == usize::MAX || left_group == right_group {
+                continue;
+            }
+            out[left_group].neighbors.push(right_group);
+            out[right_group].neighbors.push(left_group);
+        }
+    }
+    for group in &mut out {
+        group.neighbors.sort_unstable();
+        group.neighbors.dedup();
+    }
+
+    (out, value_group)
+}
+
+const REGISTER_MASK_WORDS: usize = (GENERAL_REGISTER_COUNT + 63) / 64;
+
+#[derive(Clone, Debug)]
+struct RegisterMask {
+    words: [u64; REGISTER_MASK_WORDS],
+}
+
+impl Default for RegisterMask {
+    fn default() -> Self {
+        Self {
+            words: [0; REGISTER_MASK_WORDS],
+        }
+    }
+}
+
+impl RegisterMask {
+    #[inline]
+    fn contains(&self, reg: usize) -> bool {
+        (self.words[reg / 64] & (1u64 << (reg % 64))) != 0
+    }
+
+    #[inline]
+    fn insert(&mut self, reg: usize) -> bool {
+        let word = &mut self.words[reg / 64];
+        let mask = 1u64 << (reg % 64);
+        let changed = (*word & mask) == 0;
+        *word |= mask;
+        changed
+    }
+
+    #[inline]
+    fn count(&self) -> usize {
+        self.words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllocationQueueEntry {
+    saturation: usize,
+    degree: usize,
+    priority: u64,
+    weighted_uses: u64,
+    use_count: u64,
+    live_points: u64,
+    start: u32,
+    group: usize,
+    version: u32,
+}
+
+impl Ord for AllocationQueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.saturation,
+            self.degree,
+            self.priority,
+            self.weighted_uses,
+            self.use_count,
+            Reverse(self.live_points),
+            Reverse(self.start),
+            Reverse(self.group),
+            self.version,
+        )
+            .cmp(&(
+                other.saturation,
+                other.degree,
+                other.priority,
+                other.weighted_uses,
+                other.use_count,
+                Reverse(other.live_points),
+                Reverse(other.start),
+                Reverse(other.group),
+                other.version,
+            ))
+    }
+}
+
+impl PartialOrd for AllocationQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AllocationFailure {
+    Pressure {
+        value: usize,
+        forbidden_registers: usize,
+    },
+    Conflict {
+        left: usize,
+        right: usize,
+        reg: Reg,
+    },
+}
+
+fn group_priority(group: &AllocationGroup) -> u64 {
+    // Prefer frequently used values with short live ranges. u128 keeps profile
+    // counts from overflowing when hot functions have accumulated large counters.
+    let numerator = (group.weighted_uses as u128)
+        .saturating_mul(1 << 20)
+        .saturating_add((group.use_count as u128) << 12);
+    (numerator / u128::from(group.live_points)).min(u128::from(u64::MAX)) as u64
+}
+
+fn queue_entry(
+    group: usize,
+    groups: &[AllocationGroup],
+    saturation: &[usize],
+    versions: &[u32],
+) -> AllocationQueueEntry {
+    let data = &groups[group];
+    AllocationQueueEntry {
+        saturation: saturation[group],
+        degree: data.neighbors.len(),
+        priority: group_priority(data),
+        weighted_uses: data.weighted_uses,
+        use_count: data.use_count,
+        live_points: data.live_points,
+        start: data.start,
+        group,
+        version: versions[group],
+    }
+}
+
+/// Color the interference graph with a DSATUR-style priority queue. Saturation
+/// handles local pressure, degree handles difficult regions, and the weighted
+/// use-density tie breakers keep hot/short-lived SSA values from being forced
+/// into poor colors merely because they appear later in layout order.
+fn color_allocation_groups(
+    intervals: &[LiveInterval],
+    interference: &InterferenceGraph,
+    affinities: &AffinityGraph,
+    coalesced: CoalescedGroups,
+) -> Result<(Vec<Option<Reg>>, u16), AllocationFailure> {
+    debug_assert!(GENERAL_REGISTER_COUNT <= 256);
+    let (groups, value_group) = build_allocation_groups(intervals, interference, coalesced);
+    let mut group_regs = vec![None::<usize>; groups.len()];
+    let mut neighbor_colors = vec![RegisterMask::default(); groups.len()];
+    let mut saturation = vec![0usize; groups.len()];
+    let mut versions = vec![0u32; groups.len()];
+    let mut queue = BinaryHeap::new();
+
+    for group in 0..groups.len() {
+        queue.push(queue_entry(group, &groups, &saturation, &versions));
+    }
+
+    let mut affinity_scores = vec![0u64; GENERAL_REGISTER_COUNT];
+    let mut max_reg = None::<usize>;
+    let mut colored = 0usize;
+
+    while colored < groups.len() {
+        let current = loop {
+            let Some(entry) = queue.pop() else {
+                unreachable!("register-allocation queue exhausted before coloring all groups");
+            };
+            if group_regs[entry.group].is_none() && versions[entry.group] == entry.version {
+                break entry.group;
+            }
+        };
+
+        let forbidden = &neighbor_colors[current];
+        affinity_scores.fill(0);
+        for &value in &groups[current].members {
+            for &(other, weight) in &affinities.edges[value] {
+                let other_group = value_group[other.0 as usize];
+                if other_group == usize::MAX || other_group == current {
+                    continue;
+                }
+                if let Some(reg) = group_regs[other_group] {
+                    affinity_scores[reg] = affinity_scores[reg].saturating_add(weight);
+                }
+            }
+        }
+
+        let mut selected = None::<usize>;
+        let mut selected_score = 0u64;
+        for reg in 0..GENERAL_REGISTER_COUNT {
+            if forbidden.contains(reg) {
+                continue;
+            }
+            let score = affinity_scores[reg];
+            if selected.is_none() || score > selected_score {
+                selected = Some(reg);
+                selected_score = score;
+            }
+        }
+
+        let Some(reg) = selected else {
+            return Err(AllocationFailure::Pressure {
+                value: groups[current].members[0],
+                forbidden_registers: forbidden.count(),
+            });
+        };
+
+        group_regs[current] = Some(reg);
+        max_reg = Some(max_reg.map_or(reg, |old| old.max(reg)));
+        colored += 1;
+
+        for &neighbor in &groups[current].neighbors {
+            if group_regs[neighbor].is_some() {
+                continue;
+            }
+            if neighbor_colors[neighbor].insert(reg) {
+                saturation[neighbor] += 1;
+                versions[neighbor] = versions[neighbor].wrapping_add(1);
+                queue.push(queue_entry(neighbor, &groups, &saturation, &versions));
+            }
+        }
+    }
+
+    let mut value_regs = vec![None; intervals.len()];
+    for (group, data) in groups.iter().enumerate() {
+        let reg = Reg(group_regs[group].unwrap() as u8);
+        for &value in &data.members {
+            value_regs[value] = Some(reg);
+        }
+    }
+
+    // Keep this invariant checked in release builds too. A bad register
+    // assignment silently corrupts bytecode state and is much worse than a
+    // compiler error.
+    for (left, edges) in interference.edges.iter().enumerate() {
+        let Some(left_reg) = value_regs[left] else {
+            continue;
+        };
+        for &right in edges {
+            if left >= right {
+                continue;
+            }
+            if value_regs[right] == Some(left_reg) {
+                return Err(AllocationFailure::Conflict {
+                    left,
+                    right,
+                    reg: left_reg,
+                });
+            }
+        }
+    }
+
+    Ok((
+        value_regs,
+        max_reg.map_or(0, |reg| (reg + 1) as u16),
+    ))
+}
+
 fn allocate_registers(
     function: &Function,
     intervals: Vec<LiveInterval>,
     affinities: &AffinityGraph,
 ) -> Result<RegisterAllocation, CompileError> {
-    let mut order = intervals
-        .iter()
-        .enumerate()
-        .filter(|(_, interval)| !interval.ranges.is_empty())
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
+    let interference = build_interference_graph(&intervals);
+    let weighted_affinities = canonical_affinities(affinities);
+    let coalesced = coalesce_affinity_groups(&intervals, &interference, &weighted_affinities);
+    let has_real_coalescing = coalesced.groups.iter().any(|group| group.len() > 1);
 
-    order.sort_by_key(|&index| {
-        let interval = &intervals[index];
-        (interval.start, Reverse(interval.use_weight), interval.end)
+    let allocation = color_allocation_groups(
+        &intervals,
+        &interference,
+        affinities,
+        coalesced,
+    )
+    .or_else(|failure| match failure {
+        // Coalescing can theoretically make a colorable graph harder even when
+        // every merged pair is non-interfering. Never turn a copy optimization
+        // into a compilation failure: retry the same priority allocator with
+        // singleton groups before reporting register pressure. Internal conflict
+        // failures are never hidden by the retry.
+        AllocationFailure::Pressure { .. } if has_real_coalescing => color_allocation_groups(
+            &intervals,
+            &interference,
+            affinities,
+            singleton_groups(&intervals),
+        ),
+        other => Err(other),
     });
 
-    let mut value_regs: Vec<Option<Reg>> = vec![None; function.values.len()];
-    let mut reg_intervals = (0..GENERAL_REGISTER_COUNT)
-        .map(|_| Vec::<usize>::new())
-        .collect::<Vec<_>>();
-    let mut max_reg: Option<usize> = None;
+    let (value_regs, frame_register_count) = allocation.map_err(|failure| match failure {
+        AllocationFailure::Pressure {
+            value,
+            forbidden_registers,
+        } => CompileError::RegisterPressure {
+            function: function.id,
+            value: intervals[value].value,
+            simultaneously_required: forbidden_registers.saturating_add(1),
+        },
+        AllocationFailure::Conflict { left, right, reg } => CompileError::Internal {
+            function: Some(function.id),
+            message: format!(
+                "register allocator assigned interfering values {:?} and {:?} to {:?}",
+                intervals[left].value, intervals[right].value, reg
+            ),
+        },
+    })?;
 
-    let feasible = |reg: usize, interval_index: usize, reg_intervals: &Vec<Vec<usize>>| {
-        reg_intervals[reg]
-            .iter()
-            .all(|&other| !intervals[interval_index].intersects(&intervals[other]))
-    };
-
-    for interval_index in order {
-        let interval = &intervals[interval_index];
-        let value = interval.value;
-
-        let mut preferred_scores: HashMap<usize, u64> = HashMap::default();
-        for &(other, weight) in &affinities.edges[value.0 as usize] {
-            if let Some(reg) = value_regs[other.0 as usize] {
-                let score = preferred_scores.entry(reg.index()).or_default();
-                *score = (*score).saturating_add(weight);
-            }
-        }
-
-        let mut preferred = preferred_scores.into_iter().collect::<Vec<_>>();
-        preferred.sort_by_key(|&(reg, score)| (Reverse(score), reg));
-
-        let mut selected = None;
-        for (reg, _) in preferred {
-            if feasible(reg, interval_index, &reg_intervals) {
-                selected = Some(reg);
-                break;
-            }
-        }
-
-        if selected.is_none() {
-            selected = (0..GENERAL_REGISTER_COUNT)
-                .find(|&reg| feasible(reg, interval_index, &reg_intervals));
-        }
-
-        let Some(reg_index) = selected else {
-            let pressure = reg_intervals
-                .iter()
-                .filter(|occupants| {
-                    occupants
-                        .iter()
-                        .any(|&other| interval.intersects(&intervals[other]))
-                })
-                .count()
-                .saturating_add(1);
-            return Err(CompileError::RegisterPressure {
-                function: function.id,
-                value,
-                simultaneously_required: pressure,
-            });
-        };
-
-        let reg = Reg(reg_index as u8);
-        value_regs[value.0 as usize] = Some(reg);
-        reg_intervals[reg_index].push(interval_index);
-        max_reg = Some(max_reg.map_or(reg_index, |current| current.max(reg_index)));
-    }
-
-    let frame_register_count = max_reg.map_or(0, |reg| (reg + 1) as u16);
     Ok(RegisterAllocation {
         value_regs,
         intervals,
@@ -3508,6 +3978,60 @@ mod tests {
     use super::*;
     use crate::napalm_bytecode::{disassemble, BytecodeVerifier, Decoder};
     use crate::napalm_ir::{Builder, IntBinOp};
+
+    fn synthetic_interval(value: u32, ranges: &[(u32, u32)], use_weight: u64) -> LiveInterval {
+        let mut interval = LiveInterval::new(ValueId(value));
+        for &(start, end) in ranges {
+            interval.add_range(LiveRange { start, end });
+        }
+        interval.use_weight = use_weight;
+        interval.use_count = ranges.len() as u64;
+        interval.normalize();
+        interval
+    }
+
+    #[test]
+    fn interference_graph_preserves_lifetime_holes() {
+        let intervals = vec![
+            synthetic_interval(0, &[(0, 2), (8, 10)], 10),
+            synthetic_interval(1, &[(4, 6)], 10),
+            synthetic_interval(2, &[(2, 4)], 10),
+        ];
+        let graph = build_interference_graph(&intervals);
+
+        assert!(!graph.interferes(0, 1), "a lifetime hole must stay reusable");
+        assert!(graph.interferes(0, 2), "inclusive endpoints must interfere");
+        assert!(graph.interferes(1, 2), "overlapping ranges must interfere");
+    }
+
+    #[test]
+    fn weighted_affinity_coalescing_shares_a_register_without_conflicts() {
+        let intervals = vec![
+            synthetic_interval(0, &[(0, 2)], 100),
+            synthetic_interval(1, &[(3, 5)], 100),
+            synthetic_interval(2, &[(1, 4)], 1),
+        ];
+        let interference = build_interference_graph(&intervals);
+        let mut affinities = AffinityGraph::new(intervals.len());
+        affinities.add(ValueId(0), ValueId(1), 1_000_000);
+        affinities.add(ValueId(0), ValueId(2), 1);
+
+        let weighted = canonical_affinities(&affinities);
+        let coalesced = coalesce_affinity_groups(&intervals, &interference, &weighted);
+        assert_eq!(coalesced.value_group[0], coalesced.value_group[1]);
+        assert_ne!(coalesced.value_group[0], coalesced.value_group[2]);
+
+        let (regs, frame_register_count) = color_allocation_groups(
+            &intervals,
+            &interference,
+            &affinities,
+            coalesced,
+        )
+        .expect("synthetic graph must color");
+        assert_eq!(regs[0], regs[1], "coalesced affinity must eliminate the copy");
+        assert_ne!(regs[0], regs[2], "interfering values must use different registers");
+        assert_eq!(frame_register_count, 2);
+    }
 
     #[test]
     fn compiles_arithmetic_and_reuses_registers() {
