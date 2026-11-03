@@ -856,14 +856,16 @@ impl<'a> Parser<'a> {
             };
             self.type_parameters()?;
             let params = self.params()?;
-            self.annotation()?;
+            // `async` functions declare `Promise<T>` while their body returns `T`;
+            // the annotation therefore never constrains `return` statements.
+            let return_type = self.variable_annotation()?.filter(|_| !async_);
             // TypeScript overload signatures have no runtime body. Keep the final
             // implementation only; the overloads are erased like other types.
             if !self.at("{") {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            let body = self.function_body(params, start)?;
+            let body = self.function_body(params, return_type, start)?;
             let initializer = Expr::new(
                 if concurrent_ {
                     ExprKind::ConcurrentClosure(body)
@@ -1942,7 +1944,12 @@ impl<'a> Parser<'a> {
         Ok(prefix)
     }
 
-    fn function_body(&mut self, params: Vec<Ident>, start: usize) -> Result<FunctionBody> {
+    fn function_body(
+        &mut self,
+        params: Vec<Ident>,
+        return_type: Option<TypeAnnotation>,
+        start: usize,
+    ) -> Result<FunctionBody> {
         self.lines();
         let block = self.block()?;
         let StmtKind::Block(body_statements) = block.kind else {
@@ -1954,6 +1961,7 @@ impl<'a> Parser<'a> {
         Ok(FunctionBody {
             params,
             param_types,
+            return_type,
             kind: FunctionBodyKind::Statements(statements),
             span: self.end(start),
         })
@@ -2767,16 +2775,19 @@ impl<'a> Parser<'a> {
         // Named functions and parenthesized arrow functions may carry a return
         // annotation here. For an unparenthesized arrow the preceding annotation
         // was the parameter annotation itself.
-        if function || parenthesized {
-            self.annotation()?;
-        }
+        let return_type = if function || parenthesized {
+            // Async closures declare `Promise<T>`; their `return` yields `T`.
+            self.variable_annotation()?.filter(|_| !async_)
+        } else {
+            None
+        };
         let body = if function {
-            self.function_body(params, start)?
+            self.function_body(params, return_type, start)?
         } else {
             self.expect("=>")?;
             self.lines();
             if self.at("{") {
-                self.function_body(params, start)?
+                self.function_body(params, return_type, start)?
             } else {
                 let value = self.expr(1)?;
                 let param_types = self.take_parameter_types(&params);
@@ -2786,7 +2797,7 @@ impl<'a> Parser<'a> {
                     statements.push(Stmt { span: value.span, kind: StmtKind::Return(Some(value)) });
                     FunctionBodyKind::Statements(statements)
                 };
-                FunctionBody { params, param_types, kind, span: self.end(start) }
+                FunctionBody { params, param_types, return_type, kind, span: self.end(start) }
             }
         };
         Ok(Expr::new(
@@ -2832,13 +2843,14 @@ impl<'a> Parser<'a> {
         }
         self.lines();
         let body = if self.at("{") {
-            self.function_body(params, start)?
+            self.function_body(params, None, start)?
         } else {
             let value = self.expr(1)?;
             let param_types = self.take_parameter_types(&params);
             FunctionBody {
                 params,
                 param_types,
+                return_type: None,
                 kind: FunctionBodyKind::Expression(Box::new(value)),
                 span: self.end(start),
             }
@@ -3551,11 +3563,11 @@ impl<'a> Parser<'a> {
                         ));
                     }
                 };
-                self.annotation()?;
+                let return_type = self.variable_annotation()?;
                 if !self.at("{") {
                     return self.error("operator overloads require an implementation body");
                 }
-                let body = Some(self.function_body(params, member_start)?);
+                let body = Some(self.function_body(params, return_type, member_start)?);
                 methods.push(MethodDecl {
                     signature,
                     is_async: false,
@@ -3615,7 +3627,9 @@ impl<'a> Parser<'a> {
                         "a watcher requires a function body"
                     });
                 }
-                let body = self.function_body(Vec::new(), member_start)?;
+                // Computed/watch bodies are wrapped by reactive machinery whose
+                // public getter is synthesized separately; keep them unconstrained.
+                let body = self.function_body(Vec::new(), None, member_start)?;
                 if is_computed {
                     let local_span = Span::empty(self.synthetic_span);
                     self.synthetic_span += 1;
@@ -3648,7 +3662,7 @@ impl<'a> Parser<'a> {
             if self.at("(") {
                 let (params, parameter_properties) = self.params_with_properties(is_constructor)?;
                 let body_params = params.clone();
-                self.annotation()?;
+                let return_type = self.variable_annotation()?;
                 let signature = match access {
                     Some("get") if params.is_empty() => MethodSignatureAst::Getter { name: member },
                     Some("set") if params.len() == 1 => MethodSignatureAst::Setter {
@@ -3712,7 +3726,10 @@ impl<'a> Parser<'a> {
                     if is_constructor {
                         self.constructor_properties = Some(Vec::new());
                     }
-                    let body = self.function_body(body_params, member_start)?;
+                    // Constructors always yield the new instance; `async` methods
+                    // declare `Promise<T>`. Neither annotation constrains `return`.
+                    let return_type = return_type.filter(|_| !is_constructor && !async_);
+                    let body = self.function_body(body_params, return_type, member_start)?;
                     if is_constructor {
                         constructor_properties = self.constructor_properties.take().unwrap();
                     }
@@ -3870,6 +3887,7 @@ impl<'a> Parser<'a> {
                     body: Some(FunctionBody {
                         params: Vec::new(),
                         param_types: Vec::new(),
+                        return_type: None,
                         kind: FunctionBodyKind::Statements(statements),
                         span: self.end(start),
                     }),
@@ -3916,6 +3934,7 @@ impl<'a> Parser<'a> {
                 body: Some(FunctionBody {
                     params: Vec::new(),
                     param_types: Vec::new(),
+                    return_type: None,
                     kind: FunctionBodyKind::Statements(static_initializers),
                     span: self.end(start),
                 }),
@@ -4090,6 +4109,7 @@ fn synthesize_computed_property(
         body: Some(FunctionBody {
             params: Vec::new(),
             param_types: Vec::new(),
+            return_type: None,
             kind: FunctionBodyKind::Statements(vec![
                 callback_decl,
                 guarded_eval,
@@ -4196,15 +4216,20 @@ fn synthesize_class_property(
         member.span,
     );
     let param = Spanned::new("<value>".into(), member.span);
+    // The accessors carry no explicit result annotation: the backing field's
+    // declared type already types the LoadField, and return-type inference
+    // propagates it to every statically resolved caller.
     let read = FunctionBody {
         params: Vec::new(),
         param_types: Vec::new(),
+        return_type: None,
         kind: FunctionBodyKind::Expression(Box::new(field.clone())),
         span: member.span,
     };
     let write = FunctionBody {
         params: Vec::new(),
         param_types: Vec::new(),
+        return_type: None,
         kind: FunctionBodyKind::Expression(Box::new(Expr::new(
             ExprKind::Assign {
                 target: Box::new(field.clone()),
@@ -4468,6 +4493,7 @@ impl DecoratorAst<'_> {
             attributes: Vec::new(),
             body: Some(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(statements),
                 span,
@@ -4661,6 +4687,7 @@ impl DecoratorAst<'_> {
         let span = self.span();
         Expr::new(ExprKind::Closure(FunctionBody {
             param_types: vec![None; params.len()],
+            return_type: None,
             params,
             kind: FunctionBodyKind::Statements(statements),
             span,

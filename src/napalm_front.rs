@@ -1259,6 +1259,11 @@ pub struct FunctionBody {
     /// Source-visible parameter annotations, aligned with `params`. Legacy syntax
     /// has no parameter type grammar, so its entries are always `None`.
     pub param_types: Vec<Option<TypeAnnotation>>,
+    /// Source-declared result annotation (`function f(): T`). The lowerer treats
+    /// it as an inviolable contract: every return is checked against it, so
+    /// callers whose target is statically known may rely on the result type.
+    /// Legacy syntax has no return type grammar and always leaves this `None`.
+    pub return_type: Option<TypeAnnotation>,
     pub kind: FunctionBodyKind,
     pub span: Span,
 }
@@ -2632,6 +2637,7 @@ impl<'a> Parser<'a> {
             let end = self.previous().span.end;
             return Ok(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(Vec::new()),
                 span: Span::new(start, end),
@@ -2660,6 +2666,7 @@ impl<'a> Parser<'a> {
             )?;
             return Ok(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(statements),
                 span: Span::new(start, close.span.end),
@@ -2674,6 +2681,7 @@ impl<'a> Parser<'a> {
         )?;
         Ok(FunctionBody {
             param_types: vec![None; params.len()],
+            return_type: None,
             params,
             kind: FunctionBodyKind::Expression(Box::new(expression)),
             span: Span::new(start, close.span.end),

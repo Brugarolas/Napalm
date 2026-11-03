@@ -1466,6 +1466,21 @@ impl Host for BuiltinHost {
         )
     }
 
+    fn standard_list_method(
+        &self,
+        primitive: PrimitiveId,
+        name: &str,
+        arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceListMethod> {
+        use crate::napalm_tracing_jit::TraceListMethod;
+        use BuiltinPrimitive::*;
+        match (self.manifest.implementation(primitive), name, arity) {
+            (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
+            (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
+            _ => None,
+        }
+    }
+
     fn call_primitive(
         &mut self,
         context: &mut HostContext<'_>,

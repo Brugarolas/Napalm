@@ -16,9 +16,14 @@
 //!    returned values type every statically resolved call, so callers keep
 //!    numeric/object facts across call boundaries.
 //! 3. **Builtin and numeric result types.** Stock `Num` operators over proven
-//!    numbers, typed list subscripts and collection lengths get precise results.
+//!    numbers, typed list subscripts (`T | null`) and the count getters each
+//!    builtin class registers get precise results.
 //! 4. **Validation elimination.** A scalar `BindInterface` whose operand is
-//!    already proven to satisfy the contract is a no-op and is removed.
+//!    already proven to satisfy the contract is a no-op and is removed, as is a
+//!    heap-contract binding of a value just bound to the identical contract.
+//! 5. **Allocation-enabling inlining.** A small straight-line direct callee that
+//!    receives a caller-allocated object is copied into the caller so escape
+//!    analysis can scalar-replace the object (see `inline_allocation_calls`).
 //!
 //! The analysis is deliberately conservative. Any class whose superclass cannot
 //! be identified statically, any `BindMethod` whose class cannot be traced, and
@@ -73,6 +78,13 @@ impl ProgramOptimization for StaticTypeSpecialization {
                 apply_plan(&mut program.functions[index], plan);
                 touched.push(index);
             }
+            // Direct calls that receive a caller-allocated object are inlined so
+            // the re-run below can scalar-replace the object.
+            for index in inline_allocation_calls(program) {
+                if !touched.contains(&index) {
+                    touched.push(index);
+                }
+            }
 
             if touched.is_empty() {
                 break;
@@ -110,8 +122,12 @@ enum NumericOp {
 enum BuiltinSelector {
     /// `[]` subscript getter with one index.
     Subscript,
-    /// `length` / `count` / `size` getters (and the `length()` List method).
+    /// `length` getter (and the `length()` List method): List and String only.
     Length,
+    /// `count` getter: List, String, Map-backed values and Set.
+    Count,
+    /// `size` getter: Map-backed values and Set.
+    Size,
 }
 
 /// Precomputed classification of the program's interned method selectors.
@@ -143,7 +159,9 @@ impl SelectorTable {
             }
             let builtin = match (signature.kind, signature.arity, name) {
                 (MethodKind::SubscriptGetter, 1, "[]") => Some(BuiltinSelector::Subscript),
-                (MethodKind::Getter, 0, "length" | "count" | "size") => Some(BuiltinSelector::Length),
+                (MethodKind::Getter, 0, "length") => Some(BuiltinSelector::Length),
+                (MethodKind::Getter, 0, "count") => Some(BuiltinSelector::Count),
+                (MethodKind::Getter, 0, "size") => Some(BuiltinSelector::Size),
                 (MethodKind::Method, 0, "length") => Some(BuiltinSelector::Length),
                 _ => None,
             };
@@ -653,9 +671,19 @@ fn builtin_result(
         BuiltinSelector::Subscript => {
             let Type::List(Some(element)) = receiver else { return None };
             // A Range index slices; only a numeric index yields one element.
-            matches!(type_of(*args.first()?), Type::Num).then(|| (**element).clone())
+            // Out-of-range (and fractional) indices yield `null`, so the
+            // guaranteed result is `T | null`, never plain `T`.
+            matches!(type_of(*args.first()?), Type::Num)
+                .then(|| element.flow_join(&Type::Null))
         }
+        // Only the stock count getters registered for each builtin class: on a
+        // Map-backed value `length` is an ordinary property read, and `size`
+        // does not exist on List/String.
         BuiltinSelector::Length => match receiver {
+            Type::List(_) | Type::String => Some(Type::Num),
+            _ => None,
+        },
+        BuiltinSelector::Count => match receiver {
             Type::List(_)
             | Type::String
             | Type::Map
@@ -663,6 +691,12 @@ fn builtin_result(
             | Type::Interface(_)
             | Type::Record(_)
             | Type::Set(_) => Some(Type::Num),
+            _ => None,
+        },
+        BuiltinSelector::Size => match receiver {
+            Type::Map | Type::GenericMap(_, _) | Type::Interface(_) | Type::Record(_) | Type::Set(_) => {
+                Some(Type::Num)
+            }
             _ => None,
         },
     }
@@ -855,8 +889,13 @@ impl Planner<'_> {
             Inst::BindInterface { value, expected, .. } => {
                 // Scalar contracts only validate; when the operand is already
                 // proven to satisfy them the check is a no-op. Heap contracts
-                // are persistent writes and must stay.
+                // are persistent writes and must stay, except when the operand
+                // comes straight out of a binding of the identical contract:
+                // rebinding an installed contract returns immediately at runtime.
                 if requires_runtime_contract(expected) {
+                    if bound_by_identical_contract(self.function, *value, expected) {
+                        self.plan.rewrites.push((id, Rewrite::Replace(Inst::Move(*value))));
+                    }
                     return;
                 }
                 let actual = self.type_of(*value);
@@ -1049,4 +1088,212 @@ fn apply_plan(function: &mut Function, plan: FunctionPlan) {
     for block_ix in changed_blocks {
         repair_effect_chain(function, block_ix);
     }
+}
+
+// =============================================================================
+// Allocation-enabling inlining
+// =============================================================================
+
+/// Upper bound on the instructions of an inlined callee body.
+const MAX_INLINE_INSTS: usize = 24;
+
+/// A straight-line callee body that can be copied into a caller verbatim.
+struct InlineBody {
+    params: Vec<ValueId>,
+    /// (instruction, result types, source) in program order, Return excluded.
+    insts: Vec<(Inst, Vec<ValueId>, Vec<Type>, Option<crate::napalm_ir::SourceSpan>)>,
+    returned: ValueId,
+}
+
+/// Whether a callee instruction may be copied into another function. Only
+/// context-free operations qualify: no field/module/capture state of the callee's
+/// own frame, no deopt metadata, no control flow, fibers or tail calls. Errors
+/// raised by the copies (e.g. a failed contract) propagate exactly like errors
+/// of the call they replace, through the caller's own exception regions.
+fn inlinable_inst(kind: &Inst) -> bool {
+    matches!(
+        kind,
+        Inst::Const(_)
+            | Inst::Move(_)
+            | Inst::BindInterface { .. }
+            | Inst::Invoke { .. }
+            | Inst::CallDirect { conv: CallConv::Napalm, .. }
+            | Inst::LoadProperty { .. }
+            | Inst::StoreProperty { .. }
+            | Inst::AllocMap
+            | Inst::MapGet { .. }
+            | Inst::MapSet { .. }
+            | Inst::MapLen { .. }
+            | Inst::AllocList { .. }
+            | Inst::ListLen { .. }
+            | Inst::ListGet { .. }
+            | Inst::ListAppend { .. }
+            | Inst::StringLen { .. }
+            | Inst::StringConcat { .. }
+            | Inst::IntUnary { .. }
+            | Inst::IntBin { .. }
+            | Inst::F64Unary { .. }
+            | Inst::F64Bin { .. }
+            | Inst::CmpInt { .. }
+            | Inst::CmpF64 { .. }
+            | Inst::RefEq { .. }
+            | Inst::NumToInt32 { .. }
+            | Inst::NumToF64 { .. }
+            | Inst::Int32ToNum { .. }
+            | Inst::F64ToNum { .. }
+    )
+}
+
+fn inline_body(function: &Function) -> Option<InlineBody> {
+    if function.is_async
+        || function.is_concurrent
+        || !function.captures.is_empty()
+        || !function.exception_regions.is_empty()
+        || !matches!(function.kind, FunctionKind::Closure | FunctionKind::Method | FunctionKind::StaticMethod)
+    {
+        return None;
+    }
+    let entry = function.blocks.get(function.entry.0 as usize)?;
+    let (&last, body) = entry.insts.split_last()?;
+    let Inst::Return(returned) = function.nodes.get(last.0 as usize)?.kind else { return None };
+    if body.len() > MAX_INLINE_INSTS {
+        return None;
+    }
+    // Every operand must be a parameter or an earlier result of the body.
+    let mut defined: HashSet<ValueId> = entry.params.iter().copied().collect();
+    let mut insts = Vec::with_capacity(body.len());
+    for &id in body {
+        let node = function.nodes.get(id.0 as usize)?;
+        if !inlinable_inst(&node.kind) || node.kind.operands().iter().any(|value| !defined.contains(value)) {
+            return None;
+        }
+        if matches!(node.kind, Inst::CallDirect { callee, .. } if callee == function.id) {
+            return None;
+        }
+        let types = node
+            .results
+            .iter()
+            .map(|value| function.values.get(value.0 as usize).map(|value| value.ty.clone()))
+            .collect::<Option<Vec<_>>>()?;
+        defined.extend(node.results.iter().copied());
+        insts.push((node.kind.clone(), node.results.clone(), types, node.source));
+    }
+    defined.contains(&returned).then(|| InlineBody { params: entry.params.clone(), insts, returned })
+}
+
+/// Whether `value` is (a copy or binding of) an allocation made by `function`.
+/// Passing such an object to a small callee is what keeps scalar replacement
+/// from removing it; inlining the callee lets escape analysis see its uses.
+fn is_local_allocation(function: &Function, mut value: ValueId) -> bool {
+    for _ in 0..TRACE_DEPTH {
+        let Some(info) = function.values.get(value.0 as usize) else { return false };
+        let ValueDef::InstResult(id, 0) = info.def else { return false };
+        match &function.nodes[id.0 as usize].kind {
+            Inst::AllocMap | Inst::AllocList { .. } => return true,
+            Inst::Move(source) | Inst::BindInterface { value: source, .. } => value = *source,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Inline small straight-line `CallDirect` targets that receive an object
+/// allocated by the caller. Static types made these calls direct; inlining them
+/// lets the ordinary escape analysis scalar-replace the object (e.g. a
+/// structural `{ x, y }` literal handed to `dist(a: Point, b: Point)`), which
+/// removes the allocation, its contract binding and every property access.
+/// Returns the indices of the rewritten callers.
+fn inline_allocation_calls(program: &mut Program) -> Vec<usize> {
+    let bodies: HashMap<FuncId, InlineBody> = program
+        .functions
+        .iter()
+        .filter_map(|function| inline_body(function).map(|body| (function.id, body)))
+        .collect();
+    if bodies.is_empty() {
+        return Vec::new();
+    }
+    let mut touched = Vec::new();
+    for index in 0..program.functions.len() {
+        let caller_id = program.functions[index].id;
+        let mut sites: Vec<(usize, InstId, FuncId)> = Vec::new();
+        {
+            let caller = &program.functions[index];
+            for (block_ix, block) in caller.blocks.iter().enumerate() {
+                for &id in &block.insts {
+                    let Inst::CallDirect { conv: CallConv::Napalm, callee, args } = &caller.nodes[id.0 as usize].kind
+                    else {
+                        continue;
+                    };
+                    let Some(body) = bodies.get(callee) else { continue };
+                    if *callee == caller_id
+                        || body.params.len() != args.len()
+                        || caller.nodes[id.0 as usize].results.len() != 1
+                        || !args.iter().any(|arg| is_local_allocation(caller, *arg))
+                    {
+                        continue;
+                    }
+                    sites.push((block_ix, id, *callee));
+                }
+            }
+        }
+        if sites.is_empty() {
+            continue;
+        }
+        let mut changed_blocks: HashSet<usize> = HashSet::default();
+        for (block_ix, call, callee) in sites {
+            let body = &bodies[&callee];
+            let mut fresh_sites = Vec::new();
+            for (kind, ..) in &body.insts {
+                if matches!(kind, Inst::Invoke { .. }) {
+                    fresh_sites.push(program.fresh_site());
+                }
+            }
+            let caller = &mut program.functions[index];
+            let Inst::CallDirect { args, .. } = caller.nodes[call.0 as usize].kind.clone() else { continue };
+            let source = caller.nodes[call.0 as usize].source;
+            let mut map: HashMap<ValueId, ValueId> = body.params.iter().copied().zip(args).collect();
+            let mut created = Vec::with_capacity(body.insts.len());
+            let mut fresh_sites = fresh_sites.into_iter();
+            for (kind, results, types, inst_source) in &body.insts {
+                let mut kind = kind.clone();
+                kind.for_each_operand_mut(|value| *value = map[value]);
+                if let Inst::Invoke { site, .. } = &mut kind {
+                    *site = fresh_sites.next().expect("one fresh site per Invoke");
+                }
+                let (id, new_results) = InstFactory::new(caller).create(kind, types, inst_source.or(source));
+                for (old, new) in results.iter().zip(new_results) {
+                    map.insert(*old, new);
+                }
+                created.push(id);
+            }
+            // The call node keeps its result value (and therefore all its uses).
+            caller.nodes[call.0 as usize].kind = Inst::Move(map[&body.returned]);
+            let block = &mut caller.blocks[block_ix];
+            let position = block.insts.iter().position(|id| *id == call).expect("call site in its block");
+            block.insts.splice(position..position, created);
+            changed_blocks.insert(block_ix);
+        }
+        let caller = &mut program.functions[index];
+        for block_ix in changed_blocks {
+            repair_effect_chain(caller, block_ix);
+        }
+        touched.push(index);
+    }
+    touched
+}
+
+/// Whether `value` is (a copy of) the result of `BindInterface` with exactly
+/// `expected`. Persistent contracts cannot be removed, so such a value already
+/// carries the installed contract and binding it again is a runtime no-op.
+fn bound_by_identical_contract(function: &Function, mut value: ValueId, expected: &Type) -> bool {
+    for _ in 0..TRACE_DEPTH {
+        let Some(info) = function.values.get(value.0 as usize) else { return false };
+        let ValueDef::InstResult(id, 0) = info.def else { return false };
+        match &function.nodes[id.0 as usize].kind {
+            Inst::BindInterface { expected: installed, .. } if installed == expected => return true,
+            Inst::Move(source) => value = *source,
+            _ => return false,
+        }
+    }
+    false
 }

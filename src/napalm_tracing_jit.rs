@@ -549,6 +549,16 @@ pub struct ShapedMapAccess {
 ///   Non-GC leaf calls preserve them; full/runtime-call boundaries may move the
 ///   register stack or heap and must refresh `TraceActivation` before native code
 ///   resumes.
+/// Stock List methods whose fast path a trace replays natively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceListMethod {
+    /// `list.length`: the element count as a Num.
+    Length,
+    /// `list[i]` for an Int32 index in `0..len`; every other index (negative,
+    /// out of range, fractional, Range, nested) replays the original Invoke.
+    Subscript,
+}
+
 pub trait TraceRuntime {
     type RuntimeError: Error + Send + Sync + 'static;
 
@@ -557,6 +567,10 @@ pub trait TraceRuntime {
     /// Only specialize a numeric Invoke when its actual method target has the
     /// standard semantics. A method name alone is insufficient for host bindings.
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
+
+    /// Which stock List method an Invoke site resolves to for List receivers
+    /// under the current method tables, if any.
+    fn trace_standard_list_method(&self, _function: FuncId, _cache: u32) -> Option<TraceListMethod> { None }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
 
@@ -1926,6 +1940,97 @@ impl<'a> TraceRecorder<'a> {
         if !matches!(field_type, Type::Top) {
             builder.set_proven_type(result, field_type);
         }
+        self.write_gpr(builder, op.a, result);
+        Ok(true)
+    }
+
+    /// Native fast path for the stock `list.length` and `list[i]` Invokes. Every
+    /// guard replays the original Invoke, so negative/out-of-range/fractional
+    /// indices, ranges and rebound methods keep their baseline semantics. A
+    /// statically typed `List<T>` receiver also proves the element type `T`
+    /// (the list carries a persistent element contract).
+    fn record_list_invoke<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<bool, RecordingAbort> {
+        if op.opcode != Opcode::Invoke || runtime.trace_reactive_tracking_active() {
+            return Ok(false);
+        }
+        let Some(method) = runtime.trace_standard_list_method(op.location.function, op.x) else {
+            return Ok(false);
+        };
+        let arity = match method {
+            TraceListMethod::Length => 0,
+            TraceListMethod::Subscript => 1,
+        };
+        if op.c as usize != arity || op.args.len() != arity {
+            return Ok(false);
+        }
+        // Validate every observation before emitting anything.
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let Some(length) = runtime.trace_list_len(receiver_word) else {
+            return Ok(false);
+        };
+        if method == TraceListMethod::Subscript {
+            let index_word = runtime
+                .trace_read_slot(FrameSlot::General(op.args[0]))
+                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+            let Some(index) = word_num(index_word) else {
+                return Ok(false);
+            };
+            if !(index.fract() == 0.0 && index >= 0.0 && index < length as f64 && index <= i32::MAX as f64) {
+                return Ok(false);
+            }
+        }
+
+        let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+        let result = match method {
+            TraceListMethod::Length => {
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit1(TraceInst::BoxInt32 { value: length }, TraceType::Num, TraceRep::Tagged)
+            }
+            TraceListMethod::Subscript => {
+                let element_type = match builder.proven_type(list) {
+                    Some(Type::List(Some(element))) => (**element).clone(),
+                    _ => Type::Top,
+                };
+                let index = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let index = builder.emit1(
+                    TraceInst::GuardInt32 { value: index, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit0(TraceInst::GuardBounds { index, length, exit });
+                let (trace_ty, trace_rep) = Self::semantic_trace_layout(&element_type);
+                let element = builder.emit1(
+                    TraceInst::HeapListGet { list, index, exit },
+                    trace_ty,
+                    trace_rep,
+                );
+                if !matches!(element_type, Type::Top) {
+                    builder.set_proven_type(element, element_type);
+                }
+                element
+            }
+        };
         self.write_gpr(builder, op.a, result);
         Ok(true)
     }
@@ -3812,6 +3917,7 @@ impl<'a> TraceRecorder<'a> {
 
             Invoke => {
                 if self.record_num_invoke(runtime, program, function, op, builder)?
+                    || self.record_list_invoke(runtime, op, builder)?
                     || self.record_map_property_invoke(runtime, program, function, op, builder)?
                 {
                     Ok(ExpectedStep::Exact(next))
@@ -5254,7 +5360,11 @@ impl<'a> TraceRecorder<'a> {
             let initial_semantic = builder.proven_type(initial).cloned();
             let backedge_semantic = builder.proven_type(final_value).cloned();
             let phi = builder.add_loop_phi(slot, initial, ty, rep);
-            if let (Some(initial), Some(backedge)) = (initial_semantic, backedge_semantic) {
+            if let Some(header) = builder.entry_type(slot).cloned() {
+                // The static type at the loop header holds on every arrival,
+                // the backedge included.
+                builder.set_proven_type(phi, header);
+            } else if let (Some(initial), Some(backedge)) = (initial_semantic, backedge_semantic) {
                 let joined = initial.flow_join(&backedge);
                 if !matches!(joined, Type::Top) {
                     builder.set_proven_type(phi, joined);
@@ -5353,6 +5463,15 @@ impl<'a> TraceRecorder<'a> {
             },
         );
         builder.reserve_for_recording(self.options.max_trace_steps);
+        // Napalm annotations are enforced contracts: the WIR type of every live
+        // register at the anchor is a fact about the values entering the trace.
+        builder.set_entry_types(
+            function
+                .chunk
+                .types_at(self.anchor.pc)
+                .iter()
+                .map(|(reg, ty)| (FrameSlot::General(*reg), ty.clone())),
+        );
 
         for (reg, constant) in function.chunk.constants_at(self.anchor.pc) {
             let constant = match constant {
@@ -5434,6 +5553,36 @@ impl<'a> TraceRecorder<'a> {
                     .map_err(RecordOutcome::Abort)?
             };
 
+            // A synchronized boundary continues natively only when it resumes at
+            // this continuation (otherwise the trace ends below), so the static
+            // register types there describe every value reloaded after it,
+            // including the call result typed by the static WIR passes.
+            let resume = match expected {
+                ExpectedStep::RuntimeCall | ExpectedStep::Runtime { terminal: false } => Some(op.next_pc),
+                ExpectedStep::RuntimeFused { next, .. } => Some(next.pc),
+                _ => None,
+            };
+            if let Some(resume) = resume {
+                let mut types: Vec<(FrameSlot, Type)> = function
+                    .chunk
+                    .types_at(resume)
+                    .iter()
+                    .map(|(reg, ty)| (FrameSlot::General(*reg), ty.clone()))
+                    .collect();
+                // A statically bound callee also proves its own result type.
+                if op.opcode == Opcode::CallDirect && matches!(expected, ExpectedStep::RuntimeCall) {
+                    let destination = FrameSlot::General(Reg(op.a));
+                    if let Some(callee) = program.function(FuncId(op.x)) {
+                        if !matches!(callee.result_type, Type::Top)
+                            && !types.iter().any(|(slot, _)| *slot == destination)
+                        {
+                            types.push((destination, callee.result_type.clone()));
+                        }
+                    }
+                }
+                builder.set_boundary_types(types);
+            }
+
             let mut step = match expected {
                 ExpectedStep::RuntimeCall => runtime.trace_execute_call_to_return(),
                 _ => runtime.trace_execute_unfused_step(),
@@ -5471,10 +5620,19 @@ impl<'a> TraceRecorder<'a> {
             }
 
             if let ExpectedStep::Inlined { next, callee, steps: callee_steps } = expected {
-                if !step.running || step.after != TraceLocation::new(callee, BytecodePc(0)) {
+                // A callee already compiled by the whole-function tier runs to
+                // completion within the call step. The inlined trace code does not
+                // depend on how the recording run executed it, only on returning
+                // to the caller's continuation.
+                let completed = step.running
+                    && step.after == next
+                    && runtime.trace_current_location() == next;
+                if !completed
+                    && (!step.running || step.after != TraceLocation::new(callee, BytecodePc(0)))
+                {
                     return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
                 }
-                for _ in 0..callee_steps {
+                for _ in 0..if completed { 0 } else { callee_steps } {
                     if !step.running || runtime.trace_current_location().function != callee {
                         return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
                     }
@@ -10333,6 +10491,34 @@ fn jit_events_enabled() -> bool {
     std::env::var_os("NAPALM_JIT_EVENTS").is_some()
 }
 
+/// Opt-in (`NAPALM_JIT_DUMP`) listing of an optimized trace: loop phis, then the
+/// live preheader and body nodes. Used to audit which guards survive.
+fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
+    use crate::napalm_trace_ir::TraceInst;
+    eprintln!("[napalm-jit] trace {:?} anchor {:?}", trace.id, trace.anchor);
+    for phi in &trace.loop_phis {
+        let ty = trace.value(phi.value).map(|value| (value.ty, value.rep));
+        eprintln!("  phi {:?} {:?}", phi, ty);
+    }
+    for (label, ids) in [
+        ("pre", trace.preheader.clone()),
+        ("body", (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect()),
+    ] {
+        for id in ids {
+            let node = &trace.nodes[id];
+            if matches!(node.kind, TraceInst::Nop) {
+                continue;
+            }
+            let results: Vec<_> = node
+                .results
+                .iter()
+                .map(|&value| (value, trace.value(value).map(|value| (value.ty, value.rep))))
+                .collect();
+            eprintln!("  {label} #{id} {:?} -> {:?}", node.kind, results);
+        }
+    }
+}
+
 impl TracingJit {
     #[cfg(test)]
     pub(crate) fn execute_one_for_test<R: TraceRuntime>(&mut self, runtime: &mut R) -> Result<(), TracingJitError> {
@@ -11141,6 +11327,9 @@ impl TracingJit {
                 trace.loop_phis.len(),
             );
         }
+        if std::env::var_os("NAPALM_JIT_DUMP").is_some() {
+            dump_trace(&trace);
+        }
 
         // Recording one iteration ended at the same root header.
         if runtime.trace_current_location() == location {
@@ -11814,6 +12003,7 @@ mod tests {
                 kind: crate::napalm_ir::FunctionKind::ModuleBody,
                 is_async: false, is_concurrent: false, memoization: crate::napalm_ir::MemoizationKind::None, field_owner: None,
                 name: StringId(0), arity: 0, capture_count: 0,
+                result_type: Type::Top,
                 frame: crate::napalm_bytecode::FrameLayout {
                     general_register_count: 18, parameters: vec![], captures: vec![],
                     return_kind: RegisterKind::Value,

@@ -2369,14 +2369,51 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
         param_types.extend((0..node.formal_params.len()).map(|_| Type::Top));
 
+        // A declared result type becomes the function's signature result. The
+        // lowering below validates every return path against it, so the
+        // signature is a sound guarantee rather than a hint. `never`/unparsed
+        // annotations resolve to Bottom and `void`/generics to Top: neither
+        // constrains returns, so both are treated as "no contract".
+        let return_contract = match &node.ast {
+            FunctionAst::Body(body) if !spec.constructor && !spec.is_async => {
+                body.return_type.as_ref().and_then(|annotation| {
+                    if invalid_structural_annotation(annotation, &self.interface_types) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T002",
+                            "unsupported field type in object interface",
+                            annotation.span,
+                        ));
+                        return None;
+                    }
+                    let expected = resolve_type_annotation(
+                        annotation,
+                        &self.top_level_classes,
+                        &self.interface_types,
+                    );
+                    (!matches!(expected, Type::Top | Type::Bottom)).then(|| StaticBindingType {
+                        expected,
+                        origin: annotation.span,
+                        display: display_type_annotation(annotation),
+                    })
+                })
+            }
+            _ => None,
+        };
+        let result_type = return_contract
+            .as_ref()
+            .map_or(Type::Top, |contract| contract.expected.clone());
+
         let mut builder = Builder::new(
             self.program,
             module,
             &spec.name,
             spec.kind,
             param_types,
-            Type::Top,
+            result_type,
         );
+        if let Some(contract) = &return_contract {
+            let _ = builder.intern_structural_layout(&contract.expected);
+        }
         builder.set_async(spec.is_async);
         builder.set_concurrent(spec.is_concurrent);
         if let Some(class) = spec.class {
@@ -2476,6 +2513,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             has_receiver,
             is_concurrent: spec.is_concurrent,
             allows_await: node.is_async || node.is_concurrent || (node_id.0 == 0 && spec.kind == FunctionKind::ModuleBody),
+            return_contract,
         };
         let diagnostics = &mut self.diagnostics;
         let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values);
@@ -2618,6 +2656,9 @@ struct FunctionCompilerContext<'a> {
     has_receiver: bool,
     is_concurrent: bool,
     allows_await: bool,
+    /// Declared result contract (`function f(): T`). Every `return` validates
+    /// against it, which makes `Signature::result` a guarantee callers can use.
+    return_contract: Option<StaticBindingType>,
 }
 
 struct FunctionCompiler<'p, 'a, 'd> {
@@ -2844,6 +2885,38 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.bind_interface(value, &binding_type.expected)
     }
 
+    /// Validate a returned value against the declared result contract.
+    ///
+    /// Statically incompatible explicit returns are compile errors. Dynamic
+    /// values are checked by `BindInterface`, so the function's signature result
+    /// is guaranteed on every normal exit. Implicit fall-through returns (`null`)
+    /// are only checked at runtime: the lowering cannot always prove that the
+    /// end of a body is unreachable, and a false compile error would reject
+    /// valid programs.
+    fn check_return(&mut self, value: ValueId, span: Span, explicit: bool) -> ValueId {
+        let Some(contract) = self.context.return_contract.clone() else {
+            return value;
+        };
+        let actual = self.builder.value_type(value).clone();
+        if explicit && assignment_is_known_incompatible(&contract.expected, &actual) {
+            let actual = display_source_type(&semantic_source_type(&actual));
+            let expected = contract.display.clone();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "NAPALM-T007",
+                    format!("cannot return `{actual}` from a function declared to return `{expected}`"),
+                    span,
+                )
+                .with_primary_label(span, format!("this value has type `{actual}`"))
+                .with_secondary_label(
+                    contract.origin,
+                    format!("the result is declared as `{expected}` here"),
+                ),
+            );
+        }
+        self.bind_interface(value, &contract.expected)
+    }
+
     fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) -> ValueId {
         let Some(binding_type) = self.context.module_binding_types.get(name).cloned() else {
             return value;
@@ -2909,7 +2982,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         if let Some(instance) = self.constructor_this {
                             self.builder.ret(instance);
                         } else {
-                            self.builder.ret(value);
+                            let value = self.check_return(value, expr.span, true);
+                            if !self.current_terminated() {
+                                self.builder.ret(value);
+                            }
                         }
                     }
                 }
@@ -2929,7 +3005,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.builder.ret(instance);
         } else {
             let null = self.builder.const_null();
-            self.builder.ret(null);
+            let span = self.default_return_span();
+            let null = self.check_return(null, span, false);
+            if !self.current_terminated() {
+                self.builder.ret(null);
+            }
+        }
+    }
+
+    fn default_return_span(&self) -> Span {
+        let node = &self.context.analysis.nodes[self.context.node_id.0];
+        match &node.ast {
+            FunctionAst::Body(body) => Span::empty(body.span.end),
+            FunctionAst::Statements(_) => function_node_span(node),
         }
     }
 
@@ -3860,9 +3948,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             return;
         }
+        let explicit = value.is_some();
+        let value_span = value.map_or(span, |expr| expr.span);
         let value = value
             .map(|expr| self.lower_expr(expr))
             .unwrap_or_else(|| self.builder.const_null());
+        // Validate before deferred cleanup runs, so a contract violation is
+        // raised at the `return` and still flows through finally/errdefer.
+        let value = if self.current_terminated() {
+            value
+        } else {
+            self.check_return(value, value_span, explicit)
+        };
         self.emit_exit_actions_from(0);
         if !self.current_terminated() {
             self.builder.ret(value);

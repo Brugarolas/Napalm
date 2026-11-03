@@ -34,6 +34,209 @@ fn static_type_results(program: &BytecodeProgram, entry: FuncId, manifest: &Buil
     })
 }
 
+/// Run once on the interpreter only and once with every native tier, returning
+/// both results plus the tracing-JIT statistics of the native run.
+fn static_type_native_run(
+    program: &BytecodeProgram,
+    entry: FuncId,
+    manifest: &BuiltinManifest,
+) -> ([f64; 2], crate::napalm_tracing_jit::TracingJitStats) {
+    let mut baseline = source_vm(program, manifest);
+    baseline.set_jit_options(None);
+    baseline.run_module(entry).unwrap();
+    let mut native = source_vm(program, manifest);
+    native.run_module(entry).unwrap();
+    let stats = native.jit_stats().cloned().expect("tracing JIT enabled");
+    ([source_result(&baseline), source_result(&native)], stats)
+}
+
+#[test]
+fn napalm_bytecode_carries_static_register_and_result_types() {
+    let (program, _entry, _manifest) = compile_typescript_module(r#"
+        function sum(xs: number[]): number {
+            let total = 0;
+            for (let i = 0; i < xs.length; i = i + 1) total = total + xs[i];
+            return total;
+        }
+        const result = sum([1, 2, 3]);
+    "#);
+    let module = program.functions.last().unwrap().module;
+    let sum = program
+        .functions
+        .iter()
+        .find(|function| function.module == module && function.kind == FunctionKind::Closure)
+        .expect("sum");
+    // The declared result contract becomes the bytecode-level result type.
+    assert_eq!(sum.result_type, Type::Num);
+    // Live registers carry their guaranteed WIR types for trace anchors.
+    let typed_list = Type::List(Some(Box::new(Type::Num)));
+    assert!(
+        sum.chunk.live_registers.iter().any(|entry| entry.types.iter().any(|(_, ty)| *ty == typed_list)),
+        "{:#?}",
+        sum.chunk.live_registers
+    );
+    // Internal representations are never published as semantic facts.
+    assert!(sum.chunk.live_registers.iter().all(|entry| entry
+        .types
+        .iter()
+        .all(|(_, ty)| !matches!(ty, Type::Int32 | Type::F64 | Type::RawPtr | Type::Top | Type::Cell(_)))));
+}
+
+#[test]
+fn napalm_typed_list_length_and_subscript_trace_natively_with_baseline_edge_cases() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        function sum(xs: number[]): number {
+            let total = 0;
+            for (let i = 0; i < xs.length; i = i + 1) total = total + xs[i];
+            return total;
+        }
+        function edges(xs: number[]): number {
+            // Negative indices wrap and out-of-range reads yield null: both
+            // must leave the native fast path and replay the baseline Invoke.
+            let acc = 0;
+            for (let i = 0; i < 400; i = i + 1) acc = acc + (xs[i % 7 - 2] ?? 1000);
+            return acc;
+        }
+        function run(): number {
+            const big: number[] = [];
+            for (let i = 0; i < 3000; i = i + 1) big.push(i);
+            const small: number[] = [1, 2, 3];
+            return sum(big) + edges(small);
+        }
+        const result = run();
+    "#);
+    let (results, stats) = static_type_native_run(&program, entry, &manifest);
+    // 0+..+2999 = 4498500; one 7-step cycle of `edges` adds 2+3+1+2+3+1000+1000,
+    // 57 full cycles plus i = 399 (index -2 -> 2).
+    assert_eq!(results, [4498500.0 + 57.0 * 2011.0 + 2.0; 2]);
+    assert!(stats.traces_compiled > 0, "{stats:#?}");
+}
+
+#[test]
+fn napalm_structural_arguments_are_scalar_replaced_after_direct_call_inlining() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        interface Point { x: number; y: number; }
+        function dist2(a: Point, b: Point): number {
+            let dx = a.x - b.x;
+            let dy = a.y - b.y;
+            return dx * dx + dy * dy;
+        }
+        function points(n: number): number {
+            let a: Point = { x: 1, y: 2 };
+            let total = 0;
+            for (let i = 0; i < n; i = i + 1) {
+                let b: Point = { x: i, y: i + 1 };
+                total = total + dist2(a, b) % 13;
+            }
+            return total;
+        }
+        // dist2 stays an ordinary function for other callers.
+        const direct = dist2({ x: 0, y: 0 }, { x: 3, y: 4 });
+        const result = points(2000) + direct;
+    "#);
+    // `points` is the second source function. Its literals no longer escape
+    // into a call, so neither the maps nor their property traffic remain.
+    let opcodes = static_type_closure_opcodes(&program, 1);
+    for opcode in [Opcode::AllocMap, Opcode::StoreProperty, Opcode::LoadProperty, Opcode::CallDirect] {
+        assert!(!opcodes.contains(&opcode), "{opcode:?} in {opcodes:?}");
+    }
+    let expected: f64 = (0..2000)
+        .map(|i| {
+            let (dx, dy) = (1.0 - i as f64, 2.0 - (i as f64 + 1.0));
+            (dx * dx + dy * dy) % 13.0
+        })
+        .sum::<f64>()
+        + 25.0;
+    assert_eq!(static_type_results(&program, entry, &manifest), [expected; 2]);
+}
+
+#[test]
+fn napalm_structural_contracts_still_reject_bad_arguments_after_inlining() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        interface Point { x: number; y: number; }
+        function norm(p: Point): number { return p.x * p.x + p.y * p.y; }
+        function run(): number {
+            let total = 0;
+            for (let i = 0; i < 10; i = i + 1) {
+                const bad = { x: i, y: "not a number" };
+                total = total + norm(bad);
+            }
+            return total;
+        }
+        const result = run();
+    "#);
+    for native in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        if !native {
+            vm.set_jit_options(None);
+        }
+        assert!(vm.run_module(entry).is_err(), "the inlined Point contract must still fail");
+    }
+}
+
+#[test]
+fn napalm_typed_list_subscript_results_stay_nullable() {
+    // `List<T>[i]` is `T | null`: an out-of-range read yields null, so neither
+    // the static pass nor trace type seeding may treat the result as plain T.
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        function probe(xs: number[], n: number): number {
+            let hits = 0;
+            for (let i = 0; i < n; i = i + 1) {
+                const v = xs[i % 5];
+                if (v == null) hits = hits + 100; else hits = hits + v;
+            }
+            return hits;
+        }
+        const result = probe([1, 2, 3], 1000);
+    "#);
+    // Per 5-step cycle: 1 + 2 + 3 + 100 + 100.
+    assert_eq!(static_type_results(&program, entry, &manifest), [200.0 * 206.0; 2]);
+}
+
+#[test]
+fn napalm_inlined_receiver_stores_replay_correctly_on_class_guard_failure() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        class Particle {
+            x: number;
+            v: number;
+            constructor(x: number, v: number) { this.x = x; this.v = v; }
+            function advance(dt: number): number {
+                this.x = this.x + this.v * dt;
+                this.v = this.v * 0.5 + 1;
+                return this.x;
+            }
+        }
+        class Heavy extends Particle {
+            constructor(x: number, v: number) { super(x, v); }
+        }
+        function nudge(p: Particle): number { return p.advance(0.25); }
+        function run(): number {
+            const items = [];
+            const typed: Particle[] = [];
+            for (let i = 0; i < 8; i = i + 1) {
+                items.push(new Particle(i, 1));
+                typed.push(new Particle(i * 2, 3));
+            }
+            let total = 0;
+            for (let s = 0; s < 300; s = s + 1) {
+                // A new receiver class makes the inlined class guard fail; the
+                // exit must replay the call before any of its stores happened.
+                if (s == 200) items.push(new Heavy(100, 2));
+                for (let i = 0; i < items.length; i = i + 1) total = total + items[i].advance(0.5);
+                for (let i = 0; i < typed.length; i = i + 1) total = total + nudge(typed[i]);
+            }
+            for (let i = 0; i < items.length; i = i + 1) total = total + items[i].x * 7 + items[i].v;
+            for (let i = 0; i < typed.length; i = i + 1) total = total + typed[i].x * 5 + typed[i].v;
+            return total;
+        }
+        const result = run();
+    "#);
+    let (results, stats) = static_type_native_run(&program, entry, &manifest);
+    assert!(results[0].is_finite() && results[0] > 0.0, "{results:?}");
+    assert_eq!(results[0], results[1], "native stores must match the interpreter");
+    assert!(stats.inlined_calls > 0, "{stats:#?}");
+}
+
 #[test]
 fn napalm_static_return_contract_rejects_statically_wrong_returns() {
     let diagnostics = static_type_diagnostics(r#"

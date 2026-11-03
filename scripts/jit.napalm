@@ -1,12 +1,12 @@
 let start = System.clock
 
 class JitBench {
-  static integratePi(steps) {
-    let sum = 0.0
-    let i = 0
+  static integratePi(steps: number) {
+    let sum: number = 0.0
+    let i: number = 0
 
     while (i < steps) {
-      let x = (i + 0.5) / steps
+      let x: number = (i + 0.5) / steps
       sum = sum + 4.0 / (1.0 + x * x)
       i = i + 1
     }
@@ -14,10 +14,10 @@ class JitBench {
     return sum / steps
   }
 
-  static xorshift(iterations) {
-    let x = 123456789
-    let checksum = 0
-    let i = 0
+  static xorshift(iterations: number) {
+    let x: number = 123456789
+    let checksum: number = 0
+    let i: number = 0
 
     while (i < iterations) {
       x = x ^ (x << 13)
@@ -38,10 +38,10 @@ class JitBench {
     return checksum + x
   }
 
-  static mandelbrot(width, height, maxIter) {
-    let checksum = 0
-    let escaped = 0
-    let y = 0
+  static mandelbrot(width: number, height: number, maxIter: number) {
+    let checksum: number = 0
+    let escaped: number = 0
+    let y: number = 0
 
     while (y < height) {
       let ci = (y / height) * 2.0 - 1.0
@@ -50,11 +50,11 @@ class JitBench {
       while (x < width) {
         let cr = (x / width) * 3.5 - 2.5
 
-        let zr = 0.0
-        let zi = 0.0
-        let zr2 = 0.0
-        let zi2 = 0.0
-        let i = 0
+        let zr: number = 0.0
+        let zi: number = 0.0
+        let zr2: number = 0.0
+        let zi2: number = 0.0
+        let i: number = 0
 
         while (i < maxIter && (zr2 + zi2) <= 4.0) {
           zi = 2.0 * zr * zi + ci

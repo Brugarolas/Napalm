@@ -1239,6 +1239,19 @@ fn register_kind(ty: &Type) -> RegisterKind {
     }
 }
 
+/// Whether a WIR type is a useful, Napalm-visible fact for the JIT tiers.
+/// Internal representations (Int32/F64/RawPtr/Cell) describe register encoding,
+/// not semantic values, and Top/Bottom carry no information.
+fn is_trace_fact_type(ty: &Type) -> bool {
+    match ty {
+        Type::Top | Type::Bottom | Type::Int32 | Type::F64 | Type::RawPtr | Type::Cell(_) => false,
+        Type::Union(types) => !types.is_empty() && types.iter().all(is_trace_fact_type),
+        Type::List(Some(element)) | Type::Set(Some(element)) => is_trace_fact_type(element),
+        Type::Builtin(_, Some(payload)) => is_trace_fact_type(payload),
+        _ => true,
+    }
+}
+
 fn type_may_reference(ty: &Type) -> bool {
     match ty {
         Type::Top => true,
@@ -2167,14 +2180,29 @@ impl<'a> FunctionEmitter<'a> {
     }
 
     fn live_register_entry(&self, pc: BytecodePc, position: u32) -> LiveRegisterEntry {
-        let mut entry = LiveRegisterEntry { pc, live: LiveRegisterMap::default(), constants: Vec::new() };
+        let mut entry = LiveRegisterEntry {
+            pc,
+            live: LiveRegisterMap::default(),
+            constants: Vec::new(),
+            types: Vec::new(),
+        };
+        // A register claimed by two intervals here would make its type ambiguous;
+        // `position` is a use position so this should not happen, but never
+        // publish a type fact that is not uniquely attributable.
+        let mut ambiguous: Vec<Reg> = Vec::new();
         for interval in &self.allocation.intervals {
             if interval.ranges.is_empty() || !interval.contains(position) {
                 continue;
             }
             if let Some(reg) = self.allocation.value_regs[interval.value.0 as usize] {
+                if entry.live.general_is_live(reg) {
+                    ambiguous.push(reg);
+                }
                 entry.live.set_general(reg, true);
                 let value = &self.function.values[interval.value.0 as usize];
+                if is_trace_fact_type(&value.ty) {
+                    entry.types.push((reg, value.ty.clone()));
+                }
                 if let ValueDef::InstResult(id, 0) = value.def {
                     if let Inst::Const(constant) = &self.function.nodes[id.0 as usize].kind {
                         if !matches!(constant, Constant::String(_)) {
@@ -2184,7 +2212,39 @@ impl<'a> FunctionEmitter<'a> {
                 }
             }
         }
+        if !ambiguous.is_empty() {
+            entry.types.retain(|(reg, _)| !ambiguous.contains(reg));
+        }
         entry
+    }
+
+    /// Join of the static types of every value this function can return to a
+    /// synchronous caller. Each `Return` operand's WIR type is a guarantee
+    /// (declared result contracts are bound before the return), so the join is
+    /// a sound fact about the call result. Tail calls leave the result unknown.
+    fn result_type(&self) -> Type {
+        if self.function.is_async || self.function.is_concurrent {
+            return Type::Top;
+        }
+        let mut returned = Vec::new();
+        for (index, node) in self.function.nodes.iter().enumerate() {
+            if !self.dce.live_nodes[index] {
+                continue;
+            }
+            match &node.kind {
+                Inst::Return(value) => match self.function.value(*value) {
+                    Some(value) => returned.push(value.ty.clone()),
+                    None => return Type::Top,
+                },
+                Inst::TailInvoke { .. }
+                | Inst::TailInvokeSuper { .. }
+                | Inst::TailCallDirect { .. }
+                | Inst::TailCallClosure { .. } => return Type::Top,
+                _ => {}
+            }
+        }
+        let joined = Type::flow_join_many(returned);
+        if is_trace_fact_type(&joined) { joined } else { Type::Top }
     }
 
     fn live_reference_map(&self, position: u32) -> ReferenceMap {
@@ -3579,6 +3639,7 @@ impl FunctionEmitter<'_> {
         })?;
 
         let function_id = self.function.id;
+        let result_type = self.result_type();
         let chunk = self.assembler.finish().map_err(|error| CompileError::Assemble {
             function: function_id,
             message: error.to_string(),
@@ -3605,6 +3666,7 @@ impl FunctionEmitter<'_> {
             field_owner: self.function.field_owner,
             name: self.function.signature.name,
             arity,
+            result_type,
             capture_count,
             frame,
             chunk,

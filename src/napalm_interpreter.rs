@@ -5107,6 +5107,14 @@ impl HostContext<'_> {
 
 pub trait Host {
     fn standard_numeric_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
+    /// Opt in only for the stock List `length` / `[]` implementations, whose
+    /// in-bounds integer fast path the tracing JIT may replay natively.
+    fn standard_list_method(
+        &self,
+        _primitive: PrimitiveId,
+        _name: &str,
+        _arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceListMethod> { None }
     /// Opt in only for the stock bitwise Object ==/!= implementation.
     fn standard_identity_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
@@ -18025,6 +18033,26 @@ impl TraceRuntime for Interpreter<'_> {
             && self.host.standard_numeric_method(primitive, name, signature.arity)
     }
 
+    fn trace_standard_list_method(
+        &self,
+        function: FuncId,
+        cache: u32,
+    ) -> Option<crate::napalm_tracing_jit::TraceListMethod> {
+        let function = self.program.function(function)?;
+        let cache = function.chunk.inline_caches.get(cache as usize)?;
+        if cache.home_class.is_some() {
+            return None;
+        }
+        let Some(CallTarget::Primitive(primitive)) =
+            self.builtin_methods[BuiltinClass::List as usize][cache.method.0 as usize]
+        else {
+            return None;
+        };
+        let signature = self.program.metadata.method(cache.method)?;
+        let name = self.program.metadata.string(signature.name).unwrap_or("");
+        self.host.standard_list_method(primitive, name, signature.arity)
+    }
+
     fn trace_fulfilled_promise(
         &self,
         value: RegisterWord,
@@ -18991,6 +19019,7 @@ mod tests {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
             field_owner: None,
             name: StringId(0), is_async: false, is_concurrent: false, memoization: crate::napalm_ir::MemoizationKind::None, arity: 0, capture_count: 0,
+            result_type: crate::napalm_ir::Type::Top,
             frame: FrameLayout { general_register_count: gprs, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value },
             chunk,
         }).unwrap();
