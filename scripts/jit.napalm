@@ -81,9 +81,10 @@ class JitBench {
   }
 }
 
-JitBench.integratePi(1000000)
-JitBench.xorshift(1000000)
-JitBench.mandelbrot(800, 600, 1000)
+let pi = JitBench.integratePi(1000000)
+let randomChecksum = JitBench.xorshift(1000000)
+let fractalChecksum = JitBench.mandelbrot(800, 600, 1000)
 
 let elapsed = System.clock - start
+System.print(`checksums: ${pi}, ${randomChecksum}, ${fractalChecksum}`)
 System.print(`elapsed: ${elapsed}`)

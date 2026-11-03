@@ -1,4 +1,4 @@
-// Compare with WREN_NO_ENTRY_JIT=1 (loop tier only) and WREN_NO_JIT=1.
+// Compare with NAPALM_NO_JIT=1 to disable native execution.
 class EntryBench {
     static kernel(x): Number {
         let a: Number = x * 1.0001 + 0.25
@@ -22,5 +22,6 @@ class EntryBench {
 EntryBench.run(1000)
 let start = System.clock
 let checksum = EntryBench.run(1000000)
+let elapsed = System.clock - start
 System.print(`checksum: ${checksum}`)
-System.print(`elapsed: ${System.clock - start}`)
+System.print(`elapsed: ${elapsed}`)

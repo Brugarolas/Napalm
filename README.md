@@ -196,6 +196,44 @@ Package modules use `@lib/...`, standard modules use `@std/...`, with default ro
 
 `NAPALM_NO_JIT`, `NAPALM_JIT_STATS`, and `NAPALM_GC_STATS` control CLI diagnostics. Existing internal `WREN_*` tuning flags remain available for the inherited engine. Benchmark programs are in `scripts/jit.nap`, `scripts/jit_entries.nap` and `scripts/gc.nap`; historical Wren benchmark results are not claims about this syntax revision.
 
+### JIT benchmarks
+
+```sh
+npm run cargo::bench::jit
+npm run node::bench::jit
+npm run cargo::bench::entries
+npm run node::bench::entries
+bun bench/jit.js
+bun bench/jit_entries.js
+```
+
+The Napalm commands build and run **release** executables. Compare the elapsed
+times printed by each program, not Cargo/build time or process startup. Run each
+command several times and compare medians on an otherwise idle machine.
+
+Both versions print matching checksums outside the timed region. The general
+benchmark includes cold JIT compilation; the entry benchmark warms up with 1,000
+calls before timing 1,000,000 iterations. The JavaScript xorshift uses `>>>`
+because Napalm's `>>` is an unsigned 32-bit shift.
+
+Primitive type bindings remain eligible for replay-safe numeric inlining.
+Structural/collection bindings still use the runtime to install persistent
+contracts, and failed inlined primitive checks replay the original call to
+preserve type diagnostics. Native boolean branch guards use the comparison
+directly rather than materializing an integer and comparing it again.
+
+The JIT also preserves live SSA literals at loop entry, folds successful literal
+numeric guards, and merges small, effect-free numeric branches into unboxed
+selections. Speculative checks replay the original branch; stores, allocations,
+and arbitrary calls are not evaluated speculatively. Cold native-link exit
+stubs stay outside the hot loop layout.
+
+Remainders with integral constant divisors use exact integer strength reduction
+when the dividend magnitude and divisor fit signed 32-bit range. Fractional
+dividends and signed zero retain their original semantics; other values use the
+existing floating-point remainder helper. These optimizations do not enable
+approximate arithmetic or change the workloads or iteration counts.
+
 ## Verification
 
 The new regression tests compile and execute programs through the full pipeline with JIT both disabled and enabled, covering closures, typed syntax, class initialization/inheritance, control flow, evaluation order, objects, imports/exports and asynchronous cleanup. Historical backend regressions are retained separately. See [validation notes](docs/VALIDATION.md) for the baseline comparison.

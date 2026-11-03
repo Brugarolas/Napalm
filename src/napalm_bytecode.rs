@@ -1404,10 +1404,12 @@ impl LiveRegisterMap {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LiveRegisterEntry {
     pub pc: BytecodePc,
     pub live: LiveRegisterMap,
+    /// Live SSA literals, including constants hoisted outside a traced loop.
+    pub constants: Vec<(Reg, Constant)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1560,6 +1562,13 @@ impl BytecodeChunk {
             .binary_search_by_key(&pc.0, |entry| entry.pc.0)
             .ok()
             .map(|index| &self.live_registers[index].live)
+    }
+
+    pub fn constants_at(&self, pc: BytecodePc) -> &[(Reg, Constant)] {
+        self.live_registers
+            .binary_search_by_key(&pc.0, |entry| entry.pc.0)
+            .ok()
+            .map_or(&[], |index| self.live_registers[index].constants.as_slice())
     }
 
     pub fn deopt_by_id(&self, id: DeoptId) -> Option<&BytecodeDeoptPoint> {

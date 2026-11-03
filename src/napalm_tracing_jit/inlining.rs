@@ -76,6 +76,18 @@ impl TraceRecorder<'_> {
             let value = match inst.opcode {
                 Nop | OsrPoint => { pc = inst.next_pc; continue; }
                 Move => get(inst.b)?,
+                BindInterface => {
+                    let descriptor = callee.chunk.type_guards.get(inst.x as usize)
+                        .ok_or(RecordingAbort::UnsupportedCall)?;
+                    if !matches!(descriptor.expected, Type::Top | Type::Null | Type::Bool | Type::Num) {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                    // Primitive checks are replayable; heap contracts are not.
+                    // A failed guard must replay the caller, not a callee PC.
+                    self.guard_store_value(builder, scalar(inst.b, TraceRep::Tagged)?,
+                        &descriptor.expected, op.location.pc)
+                        .ok_or(RecordingAbort::UnsupportedCall)?
+                }
                 LoadNull => builder.constant(TraceConstant::Null),
                 LoadFalse | LoadTrue => builder.constant(TraceConstant::Bool(inst.opcode == LoadTrue)),
                 LoadI8 => builder.constant(TraceConstant::Int32(inst.b as i8 as i32)),
@@ -208,19 +220,7 @@ impl TraceRecorder<'_> {
                     builder.emit1(TraceInst::F64Binary { op: bin, lhs, rhs }, TraceType::F64, TraceRep::F64)
                 }
                 Invoke if runtime.trace_standard_numeric_method(target, inst.x) => {
-                    let cache = callee.chunk.inline_caches.get(inst.x as usize).ok_or(RecordingAbort::UnsupportedCall)?;
-                    let signature = program.metadata.method(cache.method).ok_or(RecordingAbort::UnsupportedCall)?;
-                    if signature.kind != MethodKind::Method || signature.arity != 1 || inst.args.len() != 1 { return Err(RecordingAbort::UnsupportedCall); }
-                    let bin = match program.metadata.string(signature.name) {
-                        Some("+") => F64BinOp::Add, Some("-") => F64BinOp::Sub,
-                        Some("*") => F64BinOp::Mul, Some("/") => F64BinOp::Div,
-                        Some("%") => F64BinOp::Rem, _ => return Err(RecordingAbort::UnsupportedCall),
-                    };
-                    let (left, right) = (scalar(inst.b, TraceRep::Tagged)?, scalar(inst.args[0].0, TraceRep::Tagged)?);
-                    let lhs = builder.emit1(TraceInst::GuardF64 { value: left, exit }, TraceType::F64, TraceRep::F64);
-                    let rhs = builder.emit1(TraceInst::GuardF64 { value: right, exit }, TraceType::F64, TraceRep::F64);
-                    let result = builder.emit1(TraceInst::F64Binary { op: bin, lhs, rhs }, TraceType::F64, TraceRep::F64);
-                    builder.emit1(TraceInst::BoxF64 { value: result }, TraceType::Num, TraceRep::Tagged)
+                    self.inline_numeric_invoke(program, callee, &inst, &registers, builder, exit)?
                 }
                 Return => {
                     let result = scalar(inst.a, TraceRep::Tagged)?;
@@ -236,5 +236,171 @@ impl TraceRecorder<'_> {
             pc = inst.next_pc;
         }
         Err(RecordingAbort::UnsupportedCall)
+    }
+
+    fn inline_numeric_invoke(
+        &self, program: &BytecodeProgram, function: &BytecodeFunction, op: &RecordedOp,
+        registers: &[Option<TraceValueId>], builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        exit: SideExitId,
+    ) -> Result<TraceValueId, RecordingAbort> {
+        let cache = function.chunk.inline_caches.get(op.x as usize).ok_or(RecordingAbort::UnsupportedCall)?;
+        let signature = program.metadata.method(cache.method).ok_or(RecordingAbort::UnsupportedCall)?;
+        if signature.kind != MethodKind::Method || signature.arity != 1 || op.args.len() != 1 {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let get = |reg: u8| {
+            registers[reg as usize].filter(|&value| builder.trace().value(value)
+                .is_some_and(|v| v.rep == TraceRep::Tagged)).ok_or(RecordingAbort::UnsupportedCall)
+        };
+        let (left, right) = (get(op.b)?, get(op.args[0].0)?);
+        match program.metadata.string(signature.name) {
+            Some(name @ ("+" | "-" | "*" | "/" | "%")) => {
+                let op = match name {
+                    "+" => F64BinOp::Add, "-" => F64BinOp::Sub, "*" => F64BinOp::Mul,
+                    "/" => F64BinOp::Div, _ => F64BinOp::Rem,
+                };
+                let lhs = builder.emit1(TraceInst::GuardF64 { value: left, exit }, TraceType::F64, TraceRep::F64);
+                let rhs = builder.emit1(TraceInst::GuardF64 { value: right, exit }, TraceType::F64, TraceRep::F64);
+                let result = builder.emit1(TraceInst::F64Binary { op, lhs, rhs }, TraceType::F64, TraceRep::F64);
+                Ok(builder.emit1(TraceInst::BoxF64 { value: result }, TraceType::Num, TraceRep::Tagged))
+            }
+            Some(name @ ("&" | "|" | "^" | "<<" | ">>")) => {
+                let op = match name {
+                    "&" => IntBinOp::BitAnd, "|" => IntBinOp::BitOr, "^" => IntBinOp::BitXor,
+                    "<<" => IntBinOp::Shl, _ => IntBinOp::ShrU,
+                };
+                let lhs = builder.emit1(TraceInst::GuardUInt32 { value: left, exit }, TraceType::UInt32, TraceRep::UInt32);
+                let rhs = builder.emit1(TraceInst::GuardUInt32 { value: right, exit }, TraceType::UInt32, TraceRep::UInt32);
+                let result = builder.emit1(TraceInst::IntBinary { op, lhs, rhs }, TraceType::UInt32, TraceRep::UInt32);
+                Ok(builder.emit1(TraceInst::BoxUInt32 { value: result }, TraceType::Num, TraceRep::Tagged))
+            }
+            _ => Err(RecordingAbort::UnsupportedCall),
+        }
+    }
+
+    pub(super) fn inline_numeric_diamond<R: TraceRuntime>(
+        &self, runtime: &R, program: &BytecodeProgram, function: &BytecodeFunction,
+        branch: &RecordedOp, condition: TraceValueId,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        let alternate = relative_target(branch.next_pc, branch.x);
+        if alternate.0 <= branch.next_pc.0 { return Err(RecordingAbort::UnsupportedCall); }
+        let mut arms = [Vec::new(), Vec::new()];
+        let mut pc = branch.next_pc;
+        let mut join = None;
+        for _ in 0..8 {
+            if pc.0 >= alternate.0 { break; }
+            let op = decode_at(program, TraceLocation::new(function.id, pc))
+                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+            if op.opcode == Opcode::Jump {
+                join = Some(relative_target(op.next_pc, op.x));
+                break;
+            }
+            pc = op.next_pc;
+            arms[0].push(op);
+        }
+        let join = join.filter(|pc| pc.0 >= alternate.0).ok_or(RecordingAbort::UnsupportedCall)?;
+        pc = alternate;
+        for _ in 0..8 {
+            if pc == join { break; }
+            if pc.0 > join.0 { return Err(RecordingAbort::UnsupportedCall); }
+            let op = decode_at(program, TraceLocation::new(function.id, pc))
+                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+            if op.opcode == Opcode::Jump {
+                pc = relative_target(op.next_pc, op.x);
+                break;
+            }
+            pc = op.next_pc;
+            arms[1].push(op);
+        }
+        if pc != join { return Err(RecordingAbort::UnsupportedCall); }
+
+        let mut registers = [None; 256];
+        for op in arms.iter().flatten() {
+            if !matches!(op.opcode, Opcode::Move | Opcode::LoadConst | Opcode::LoadNull
+                | Opcode::LoadFalse | Opcode::LoadTrue | Opcode::BindInterface | Opcode::Invoke)
+            {
+                return Err(RecordingAbort::UnsupportedCall);
+            }
+            if op.opcode == Opcode::Invoke && !runtime.trace_standard_numeric_method(function.id, op.x) {
+                return Err(RecordingAbort::UnsupportedCall);
+            }
+            let roles = crate::napalm_bytecode::operand_roles(op.opcode);
+            for (reg, role) in [op.a, op.b, op.c].into_iter().zip(roles) {
+                if role == crate::napalm_bytecode::OperandRole::General && registers[reg as usize].is_none() {
+                    registers[reg as usize] = Some(self.read_gpr(builder, reg, TraceType::Any, TraceRep::Tagged)?);
+                }
+            }
+            for &reg in &op.args {
+                if registers[reg.0 as usize].is_none() {
+                    registers[reg.0 as usize] = Some(self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)?);
+                }
+            }
+        }
+
+        // Both arms are replayable scalar work. Guards precede the merge and
+        // resume at the branch, so an untaken arm can never introduce an effect.
+        let exit = builder.add_side_exit(ExitReason::GuardValue, branch.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch { expected: runtime.trace_method_epoch(), exit });
+        let mut results = [registers, registers];
+        for (arm, state) in arms.iter().zip(&mut results) {
+            for op in arm {
+                let source = || state[op.b as usize].ok_or(RecordingAbort::UnsupportedCall);
+                let value = match op.opcode {
+                    Opcode::Move => source()?,
+                    Opcode::LoadNull => builder.constant(TraceConstant::Null),
+                    Opcode::LoadFalse | Opcode::LoadTrue => builder.constant(TraceConstant::Bool(op.opcode == Opcode::LoadTrue)),
+                    Opcode::LoadConst => {
+                        let constant = match function.chunk.constants.get(op.x as usize) {
+                            Some(Constant::Null) => TraceConstant::Null,
+                            Some(Constant::Bool(value)) => TraceConstant::Bool(*value),
+                            Some(Constant::Num(value)) => TraceConstant::NumBits(
+                                if value.is_nan() { CANONICAL_NAN } else { value.to_bits() }),
+                            _ => return Err(RecordingAbort::UnsupportedCall),
+                        };
+                        builder.constant(constant)
+                    }
+                    Opcode::BindInterface => {
+                        let descriptor = function.chunk.type_guards.get(op.x as usize)
+                            .ok_or(RecordingAbort::UnsupportedCall)?;
+                        if !matches!(descriptor.expected, Type::Top | Type::Num | Type::Bool | Type::Null) {
+                            return Err(RecordingAbort::UnsupportedCall);
+                        }
+                        self.guard_store_value(builder, source()?, &descriptor.expected, branch.location.pc)
+                            .ok_or(RecordingAbort::UnsupportedCall)?
+                    }
+                    Opcode::Invoke => self.inline_numeric_invoke(program, function, op, state, builder, exit)?,
+                    _ => return Err(RecordingAbort::UnsupportedCall),
+                };
+                state[op.a as usize] = Some(value);
+            }
+        }
+        let live = function.chunk.live_registers_at(join);
+        for reg in 0..256 {
+            if live.is_some_and(|live| !live.general_is_live(Reg(reg as u8))) { continue; }
+            let (Some(left), Some(right)) = (results[0][reg], results[1][reg]) else { continue };
+            if results[0][reg] == registers[reg] && results[1][reg] == registers[reg] { continue; }
+            let value = if left == right { left } else {
+                let lhs = builder.trace().value(left).unwrap();
+                let rhs = builder.trace().value(right).unwrap();
+                if lhs.rep != rhs.rep { return Err(RecordingAbort::UnsupportedCall); }
+                let rep = lhs.rep;
+                let ty = if lhs.ty == rhs.ty { lhs.ty } else { TraceType::Any };
+                let (if_true, if_false) = if branch.opcode == Opcode::JumpIfFalse { (left, right) } else { (right, left) };
+                if ty == TraceType::Num && rep == TraceRep::Tagged {
+                    let if_true = builder.emit1(TraceInst::GuardF64 { value: if_true, exit }, TraceType::F64, TraceRep::F64);
+                    let if_false = builder.emit1(TraceInst::GuardF64 { value: if_false, exit }, TraceType::F64, TraceRep::F64);
+                    let value = builder.emit1(TraceInst::Select { condition, if_true, if_false }, TraceType::F64, TraceRep::F64);
+                    builder.emit1(TraceInst::BoxF64 { value }, TraceType::Num, TraceRep::Tagged)
+                } else {
+                    builder.emit1(TraceInst::Select { condition, if_true, if_false }, ty, rep)
+                }
+            };
+            self.write_gpr(builder, reg as u8, value);
+        }
+        Ok(ExpectedStep::Region {
+            next: TraceLocation::new(function.id, join),
+            max_steps: arms[0].len() + arms[1].len() + 3,
+        })
     }
 }

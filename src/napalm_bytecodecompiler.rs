@@ -1695,17 +1695,25 @@ impl<'a> FunctionEmitter<'a> {
         self.positions.node_use[node.0 as usize]
     }
 
-    fn live_register_map(&self, position: u32) -> LiveRegisterMap {
-        let mut map = LiveRegisterMap::default();
+    fn live_register_entry(&self, pc: BytecodePc, position: u32) -> LiveRegisterEntry {
+        let mut entry = LiveRegisterEntry { pc, live: LiveRegisterMap::default(), constants: Vec::new() };
         for interval in &self.allocation.intervals {
             if interval.ranges.is_empty() || !interval.contains(position) {
                 continue;
             }
             if let Some(reg) = self.allocation.value_regs[interval.value.0 as usize] {
-                map.set_general(reg, true);
+                entry.live.set_general(reg, true);
+                let value = &self.function.values[interval.value.0 as usize];
+                if let ValueDef::InstResult(id, 0) = value.def {
+                    if let Inst::Const(constant) = &self.function.nodes[id.0 as usize].kind {
+                        if !matches!(constant, Constant::String(_)) {
+                            entry.constants.push((reg, constant.clone()));
+                        }
+                    }
+                }
             }
         }
-        map
+        entry
     }
 
     fn live_reference_map(&self, position: u32) -> ReferenceMap {
@@ -3002,7 +3010,7 @@ impl FunctionEmitter<'_> {
 
                 let live = if self.dce.live_nodes[inst_id.0 as usize] {
                     self.stats.emitted_hir_nodes += 1;
-                    let live = self.live_register_map(self.instruction_position(inst_id));
+                    let live = self.live_register_entry(before, self.instruction_position(inst_id));
                     self.emit_control_node(block_id, node, next_block)?;
                     Some(live)
                 } else {
@@ -3027,10 +3035,7 @@ impl FunctionEmitter<'_> {
                         // Keep all physical GPR liveness separate from GC reference maps.
                         // If a single HIR node emits several bytecodes, the start PC is
                         // still the semantically valid re-entry point for that node.
-                        self.assembler.chunk.live_registers.push(LiveRegisterEntry {
-                            pc: before,
-                            live,
-                        });
+                        self.assembler.chunk.live_registers.push(live);
                     }
                 }
                 self.pc_map.after_inst[inst_id.0 as usize] = Some(after);
@@ -3501,7 +3506,7 @@ fn compile_program_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::napalm_bytecode::{disassemble, BytecodeVerifier};
+    use crate::napalm_bytecode::{disassemble, BytecodeVerifier, Decoder};
     use crate::napalm_ir::{Builder, IntBinOp};
 
     #[test]
@@ -3541,6 +3546,14 @@ mod tests {
         let text = disassemble(&output.program.functions[0]).expect("must disassemble");
         assert!(text.contains("IAdd"));
         assert!(text.contains("Int32ToNum"));
+        let chunk = &output.program.functions[0].chunk;
+        let instructions = Decoder::new(&chunk.code).collect::<Result<Vec<_>, _>>().unwrap();
+        let add = instructions.iter().find(|op| op.opcode == Opcode::IAdd).unwrap();
+        assert!(chunk.constants_at(add.pc).contains(&(Reg(add.first.b()), Constant::Int32(1))));
+        assert!(chunk.constants_at(add.pc).contains(&(Reg(add.first.c()), Constant::Int32(2))));
+        let convert = instructions.iter().find(|op| op.opcode == Opcode::Int32ToNum).unwrap();
+        assert!(chunk.constants_at(convert.pc).is_empty(),
+            "a register reused for an arithmetic result must not retain its previous literal");
     }
 
     #[test]
@@ -3579,6 +3592,11 @@ mod tests {
 
         let output = compile_program(&hir).expect("HIR must compile");
         BytecodeVerifier::verify_program(&output).expect("bytecode must verify");
+        let chunk = &output.functions[0].chunk;
+        let instructions = Decoder::new(&chunk.code).collect::<Result<Vec<_>, _>>().unwrap();
+        let convert = instructions.iter().find(|op| op.opcode == Opcode::Int32ToNum).unwrap();
+        assert!(chunk.constants_at(convert.pc).is_empty(),
+            "a block parameter merging different literals is not itself a literal");
     }
 
     #[test]

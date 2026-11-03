@@ -58,7 +58,7 @@ mod inlining;
 #[path = "tests/heap_proof_tests.rs"]
 mod heap_proof_tests;
 
-use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
+use cranelift::codegen::ir::{BlockArg, Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Linkage, Module};
 use cranelift::prelude::*;
@@ -3299,6 +3299,15 @@ impl<'a> TraceRecorder<'a> {
                     TraceType::Any,
                     TraceRep::Tagged,
                 )?;
+                if self.options.optimize_trace_ir {
+                    if let Some(raw_bool) = self.raw_recorded_bool(builder, condition) {
+                        let checkpoint = builder.clone();
+                        match self.inline_numeric_diamond(runtime, program, function, op, raw_bool, builder) {
+                            Ok(step) => return Ok(step),
+                            Err(_) => *builder = checkpoint,
+                        }
+                    }
+                }
                 let physical = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -5305,7 +5314,7 @@ impl<'a> TraceRecorder<'a> {
         let program_ptr = runtime.trace_program() as *const BytecodeProgram;
         let program = unsafe { &*program_ptr };
 
-        program
+        let function = program
             .function(self.anchor.function)
             .ok_or_else(|| RecordOutcome::Fatal(TracingJitError::Record {
                 location: self.anchor,
@@ -5329,6 +5338,20 @@ impl<'a> TraceRecorder<'a> {
             },
         );
         builder.reserve_for_recording(self.options.max_trace_steps);
+
+        for (reg, constant) in function.chunk.constants_at(self.anchor.pc) {
+            let constant = match constant {
+                Constant::Null => TraceConstant::Null,
+                Constant::Bool(value) => TraceConstant::Bool(*value),
+                Constant::Num(value) => TraceConstant::NumBits(
+                    if value.is_nan() { CANONICAL_NAN } else { value.to_bits() }
+                ),
+                Constant::Int32(value) => TraceConstant::Int32(*value),
+                Constant::String(_) => continue,
+            };
+            let value = builder.constant(constant);
+            self.write_gpr(&mut builder, reg.0, value);
+        }
 
         let mut steps = 0usize;
         let mut runtime_end = false;
@@ -5376,6 +5399,8 @@ impl<'a> TraceRecorder<'a> {
                         && !visited.contains(&next) => step,
                     Ok(step @ ExpectedStep::Inlined { next, .. }) if next.pc.0 > location.pc.0
                         && !visited.contains(&next) => step,
+                    Ok(step @ ExpectedStep::Region { next, .. }) if next.pc.0 > location.pc.0
+                        && !visited.contains(&next) => step,
                     // Synchronous call/runtime boundaries can remain inside an
                     // entry trace as long as the helper returns to the same frame.
                     // The recording loop below validates the exact continuation
@@ -5401,6 +5426,20 @@ impl<'a> TraceRecorder<'a> {
             .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
 
             let mut recorded_bytecodes = 1usize;
+            if let ExpectedStep::Region { next, max_steps } = expected {
+                while step.after != next && recorded_bytecodes < max_steps {
+                    if !step.running || step.frame_changed {
+                        return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
+                    }
+                    step = runtime.trace_execute_unfused_step()
+                        .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+                    recorded_bytecodes += 1;
+                }
+                if !step.running || step.frame_changed || step.after != next {
+                    return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
+                }
+                step = TraceStep::simple(location, next);
+            }
             if let ExpectedStep::RuntimeFused { next, bytecodes } = expected {
                 recorded_bytecodes = bytecodes.max(1);
                 for _ in 1..recorded_bytecodes {
@@ -5494,7 +5533,9 @@ impl<'a> TraceRecorder<'a> {
                 }));
             }
 
-            if let ExpectedStep::Exact(expected_location) | ExpectedStep::Inlined { next: expected_location, .. } = expected {
+            if let ExpectedStep::Exact(expected_location)
+                | ExpectedStep::Inlined { next: expected_location, .. }
+                | ExpectedStep::Region { next: expected_location, .. } = expected {
                 if step.after != expected_location {
                     return Err(RecordOutcome::Fatal(TracingJitError::Record {
                         location,
@@ -5633,6 +5674,7 @@ enum RecordOutcome {
 enum ExpectedStep {
     Exact(TraceLocation),
     Inlined { next: TraceLocation, callee: FuncId, steps: usize },
+    Region { next: TraceLocation, max_steps: usize },
     Runtime { terminal: bool },
     /// One generated runtime helper replaces several contiguous baseline
     /// bytecodes. Recording executes all `bytecodes` to validate exact semantics.
@@ -7314,6 +7356,42 @@ impl CraneliftLoweringState<'_, '_> {
         self.builder.ins().select(is_nan, canonical, bits)
     }
 
+    fn f64_remainder(&mut self, lhs: Value, rhs: Value, constant: Option<f64>) -> Value {
+        let Some(divisor) = constant.map(f64::abs)
+            .filter(|n| n.fract() == 0.0 && (1.0..=i32::MAX as f64).contains(n))
+        else {
+            return self.call_scalar_helper(native_frem as usize, &[lhs, rhs]);
+        };
+
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        self.builder.append_block_param(done, types::F64);
+        let magnitude = self.builder.ins().fabs(lhs);
+        let limit = self.builder.ins().f64const(i32::MAX as f64);
+        let in_range = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
+        self.builder.ins().brif(in_range, fast, &[], slow, &[]);
+
+        self.builder.switch_to_block(fast);
+        // For integral d, floor(x / d) == floor(x) / d. All products fit
+        // signed i32 here, so subtracting the converted multiple is exact.
+        // Constant integer division lowers to multiply/shift rather than idiv.
+        let integer = self.builder.ins().fcvt_to_sint_sat(types::I32, magnitude);
+        let quotient = self.builder.ins().udiv_imm(integer, divisor as i64);
+        let multiple = self.builder.ins().imul_imm(quotient, divisor as i64);
+        let multiple = self.builder.ins().fcvt_from_sint(types::F64, multiple);
+        let remainder = self.builder.ins().fsub(magnitude, multiple);
+        let result = self.builder.ins().fcopysign(remainder, lhs);
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+
+        self.builder.switch_to_block(slow);
+        let result = self.call_scalar_helper(native_frem as usize, &[lhs, rhs]);
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+        self.builder.switch_to_block(done);
+        self.builder.block_params(done)[0]
+    }
+
     fn guard_numeric(
         &mut self,
         tagged: Value,
@@ -7417,12 +7495,20 @@ impl CraneliftLoweringState<'_, '_> {
         exit_id: SideExitId,
         failure_condition: Value,
     ) -> Result<(), TracingJitError> {
+        self.emit_conditional_side_exit(exit_id, failure_condition, true)
+    }
+
+    fn emit_conditional_side_exit(
+        &mut self,
+        exit_id: SideExitId,
+        condition: Value,
+        exit_when_true: bool,
+    ) -> Result<(), TracingJitError> {
         let exit_plans = self.exit_plans;
         let plan = exit_plans
             .get(exit_id.0 as usize)
             .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?;
 
-        let failure_condition = self.bool32(failure_condition);
         let resume = self.builder.create_block();
 
         // If the snapshot contains no dynamic SSA values, every guard using this
@@ -7432,9 +7518,10 @@ impl CraneliftLoweringState<'_, '_> {
         if plan.dynamic_values.is_empty() {
             let key = (exit_id.0, self.native_budget_remaining);
             if let Some(&stop) = self.shared_constant_exit_blocks.get(&key) {
+                let (if_true, if_false) = if exit_when_true { (stop, resume) } else { (resume, stop) };
                 self.builder
                     .ins()
-                    .brif(failure_condition, stop, &[], resume, &[]);
+                    .brif(condition, if_true, &[], if_false, &[]);
                 self.builder.switch_to_block(resume);
                 return Ok(());
             }
@@ -7442,9 +7529,10 @@ impl CraneliftLoweringState<'_, '_> {
             let stop = self.builder.create_block();
             self.builder.set_cold_block(stop);
             self.shared_constant_exit_blocks.insert(key, stop);
+            let (if_true, if_false) = if exit_when_true { (stop, resume) } else { (resume, stop) };
             self.builder
                 .ins()
-                .brif(failure_condition, stop, &[], resume, &[]);
+                .brif(condition, if_true, &[], if_false, &[]);
 
             self.builder.switch_to_block(stop);
             self.materialize_exit_or_native_link(&plan)?;
@@ -7454,9 +7542,10 @@ impl CraneliftLoweringState<'_, '_> {
 
         let stop = self.builder.create_block();
         self.builder.set_cold_block(stop);
+        let (if_true, if_false) = if exit_when_true { (stop, resume) } else { (resume, stop) };
         self.builder
             .ins()
-            .brif(failure_condition, stop, &[], resume, &[]);
+            .brif(condition, if_true, &[], if_false, &[]);
 
         self.builder.switch_to_block(stop);
         self.materialize_exit_or_native_link(&plan)?;
@@ -7500,6 +7589,10 @@ impl CraneliftLoweringState<'_, '_> {
         let linked = self.builder.ins().icmp_imm(IntCC::NotEqual, child, -1);
         let linked_block = self.builder.create_block();
         let slow_exit = self.builder.create_block();
+        // A nested native-link stub must not split an otherwise contiguous hot loop.
+        if self.builder.current_block().is_some_and(|block| self.builder.func.layout.is_cold(block)) {
+            self.builder.set_cold_block(linked_block);
+        }
         self.builder.set_cold_block(slow_exit);
         self.builder.ins().brif(linked, linked_block, &[], slow_exit, &[]);
 
@@ -8803,6 +8896,16 @@ impl CraneliftLoweringState<'_, '_> {
                 }
 
                 match observed {
+                    // Keep the comparison as a branch condition instead of
+                    // materializing it as an integer and comparing it again.
+                    TraceSwitchGuard::Case(0) if rep == TraceRep::Bool => {
+                        let condition = self.builder.ins().ireduce(types::I8, tag_value);
+                        self.emit_side_exit(*exit, condition)?;
+                    }
+                    TraceSwitchGuard::Case(1) if rep == TraceRep::Bool => {
+                        let condition = self.builder.ins().ireduce(types::I8, tag_value);
+                        self.emit_conditional_side_exit(*exit, condition, false)?;
+                    }
                     TraceSwitchGuard::Case(case) => {
                         let failure = self.builder.ins().icmp_imm_s(
                             IntCC::NotEqual,
@@ -9049,6 +9152,11 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             F64Binary { op, lhs, rhs } => {
+                let divisor = self.trace.value(self.trace.canonical_value(*rhs))
+                    .and_then(|value| match value.origin {
+                        TraceValueOrigin::Constant(TraceConstant::F64Bits(bits)) => Some(f64::from_bits(bits)),
+                        _ => None,
+                    });
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
                 let result = match op {
@@ -9057,7 +9165,7 @@ impl CraneliftLoweringState<'_, '_> {
                     F64BinOp::Mul => self.builder.ins().fmul(lhs, rhs),
                     F64BinOp::Div => self.builder.ins().fdiv(lhs, rhs),
                     F64BinOp::Rem => {
-                        self.call_scalar_helper(native_frem as *const () as usize, &[lhs, rhs])
+                        self.f64_remainder(lhs, rhs, divisor)
                     }
                 };
                 self.cache_value(one_result(node)?, result);
@@ -10222,7 +10330,8 @@ impl TracingJit {
         let expected = recorder.translate_op(runtime, program, function, &op, &mut builder)
             .map_err(|reason| TracingJitError::Record { location, message: reason.to_string() })?;
         match expected {
-            ExpectedStep::Exact(next) | ExpectedStep::Inlined { next, .. } => {
+            ExpectedStep::Exact(next) | ExpectedStep::Inlined { next, .. }
+                | ExpectedStep::Region { next, .. } => {
                 let exit = builder.add_side_exit(ExitReason::GuardValue, next.pc);
                 builder.set_terminator(TraceTerminator::Exit(exit));
             },
@@ -11727,6 +11836,40 @@ mod tests {
     }
 
     #[test]
+    fn boolean_switch_guards_preserve_float_comparisons_and_exit_polarity() {
+        for op in [CmpKind::Eq, CmpKind::Ne, CmpKind::Lt, CmpKind::Le, CmpKind::Gt, CmpKind::Ge] {
+            for observed in [0, 1] {
+                let mut b = crate::napalm_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor {
+                    kind: TraceKind::Side,
+                    location: TraceLocation::new(FuncId(0), BytecodePc(0)),
+                });
+                let lhs = b.read_slot(FrameSlot::General(Reg(0)), TraceType::F64, TraceRep::F64);
+                let rhs = b.constant(TraceConstant::F64Bits(0.0f64.to_bits()));
+                let condition = b.emit1(TraceInst::F64Compare { op, lhs, rhs }, TraceType::Bool, TraceRep::Bool);
+                let failure = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+                b.emit0(TraceInst::GuardSwitch { tag: condition, observed: TraceSwitchGuard::Case(observed), exit: failure });
+                let result = b.constant(TraceConstant::Int32(7));
+                b.write_slot(FrameSlot::General(Reg(1)), result);
+                let success = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+                b.set_terminator(TraceTerminator::Exit(success));
+                let trace = b.finish().unwrap();
+                for input in [f64::NAN, f64::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f64::INFINITY] {
+                    let condition = match op {
+                        CmpKind::Eq => input == 0.0, CmpKind::Ne => input != 0.0,
+                        CmpKind::Lt => input < 0.0, CmpKind::Le => input <= 0.0,
+                        CmpKind::Gt => input > 0.0, CmpKind::Ge => input >= 0.0,
+                    };
+                    let passes = i64::from(condition) == observed;
+                    let mut registers = [RegisterWord(input.to_bits()), RegisterWord(99)];
+                    let exit = run_scalar_trace(&trace, &mut registers, 0, 0);
+                    assert_eq!(exit, if passes { success.0 } else { failure.0 }, "{op:?} {input} case={observed}");
+                    assert_eq!(registers[1].0, if passes { 7 } else { 99 });
+                }
+            }
+        }
+    }
+
+    #[test]
     fn optimized_affine_loop_matches_native_wraparound_and_budget_snapshots() {
         let mut b = crate::napalm_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Loop, location: TraceLocation::new(FuncId(0), BytecodePc(0)) });
         let slot = FrameSlot::General(Reg(0));
@@ -11845,6 +11988,61 @@ mod tests {
             let mut actual = baseline;
             assert_eq!(run_scalar_trace(&original, &mut baseline, 0, 0), run_scalar_trace(&optimized, &mut actual, 0, 0));
             assert_eq!(actual, baseline);
+        }
+    }
+
+    #[test]
+    fn constant_remainder_matches_ieee_edges_and_multiple_boundaries() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        for divisor in [0.0, -0.0, 0.5, 1.0, -1.0, 2.0, 3.0, 7.0, 97.0, -97.0,
+                        i32::MAX as f64, u32::MAX as f64, f64::INFINITY, f64::NAN] {
+            let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+            let mut b = crate::napalm_trace_ir::TraceBuilder::new(
+                TraceId(0), TraceAnchor { kind: TraceKind::Side, location });
+            let lhs = b.read_slot(FrameSlot::General(Reg(0)), TraceType::F64, TraceRep::F64);
+            let rhs = b.constant(TraceConstant::F64Bits(divisor.to_bits()));
+            let result = b.emit1(TraceInst::F64Binary { op: F64BinOp::Rem, lhs, rhs }, TraceType::F64, TraceRep::F64);
+            b.write_slot(FrameSlot::General(Reg(1)), result);
+            let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+            b.set_terminator(TraceTerminator::Exit(exit));
+            let trace = b.finish().unwrap();
+            let mut jit = TracingJit::new(TracingJitOptions::default());
+            let compiled = jit.compile_trace(&trace).unwrap();
+            let mut inputs = vec![
+                -0.0, 0.0, 0.5, -0.5, 1.0, -1.0, f64::MIN_POSITIVE, f64::from_bits(1),
+                i32::MAX as f64, i32::MAX as f64 + 0.5, u32::MAX as f64,
+                f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+            ];
+            for quotient in [1.0, 2.0, 7.0, 1000.0, (i32::MAX as f64 / divisor.abs()).floor()] {
+                let multiple = quotient * divisor.abs();
+                inputs.extend([multiple.next_down(), multiple, multiple.next_up()]);
+            }
+            let mut random = 0x1234_5678_9abc_def0u64;
+            for _ in 0..10000 {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                inputs.push(f64::from_bits(random));
+                inputs.push((random as u32 as f64) / 16.0);
+            }
+            for input in inputs.into_iter().flat_map(|x| [x, -x]) {
+                let expected = input % divisor;
+                let mut general = [RegisterWord(input.to_bits()), RegisterWord(0)];
+                let mut activation = TraceActivation::new(TraceActivationInputs {
+                    general: general.as_mut_ptr(), arguments: std::ptr::null_mut(),
+                    returns: std::ptr::null_mut(), special: std::ptr::null_mut(),
+                    runtime: std::ptr::null_mut(), execute: unexpected_runtime,
+                    heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
+                });
+                activation.current_links = compiled.native_links.as_ptr();
+                assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                let actual = f64::from_bits(general[1].0);
+                assert!(if expected.is_nan() { actual.is_nan() } else { actual.to_bits() == expected.to_bits() },
+                    "{input:?} % {divisor:?}: {actual:?} != {expected:?}");
+            }
         }
     }
 
