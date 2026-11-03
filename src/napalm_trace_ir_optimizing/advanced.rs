@@ -62,6 +62,26 @@ fn evaluate(kind: &TraceInst, get: impl Fn(TraceValueId) -> Option<TraceConstant
     let f = |v| float(get(v)?);
     let result = match *kind {
         Copy { value } => get(value)?,
+        GuardF64 { value, .. } => {
+            let TraceConstant::NumBits(bits) = get(value)? else { return None };
+            if f64::from_bits(bits).is_nan() { return None; }
+            TraceConstant::F64Bits(bits)
+        }
+        GuardInt32 { value, .. } | GuardUInt32 { value, .. } => {
+            let TraceConstant::NumBits(bits) = get(value)? else { return None };
+            let n = f64::from_bits(bits);
+            if n.fract() != 0.0 { return None; }
+            let integer = if matches!(kind, GuardUInt32 { .. }) {
+                if !(0.0..=u32::MAX as f64).contains(&n) { return None; }
+                n as u32 as i32
+            } else {
+                if bits == (-0.0f64).to_bits() || !(i32::MIN as f64..=i32::MAX as f64).contains(&n) {
+                    return None;
+                }
+                n as i32
+            };
+            TraceConstant::Int32(integer)
+        }
         IntUnary { op, value } => TraceConstant::Int32(match op {
             IntUnaryOp::Neg => i(value)?.wrapping_neg(), IntUnaryOp::BitNot => !i(value)?,
         }),
@@ -1624,6 +1644,14 @@ impl TraceOptimization for DeadCodeElimination {
                 node.kind = TraceInst::Nop;
                 eliminated += 1;
             }
+            if matches!(node.kind, TraceInst::Nop) {
+                let before = node.results.len();
+                // Dead aliases must not retain a declaration that requires
+                // their now-eliminated producer to dominate this Nop.
+                node.results.retain(|value| live_values.contains(&resolve(*value))
+                    || !matches!(trace.values[value.0 as usize].origin, TraceValueOrigin::Alias(_)));
+                eliminated += before - node.results.len();
+            }
         }
         let before_phis = trace.loop_phis.len();
         trace
@@ -1678,6 +1706,27 @@ mod tests {
         assert_eq!(constant(&trace, fixed), Some(TraceConstant::Int32(2)));
         assert_eq!(constant(&trace, next), None);
         assert_eq!(constant(&trace, trap), None);
+    }
+
+    #[test]
+    fn sccp_folds_only_successful_literal_numeric_guards() {
+        for n in [-0.0, 0.0, -1.0, 0.5, 2.0, i32::MIN as f64, i32::MAX as f64,
+                  u32::MAX as f64, u32::MAX as f64 + 1.0, f64::INFINITY, f64::NAN] {
+            let mut b = builder(TraceKind::Side);
+            let value = b.constant(TraceConstant::NumBits(n.to_bits()));
+            let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+            let float = b.emit1(TraceInst::GuardF64 { value, exit }, TraceType::F64, TraceRep::F64);
+            let signed = b.emit1(TraceInst::GuardInt32 { value, exit }, TraceType::Int32, TraceRep::Int32);
+            let unsigned = b.emit1(TraceInst::GuardUInt32 { value, exit }, TraceType::UInt32, TraceRep::UInt32);
+            let mut trace = finish(b);
+            Optimize::new().with_pass(SparseConditionalConstantPropagation).optimize_trace(&mut trace).unwrap();
+            assert_eq!(constant(&trace, float), (!n.is_nan()).then_some(TraceConstant::F64Bits(n.to_bits())));
+            let signed_ok = n.fract() == 0.0 && n.to_bits() != (-0.0f64).to_bits()
+                && (i32::MIN as f64..=i32::MAX as f64).contains(&n);
+            let unsigned_ok = n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n);
+            assert_eq!(constant(&trace, signed), signed_ok.then_some(TraceConstant::Int32(n as i32)), "{n}");
+            assert_eq!(constant(&trace, unsigned), unsigned_ok.then_some(TraceConstant::Int32(n as u32 as i32)), "{n}");
+        }
     }
 
     #[test]
@@ -2020,6 +2069,24 @@ mod tests {
         assert!(matches!(trace.nodes[1].kind, TraceInst::Nop));
         assert!(matches!(trace.nodes[3].kind, TraceInst::Nop));
         assert_eq!(trace.stats.redundant_guards, 2);
+    }
+
+    #[test]
+    fn dead_code_elimination_removes_declarations_of_dead_aliases() {
+        let mut b = builder(TraceKind::Side);
+        let x = input(&mut b, 0, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let dead = binary(&mut b, IntBinOp::Add, x, one);
+        b.emit1(TraceInst::Copy { value: dead }, TraceType::Int32, TraceRep::Int32);
+        let mut trace = finish(b);
+        Optimize::new()
+            .with_pass(TraceCanonicalization { promote_loop_representations: true })
+            .with_pass(DeadCodeElimination)
+            .verify_after_each_pass(true)
+            .optimize_trace(&mut trace)
+            .unwrap();
+        assert!(trace.nodes.iter().all(|node| matches!(node.kind, TraceInst::Nop)));
+        assert!(trace.nodes[1].results.is_empty());
     }
 
     #[test]

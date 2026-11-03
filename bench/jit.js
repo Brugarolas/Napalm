@@ -21,7 +21,8 @@ class JitBench {
 
     while (i < iterations) {
       x = x ^ (x << 13)
-      x = x ^ (x >> 17)
+      // Napalm's >> is an unsigned 32-bit shift.
+      x = x ^ (x >>> 17)
       x = x ^ (x << 5)
 
       x = x & 2147483647
@@ -81,11 +82,12 @@ class JitBench {
   }
 }
 
-JitBench.integratePi(1000000)
-JitBench.xorshift(1000000)
-JitBench.mandelbrot(800, 600, 1000)
+let pi = JitBench.integratePi(1000000)
+let randomChecksum = JitBench.xorshift(1000000)
+let fractalChecksum = JitBench.mandelbrot(800, 600, 1000)
 
 var t1 = performance.now();     // 2) end
 var elapsed = t1 - t0
 var secs = elapsed / 1000;           // 3) milliseconds to seconds
+console.log(`checksums: ${pi}, ${randomChecksum}, ${fractalChecksum}`)
 console.log(`Execution time: ${secs.toFixed(6)} s`);  // 4) print

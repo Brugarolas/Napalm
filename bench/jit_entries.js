@@ -21,8 +21,8 @@ class EntryBench {
 EntryBench.run(1000)
 var t0 = performance.now();     // 1) start
 let checksum = EntryBench.run(1000000)
-console.log(`checksum: ${checksum}`)
 var t1 = performance.now();     // 2) end
 var elapsed = t1 - t0
 var secs = elapsed / 1000;           // 3) milliseconds to seconds
+console.log(`checksum: ${checksum}`)
 console.log(`Execution time: ${secs.toFixed(6)} s`);  // 4) print
