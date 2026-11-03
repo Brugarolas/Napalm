@@ -1,0 +1,406 @@
+use crate::store::{Ctx, MyWasiCtx};
+use std::path::{Path, PathBuf};
+use test_programs_artifacts::*;
+use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::{Result, error::Context as _, format_err};
+use wasmtime_wasi::p3::bindings::Command;
+use wasmtime_wasi::{
+    FsPerms, NamedId, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiNamedView, WasiView,
+};
+
+async fn run(path: &str) -> Result<()> {
+    run_allow_blocking_current_thread(path, false).await
+}
+
+async fn run_allow_blocking_current_thread(
+    path: &str,
+    allow_blocking_current_thread: bool,
+) -> Result<()> {
+    run_with_builder(path, allow_blocking_current_thread, |_| {}).await
+}
+
+async fn run_with_builder(
+    path: &str,
+    allow_blocking_current_thread: bool,
+    configure: impl FnOnce(&mut WasiCtxBuilder),
+) -> Result<()> {
+    let path = Path::new(path);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    let engine = test_programs_artifacts::engine(|config| {
+        config.wasm_component_model_async(true);
+    });
+    let mut linker = Linker::new(&engine);
+    // TODO: Remove once test components are not built for `wasm32-wasip1`
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .context("failed to link `wasi:cli@0.2.x`")?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker).context("failed to link `wasi:cli@0.3.x`")?;
+
+    let (mut store, _td) = Ctx::new(&engine, name, |builder| {
+        configure(builder);
+        MyWasiCtx::new(
+            builder
+                .allow_blocking_current_thread(allow_blocking_current_thread)
+                .build(),
+        )
+    })?;
+    let component = Component::from_file(&engine, path)?;
+    let command = Command::instantiate_async(&mut store, &component, &linker)
+        .await
+        .context("failed to instantiate `wasi:cli/command`")?;
+    store
+        .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
+        .await
+        .context("failed to call `wasi:cli/run#run`")?
+        .context("guest trapped")?
+        .map_err(|()| format_err!("`wasi:cli/run#run` failed"))
+}
+
+foreach_p3!(assert_test_exists);
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_big_random_buf() -> wasmtime::Result<()> {
+    run(P3_BIG_RANDOM_BUF_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_cli() -> wasmtime::Result<()> {
+    run(P3_CLI_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_large_stdio_write() -> wasmtime::Result<()> {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use wasmtime_wasi::cli::AsyncStdoutStream;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl tokio::io::AsyncWrite for Capture {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Use a write budget much smaller than the guest's single write to
+    // exercise partial writes through `AsyncStdoutStream`.
+    const SIZE: usize = 100_000;
+    let stdout = Capture::default();
+    let stderr = Capture::default();
+    run_with_builder(P3_LARGE_STDIO_WRITE_COMPONENT, false, |builder| {
+        builder
+            .arg(SIZE.to_string())
+            .stdout(AsyncStdoutStream::new(1024, stdout.clone()))
+            .stderr(AsyncStdoutStream::new(1024, stderr.clone()));
+    })
+    .await?;
+
+    assert!(
+        *stdout.0.lock().unwrap() == vec![0; SIZE],
+        "stdout mismatch"
+    );
+    assert!(
+        *stderr.0.lock().unwrap() == vec![1; SIZE],
+        "stderr mismatch"
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_clocks_sleep() -> wasmtime::Result<()> {
+    run(P3_CLOCKS_SLEEP_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_filesystem_file_read_write() -> wasmtime::Result<()> {
+    run(P3_FILESYSTEM_FILE_READ_WRITE_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_filesystem_file_read_write_blocking() -> wasmtime::Result<()> {
+    run_allow_blocking_current_thread(P3_FILESYSTEM_FILE_READ_WRITE_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_random_imports() -> wasmtime::Result<()> {
+    run(P3_RANDOM_IMPORTS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_ip_name_lookup() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_IP_NAME_LOOKUP_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_bind() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_BIND_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_connect() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_CONNECT_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_listen() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_LISTEN_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_sample_application() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_SAMPLE_APPLICATION_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_sockopts() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_SOCKOPTS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_states() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_STATES_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_streams() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_STREAMS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_tcp_busy_poll() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_TCP_BUSY_POLL_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_bind() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_BIND_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_connect() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_CONNECT_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_receive() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_RECEIVE_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_sample_application() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_SAMPLE_APPLICATION_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_send() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_SEND_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_send_race() -> wasmtime::Result<()> {
+    use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, UdpSocket};
+    use tokio::task::yield_now;
+    use wasmtime_wasi::sockets::SocketAddrUse;
+
+    let allowed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let forbidden = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let allowed_addr = allowed.local_addr()?;
+    let forbidden_addr = forbidden.local_addr()?;
+
+    run_with_builder(P3_SOCKETS_UDP_SEND_RACE_COMPONENT, false, |builder| {
+        builder.socket_addr_check(move |addr, use_| {
+            Box::pin(async move {
+                yield_now().await;
+                !matches!(use_, SocketAddrUse::UdpSend) || addr != forbidden_addr
+            })
+        });
+        builder.env("ALLOWED_PORT", allowed_addr.port().to_string());
+        builder.env("FORBIDDEN_PORT", forbidden_addr.port().to_string());
+    })
+    .await?;
+
+    let mut buf = [0; 16];
+    allowed.set_nonblocking(true)?;
+    let n = allowed.recv(&mut buf)?;
+    assert_eq!(&buf[..n], b"x");
+
+    forbidden.set_nonblocking(true)?;
+    assert!(
+        matches!(forbidden.recv(&mut buf), Err(e) if e.kind() == ErrorKind::WouldBlock),
+        "unexpected datagram delivered to the forbidden address"
+    );
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_sockopts() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_SOCKOPTS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_sockets_udp_states() -> wasmtime::Result<()> {
+    run(P3_SOCKETS_UDP_STATES_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_readdir() -> wasmtime::Result<()> {
+    run(P3_READDIR_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_readdir_blocking() -> wasmtime::Result<()> {
+    run_allow_blocking_current_thread(P3_READDIR_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_path_rename_trailing_slashes() -> wasmtime::Result<()> {
+    let fixture = crate::store::SandboxFixture::new()?;
+    run_with_builder(P3_PATH_RENAME_TRAILING_SLASHES_COMPONENT, false, |b| {
+        fixture.configure_wasi(b)
+    })
+    .await?;
+    fixture.assert_secure();
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_write() -> wasmtime::Result<()> {
+    run(P3_FILE_WRITE_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_write_blocking() -> wasmtime::Result<()> {
+    run_allow_blocking_current_thread(P3_FILE_WRITE_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_write_chunked() -> wasmtime::Result<()> {
+    run(P3_FILE_WRITE_CHUNKED_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_settime_overflow() -> wasmtime::Result<()> {
+    run(P3_FILE_SETTIME_OVERFLOW_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_truncation_readonly() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_TRUNCATION_READONLY_COMPONENT).await
+}
+async fn run_with_readonly_testfile(component_path: &str) -> wasmtime::Result<()> {
+    let prefix = "wasi_components_p3_ro_";
+    let tempdir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create readonly tempdir");
+    const FILENAME: &str = "test.txt";
+    const EXPECTED_CONTENTS: &[u8] = b"read only test file\n";
+    let mut file = PathBuf::from(tempdir.path());
+    file.push(FILENAME);
+    std::fs::write(&file, EXPECTED_CONTENTS).expect("write read only test file");
+
+    run_with_builder(component_path, false, |builder| {
+        builder
+            .preopened_dir(tempdir.path(), "readonly", FsPerms::ReadOnly)
+            .unwrap();
+    })
+    .await?;
+
+    let contents = std::fs::read(&file).expect("read read only test file");
+    assert_eq!(EXPECTED_CONTENTS, contents);
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_hardlink_across_perms() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_HARDLINK_ACROSS_PERMS_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_rename_across_perms() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_RENAME_ACROSS_PERMS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_environment_named_imports() -> Result<()> {
+    struct StoreData {
+        default: WasiCtx,
+        a: WasiCtx,
+        b: WasiCtx,
+        table: ResourceTable,
+    }
+
+    impl WasiView for Ctx<StoreData> {
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: &mut self.wasi.default,
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    impl WasiNamedView for Ctx<StoreData> {
+        fn ctx(&mut self, id: NamedId) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: match id.0 {
+                    0 => &mut self.wasi.a,
+                    1 => &mut self.wasi.b,
+                    _ => panic!("unexpected id: {}", id.0),
+                },
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    let path = Path::new(P3_ENVIRONMENT_NAMED_IMPORTS_COMPONENT);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    let engine = test_programs_artifacts::engine(|config| {
+        config.wasm_component_model_implements(true);
+    });
+    let component = Component::from_file(&engine, path)?;
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    wasmtime_wasi::p3::add_named_to_linker(&mut linker, &component, |i, name| {
+        assert_eq!(i, wasmtime_wasi::p3::Interface::CliEnvironment);
+        Ok(match name {
+            "a" => NamedId(0),
+            "b" => NamedId(1),
+            _ => panic!("unexpected name: {name}"),
+        })
+    })?;
+
+    let (mut store, _td) = Ctx::new_with_workspace_setup(
+        &engine,
+        name,
+        |_| Ok(()),
+        |builder| StoreData {
+            default: builder.env("DEFAULT", "0").build(),
+            a: WasiCtx::builder().env("A", "0").build(),
+            b: WasiCtx::builder().env("B", "0").build(),
+            table: ResourceTable::default(),
+        },
+    )?;
+    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
+    store
+        .run_concurrent(async |store| {
+            command
+                .wasi_cli_run()
+                .call_run(store)
+                .await?
+                .map_err(|()| wasmtime::format_err!("run returned a failure"))
+        })
+        .await?
+}

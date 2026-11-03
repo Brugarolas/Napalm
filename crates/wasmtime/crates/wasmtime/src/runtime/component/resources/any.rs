@@ -1,0 +1,523 @@
+//! This module defines the `ResourceAny` type in the public API of Wasmtime,
+//! which represents a dynamically typed resource handle that could either be
+//! owned by the guest or the host.
+//!
+//! This is in contrast with `Resource<T>`, for example, and `ResourceAny` has
+//! more "state" behind it. Most `ResourceAny` values have a type and a
+//! `HostResourceIndex` which points inside of a store. These must be dropped
+//! or converted to a typed resource to release that state. A synthetic borrow
+//! converted from `Resource::new_borrow` instead holds its representation
+//! directly and has no host table entry.
+
+use crate::component::func::{LiftContext, LowerContext, bad_type_info, desc};
+use crate::component::matching::InstanceType;
+use crate::component::resources::host::{HostResource, HostResourceType};
+use crate::component::resources::{HostResourceIndex, HostResourceTables};
+use crate::component::{ComponentType, Lift, Lower, Resource, ResourceDynamic, ResourceType};
+use crate::prelude::*;
+use crate::runtime::vm::{UncaughtException, ValRaw};
+use crate::{AsContextMut, StoreContextMut};
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+use wasmtime_environ::component::{CanonicalAbiInfo, InterfaceType};
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+enum ResourceAnyIndex {
+    Table(HostResourceIndex),
+    Borrow(u32),
+}
+
+/// Representation of a dynamically typed guest-defined or host-defined
+/// resource in the component model.
+///
+/// # Guest-defined resources
+///
+/// Guest-defined resources enter the host through generated bindings, such as
+/// a function that returns an owned resource. Their methods are called through
+/// the generated type for that resource, for example `GuestLogger` in the
+/// exported resources example in [`bindgen_examples`]. A guest-defined
+/// [`ResourceAny`] cannot be converted to [`Resource`] or [`ResourceDynamic`],
+/// because those types represent host-defined resources.
+///
+/// [`bindgen_examples`]: crate::component::bindgen_examples
+///
+/// # Host-defined resources
+///
+/// Convert a host-defined [`Resource<T>`](Resource) to this type with
+/// [`ResourceAny::try_from_resource`]. Convert it back with
+/// [`ResourceAny::try_into_resource`] or
+/// [`ResourceAny::try_into_resource_dynamic`]. These conversions check the
+/// resource type at runtime.
+///
+/// # Ownership and destruction
+///
+/// Like [`Resource`] this type represents either an `own` or a `borrow`
+/// resource internally, and the WIT signature controls which one a value is.
+/// Passing a resource to an `own` parameter transfers ownership to the callee,
+/// while passing it to a `borrow` parameter keeps ownership with the caller.
+/// When a function returns an `own` resource, the caller acquires ownership.
+/// The same applies to each owned resource nested in a record, variant, list,
+/// or other value.
+///
+/// A [`ResourceAny`] with a host table entry that the host still owns must
+/// eventually be passed to an `own` parameter, converted to a typed resource,
+/// or explicitly destroyed with [`ResourceAny::resource_drop`]. Destroying it
+/// updates dynamic state tracking and invokes the WebAssembly-defined
+/// destructor for a resource, if any. `ResourceAny` is `Copy`, but once
+/// ownership has been transferred the handle must not be used again.
+///
+/// `ResourceAny` has no static type parameter, so using one with the wrong
+/// generated function produces a runtime type error.
+///
+/// Borrows lifted from a component have host table state and must be dropped.
+/// Synthetic borrows converted from [`Resource::new_borrow`] have no host table
+/// state; calling `resource_drop` on one is harmless but unnecessary.
+///
+/// Note that special care should be taken when handling `ResourceAny` in async
+/// functions. In this scenario an async host function can be cancelled
+/// (dropped) at any time and if `ResourceAny` isn't destroyed then what it's
+/// referring to can leak within the store. If a `ResourceAny` is a borrow
+/// internally then failing to drop it, even on cancellation, will lead to a
+/// trap being raised and poisoning the store.
+///
+/// [`LinkerInstance::func_wrap_concurrent`]: crate::component::LinkerInstance::func_wrap_concurrent
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct ResourceAny {
+    idx: ResourceAnyIndex,
+    ty: ResourceType,
+    owned: bool,
+}
+
+impl ResourceAny {
+    pub(crate) fn new(idx: HostResourceIndex, ty: ResourceType, owned: bool) -> ResourceAny {
+        ResourceAny {
+            idx: ResourceAnyIndex::Table(idx),
+            ty,
+            owned,
+        }
+    }
+
+    pub(crate) fn new_borrow(rep: u32, ty: ResourceType) -> ResourceAny {
+        ResourceAny {
+            idx: ResourceAnyIndex::Borrow(rep),
+            ty,
+            owned: false,
+        }
+    }
+
+    /// Attempts to convert a host-defined [`Resource`] into [`ResourceAny`].
+    ///
+    /// * `resource` is the resource to convert.
+    /// * `store` is the store to place the returned resource into.
+    ///
+    /// The returned `ResourceAny` has no destructor attached to it, so
+    /// `resource_drop` will not invoke a host-defined destructor. This matches
+    /// [`Resource`], which has no associated destructor.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an error if `resource` has already been "taken"
+    /// and has ownership transferred elsewhere which can happen in situations
+    /// such as when it's already lowered into a component.
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    pub fn try_from_resource<T: 'static>(
+        resource: Resource<T>,
+        store: impl AsContextMut,
+    ) -> Result<Self> {
+        resource.try_into_resource_any(store)
+    }
+
+    /// Creates a new owned resource of type `ty` with the `rep` specified.
+    ///
+    /// Unlike `try_from_resource`, which derives the resource type from a Rust
+    /// type parameter, this takes the type dynamically. It is used to
+    /// synthesize a handle whose type is only known at runtime, such as a
+    /// default value for an `own` result; see
+    /// `Linker::define_unknown_imports_as_default_values`.
+    ///
+    /// No destructor is attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ty` is not host-defined. A guest resource's
+    /// representation belongs to the guest that defines it, so the host
+    /// cannot conjure an instance of one.
+    pub(crate) fn new_own_dynamic(
+        ty: ResourceType,
+        rep: u32,
+        mut store: impl AsContextMut,
+    ) -> Result<Self> {
+        if !ty.is_host_defined() {
+            bail!("cannot synthesize a resource of a non-host-defined type");
+        }
+        let store = store.as_context_mut();
+        let idx =
+            HostResourceTables::new_host(store.0)?.host_resource_lower_own(rep, None, None)?;
+        Ok(ResourceAny::new(idx, ty, true))
+    }
+
+    /// Attempts to convert this value into a statically typed, host-defined
+    /// [`Resource`].
+    ///
+    /// This conversion accepts only host-defined resources of type `T`.
+    /// Guest-defined resources must remain [`ResourceAny`] values and be used
+    /// through their generated functions and resource projection.
+    ///
+    /// # Errors
+    ///
+    /// See [`Resource::try_from_resource_any`] for the conditions under which
+    /// this conversion fails.
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    pub fn try_into_resource<T: 'static>(self, store: impl AsContextMut) -> Result<Resource<T>> {
+        Resource::try_from_resource_any(self, store)
+    }
+
+    /// Attempts to convert this value into a dynamically typed, host-defined
+    /// [`ResourceDynamic`].
+    ///
+    /// This conversion accepts only host-defined resources. Guest-defined
+    /// resources must remain [`ResourceAny`] values and be used through their
+    /// generated functions and resource projection.
+    ///
+    /// # Errors
+    ///
+    /// See [`Resource::try_from_resource_any`] for the conditions under which
+    /// this conversion fails.
+    pub fn try_into_resource_dynamic(self, store: impl AsContextMut) -> Result<ResourceDynamic> {
+        ResourceDynamic::try_from_resource_any(self, store)
+    }
+
+    /// See [`Resource::try_from_resource_any`]
+    pub(crate) fn try_into_host_resource<T, D>(
+        self,
+        mut store: impl AsContextMut,
+    ) -> Result<HostResource<T, D>>
+    where
+        T: HostResourceType<D>,
+        D: PartialEq + Send + Sync + Copy + 'static,
+    {
+        let ResourceAny { idx, ty, owned } = self;
+        let ty = T::typecheck(ty).ok_or_else(|| crate::format_err!("resource type mismatch"))?;
+        match idx {
+            ResourceAnyIndex::Borrow(rep) => {
+                assert!(!owned);
+                Ok(HostResource::new_borrow(rep, ty))
+            }
+            ResourceAnyIndex::Table(idx) => {
+                let store = store.as_context_mut();
+                let mut tables = HostResourceTables::new_host(store.0)?;
+                if owned {
+                    let rep = tables.host_resource_lift_own(idx)?;
+                    Ok(HostResource::new_own(rep, ty))
+                } else {
+                    // Typed borrows have no dynamic state. Remove the table
+                    // entry after reading its representation.
+                    let rep = tables.host_resource_rep(idx)?;
+                    let res = tables.host_resource_drop(idx)?;
+                    assert!(res.is_none());
+                    Ok(HostResource::new_borrow(rep, ty))
+                }
+            }
+        }
+    }
+
+    /// Returns the corresponding type associated with this resource, either a
+    /// host-defined type or a guest-defined type.
+    ///
+    /// This can be compared against [`ResourceType::host`] for example to see
+    /// if it's a host-resource or against a type extracted with
+    /// [`Instance::get_resource`] to see if it's a guest-defined resource.
+    ///
+    /// [`Instance::get_resource`]: crate::component::Instance::get_resource
+    pub fn ty(&self) -> ResourceType {
+        self.ty
+    }
+
+    /// Returns whether this is an owned resource, and if not it's a borrowed
+    /// resource.
+    pub fn owned(&self) -> bool {
+        self.owned
+    }
+
+    /// Destroy this resource and release any state associated with it.
+    ///
+    /// This is required for resources with host table state. For synthetic
+    /// borrows converted from [`Resource::new_borrow`] it has no effect.
+    /// For owned resources this may execute the guest-defined destructor if
+    /// applicable (or the host-defined destructor if one was specified).
+    ///
+    /// Exactly one of the following must be called for each [`ResourceAny`],
+    /// depending on how the store is being driven:
+    ///
+    /// * [`ResourceAny::resource_drop`] for synchronous stores.
+    /// * `ResourceAny::resource_drop_async` for [async](crate#async) stores
+    ///   when a `StoreContextMut` is available.
+    /// * `ResourceAny::resource_drop_concurrent` when only an `Accessor` is
+    ///   available, such as inside `Store::run_concurrent` or an
+    ///   `AccessorTask`.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    ///
+    /// This will also return an error if called recursively from within e.g. a
+    /// `call_async` invocation.
+    pub fn resource_drop(self, mut store: impl AsContextMut) -> Result<()> {
+        let mut store = store.as_context_mut();
+        store.0.validate_sync_call()?;
+        self.resource_drop_impl(&mut store)
+    }
+
+    /// Drops this resource without the `validate_sync_call` check that the
+    /// public [`ResourceAny::resource_drop`] performs.
+    ///
+    /// This is for dropping handles that are already owned by the host while it
+    /// is servicing a guest call, such as the parameters handed to an unknown
+    /// import stubbed by
+    /// [`Linker::define_unknown_imports_as_default_values`](crate::component::Linker::define_unknown_imports_as_default_values).
+    /// Such a stub always runs on a fiber, where `validate_sync_call` would
+    /// reject the public entry point even though the drop itself is the same
+    /// bookkeeping the runtime does whenever a guest drops a handle mid-call.
+    pub(crate) fn resource_drop_in_guest_call<T: 'static>(
+        self,
+        store: &mut StoreContextMut<'_, T>,
+    ) -> Result<()> {
+        self.resource_drop_impl(store)
+    }
+
+    /// Same as [`ResourceAny::resource_drop`] except for use with async stores
+    /// to execute the destructor [asynchronously](crate#async).
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    #[cfg(feature = "async")]
+    pub async fn resource_drop_async(self, mut store: impl AsContextMut<Data: Send>) -> Result<()> {
+        let mut store = store.as_context_mut();
+
+        // Use the event loop if concurrency support is enabled to handle thread
+        // switches, for example, if wasm is run.
+        #[cfg(feature = "component-model-async")]
+        if store.0.concurrency_support() {
+            return store
+                .run_concurrent_trap_on_idle(async |store| {
+                    self.resource_drop_concurrent(store).await
+                })
+                .await?;
+        }
+
+        store
+            .on_fiber(|store| self.resource_drop_impl(store))
+            .await?
+    }
+
+    /// Same as [`ResourceAny::resource_drop`] except for use with an
+    /// [`Accessor`](crate::component::Accessor) while a store is executing
+    /// [`Store::run_concurrent`](crate::Store::run_concurrent).
+    ///
+    /// The resource drop is queued for execution on the store's worker fiber.
+    /// This method must be awaited while the store's concurrent event loop is
+    /// running so the queued drop can make progress.
+    ///
+    /// Once this future has been polled and the drop has been queued, dropping
+    /// the future does not cancel the resource drop.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    #[cfg(feature = "component-model-async")]
+    pub async fn resource_drop_concurrent(
+        self,
+        accessor: impl crate::component::AsAccessor,
+    ) -> Result<()> {
+        let receiver = accessor.as_accessor().with(|mut store| -> Result<_> {
+            let mut store = store.as_context_mut();
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            let token = crate::store::StoreToken::new(store.as_context_mut());
+            store.0.queue_task(move |store| {
+                _ = sender.send(self.resource_drop_impl(&mut token.as_context_mut(store)));
+                Ok(())
+            })?;
+            Ok(receiver)
+        })?;
+        receiver
+            .await
+            .map_err(|_| format_err!("resource drop task canceled"))?
+    }
+
+    fn resource_drop_impl<T: 'static>(self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
+        // Attempt to remove `self.idx` from the host table in `store`.
+        //
+        // This could fail if the index is invalid or if this is removing an
+        // `Own` entry which is currently being borrowed.
+        let idx = match self.idx {
+            ResourceAnyIndex::Table(idx) => idx,
+            ResourceAnyIndex::Borrow(_) => return Ok(()),
+        };
+        let pair = HostResourceTables::new_host(store.0)?.host_resource_drop(idx)?;
+
+        let (rep, slot) = match (pair, self.owned) {
+            (Some(pair), true) => pair,
+
+            // A `borrow` was removed from the table and no further
+            // destruction, e.g. the destructor, is required so we're done.
+            (None, false) => return Ok(()),
+
+            _ => unreachable!(),
+        };
+
+        let dtor = match slot.dtor {
+            Some(dtor) => dtor.as_non_null(),
+            None => return Ok(()),
+        };
+        let mut args = [ValRaw::u32(rep)];
+
+        // Setup async-level task infrastructure for this call. This, for
+        // example, prevents the destructor from blocking.
+        //
+        // Note that if `slot.instance` is `None` then this is skipped. That
+        // means that this is a host resource being destroyed by the host. In
+        // that case restrictions around blocking and such are exempt.
+        if let Some(instance) = slot.instance {
+            store.0.enter_guest_sync_call(false, instance)?;
+        }
+
+        // This should be safe because `dtor` has been checked to belong to the
+        // `store` provided which means it's valid and still alive. Additionally
+        // destructors have al been previously type-checked and are guaranteed
+        // to take one i32 argument and return no results, so the parameters
+        // here should be configured correctly.
+        let result = unsafe {
+            crate::Func::call_unchecked_raw(
+                store,
+                dtor,
+                NonNull::from(&mut args),
+                UncaughtException::Trap,
+            )
+        };
+        if result.is_err() {
+            store.0.set_trapped();
+        }
+        result?;
+
+        if slot.instance.is_some() {
+            store.0.exit_guest_sync_call()?;
+        }
+
+        Ok(())
+    }
+
+    fn lower_to_index<U>(&self, cx: &mut LowerContext<'_, U>, ty: InterfaceType) -> Result<u32> {
+        match ty {
+            InterfaceType::Own(t) => {
+                if cx.resource_type(t) != self.ty {
+                    bail!("mismatched resource types");
+                }
+                let rep = match self.idx {
+                    ResourceAnyIndex::Table(idx) => cx.host_resource_lift_own(idx)?,
+                    ResourceAnyIndex::Borrow(_) => {
+                        bail!("cannot lower a `borrow` resource into an `own`")
+                    }
+                };
+                cx.guest_resource_lower_own(t, rep)
+            }
+            InterfaceType::Borrow(t) => {
+                if cx.resource_type(t) != self.ty {
+                    bail!("mismatched resource types");
+                }
+                let rep = match self.idx {
+                    ResourceAnyIndex::Table(idx) => cx.host_resource_lift_borrow(idx)?,
+                    ResourceAnyIndex::Borrow(rep) => rep,
+                };
+                cx.guest_resource_lower_borrow(t, rep)
+            }
+            _ => bad_type_info(),
+        }
+    }
+
+    fn lift_from_index(cx: &mut LiftContext<'_>, ty: InterfaceType, index: u32) -> Result<Self> {
+        match ty {
+            InterfaceType::Own(t) => {
+                let ty = cx.resource_type(t);
+                let (rep, dtor, flags) = cx.guest_resource_lift_own(t, index)?;
+                let idx = cx.host_resource_lower_own(rep, dtor, flags)?;
+                Ok(ResourceAny::new(idx, ty, true))
+            }
+            InterfaceType::Borrow(t) => {
+                let ty = cx.resource_type(t);
+                let rep = cx.guest_resource_lift_borrow(t, index)?;
+                let idx = cx.host_resource_lower_borrow(rep)?;
+                Ok(ResourceAny::new(idx, ty, false))
+            }
+            _ => bad_type_info(),
+        }
+    }
+}
+
+unsafe impl ComponentType for ResourceAny {
+    const ABI: CanonicalAbiInfo = CanonicalAbiInfo::SCALAR4;
+    const MAY_REQUIRE_REALLOC: bool = false;
+
+    type Lower = <u32 as ComponentType>::Lower;
+
+    fn typecheck(ty: &InterfaceType, _types: &InstanceType<'_>) -> Result<()> {
+        match ty {
+            InterfaceType::Own(_) | InterfaceType::Borrow(_) => Ok(()),
+            other => bail!("expected `own` or `borrow`, found `{}`", desc(other)),
+        }
+    }
+}
+
+unsafe impl Lower for ResourceAny {
+    fn linear_lower_to_flat<T>(
+        &self,
+        cx: &mut LowerContext<'_, T>,
+        ty: InterfaceType,
+        dst: &mut MaybeUninit<Self::Lower>,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .linear_lower_to_flat(cx, InterfaceType::U32, dst)
+    }
+
+    fn linear_lower_to_memory<T>(
+        &self,
+        cx: &mut LowerContext<'_, T>,
+        ty: InterfaceType,
+        offset: usize,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .linear_lower_to_memory(cx, InterfaceType::U32, offset)
+    }
+}
+
+unsafe impl Lift for ResourceAny {
+    fn linear_lift_from_flat(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        src: &Self::Lower,
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_flat(cx, InterfaceType::U32, src)?;
+        ResourceAny::lift_from_index(cx, ty, index)
+    }
+
+    fn linear_lift_from_memory(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_memory(cx, InterfaceType::U32, bytes)?;
+        ResourceAny::lift_from_index(cx, ty, index)
+    }
+}

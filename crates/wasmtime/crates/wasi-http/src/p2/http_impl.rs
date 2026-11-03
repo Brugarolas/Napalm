@@ -1,0 +1,164 @@
+//! Implementation of the `wasi:http/outgoing-handler` interface.
+
+use crate::p2::{
+    HttpResult,
+    bindings::http::{
+        outgoing_handler,
+        types::{self, Scheme},
+    },
+    error::internal_error,
+    http_request_error,
+    types::{HostFutureIncomingResponse, HostOutgoingRequest},
+};
+use crate::{WasiHttpCtxView, get_content_length};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::Method;
+use std::pin::Pin;
+use wasmtime::component::Resource;
+
+impl outgoing_handler::Host for WasiHttpCtxView<'_> {
+    fn handle(
+        &mut self,
+        request_id: Resource<HostOutgoingRequest>,
+        options: Option<Resource<types::RequestOptions>>,
+    ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+        // `options` is an `own` parameter (`outgoing-handler.handle` takes ownership of it, per
+        // `wasi:http` types.wit), so it must be consumed from the table like `request` below.
+        let opts = match options {
+            Some(id) => Some(self.table.delete(id)?),
+            None => None,
+        };
+
+        let req = self.table.delete(request_id)?;
+
+        // The `content-length` header is otherwise only validated in
+        // `outgoing-request.body` and `outgoing-body.finish`, neither of which
+        // a guest is required to call. Validate it here too so that malformed
+        // requests never reach the wire.
+        let content_length =
+            get_content_length(&req.headers).map_err(|err| internal_error(format!("{err:#}")))?;
+        if req.body.is_none() && content_length.is_some_and(|n| n != 0) {
+            return Err(types::ErrorCode::HttpRequestBodySize(Some(0)).into());
+        }
+
+        let mut builder = hyper::Request::builder();
+
+        builder = builder.method(match req.method {
+            types::Method::Get => Method::GET,
+            types::Method::Head => Method::HEAD,
+            types::Method::Post => Method::POST,
+            types::Method::Put => Method::PUT,
+            types::Method::Delete => Method::DELETE,
+            types::Method::Connect => Method::CONNECT,
+            types::Method::Options => Method::OPTIONS,
+            types::Method::Trace => Method::TRACE,
+            types::Method::Patch => Method::PATCH,
+            types::Method::Other(m) => match hyper::Method::from_bytes(m.as_bytes()) {
+                Ok(method) => method,
+                Err(_) => return Err(types::ErrorCode::HttpRequestMethodInvalid.into()),
+            },
+        });
+
+        let scheme = match req.scheme {
+            Some(scheme) => {
+                let scheme = match scheme {
+                    Scheme::Http => http::uri::Scheme::HTTP,
+                    Scheme::Https => http::uri::Scheme::HTTPS,
+                    Scheme::Other(scheme) => http::uri::Scheme::try_from(scheme.as_str())
+                        .map_err(|_| types::ErrorCode::HttpProtocolError)?,
+                };
+                if !self.hooks.is_supported_scheme(&scheme) {
+                    return Err(types::ErrorCode::HttpProtocolError.into());
+                }
+                scheme
+            }
+            // Note that a hook returning `None` here means that guests are
+            // required to specify a scheme themselves.
+            None => self
+                .hooks
+                .default_scheme()
+                .ok_or(types::ErrorCode::HttpProtocolError)?,
+        };
+
+        let authority = req.authority.unwrap_or_else(String::new);
+
+        let mut uri = http::Uri::builder()
+            .scheme(scheme)
+            .authority(authority.clone());
+
+        if let Some(path) = req.path_with_query {
+            uri = uri.path_and_query(path);
+        }
+
+        builder = builder.uri(uri.build().map_err(http_request_error)?);
+
+        if self.hooks.set_host_header() {
+            builder = builder.header(http::header::HOST, authority.as_str());
+        }
+
+        for (k, v) in req.headers.iter() {
+            builder = builder.header(k, v);
+        }
+
+        let body = req.body.unwrap_or_else(|| {
+            Empty::<Bytes>::new()
+                .map_err(|_| unreachable!("Infallible error"))
+                .boxed_unsync()
+        });
+        let body = body.map_err(Into::into).boxed_unsync();
+
+        let request = builder
+            .body(body)
+            .map_err(|err| internal_error(err.to_string()))?;
+
+        let future = self
+            .hooks
+            .send_request(request, opts, Box::new(async { Ok(()) }));
+        let future = wasmtime_wasi::runtime::spawn(async move {
+            let (res, io) = Pin::from(future).await?;
+            let io = wasmtime_wasi::runtime::spawn(async move {
+                match Pin::from(io).await {
+                    Ok(()) => {}
+                    // TODO: shouldn't throw away this error and ideally should
+                    // surface somewhere.
+                    Err(e) => tracing::warn!("dropping error {e}"),
+                }
+            });
+            let res = res.map(|b| b.boxed_unsync());
+            Ok((res, io))
+        });
+
+        Ok(self
+            .table
+            .push(HostFutureIncomingResponse::Pending(future))?)
+    }
+}
+
+mod named {
+    use crate::WasiHttpNamedView;
+    use crate::p2::bindings::http::types;
+    use crate::p2::bindings::named_imports::wasi::http::outgoing_handler;
+    use crate::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
+    use crate::p2::{HttpError, HttpResult};
+    use wasmtime::component::Resource;
+    use wasmtime_wasi::{NamedId, WasiCtxNamedView};
+
+    impl<T> outgoing_handler::Host for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn handle(
+            &mut self,
+            id: NamedId,
+            request_id: Resource<HostOutgoingRequest>,
+            options: Option<Resource<types::RequestOptions>>,
+        ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+            super::outgoing_handler::Host::handle(&mut self.0.http(id), request_id, options)
+        }
+
+        fn convert_error_code(&mut self, err: HttpError) -> wasmtime::Result<types::ErrorCode> {
+            err.downcast()
+        }
+    }
+}

@@ -1,0 +1,1415 @@
+#![allow(dead_code, reason = "lots of macro-generated code")]
+
+macro_rules! gentest {
+    ($id:ident $name:tt $path:tt) => {
+        mod $id {
+            mod sugar {
+                wasmtime::component::bindgen!(in $path);
+            }
+            mod async_ {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    imports: { default: async },
+                    exports: { default: async },
+                });
+            }
+            mod concurrent {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    imports: { default: async | store },
+                    exports: { default: async | store },
+                });
+            }
+            mod tracing {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    imports: { default: tracing | verbose_tracing },
+                    exports: { default: tracing | verbose_tracing },
+                    ownership: Borrowing {
+                        duplicate_if_necessary: true
+                    }
+                });
+            }
+            mod imports_with_store {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    imports: { default: store },
+                });
+            }
+            mod with_anyhow {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    anyhow: true,
+                    imports: { default: trappable },
+                });
+            }
+        }
+    };
+}
+
+component_macro_test_helpers::foreach!(gentest);
+
+mod with_key_and_resources {
+    use wasmtime::Result;
+    use wasmtime::component::Resource;
+
+    wasmtime::component::bindgen!({
+        inline: "
+            package demo:pkg;
+
+            interface bar {
+                resource a;
+                resource b;
+            }
+
+            world foo {
+                resource a;
+                resource b;
+
+                import foo: interface {
+                    resource a;
+                    resource b;
+                }
+
+                import bar;
+            }
+        ",
+        with: {
+            "a": MyA,
+            "b": MyA,
+            "foo.a": MyA,
+            "foo.b": MyA,
+            "demo:pkg/bar.a": MyA,
+            "demo:pkg/bar.b": MyA,
+        },
+    });
+
+    pub struct MyA;
+
+    struct MyComponent;
+
+    impl FooImports for MyComponent {}
+
+    impl HostA for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+
+    impl HostB for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+
+    impl foo::Host for MyComponent {}
+
+    impl foo::HostA for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+
+    impl foo::HostB for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+
+    impl demo::pkg::bar::Host for MyComponent {}
+
+    impl demo::pkg::bar::HostA for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+
+    impl demo::pkg::bar::HostB for MyComponent {
+        fn drop(&mut self, _: Resource<MyA>) -> Result<()> {
+            loop {}
+        }
+    }
+}
+
+mod trappable_errors_with_versioned_and_unversioned_packages {
+    wasmtime::component::bindgen!({
+        world: "foo:foo/nope",
+        inline: "
+            package foo:foo@0.1.0;
+
+            interface a {
+                variant error {
+                    other(string),
+                }
+
+                f: func() -> result<_, error>;
+            }
+
+            world foo {
+                import a;
+            }
+        ",
+        path: "tests/codegen/unversioned-foo.wit",
+        trappable_error_type: {
+            "foo:foo/a@0.1.0.error" => MyX,
+        },
+    });
+
+    type MyX = u64;
+}
+
+mod trappable_errors {
+    wasmtime::component::bindgen!({
+        inline: "
+            package demo:pkg;
+
+            interface a {
+                type b = u64;
+
+                z1: func() -> result<_, b>;
+                z2: func() -> result<_, b>;
+            }
+
+            interface b {
+                use a.{b};
+                z: func() -> result<_, b>;
+            }
+
+            interface c {
+                type b = u64;
+            }
+
+            interface d {
+                use c.{b};
+                z: func() -> result<_, b>;
+            }
+
+            world foo {
+                import a;
+                import b;
+                import d;
+            }
+        ",
+        trappable_error_type: {
+            "demo:pkg/a.b" => MyX,
+            "demo:pkg/c.b" => MyX,
+        },
+    });
+
+    type MyX = u32;
+
+    mod trappable2 {
+        wasmtime::component::bindgen!({
+            inline: r#"
+                package test:pkg;
+
+                interface types {
+                    variant error {
+                        test,
+                    }
+                }
+
+                interface test {
+                    use types.{error};
+
+                    test: func() -> result<_, error>;
+                }
+
+                world repro {
+                    import test;
+                }
+            "#,
+            world: "repro",
+            trappable_error_type: {
+                "test:pkg/test.error" => String,
+            },
+            imports: {
+                default: trappable,
+            }
+        });
+    }
+}
+
+mod interface_name_with_rust_keyword {
+    wasmtime::component::bindgen!({
+        inline: "
+            package foo:foo;
+
+            interface crate { }
+
+            world foo {
+                export crate;
+            }
+        "
+    });
+}
+
+mod interface_types_with_rust_types {
+    wasmtime::component::bindgen!({
+        inline: "
+            package foo:foo;
+
+            interface a {
+                type %result = bool;
+                type %option = bool;
+
+                r: func() -> %result;
+                o: func() -> %option;
+            }
+
+            world foo {
+                export a;
+            }
+        "
+    });
+}
+
+mod with_works_with_hierarchy {
+    mod bindings {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    record t {
+                        x: u32,
+                    }
+                    x: func() -> t;
+                }
+
+                interface b {
+                    use a.{t};
+                    x: func() -> t;
+                }
+
+                interface c {
+                    use b.{t};
+                    x: func() -> t;
+                }
+
+                world foo {
+                    import c;
+                }
+            "
+        });
+    }
+
+    mod with_just_one_interface {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    record t {
+                        x: u32,
+                    }
+                    x: func() -> t;
+                }
+
+                interface b {
+                    use a.{t};
+                    x: func() -> t;
+                }
+
+                interface c {
+                    use b.{t};
+                    x: func() -> t;
+                }
+
+                world foo {
+                    use c.{t};
+
+                    import x: func() -> t;
+                }
+            ",
+            with: { "foo:foo/a": super::bindings::foo::foo::a }
+        });
+
+        struct X;
+
+        impl FooImports for X {
+            fn x(&mut self) -> super::bindings::foo::foo::a::T {
+                loop {}
+            }
+        }
+    }
+
+    mod with_whole_package {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    record t {
+                        x: u32,
+                    }
+                    x: func() -> t;
+                }
+
+                interface b {
+                    use a.{t};
+                    x: func() -> t;
+                }
+
+                interface c {
+                    use b.{t};
+                    x: func() -> t;
+                }
+
+                world foo {
+                    use c.{t};
+
+                    import x: func() -> t;
+                }
+            ",
+            with: { "foo:foo": super::bindings::foo::foo }
+        });
+
+        struct X;
+
+        impl FooImports for X {
+            fn x(&mut self) -> super::bindings::foo::foo::a::T {
+                loop {}
+            }
+        }
+    }
+
+    mod with_whole_namespace {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    record t {
+                        x: u32,
+                    }
+                    x: func() -> t;
+                }
+
+                interface b {
+                    use a.{t};
+                    x: func() -> t;
+                }
+
+                interface c {
+                    use b.{t};
+                    x: func() -> t;
+                }
+
+                world foo {
+                    use c.{t};
+
+                    import x: func() -> t;
+                }
+            ",
+            with: { "foo": super::bindings::foo }
+        });
+
+        struct X;
+
+        impl FooImports for X {
+            fn x(&mut self) -> super::bindings::foo::foo::a::T {
+                loop {}
+            }
+        }
+    }
+}
+
+// A labelled import reuses the remapped module of a plain import of the same
+// interface.
+mod implements_plain_and_labelled_with {
+    mod bindings {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface store {
+                    get: func() -> u32;
+                }
+
+                world w {
+                    import store;
+                }
+            ",
+        });
+    }
+
+    wasmtime::component::bindgen!({
+        inline: "
+            package foo:foo;
+
+            interface store {
+                get: func() -> u32;
+            }
+
+            world w {
+                import a: store;
+                import store;
+                import b: store;
+            }
+        ",
+        with: { "foo:foo/store": bindings::foo::foo::store },
+    });
+}
+
+mod trappable_imports {
+    mod none {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                world foo {
+                    import foo: func();
+                }
+            ",
+        });
+        struct X;
+
+        impl FooImports for X {
+            fn foo(&mut self) {}
+        }
+    }
+
+    mod all {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                world foo {
+                    import foo: func();
+                }
+            ",
+            imports: { default: trappable },
+        });
+        struct X;
+
+        impl FooImports for X {
+            fn foo(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+    }
+
+    mod some {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                world foo {
+                    import foo: func();
+                    import bar: func();
+                }
+            ",
+            imports: { "foo": trappable },
+        });
+        struct X;
+
+        impl FooImports for X {
+            fn foo(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn bar(&mut self) {}
+        }
+    }
+
+    mod across_interfaces {
+        use wasmtime::component::Resource;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    foo: func();
+                    bar: func();
+
+                    resource r {
+                        constructor();
+                        foo: func();
+                        bar: static func();
+                    }
+                }
+
+                world foo {
+                    import a;
+                    import foo: func();
+                    import bar: func();
+                    import i: interface {
+                        foo: func();
+                        bar: func();
+                    }
+
+                }
+            ",
+            imports: {
+                "foo": trappable | exact,
+                "i.foo": trappable,
+                "foo:foo/a.foo": trappable,
+            },
+            with: { "foo:foo/a.r": R },
+        });
+
+        struct X;
+        pub struct R;
+
+        impl FooImports for X {
+            fn foo(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn bar(&mut self) {}
+        }
+
+        impl i::Host for X {
+            fn foo(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn bar(&mut self) {}
+        }
+
+        impl foo::foo::a::Host for X {
+            fn foo(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn bar(&mut self) {}
+        }
+
+        impl foo::foo::a::HostR for X {
+            fn new(&mut self) -> Resource<R> {
+                loop {}
+            }
+            fn foo(&mut self, _: Resource<R>) {}
+            fn bar(&mut self) {}
+            fn drop(&mut self, _: Resource<R>) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+    }
+
+    mod resources {
+        use wasmtime::component::Resource;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface a {
+                    resource r {
+                        constructor();
+                        foo: func();
+                        bar: static func();
+                    }
+                }
+
+                world foo {
+                    import a;
+
+                }
+            ",
+            imports: {
+                "foo:foo/a.[constructor]r": trappable,
+                "foo:foo/a.[method]r.foo": trappable,
+                "foo:foo/a.[static]r.bar": trappable,
+            },
+            with: { "foo:foo/a.r": R },
+        });
+
+        struct X;
+        pub struct R;
+
+        impl foo::foo::a::Host for X {}
+
+        impl foo::foo::a::HostR for X {
+            fn new(&mut self) -> wasmtime::Result<Resource<R>> {
+                loop {}
+            }
+            fn foo(&mut self, _: Resource<R>) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn bar(&mut self) -> wasmtime::Result<()> {
+                Ok(())
+            }
+            fn drop(&mut self, _: Resource<R>) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+    }
+}
+
+mod custom_derives {
+    use std::collections::{HashSet, hash_map::RandomState};
+
+    wasmtime::component::bindgen!({
+        inline: "
+            package my:inline;
+
+            interface blah {
+                variant abc {
+                    a,
+                    b,
+                    c
+                }
+
+                record foo {
+                    field1: string,
+                    field2: list<u32>,
+                    field3: abc
+                }
+
+                bar: func(cool: foo);
+            }
+
+            world baz {
+                import blah;
+            }
+        ",
+        // Clone is included by default almost everywhere, so include it here to make sure it
+        // doesn't conflict
+        additional_derives: [serde::Serialize, serde::Deserialize, Hash, Clone, PartialEq, Eq],
+    });
+
+    use my::inline::blah::{Abc, Foo, Host};
+
+    struct X;
+
+    impl Host for X {
+        fn bar(&mut self, cool: Foo) {
+            // Check that built in derives that I've added actually work by seeing that this hashes
+            let _blah: HashSet<Foo, RandomState> = HashSet::from_iter([Foo {
+                field1: "hello".to_string(),
+                field2: vec![1, 2, 3],
+                field3: Abc::B,
+            }]);
+
+            // Check that the attributes from an external crate actually work. If they don't work,
+            // compilation will fail here
+            let _ = serde_json::to_string(&cool);
+        }
+    }
+}
+
+mod with_and_mixing_async {
+    mod with_async {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+                interface foo {
+                    type t = u32;
+                    foo: func() -> t;
+                }
+                interface bar {
+                    use foo.{t};
+                    bar: func() -> t;
+                }
+                world x {
+                    import bar;
+                }
+            ",
+            imports: {
+                "my:inline/bar.bar": async,
+            },
+        });
+    }
+
+    mod without_async {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+                interface foo {
+                    type t = u32;
+                    foo: func() -> t;
+                }
+                interface bar {
+                    use foo.{t};
+                    bar: func() -> t;
+                }
+                world x {
+                    import bar;
+                }
+            ",
+            with: {
+                "my:inline/foo": super::with_async::my::inline::foo,
+            },
+            require_store_data_send: true,
+        });
+    }
+
+    mod third {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+                interface foo {
+                    type t = u32;
+                    foo: func() -> t;
+                }
+                interface bar {
+                    use foo.{t};
+                    bar: func() -> t;
+                }
+                interface baz {
+                    use bar.{t};
+                    baz: func() -> t;
+                }
+                world x {
+                    import baz;
+                }
+            ",
+            with: {
+                "my:inline/foo": super::with_async::my::inline::foo,
+                "my:inline/bar": super::without_async::my::inline::bar,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
+mod trappable_error_type_and_versions {
+    struct MyError;
+
+    mod package_no_version_path_no_version {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+                interface i {
+                    enum e { a, b, c }
+                }
+                world foo {}
+            ",
+            trappable_error_type: {
+                "my:inline/i.e" => super::MyError,
+            },
+        });
+    }
+    mod package_version_path_no_version {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline@1.0.0;
+                interface i {
+                    enum e { a, b, c }
+                }
+                world foo {}
+            ",
+            trappable_error_type: {
+                "my:inline/i.e" => super::MyError,
+            },
+        });
+    }
+    mod package_version_path_version {
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline@1.0.0;
+                interface i {
+                    enum e { a, b, c }
+                }
+                world foo {}
+            ",
+            trappable_error_type: {
+                "my:inline/i@1.0.0.e" => super::MyError,
+            },
+        });
+    }
+}
+
+mod paths {
+    mod multiple_paths {
+        wasmtime::component::bindgen!({
+            world: "test:paths/test",
+            inline: r#"
+            package test:paths;
+            world test {
+                import paths:path1/test;
+                export paths:path2/test;
+            }
+            "#,
+            path: ["tests/codegen/path1", "tests/codegen/path2"],
+        });
+    }
+}
+
+mod import_async_interface {
+    pub mod async_interface_implementation {
+        wasmtime::component::bindgen!({
+            world: "test:async-import/blah-impl",
+            inline: r#"
+            package test:async-import;
+
+            interface blah {
+                foo: func();
+            }
+
+            world blah-impl {
+                import blah;
+            }
+
+            world bar {
+                import blah;
+            }
+            "#,
+            imports: { default: async },
+        });
+
+        use test::async_import::blah::Host;
+        struct X;
+
+        impl Host for X {
+            async fn foo(&mut self) {}
+        }
+    }
+
+    mod require_t_send {
+        wasmtime::component::bindgen!({
+            world: "test:async-import/bar",
+            inline: r#"
+            package test:async-import;
+
+            interface blah {
+                foo: func();
+            }
+
+            world blah-impl {
+                import blah;
+            }
+
+            world bar {
+                import blah;
+            }
+            "#,
+            with: {
+                "test:async-import/blah": super::async_interface_implementation::test::async_import::blah,
+            },
+            imports: { default: async },
+        });
+    }
+}
+
+mod anyhow_with_custom_error {
+    wasmtime::component::bindgen!({
+        inline: "
+            package foo:foo;
+
+            interface i {
+                enum error {
+                    a,
+                    b,
+                    c
+                }
+                x: func() -> result<_, error>;
+            }
+
+            world foo {
+                import i;
+            }
+        ",
+        anyhow: true,
+        imports: { default: trappable },
+        trappable_error_type: {
+            "foo:foo/i.error" => MyCustomError,
+        },
+    });
+
+    struct MyCustomError;
+}
+
+mod named_imports {
+
+    mod sync {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface handler {
+                    handle: func(req: u32) -> u32;
+                    ping: func();
+                }
+
+                world the-world {
+                    import handler;
+                }
+            ",
+            named_imports: {
+                "foo:foo/handler": String,
+            },
+        });
+
+        struct MyHost;
+
+        // The normal trait is generated as usual...
+        impl foo::foo::handler::Host for MyHost {
+            fn handle(&mut self, req: u32) -> u32 {
+                req
+            }
+            fn ping(&mut self) {}
+        }
+
+        // ...and the named-imports trait has the extra id parameter.
+        impl named_imports::foo::foo::handler::Host for MyHost {
+            fn handle(&mut self, _id: String, req: u32) -> u32 {
+                req
+            }
+            fn ping(&mut self, _id: String) {}
+        }
+    }
+
+    mod hyphenated_interface_name {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface my-itf {
+                    ping: func();
+                }
+
+                world the-world {
+                    import my-itf;
+                }
+            ",
+            named_imports: {
+                "foo:foo/my-itf": String,
+            },
+        });
+
+        struct MyHost;
+
+        impl named_imports::foo::foo::my_itf::Host for MyHost {
+            fn ping(&mut self, _id: String) {}
+        }
+    }
+
+    mod async_store {
+        #[derive(Clone)]
+        pub struct MyId(u32);
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface handler {
+                    handle: func(req: u32) -> u32;
+                    ping: func();
+                }
+
+                world the-world {
+                    import handler;
+                }
+            ",
+            named_imports: {
+                "foo:foo/handler": MyId,
+            },
+            imports: { default: async | store },
+        });
+    }
+
+    // An interface that defines a resource (with a constructor, a method, and
+    // a static function) reached through a named import. The named-imports
+    // resource trait threads the embedder-chosen id through every method,
+    // including the destructor.
+    mod resources_sync {
+        use wasmtime::component::Resource;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface store {
+                    resource cache {
+                        constructor(label: u32);
+                        get: func(key: u32) -> u32;
+                        set: func(key: u32, value: u32);
+                        merge: static func(a: u32, b: u32) -> u32;
+                    }
+                    touch: func();
+                }
+
+                world the-world {
+                    import store;
+                }
+            ",
+            named_imports: {
+                "foo:foo/store": String,
+            },
+        });
+
+        struct MyHost;
+
+        // The normal resource trait is generated as usual, with no id...
+        impl foo::foo::store::HostCache for MyHost {
+            fn new(&mut self, label: u32) -> Resource<foo::foo::store::Cache> {
+                Resource::new_own(label)
+            }
+            fn get(&mut self, _self_: Resource<foo::foo::store::Cache>, key: u32) -> u32 {
+                key
+            }
+            fn set(&mut self, _self_: Resource<foo::foo::store::Cache>, _key: u32, _value: u32) {}
+            fn merge(&mut self, a: u32, b: u32) -> u32 {
+                a + b
+            }
+            fn drop(&mut self, _rep: Resource<foo::foo::store::Cache>) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+        impl foo::foo::store::Host for MyHost {
+            fn touch(&mut self) {}
+        }
+
+        // ...and the named-imports resource trait has the extra id parameter on
+        // the constructor, methods, the static function, and the destructor.
+        impl named_imports::foo::foo::store::HostCache for MyHost {
+            fn new(&mut self, _id: String, label: u32) -> Resource<foo::foo::store::Cache> {
+                Resource::new_own(label)
+            }
+            fn get(
+                &mut self,
+                _id: String,
+                _self_: Resource<foo::foo::store::Cache>,
+                key: u32,
+            ) -> u32 {
+                key
+            }
+            fn set(
+                &mut self,
+                _id: String,
+                _self_: Resource<foo::foo::store::Cache>,
+                _key: u32,
+                _value: u32,
+            ) {
+            }
+            fn merge(&mut self, _id: String, a: u32, b: u32) -> u32 {
+                a + b
+            }
+            fn drop(
+                &mut self,
+                _id: String,
+                _rep: Resource<foo::foo::store::Cache>,
+            ) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+        impl named_imports::foo::foo::store::Host for MyHost {
+            fn touch(&mut self, _id: String) {}
+        }
+    }
+
+    // Compile-only coverage that resources also generate correctly through the
+    // async/concurrent (store) path of named imports, which uses the
+    // `*WithStore` resource trait variants and the concurrent destructor.
+    mod resources_async_store {
+        #[derive(Clone)]
+        pub struct MyId(u32);
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface store {
+                    resource cache {
+                        constructor(label: u32);
+                        get: func(key: u32) -> u32;
+                    }
+                }
+
+                world the-world {
+                    import store;
+                }
+            ",
+            named_imports: {
+                "foo:foo/store": MyId,
+            },
+            imports: { default: async | store },
+        });
+    }
+
+    mod trappable_errors {
+        use wasmtime::component::Resource;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:foo;
+
+                interface store {
+                    variant error {
+                        not-found,
+                    }
+
+                    resource cache {
+                        get: func(key: u32) -> result<u32, error>;
+                    }
+                }
+
+                world the-world {
+                    import store;
+                }
+            ",
+            imports: { default: trappable },
+            named_imports: {
+                "foo:foo/store": String,
+            },
+            trappable_error_type: {
+                "foo:foo/store.error" => MyError,
+            },
+        });
+
+        pub struct MyError;
+
+        struct MyHost;
+
+        impl named_imports::foo::foo::store::HostCache for MyHost {
+            fn get(
+                &mut self,
+                _id: String,
+                _self_: Resource<foo::foo::store::Cache>,
+                key: u32,
+            ) -> Result<u32, MyError> {
+                Ok(key)
+            }
+            fn drop(
+                &mut self,
+                _id: String,
+                _rep: Resource<foo::foo::store::Cache>,
+            ) -> wasmtime::Result<()> {
+                Ok(())
+            }
+        }
+        impl named_imports::foo::foo::store::Host for MyHost {
+            fn convert_error(&mut self, _err: MyError) -> wasmtime::Result<foo::foo::store::Error> {
+                Ok(foo::foo::store::Error::NotFound)
+            }
+        }
+    }
+
+    mod trappable2 {
+        pub struct ErrorA;
+        pub struct ErrorB;
+        wasmtime::component::bindgen!({
+            inline: "
+                package test:collision;
+                interface a { enum error { failed } }
+                interface b { enum error { failed } }
+                interface combined {
+                    use a.{error as error-a};
+                    use b.{error as error-b};
+                    first: func() -> result<_, error-a>;
+                    second: func() -> result<_, error-b>;
+                }
+                world test { import combined; }
+            ",
+            imports: { default: trappable },
+            named_imports: { "test:collision/combined": usize },
+            trappable_error_type: {
+                "test:collision/a.error" => ErrorA,
+                "test:collision/b.error" => ErrorB,
+            },
+        });
+    }
+
+    // An unversioned key applies to every imported version of the interface.
+    mod unversioned_key_multiple_versions {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:root;
+
+                package foo:foo@0.1.0 {
+                    interface store {
+                        get: func() -> u32;
+                    }
+                }
+
+                package foo:foo@0.2.0 {
+                    interface store {
+                        get: func() -> u32;
+                        put: func(v: u32);
+                    }
+                }
+
+                world the-world {
+                    import a: foo:foo/store@0.1.0;
+                    import b: foo:foo/store@0.2.0;
+                }
+            ",
+            named_imports: {
+                "foo:foo/store": u32,
+            },
+        });
+
+        struct MyHost;
+
+        impl named_imports::foo::foo0_1_0::store::Host for MyHost {
+            fn get(&mut self, id: u32) -> u32 {
+                id
+            }
+        }
+
+        impl named_imports::foo::foo0_2_0::store::Host for MyHost {
+            fn get(&mut self, id: u32) -> u32 {
+                id
+            }
+            fn put(&mut self, _id: u32, _v: u32) {}
+        }
+    }
+
+    // A versioned key takes precedence over an unversioned one.
+    mod versioned_key_precedence {
+        wasmtime::component::bindgen!({
+            inline: "
+                package foo:root;
+
+                package foo:foo@0.1.0 {
+                    interface store {
+                        get: func() -> u32;
+                    }
+                }
+
+                package foo:foo@0.2.0 {
+                    interface store {
+                        get: func() -> u32;
+                    }
+                }
+
+                world the-world {
+                    import foo:foo/store@0.1.0;
+                    import foo:foo/store@0.2.0;
+                }
+            ",
+            named_imports: {
+                "foo:foo/store": u32,
+                "foo:foo/store@0.2.0": String,
+            },
+        });
+
+        struct MyHost;
+
+        impl named_imports::foo::foo0_1_0::store::Host for MyHost {
+            fn get(&mut self, id: u32) -> u32 {
+                id
+            }
+        }
+
+        impl named_imports::foo::foo0_2_0::store::Host for MyHost {
+            fn get(&mut self, id: String) -> u32 {
+                id.len() as u32
+            }
+        }
+    }
+}
+
+mod include_component_type {
+    wasmtime::component::bindgen!({
+        inline: "
+            package demo:pkg;
+
+            interface host {
+                greet: func(name: string) -> string;
+            }
+
+            world component-type-world {
+                import host;
+                export run: func() -> u32;
+            }
+        ",
+        include_component_type: true,
+    });
+
+    #[test]
+    fn component_type_decodes() {
+        let (resolve, world) = wit_parser::decoding::decode_world(COMPONENT_TYPE).unwrap();
+        let world = &resolve.worlds[world];
+        assert_eq!(world.name, "component-type-world");
+        assert_eq!(world.imports.len(), 1);
+        assert_eq!(world.exports.len(), 1);
+    }
+}
+
+mod map_type {
+    mod default {
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        use wasmtime::{Result, Store};
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+
+                interface maps {
+                    type names-by-id = map<u32, string>;
+
+                    record entry {
+                        label: string,
+                        values: map<string, u32>,
+                    }
+
+                    named: func(a: names-by-id) -> names-by-id;
+                    anonymous: func(a: map<string, list<u8>>) -> map<string, u32>;
+                    record-roundtrip: func(a: entry) -> entry;
+                }
+
+                world maps-world {
+                    import maps;
+                    export maps;
+                }
+            ",
+            // Maps are `BTreeMap`s by default, which implement these traits,
+            // so they can be derived for records containing maps.
+            additional_derives: [Hash, PartialEq, Eq, PartialOrd, Ord],
+        });
+
+        use my::inline::maps::{Entry, Host, NamesById};
+
+        struct X;
+
+        impl Host for X {
+            fn named(&mut self, a: NamesById) -> BTreeMap<u32, String> {
+                a
+            }
+
+            fn anonymous(&mut self, a: BTreeMap<String, Vec<u8>>) -> BTreeMap<String, u32> {
+                a.into_iter()
+                    .map(|(k, v)| (k, u32::try_from(v.len()).unwrap()))
+                    .collect()
+            }
+
+            fn record_roundtrip(&mut self, a: Entry) -> Entry {
+                let _ = BTreeSet::from([a.clone()]);
+                let _ = HashSet::from([a.clone()]);
+                a
+            }
+        }
+
+        fn call_exports(store: &mut Store<()>, bindings: &MapsWorld) -> Result<()> {
+            let maps = bindings.my_inline_maps();
+            let _: BTreeMap<u32, String> = maps.call_named(&mut *store, &BTreeMap::new())?;
+            let entry = exports::my::inline::maps::Entry {
+                label: String::new(),
+                values: BTreeMap::new(),
+            };
+            let _ = maps.call_record_roundtrip(&mut *store, &entry)?;
+            Ok(())
+        }
+    }
+
+    mod custom_hasher {
+        use std::collections::HashMap;
+        use std::hash::{BuildHasherDefault, DefaultHasher};
+
+        pub type CustomMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                package my:inline;
+
+                interface maps {
+                    named: func(a: map<u32, string>) -> map<string, u32>;
+                }
+
+                world maps-world {
+                    import maps;
+                }
+            ",
+            map_type: crate::map_type::custom_hasher::CustomMap,
+        });
+
+        struct X;
+
+        impl my::inline::maps::Host for X {
+            fn named(&mut self, a: CustomMap<u32, String>) -> CustomMap<String, u32> {
+                a.into_iter().map(|(k, v)| (v, k)).collect()
+            }
+        }
+    }
+}

@@ -1,0 +1,81 @@
+name: 'Build docker image'
+description: 'Build docker image'
+
+inputs:
+  context:
+    description: 'Context argument'
+    required: true
+  file:
+    description: 'Docker file'
+    required: true
+  cache_key_prefix:
+    description: 'Cache key prefix'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Pre-pull the buildkit image that the `docker-container` driver below boots
+    # into. Booting the builder in `setup-buildx-action` pulls this image from
+    # Docker Hub, which is flaky enough to spuriously fail CI, and that action
+    # has no retry option. Pull it here with retries so that the boot below
+    # finds the image already present locally and doesn't need to hit the
+    # network. Note that `driver-opts` below is used to ensure that the two
+    # images in these steps are the same.
+    - name: Pull buildkit image
+      shell: bash
+      run: |
+        for attempt in 1 2 3 4 5; do
+          [ "$attempt" = "5" ] && exit 1
+          docker pull moby/buildkit:buildx-stable-1 && break
+          sleep 5
+        done
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+      with:
+        driver-opts: image=moby/buildkit:buildx-stable-1
+
+    # We'll be using this cache key and the "local" caching mode of docker. This
+    # allows pretty fine-grained views into what's being cache. Experimentation
+    # found that the default `gha` caching mode sprays quite a lot into the
+    # cache such that everything keeps getting evicted for being over the size
+    # limit, so this is the next-best attempt to do something a bit more
+    # targeted.
+    - name: Setup Github Actions cache
+      uses: actions/cache/restore@v5
+      id: cache-restore
+      with:
+        path: ${{ runner.tool_cache }}/docker-buildx-cache
+        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles(inputs.file) }}
+
+    # Note that this is a hand-rolled `docker buildx build` instead of
+    # `docker/build-push-action` to enable retrying the build. Fetching base
+    # images from Docker Hub is flaky enough that an unretried build fails
+    # CI from time to time, and the action itself has no retry option.
+    - name: Build docker image
+      shell: bash
+      run: |
+        for attempt in 1 2 3 4 5; do
+          [ "$attempt" = "5" ] && exit 1
+          docker buildx build \
+            --file ${{ inputs.file }} \
+            --tag build-image \
+            --cache-from type=local,src=${{ runner.tool_cache }}/docker-buildx-cache \
+            --cache-to type=local,dest=${{ runner.tool_cache }}/docker-buildx-cache \
+            --load \
+            ${{ inputs.context }} && break
+          sleep 5
+        done
+
+    # Only save caches on the `main` branch since these docker images are
+    # relatively large. This means that caches aren't filled through the merge
+    # queue nor through PRs, but instead only through the `main` branch. PRs and
+    # the merge queue will pull from the `main` branch cache, but only after a
+    # ~1 day delay after merging a change because the `main` branch CI runs only
+    # nightly to prime the caches.
+    - name: Save Github Actions cache
+      uses: actions/cache/save@v5
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: ${{ runner.tool_cache }}/docker-buildx-cache
+        key: ${{ steps.cache-restore.outputs.cache-primary-key }}

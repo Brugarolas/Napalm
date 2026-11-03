@@ -1,0 +1,23 @@
+name: 'Fetch run id for commit'
+description: 'Fetch the main.yml run id for the current commit'
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch run id
+      shell: bash
+      run: |
+        run_id=$(
+          gh api -X GET \
+              /repos/${{ github.repository }}/actions/workflows/main.yml/runs \
+              -f head_sha=${{ github.sha }} \
+              -f status=success \
+              --jq '.workflow_runs[0].id // empty'
+        )
+        if [ -z "$run_id" ]; then
+          echo "no successful main.yml run found for ${{ github.sha }}"
+          exit 1
+        fi
+        echo COMMIT_RUN_ID=${run_id} >> "$GITHUB_ENV"
+      env:
+        GH_TOKEN: ${{ github.token }}

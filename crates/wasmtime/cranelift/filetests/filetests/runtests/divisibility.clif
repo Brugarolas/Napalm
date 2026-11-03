@@ -1,0 +1,191 @@
+;; Tests for the `x % d == 0` / `x % d != 0` fold, which must agree with
+;; actually computing the remainder for every value of `x` and every `d`.
+;;
+;; Signed tests cover both signs of the dividend, and both odd and even
+;; divisors, since those take different paths through the fold.
+test interpret
+test run
+target aarch64
+target s390x
+target x86_64
+target riscv64
+target riscv64 has_c has_zcb
+target pulley32
+target pulley32be
+target pulley64
+target pulley64be
+
+set opt_level=speed
+target aarch64
+target s390x
+target x86_64
+target riscv64
+target riscv64 has_c has_zcb
+target pulley32
+target pulley32be
+target pulley64
+target pulley64be
+
+function %is_multiple_of_7_u32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_7_u32(0) == 1
+; run: %is_multiple_of_7_u32(1) == 0
+; run: %is_multiple_of_7_u32(7) == 1
+; run: %is_multiple_of_7_u32(14) == 1
+; run: %is_multiple_of_7_u32(7000) == 1
+; run: %is_multiple_of_7_u32(7001) == 0
+; run: %is_multiple_of_7_u32(0xFFFFFFFE) == 0
+; run: %is_multiple_of_7_u32(0xFFFFFFFF) == 0
+; run: %is_multiple_of_7_u32(0x24924925) == 0
+; run: %is_multiple_of_7_u32(0x99999999) == 0
+; run: %is_multiple_of_7_u32(0x80000000) == 0
+
+function %is_not_multiple_of_7_u32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp ne v2, v3
+    return v4
+}
+; run: %is_not_multiple_of_7_u32(0) == 0
+; run: %is_not_multiple_of_7_u32(1) == 1
+; run: %is_not_multiple_of_7_u32(7) == 0
+; run: %is_not_multiple_of_7_u32(7001) == 1
+; run: %is_not_multiple_of_7_u32(0xFFFFFFFF) == 1
+; run: %is_not_multiple_of_7_u32(0x80000000) == 1
+
+;; An even divisor needs the low bits of the dividend to be zero as well.
+function %is_multiple_of_6_u32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 6
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_6_u32(0) == 1
+; run: %is_multiple_of_6_u32(3) == 0
+; run: %is_multiple_of_6_u32(6) == 1
+; run: %is_multiple_of_6_u32(8) == 0
+; run: %is_multiple_of_6_u32(12) == 1
+; run: %is_multiple_of_6_u32(6000) == 1
+; run: %is_multiple_of_6_u32(6002) == 0
+; run: %is_multiple_of_6_u32(0xFFFFFFFE) == 0
+; run: %is_multiple_of_6_u32(0x80000000) == 0
+
+function %is_multiple_of_1024_u32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 1024
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_1024_u32(0) == 1
+; run: %is_multiple_of_1024_u32(1024) == 1
+; run: %is_multiple_of_1024_u32(1023) == 0
+; run: %is_multiple_of_1024_u32(0x40000000) == 1
+; run: %is_multiple_of_1024_u32(0x40000400) == 1
+
+function %is_multiple_of_7_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = srem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_7_i32(0) == 1
+; run: %is_multiple_of_7_i32(7) == 1
+; run: %is_multiple_of_7_i32(-7) == 1
+; run: %is_multiple_of_7_i32(7000) == 1
+; run: %is_multiple_of_7_i32(-7000) == 1
+; run: %is_multiple_of_7_i32(8) == 0
+; run: %is_multiple_of_7_i32(-8) == 0
+; run: %is_multiple_of_7_i32(0x7FFFFFFF) == 0
+; run: %is_multiple_of_7_i32(0x80000000) == 0
+; run: %is_multiple_of_7_i32(0x80000005) == 0
+; run: %is_multiple_of_7_i32(0xFFFFFFF9) == 1
+
+function %is_multiple_of_6_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 6
+    v2 = srem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_6_i32(0) == 1
+; run: %is_multiple_of_6_i32(6) == 1
+; run: %is_multiple_of_6_i32(-6) == 1
+; run: %is_multiple_of_6_i32(12) == 1
+; run: %is_multiple_of_6_i32(-12) == 1
+; run: %is_multiple_of_6_i32(2) == 0
+; run: %is_multiple_of_6_i32(-2) == 0
+; run: %is_multiple_of_6_i32(0x7FFFFFFF) == 0
+; run: %is_multiple_of_6_i32(0x80000000) == 0
+; run: %is_multiple_of_6_i32(0xFFFFFFFA) == 1
+
+function %is_multiple_of_7_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 7
+    v2 = srem v0, v1
+    v3 = iconst.i64 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_7_i64(0) == 1
+; run: %is_multiple_of_7_i64(7) == 1
+; run: %is_multiple_of_7_i64(-7) == 1
+; run: %is_multiple_of_7_i64(0x1000000000000000) == 0
+; run: %is_multiple_of_7_i64(0x1000000000000005) == 0
+; run: %is_multiple_of_7_i64(0x7FFFFFFFFFFFFFFF) == 1
+; run: %is_multiple_of_7_i64(0x8000000000000000) == 0
+
+function %is_multiple_of_6_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 6
+    v2 = srem v0, v1
+    v3 = iconst.i64 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_6_i64(0) == 1
+; run: %is_multiple_of_6_i64(6) == 1
+; run: %is_multiple_of_6_i64(-6) == 1
+; run: %is_multiple_of_6_i64(0x7FFFFFFFFFFFFFFE) == 1
+; run: %is_multiple_of_6_i64(0x8000000000000000) == 0
+
+function %is_multiple_of_7_u16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 7
+    v2 = urem v0, v1
+    v3 = iconst.i16 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_7_u16(0) == 1
+; run: %is_multiple_of_7_u16(7) == 1
+; run: %is_multiple_of_7_u16(8) == 0
+; run: %is_multiple_of_7_u16(0xFFFF) == 0
+
+function %is_multiple_of_7_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 7
+    v2 = srem v0, v1
+    v3 = iconst.i16 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+; run: %is_multiple_of_7_i16(0) == 1
+; run: %is_multiple_of_7_i16(7) == 1
+; run: %is_multiple_of_7_i16(-7) == 1
+; run: %is_multiple_of_7_i16(8) == 0
+; run: %is_multiple_of_7_i16(-8) == 0

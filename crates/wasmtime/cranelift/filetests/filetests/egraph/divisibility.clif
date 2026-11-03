@@ -1,0 +1,262 @@
+test optimize precise-output
+set opt_level=speed
+target x86_64
+
+;; The remainder of a division by a constant is not needed when we only want to
+;; know whether the dividend is a multiple of that constant.
+
+function %u32_multiple_of_7_eq(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %u32_multiple_of_7_eq(i32) -> i8 fast {
+; block0(v0: i32):
+;     v17 = iconst.i32 -1227133513
+;     v18 = imul v0, v17  ; v17 = -1227133513
+;     v19 = iconst.i32 0x2492_4924
+;     v20 = icmp ule v18, v19  ; v19 = 0x2492_4924
+;     return v20
+; }
+
+function %u32_multiple_of_7_ne(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp ne v2, v3
+    return v4
+}
+
+; function %u32_multiple_of_7_ne(i32) -> i8 fast {
+; block0(v0: i32):
+;     v17 = iconst.i32 -1227133513
+;     v18 = imul v0, v17  ; v17 = -1227133513
+;     v19 = iconst.i32 0x2492_4924
+;     v20 = icmp ugt v18, v19  ; v19 = 0x2492_4924
+;     return v20
+; }
+
+function %u32_multiple_of_6_eq(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 6
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %u32_multiple_of_6_eq(i32) -> i8 fast {
+; block0(v0: i32):
+;     v5 = iconst.i32 -1431655765
+;     v13 = imul v0, v5  ; v5 = -1431655765
+;     v14 = iconst.i32 1
+;     v15 = rotr v13, v14  ; v14 = 1
+;     v16 = iconst.i32 0x2aaa_aaaa
+;     v17 = icmp ule v15, v16  ; v16 = 0x2aaa_aaaa
+;     return v17
+; }
+
+function %u64_multiple_of_7_eq(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 7
+    v2 = urem v0, v1
+    v3 = iconst.i64 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %u64_multiple_of_7_eq(i64) -> i8 fast {
+; block0(v0: i64):
+;     v17 = iconst.i64 0x6db6_db6d_b6db_6db7
+;     v18 = imul v0, v17  ; v17 = 0x6db6_db6d_b6db_6db7
+;     v19 = iconst.i64 0x2492_4924_9249_2492
+;     v20 = icmp ule v18, v19  ; v19 = 0x2492_4924_9249_2492
+;     return v20
+; }
+
+function %s32_multiple_of_7_eq(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = srem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %s32_multiple_of_7_eq(i32) -> i8 fast {
+; block0(v0: i32):
+;     v17 = iconst.i32 -1227133513
+;     v18 = imul v0, v17  ; v17 = -1227133513
+;     v19 = iconst.i32 0x1249_2492
+;     v20 = iadd v18, v19  ; v19 = 0x1249_2492
+;     v21 = iconst.i32 0x2492_4924
+;     v22 = icmp ule v20, v21  ; v21 = 0x2492_4924
+;     return v22
+; }
+
+function %s32_multiple_of_6_eq(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 6
+    v2 = srem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %s32_multiple_of_6_eq(i32) -> i8 fast {
+; block0(v0: i32):
+;     v16 = iconst.i32 -1431655765
+;     v17 = imul v0, v16  ; v16 = -1431655765
+;     v18 = iconst.i32 0x2aaa_aaaa
+;     v19 = iadd v17, v18  ; v18 = 0x2aaa_aaaa
+;     v22 = iconst.i32 0x5555_5554
+;     v23 = icmp ule v19, v22  ; v22 = 0x5555_5554
+;     v20 = iconst.i32 1
+;     v21 = band v0, v20  ; v20 = 1
+;     v7 = iconst.i32 0
+;     v24 = icmp eq v21, v7  ; v7 = 0
+;     v25 = band v23, v24
+;     return v25
+; }
+
+function %s64_multiple_of_7_eq(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 7
+    v2 = srem v0, v1
+    v3 = iconst.i64 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %s64_multiple_of_7_eq(i64) -> i8 fast {
+; block0(v0: i64):
+;     v16 = iconst.i64 0x6db6_db6d_b6db_6db7
+;     v17 = imul v0, v16  ; v16 = 0x6db6_db6d_b6db_6db7
+;     v18 = iconst.i64 0x1249_2492_4924_9249
+;     v19 = iadd v17, v18  ; v18 = 0x1249_2492_4924_9249
+;     v20 = iconst.i64 0x2492_4924_9249_2492
+;     v21 = icmp ule v19, v20  ; v20 = 0x2492_4924_9249_2492
+;     return v21
+; }
+
+function %u16_multiple_of_7_eq(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 7
+    v2 = urem v0, v1
+    v3 = iconst.i16 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %u16_multiple_of_7_eq(i16) -> i8 fast {
+; block0(v0: i16):
+;     v5 = uextend.i32 v0
+;     v6 = iconst.i32 -1227133513
+;     v7 = imul v5, v6  ; v6 = -1227133513
+;     v8 = iconst.i32 0x2492_4924
+;     v9 = icmp ule v7, v8  ; v8 = 0x2492_4924
+;     return v9
+; }
+
+function %s16_multiple_of_7_eq(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 7
+    v2 = srem v0, v1
+    v3 = iconst.i16 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %s16_multiple_of_7_eq(i16) -> i8 fast {
+; block0(v0: i16):
+;     v5 = sextend.i32 v0
+;     v6 = iconst.i32 -1227133513
+;     v7 = imul v5, v6  ; v6 = -1227133513
+;     v8 = iconst.i32 0x1249_2492
+;     v9 = iadd v7, v8  ; v8 = 0x1249_2492
+;     v10 = iconst.i32 0x2492_4924
+;     v11 = icmp ule v9, v10  ; v10 = 0x2492_4924
+;     return v11
+; }
+
+;; A power-of-two divisor is already a mask and a test.
+
+function %u32_multiple_of_8_eq(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 8
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp eq v2, v3
+    return v4
+}
+
+; function %u32_multiple_of_8_eq(i32) -> i8 fast {
+; block0(v0: i32):
+;     v5 = iconst.i32 7
+;     v6 = band v0, v5  ; v5 = 7
+;     v3 = iconst.i32 0
+;     v4 = icmp eq v6, v3  ; v3 = 0
+;     return v4
+; }
+
+;; Only equality and inequality test divisibility; the ordering predicates must
+;; be left alone (and must not reach the div-const helpers).
+
+function %u32_multiple_of_7_slt(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = urem v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp slt v2, v3
+    return v4
+}
+
+; function %u32_multiple_of_7_slt(i32) -> i8 fast {
+; block0(v0: i32):
+;     v5 = iconst.i32 0x2492_4925
+;     v6 = umulhi v0, v5  ; v5 = 0x2492_4925
+;     v7 = isub v0, v6
+;     v8 = iconst.i32 1
+;     v9 = ushr v7, v8  ; v8 = 1
+;     v10 = iadd v6, v9
+;     v11 = iconst.i32 2
+;     v12 = ushr v10, v11  ; v11 = 2
+;     v1 = iconst.i32 7
+;     v13 = imul v12, v1  ; v1 = 7
+;     v14 = isub v0, v13
+;     v3 = iconst.i32 0
+;     v4 = icmp slt v14, v3  ; v3 = 0
+;     return v4
+; }
+
+function %s64_multiple_of_7_sge(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 7
+    v2 = srem v0, v1
+    v3 = iconst.i64 0
+    v4 = icmp sge v2, v3
+    return v4
+}
+
+; function %s64_multiple_of_7_sge(i64) -> i8 fast {
+; block0(v0: i64):
+;     v5 = iconst.i64 0x4924_9249_2492_4925
+;     v6 = smulhi v0, v5  ; v5 = 0x4924_9249_2492_4925
+;     v7 = iconst.i64 1
+;     v8 = sshr v6, v7  ; v7 = 1
+;     v9 = iconst.i64 63
+;     v10 = ushr v8, v9  ; v9 = 63
+;     v11 = iadd v8, v10
+;     v1 = iconst.i64 7
+;     v12 = imul v11, v1  ; v1 = 7
+;     v13 = isub v0, v12
+;     v3 = iconst.i64 0
+;     v4 = icmp sge v13, v3  ; v3 = 0
+;     return v4
+; }
+

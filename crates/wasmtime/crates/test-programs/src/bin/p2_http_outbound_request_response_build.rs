@@ -1,0 +1,90 @@
+use test_programs::wasi::http::types as http_types;
+
+fn main() {
+    println!("Called _start");
+    {
+        let headers = http_types::Headers::from_list(&[(
+            "Content-Type".to_string(),
+            "application/json".to_string().into_bytes(),
+        )])
+        .unwrap();
+        let request = http_types::OutgoingRequest::new(headers);
+
+        request
+            .set_method(&http_types::Method::Get)
+            .expect("setting method");
+        request
+            .set_scheme(Some(&http_types::Scheme::Https))
+            .expect("setting scheme");
+        request
+            .set_authority(Some("www.example.com"))
+            .expect("setting authority");
+
+        let outgoing_body = request.body().unwrap();
+        let request_body = outgoing_body.write().unwrap();
+        request_body
+            .blocking_write_and_flush("request-body".as_bytes())
+            .unwrap();
+    }
+    {
+        let headers = http_types::Headers::from_list(&[(
+            "Content-Type".to_string(),
+            "application/text".to_string().into_bytes(),
+        )])
+        .unwrap();
+        let response = http_types::OutgoingResponse::new(headers);
+        let outgoing_body = response.body().unwrap();
+        let response_body = outgoing_body.write().unwrap();
+        response_body
+            .blocking_write_and_flush("response-body".as_bytes())
+            .unwrap();
+    }
+
+    {
+        let req = http_types::OutgoingRequest::new(http_types::Fields::new());
+
+        assert!(
+            req.set_method(&http_types::Method::Other("invalid method".to_string()))
+                .is_err()
+        );
+
+        assert!(req.set_authority(Some("bad-\nhost")).is_err());
+        // IPv6 addresses with and without a port should be allowed
+        assert!(req.set_authority(Some("[::]:443")).is_ok());
+        assert!(req.set_authority(Some("[::]")).is_ok());
+        // RFC 9110 forbids sending a userinfo subcomponent, which would
+        // otherwise end up verbatim in the `Host` header.
+        assert!(req.set_authority(Some("user@example.com")).is_err());
+        assert!(
+            req.set_authority(Some("user:pass@example.com:443"))
+                .is_err()
+        );
+        assert!(req.set_authority(Some("user@[::1]:443")).is_err());
+
+        assert!(
+            req.set_scheme(Some(&http_types::Scheme::Other("bad\nscheme".to_string())))
+                .is_err()
+        );
+
+        assert!(req.set_path_with_query(Some("/bad\npath")).is_err());
+        // With an authority, RFC 3986 requires the path to be empty or start
+        // with `/`, optionally followed by a query.
+        assert!(
+            req.set_path_with_query(Some("http://other.example/x"))
+                .is_err()
+        );
+        assert!(
+            req.set_path_with_query(Some("https://other.example:8443/"))
+                .is_err()
+        );
+        assert!(req.set_path_with_query(Some("other.example/x")).is_err());
+        assert!(req.set_path_with_query(Some("*")).is_err());
+        assert!(req.set_path_with_query(Some("")).is_ok());
+        assert!(req.set_path_with_query(Some("/")).is_ok());
+        assert!(req.set_path_with_query(Some("/a?b=c")).is_ok());
+        assert!(req.set_path_with_query(Some("?a")).is_ok());
+        assert!(req.set_path_with_query(Some("//a/b")).is_ok());
+    }
+
+    println!("Done");
+}
