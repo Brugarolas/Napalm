@@ -1805,14 +1805,49 @@ struct ReactiveObserverKey {
     callback: HeapIdentity,
 }
 
+#[derive(Debug, Default)]
+struct ReactiveFieldDepState {
+    version: u64,
+    subscribers: SmallVec<[ReactiveObserverKey; 4]>,
+}
+
+#[derive(Debug)]
+struct ReactiveSourceDepState {
+    /// Generation-checked owner of this sidecar slot. Heap handles may be reused
+    /// after collection, so handle indexing alone is insufficient.
+    source: HeapIdentity,
+    /// Fixed-layout instance fields use their physical slot as a dense index.
+    instance_fields: Vec<Option<ReactiveFieldDepState>>,
+    /// Class objects use the same source-handle table but keep static slots in a
+    /// separate dense bank so instance/static namespaces cannot alias.
+    static_fields: Vec<Option<ReactiveFieldDepState>>,
+}
+
+impl ReactiveSourceDepState {
+    #[inline]
+    fn new(source: HeapIdentity) -> Self {
+        Self {
+            source,
+            instance_fields: Vec::new(),
+            static_fields: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ReactiveFrame {
     observer: ReactiveObserverKey,
     dependencies: SmallVec<[ReactiveDependency; 8]>,
+    /// Version observed for each dependency at its most recent read in this run.
+    /// This is Vue's Link.version idea without allocating one Link per edge.
+    dependency_versions: SmallVec<[u64; 8]>,
 }
 
 #[derive(Debug)]
 struct ReactiveComputedState {
+    /// Stable handle+generation of the callback owning this slot. The outer
+    /// reactive_computed table is indexed directly by heap handle.
+    callback: HeapIdentity,
     initialized: bool,
     dirty: bool,
     evaluating: bool,
@@ -1829,6 +1864,12 @@ struct ReactiveComputedState {
     /// when an upstream computed was invalidated but later re-evaluated to the
     /// same value.
     value_version: u64,
+    /// Direct subscribers of this computed output. Vue 3.5 keeps a Dep directly
+    /// on each computed instead of routing computed-to-computed edges through a
+    /// global target map. Keeping these edges here removes hash lookups from deep
+    /// chains and multi-level graphs.
+    subscribers: SmallVec<[ReactiveObserverKey; 4]>,
+    /// Dependency links captured by the most recent successful evaluation.
     dependencies: SmallVec<[ReactiveDependency; 8]>,
     dependency_versions: SmallVec<[u64; 8]>,
 }
@@ -3028,11 +3069,17 @@ fn fiber_state_external_bytes(state: &FiberState) -> usize {
         + state.registers.capacity() * std::mem::size_of::<RegisterWord>()
         + state.reactive_stack.capacity() * std::mem::size_of::<ReactiveFrame>()
         + state.reactive_stack.iter().map(|frame| {
-            if frame.dependencies.spilled() {
+            let dependency_bytes = if frame.dependencies.spilled() {
                 frame.dependencies.capacity() * std::mem::size_of::<ReactiveDependency>()
             } else {
                 0
-            }
+            };
+            let version_bytes = if frame.dependency_versions.spilled() {
+                frame.dependency_versions.capacity() * std::mem::size_of::<u64>()
+            } else {
+                0
+            };
+            dependency_bytes + version_bytes
         }).sum::<usize>()
 }
 
@@ -6786,11 +6833,17 @@ pub struct Interpreter<'p> {
     /// JIT fast paths. Registration invalidates old field-specialized traces once.
     reactive_enabled: bool,
     reactive_tracking_active: bool,
-    reactive_dependents: FastMap<ReactiveDependency, SmallVec<[ReactiveObserverKey; 4]>>,
-    /// Monotonic versions for ordinary reactive fields. Computed outputs keep
-    /// their own value_version in ReactiveComputedState.
-    reactive_versions: FastMap<ReactiveDependency, u64>,
-    reactive_computed: FastMap<HeapIdentity, ReactiveComputedState>,
+    /// The synthesized computed getter can return its hidden GC-anchor field
+    /// directly after __beginComputed/__abortComputed. This one-shot flag keeps
+    /// that implementation detail out of the parent's dependency graph.
+    reactive_skip_next_field_track: bool,
+    /// Dense per-source reactive sidecars. Heap handles select the source table
+    /// and fixed class/static field slots select the Dep directly, eliminating the
+    /// WeakMap/Map-style hashing that a dynamic JS runtime such as Vue requires.
+    reactive_field_sources: Vec<Option<ReactiveSourceDepState>>,
+    /// Direct callback-handle indexed computed table. Heap generation validation
+    /// makes recycled handles safe while avoiding a hash lookup on every getter.
+    reactive_computed: Vec<Option<ReactiveComputedState>>,
     reactive_watchers: FastMap<HeapIdentity, ReactiveWatcherState>,
     /// Watcher notifications are coalesced into one microtask per turn. The
     /// Values live here (rather than only as HeapIdentity keys) so queued watcher
@@ -7268,9 +7321,9 @@ impl<'p> Interpreter<'p> {
             native_decorator_wrappers: Vec::new(),
             reactive_enabled,
             reactive_tracking_active: false,
-            reactive_dependents: FastMap::default(),
-            reactive_versions: FastMap::default(),
-            reactive_computed: FastMap::default(),
+            reactive_skip_next_field_track: false,
+            reactive_field_sources: Vec::new(),
+            reactive_computed: Vec::new(),
             reactive_watchers: FastMap::default(),
             reactive_pending_watchers: VecDeque::new(),
             reactive_flush_scheduled: false,
@@ -9064,6 +9117,7 @@ impl<'p> Interpreter<'p> {
             task_state.reactive_stack.push(ReactiveFrame {
                 observer,
                 dependencies: SmallVec::new(),
+                dependency_versions: SmallVec::new(),
             });
         }
         let task = Arc::new(FiberCell::new(task_state));
@@ -11006,13 +11060,146 @@ impl<'p> Interpreter<'p> {
         Ok(function)
     }
 
+    #[inline(always)]
+    fn reactive_computed_state(&self, identity: HeapIdentity) -> Option<&ReactiveComputedState> {
+        self.reactive_computed
+            .get(identity.handle as usize)
+            .and_then(Option::as_ref)
+            .filter(|state| state.callback == identity)
+    }
+
+    #[inline(always)]
+    fn reactive_computed_state_mut(&mut self, identity: HeapIdentity) -> Option<&mut ReactiveComputedState> {
+        self.reactive_computed
+            .get_mut(identity.handle as usize)
+            .and_then(Option::as_mut)
+            .filter(|state| state.callback == identity)
+    }
+
+    #[inline(always)]
+    fn reactive_computed_contains(&self, identity: HeapIdentity) -> bool {
+        self.reactive_computed_state(identity).is_some()
+    }
+
+    #[inline(always)]
+    fn reactive_source_state(&self, source: HeapIdentity) -> Option<&ReactiveSourceDepState> {
+        self.reactive_field_sources
+            .get(source.handle as usize)
+            .and_then(Option::as_ref)
+            .filter(|state| state.source == source)
+    }
+
+    #[inline(always)]
+    fn reactive_source_state_mut(
+        &mut self,
+        source: HeapIdentity,
+    ) -> Option<&mut ReactiveSourceDepState> {
+        self.reactive_field_sources
+            .get_mut(source.handle as usize)
+            .and_then(Option::as_mut)
+            .filter(|state| state.source == source)
+    }
+
+    #[inline]
+    fn reactive_ensure_source_state(
+        &mut self,
+        source: HeapIdentity,
+    ) -> &mut ReactiveSourceDepState {
+        let index = source.handle as usize;
+        if self.reactive_field_sources.len() <= index {
+            self.reactive_field_sources.resize_with(index + 1, || None);
+        }
+        let replace = self.reactive_field_sources[index]
+            .as_ref()
+            .is_none_or(|state| state.source != source);
+        if replace {
+            self.reactive_field_sources[index] = Some(ReactiveSourceDepState::new(source));
+        }
+        self.reactive_field_sources[index]
+            .as_mut()
+            .expect("reactive source sidecar disappeared")
+    }
+
+    #[inline(always)]
+    fn reactive_field_dep_state(
+        &self,
+        dependency: ReactiveDependency,
+    ) -> Option<&ReactiveFieldDepState> {
+        debug_assert!(dependency.kind != ReactiveSourceKind::Computed);
+        let state = self.reactive_source_state(dependency.source)?;
+        let bank = match dependency.kind {
+            ReactiveSourceKind::InstanceField => &state.instance_fields,
+            ReactiveSourceKind::StaticField => &state.static_fields,
+            ReactiveSourceKind::Computed => unreachable!(),
+        };
+        bank.get(dependency.slot as usize).and_then(Option::as_ref)
+    }
+
+    #[inline(always)]
+    fn reactive_field_dep_state_mut(
+        &mut self,
+        dependency: ReactiveDependency,
+    ) -> Option<&mut ReactiveFieldDepState> {
+        debug_assert!(dependency.kind != ReactiveSourceKind::Computed);
+        let state = self.reactive_source_state_mut(dependency.source)?;
+        let bank = match dependency.kind {
+            ReactiveSourceKind::InstanceField => &mut state.instance_fields,
+            ReactiveSourceKind::StaticField => &mut state.static_fields,
+            ReactiveSourceKind::Computed => unreachable!(),
+        };
+        bank.get_mut(dependency.slot as usize).and_then(Option::as_mut)
+    }
+
+    #[inline]
+    fn reactive_ensure_field_dep_state(
+        &mut self,
+        dependency: ReactiveDependency,
+    ) -> &mut ReactiveFieldDepState {
+        debug_assert!(dependency.kind != ReactiveSourceKind::Computed);
+        let state = self.reactive_ensure_source_state(dependency.source);
+        let bank = match dependency.kind {
+            ReactiveSourceKind::InstanceField => &mut state.instance_fields,
+            ReactiveSourceKind::StaticField => &mut state.static_fields,
+            ReactiveSourceKind::Computed => unreachable!(),
+        };
+        let index = dependency.slot as usize;
+        if bank.len() <= index {
+            bank.resize_with(index + 1, || None);
+        }
+        bank[index].get_or_insert_with(ReactiveFieldDepState::default)
+    }
+
+    #[inline]
+    fn reactive_remove_empty_field_dep(&mut self, dependency: ReactiveDependency) {
+        let Some(state) = self.reactive_source_state_mut(dependency.source) else { return; };
+        let bank = match dependency.kind {
+            ReactiveSourceKind::InstanceField => &mut state.instance_fields,
+            ReactiveSourceKind::StaticField => &mut state.static_fields,
+            ReactiveSourceKind::Computed => return,
+        };
+        let Some(slot) = bank.get_mut(dependency.slot as usize) else { return; };
+        if slot.as_ref().is_some_and(|dep| dep.subscribers.is_empty()) {
+            *slot = None;
+        }
+    }
+
+    #[inline]
+    fn reactive_take_computed_state(&mut self, identity: HeapIdentity) -> Option<ReactiveComputedState> {
+        let slot = self.reactive_computed.get_mut(identity.handle as usize)?;
+        if slot.as_ref().is_some_and(|state| state.callback == identity) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn reactive_observer_alive(&self, observer: ReactiveObserverKey) -> bool {
         if !self.heap.identity_matches(observer.callback) {
             return false;
         }
         match observer.kind {
-            ReactiveObserverKind::Computed => self.reactive_computed.contains_key(&observer.callback),
+            ReactiveObserverKind::Computed => self.reactive_computed_contains(observer.callback),
             ReactiveObserverKind::Watcher => self.reactive_watchers.contains_key(&observer.callback),
         }
     }
@@ -11020,12 +11207,12 @@ impl<'p> Interpreter<'p> {
     fn reactive_prune_stale(&mut self) {
         let stale_computed = self
             .reactive_computed
-            .keys()
-            .copied()
+            .iter()
+            .filter_map(|state| state.as_ref().map(|state| state.callback))
             .filter(|identity| !self.heap.identity_matches(*identity))
             .collect::<Vec<_>>();
         for callback in stale_computed {
-            if let Some(state) = self.reactive_computed.remove(&callback) {
+            if let Some(state) = self.reactive_take_computed_state(callback) {
                 self.reactive_replace_dependencies(
                     ReactiveObserverKey {
                         kind: ReactiveObserverKind::Computed,
@@ -11056,25 +11243,65 @@ impl<'p> Interpreter<'p> {
             }
         }
 
-        let stale_sources = self
-            .reactive_dependents
-            .keys()
-            .copied()
-            .filter(|dependency| !self.heap.identity_matches(dependency.source))
-            .collect::<Vec<_>>();
-        for dependency in stale_sources {
-            self.reactive_dependents.remove(&dependency);
-            self.reactive_versions.remove(&dependency);
+        // Source sidecars are indexed by recyclable heap handle. Discard a whole
+        // sidecar when its generation no longer matches instead of scanning each
+        // field dependency independently.
+        for index in 0..self.reactive_field_sources.len() {
+            let stale = self.reactive_field_sources[index]
+                .as_ref()
+                .is_some_and(|state| !self.heap.identity_matches(state.source));
+            if stale {
+                self.reactive_field_sources[index] = None;
+            }
         }
+    }
 
-        let stale_versions = self
-            .reactive_versions
-            .keys()
-            .copied()
-            .filter(|dependency| !self.heap.identity_matches(dependency.source))
-            .collect::<Vec<_>>();
-        for dependency in stale_versions {
-            self.reactive_versions.remove(&dependency);
+    #[inline]
+    fn reactive_remove_subscriber(
+        &mut self,
+        dependency: ReactiveDependency,
+        observer: ReactiveObserverKey,
+    ) {
+        match dependency.kind {
+            ReactiveSourceKind::Computed => {
+                if let Some(state) = self.reactive_computed_state_mut(dependency.source) {
+                    state.subscribers.retain(|candidate| *candidate != observer);
+                }
+            }
+            ReactiveSourceKind::InstanceField | ReactiveSourceKind::StaticField => {
+                let remove = if let Some(dep) = self.reactive_field_dep_state_mut(dependency) {
+                    dep.subscribers.retain(|candidate| *candidate != observer);
+                    dep.subscribers.is_empty()
+                } else {
+                    false
+                };
+                if remove {
+                    self.reactive_remove_empty_field_dep(dependency);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn reactive_add_subscriber(
+        &mut self,
+        dependency: ReactiveDependency,
+        observer: ReactiveObserverKey,
+    ) {
+        match dependency.kind {
+            ReactiveSourceKind::Computed => {
+                if let Some(state) = self.reactive_computed_state_mut(dependency.source) {
+                    if !state.subscribers.contains(&observer) {
+                        state.subscribers.push(observer);
+                    }
+                }
+            }
+            ReactiveSourceKind::InstanceField | ReactiveSourceKind::StaticField => {
+                let dep = self.reactive_ensure_field_dep_state(dependency);
+                if !dep.subscribers.contains(&observer) {
+                    dep.subscribers.push(observer);
+                }
+            }
         }
     }
 
@@ -11087,33 +11314,18 @@ impl<'p> Interpreter<'p> {
         if old == new {
             return;
         }
-        // Stable dependencies are by far the common case. When a branch changes
-        // only part of the dependency set, preserve the edges that survived
-        // instead of tearing down and rebuilding the whole observer list.
-        for dependency in old {
-            if new.contains(dependency) {
-                continue;
-            }
-            let remove_key = if let Some(observers) = self.reactive_dependents.get_mut(dependency) {
-                observers.retain(|candidate| *candidate != observer);
-                observers.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                self.reactive_dependents.remove(dependency);
-                if dependency.kind != ReactiveSourceKind::Computed {
-                    self.reactive_versions.remove(dependency);
-                }
+
+        // Reactive dependency sets are normally stable. Preserve surviving edges
+        // and only patch the small symmetric difference. Computed edges are stored
+        // directly in the producer state and therefore never touch the hash map.
+        for &dependency in old {
+            if !new.contains(&dependency) {
+                self.reactive_remove_subscriber(dependency, observer);
             }
         }
         for &dependency in new {
-            if old.contains(&dependency) {
-                continue;
-            }
-            let observers = self.reactive_dependents.entry(dependency).or_default();
-            if !observers.contains(&observer) {
-                observers.push(observer);
+            if !old.contains(&dependency) {
+                self.reactive_add_subscriber(dependency, observer);
             }
         }
     }
@@ -11131,26 +11343,12 @@ impl<'p> Interpreter<'p> {
     fn reactive_dependency_version(&self, dependency: ReactiveDependency) -> u64 {
         match dependency.kind {
             ReactiveSourceKind::Computed => self
-                .reactive_computed
-                .get(&dependency.source)
+                .reactive_computed_state(dependency.source)
                 .map_or(0, |state| state.value_version),
             ReactiveSourceKind::InstanceField | ReactiveSourceKind::StaticField => self
-                .reactive_versions
-                .get(&dependency)
-                .copied()
-                .unwrap_or(0),
+                .reactive_field_dep_state(dependency)
+                .map_or(0, |dep| dep.version),
         }
-    }
-
-    fn reactive_snapshot_versions(
-        &self,
-        dependencies: &[ReactiveDependency],
-    ) -> SmallVec<[u64; 8]> {
-        dependencies
-            .iter()
-            .copied()
-            .map(|dependency| self.reactive_dependency_version(dependency))
-            .collect()
     }
 
     /// Return true when an observer's dependency snapshot can no longer be
@@ -11172,8 +11370,7 @@ impl<'p> Interpreter<'p> {
             .any(|(dependency, version)| {
                 if dependency.kind == ReactiveSourceKind::Computed
                     && self
-                        .reactive_computed
-                        .get(&dependency.source)
+                        .reactive_computed_state(dependency.source)
                         .is_some_and(|state| state.dirty || state.evaluating)
                 {
                     return true;
@@ -11187,14 +11384,39 @@ impl<'p> Interpreter<'p> {
         if !self.reactive_tracking_active {
             return;
         }
+        let version = self.reactive_dependency_version(dependency);
         let current = self.current_fiber;
         let stack = &mut self.fiber_mut(current).reactive_stack;
-        // Track only the currently executing observer. Nested computed values are
-        // first-class dependency nodes, so an outer observer subscribes to the
-        // inner computed rather than duplicating all of its transitive field edges.
         let Some(frame) = stack.last_mut() else { return; };
-        if !frame.dependencies.contains(&dependency) {
+
+        if let Some(index) = frame
+            .dependencies
+            .iter()
+            .position(|candidate| *candidate == dependency)
+        {
+            // A computed dependency can be observed, refreshed, then observed
+            // again during one evaluation. Keep the last observed version.
+            frame.dependency_versions[index] = version;
+        } else {
             frame.dependencies.push(dependency);
+            frame.dependency_versions.push(version);
+        }
+    }
+
+    #[inline]
+    fn reactive_sync_parent_dependency(&mut self, dependency: ReactiveDependency) {
+        if !self.reactive_tracking_active {
+            return;
+        }
+        let version = self.reactive_dependency_version(dependency);
+        let current = self.current_fiber;
+        let Some(frame) = self.fiber_mut(current).reactive_stack.last_mut() else { return; };
+        if let Some(index) = frame
+            .dependencies
+            .iter()
+            .position(|candidate| *candidate == dependency)
+        {
+            frame.dependency_versions[index] = version;
         }
     }
 
@@ -11215,7 +11437,7 @@ impl<'p> Interpreter<'p> {
         // field stores them, so identity membership gives us a zero-metadata way
         // to keep those loads out of user dependency graphs.
         if let Some(identity) = self.heap.identity(value) {
-            if self.reactive_computed.contains_key(&identity)
+            if self.reactive_computed_contains(identity)
                 || self.reactive_watchers.contains_key(&identity)
             {
                 return;
@@ -11253,23 +11475,31 @@ impl<'p> Interpreter<'p> {
     }
 
     /// Propagate invalidation through the computed DAG without recomputing any
-    /// value. A computed that is already dirty is a natural batch boundary: all
-    /// downstream observers were notified by the first invalidation, so later
-    /// writes before the next read are O(1) with respect to that subgraph.
+    /// value. Ordinary fields enter through their dense source/slot sidecar;
+    /// every computed-to-computed hop then follows the producer's direct subscriber
+    /// list, matching Vue's per-computed Dep layout.
     fn reactive_propagate_invalidations(&mut self, initial: &[ReactiveDependency]) {
         let mut queue = std::mem::take(&mut self.reactive_invalidation_queue);
         queue.clear();
         queue.extend_from_slice(initial);
 
         while let Some(dependency) = queue.pop() {
-            // Temporarily own the observer vector so propagation can mutate the
-            // rest of the runtime without cloning this list. Compact live entries
-            // in-place and reuse the same allocation when reinserting it.
-            let Some(mut observers) = self.reactive_dependents.remove(&dependency) else {
-                continue;
+            let (mut observers, direct_computed) = match dependency.kind {
+                ReactiveSourceKind::Computed => {
+                    let Some(state) = self.reactive_computed_state_mut(dependency.source) else {
+                        continue;
+                    };
+                    (std::mem::take(&mut state.subscribers), true)
+                }
+                ReactiveSourceKind::InstanceField | ReactiveSourceKind::StaticField => {
+                    let Some(dep) = self.reactive_field_dep_state_mut(dependency) else {
+                        continue;
+                    };
+                    (std::mem::take(&mut dep.subscribers), false)
+                }
             };
-            let mut live_len = 0usize;
 
+            let mut live_len = 0usize;
             for index in 0..observers.len() {
                 let observer = observers[index];
                 if !self.reactive_observer_alive(observer) {
@@ -11281,14 +11511,8 @@ impl<'p> Interpreter<'p> {
                 match observer.kind {
                     ReactiveObserverKind::Computed => {
                         let propagate = self
-                            .reactive_computed
-                            .get_mut(&observer.callback)
+                            .reactive_computed_state_mut(observer.callback)
                             .is_some_and(|state| {
-                                // Published edges describe the previous completed
-                                // evaluation. While recomputing, only dependencies
-                                // already seen by the active frame may invalidate
-                                // the in-flight result; reactive_trigger handles that
-                                // case before entering this propagation loop.
                                 if state.evaluating || state.dirty {
                                     false
                                 } else {
@@ -11308,12 +11532,14 @@ impl<'p> Interpreter<'p> {
             }
 
             observers.truncate(live_len);
-            if observers.is_empty() {
-                if dependency.kind != ReactiveSourceKind::Computed {
-                    self.reactive_versions.remove(&dependency);
+            if direct_computed {
+                if let Some(state) = self.reactive_computed_state_mut(dependency.source) {
+                    state.subscribers = observers;
                 }
-            } else {
-                self.reactive_dependents.insert(dependency, observers);
+            } else if observers.is_empty() {
+                self.reactive_remove_empty_field_dep(dependency);
+            } else if let Some(dep) = self.reactive_field_dep_state_mut(dependency) {
+                dep.subscribers = observers;
             }
         }
 
@@ -11331,13 +11557,15 @@ impl<'p> Interpreter<'p> {
         // entries or touching dependency vectors for those writes. If tracking is
         // currently active we still inspect the in-flight frame because its edge
         // has not been published yet.
-        let has_published_observers = self.reactive_dependents.contains_key(&dependency);
+        let has_published_observers = self
+            .reactive_field_dep_state(dependency)
+            .is_some_and(|dep| !dep.subscribers.is_empty());
         if !has_published_observers && !self.reactive_tracking_active {
             return;
         }
 
         // Dependencies discovered by a currently executing computed have not yet
-        // been published in reactive_dependents. Preserve writes that occur during
+        // been published in the source sidecar. Preserve writes that occur during
         // that same evaluation and force the next read to execute again.
         let active_computed = self
             .fiber(self.current_fiber)
@@ -11356,16 +11584,15 @@ impl<'p> Interpreter<'p> {
 
         // StoreField/StoreStaticField already compare old/new raw values before
         // calling this hook, so every observed trigger is a semantically visible
-        // source version change.
-        let version = self.reactive_versions.entry(dependency).or_insert(0);
-        *version = version.wrapping_add(1).max(1);
+        // source version change. Keep version and subscriber storage together.
+        let dep = self.reactive_ensure_field_dep_state(dependency);
+        dep.version = dep.version.wrapping_add(1).max(1);
 
         let mut initial = SmallVec::<[ReactiveDependency; 4]>::new();
         initial.push(dependency);
         for callback in active_computed {
             let propagate = self
-                .reactive_computed
-                .get_mut(&callback)
+                .reactive_computed_state_mut(callback)
                 .is_some_and(|state| {
                     let was_dirty = state.dirty;
                     state.dirty = true;
@@ -11388,16 +11615,27 @@ impl<'p> Interpreter<'p> {
             .identity(callback)
             .ok_or_else(|| RuntimeError::new("computed callback is not a live function"))?;
         self.enable_reactivity();
-        self.reactive_computed.entry(identity).or_insert(ReactiveComputedState {
-            initialized: false,
-            dirty: true,
-            evaluating: false,
-            force_recompute: true,
-            cached_value: Value::NULL,
-            value_version: 0,
-            dependencies: SmallVec::new(),
-            dependency_versions: SmallVec::new(),
-        });
+        let index = identity.handle as usize;
+        if self.reactive_computed.len() <= index {
+            self.reactive_computed.resize_with(index + 1, || None);
+        }
+        let replace = self.reactive_computed[index]
+            .as_ref()
+            .is_none_or(|state| state.callback != identity);
+        if replace {
+            self.reactive_computed[index] = Some(ReactiveComputedState {
+                callback: identity,
+                initialized: false,
+                dirty: true,
+                evaluating: false,
+                force_recompute: true,
+                cached_value: Value::NULL,
+                value_version: 0,
+                subscribers: SmallVec::new(),
+                dependencies: SmallVec::new(),
+                dependency_versions: SmallVec::new(),
+            });
+        }
         Ok(callback)
     }
 
@@ -11437,8 +11675,7 @@ impl<'p> Interpreter<'p> {
 
         let (initialized, dirty, evaluating, force_recompute, dependencies_changed) = {
             let state = self
-                .reactive_computed
-                .get(&identity)
+                .reactive_computed_state(identity)
                 .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
             let changed = state.initialized
                 && state.dirty
@@ -11467,6 +11704,7 @@ impl<'p> Interpreter<'p> {
         }
 
         if initialized && !dirty {
+            self.reactive_skip_next_field_track = true;
             return Ok(false);
         }
 
@@ -11475,15 +11713,15 @@ impl<'p> Interpreter<'p> {
         // recorded dependency version still matches and this cached value remains
         // valid; clear the speculative dirty bit without executing user code.
         if initialized && dirty && !force_recompute && !dependencies_changed {
-            if let Some(state) = self.reactive_computed.get_mut(&identity) {
+            if let Some(state) = self.reactive_computed_state_mut(identity) {
                 state.dirty = false;
             }
+            self.reactive_skip_next_field_track = true;
             return Ok(false);
         }
 
         let state = self
-            .reactive_computed
-            .get_mut(&identity)
+            .reactive_computed_state_mut(identity)
             .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
         state.evaluating = true;
         // Any write observed after this point sets dirty + force_recompute again.
@@ -11497,6 +11735,7 @@ impl<'p> Interpreter<'p> {
         self.fiber_mut(self.current_fiber).reactive_stack.push(ReactiveFrame {
             observer,
             dependencies: SmallVec::new(),
+            dependency_versions: SmallVec::new(),
         });
         self.reactive_tracking_active = true;
         Ok(true)
@@ -11522,19 +11761,18 @@ impl<'p> Interpreter<'p> {
         }
         self.reactive_tracking_active = !self.fiber(self.current_fiber).reactive_stack.is_empty();
 
-        let dependency_versions = self.reactive_snapshot_versions(&frame.dependencies);
+        let new_dependencies = frame.dependencies;
+        let dependency_versions = frame.dependency_versions;
         let old_dependencies = {
             let state = self
-                .reactive_computed
-                .get_mut(&identity)
+                .reactive_computed_state_mut(identity)
                 .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
             std::mem::take(&mut state.dependencies)
         };
-        self.reactive_replace_dependencies(observer, &old_dependencies, &frame.dependencies);
+        self.reactive_replace_dependencies(observer, &old_dependencies, &new_dependencies);
 
         let state = self
-            .reactive_computed
-            .get_mut(&identity)
+            .reactive_computed_state_mut(identity)
             .expect("computed state disappeared during dependency replacement");
         let value_changed = !state.initialized || state.cached_value.raw_bits() != value.raw_bits();
         if value_changed {
@@ -11545,8 +11783,12 @@ impl<'p> Interpreter<'p> {
         state.evaluating = false;
         // `dirty` and `force_recompute` may have been set by a dependency write
         // during evaluation; intentionally preserve them here.
-        state.dependencies = frame.dependencies;
+        state.dependencies = new_dependencies;
         state.dependency_versions = dependency_versions;
+        let output_dependency = Self::reactive_computed_dependency(identity);
+        // The parent tracked this computed before entering it. Synchronize that
+        // edge after the child refresh, exactly like Vue's computed getter does.
+        self.reactive_sync_parent_dependency(output_dependency);
         Ok(value)
     }
 
@@ -11556,8 +11798,7 @@ impl<'p> Interpreter<'p> {
             .identity(callback)
             .ok_or_else(|| RuntimeError::new("computed callback is no longer live"))?;
         let state = self
-            .reactive_computed
-            .get(&identity)
+            .reactive_computed_state(identity)
             .ok_or_else(|| RuntimeError::new("unknown computed callback"))?;
         if !state.initialized {
             return Err(RuntimeError::new("computed value was read before evaluation"));
@@ -11579,11 +11820,15 @@ impl<'p> Interpreter<'p> {
         if should_pop {
             self.fiber_mut(self.current_fiber).reactive_stack.pop();
             self.reactive_tracking_active = !self.fiber(self.current_fiber).reactive_stack.is_empty();
-            if let Some(state) = self.reactive_computed.get_mut(&identity) {
+            if let Some(state) = self.reactive_computed_state_mut(identity) {
                 state.evaluating = false;
                 state.dirty = true;
                 state.force_recompute = true;
             }
+        } else {
+            // Successful __finishComputed already popped the collector. The next
+            // field load in the synthesized getter is the hidden GC cache anchor.
+            self.reactive_skip_next_field_track = true;
         }
         Ok(())
     }
@@ -11608,7 +11853,8 @@ impl<'p> Interpreter<'p> {
             fiber.reactive_stack.remove(index)
         };
         let observer = frame.observer;
-        let dependency_versions = self.reactive_snapshot_versions(&frame.dependencies);
+        let dependencies = frame.dependencies;
+        let dependency_versions = frame.dependency_versions;
         let old = match self.reactive_watchers.get_mut(&observer.callback) {
             Some(state) => {
                 state.scheduled = false;
@@ -11616,9 +11862,9 @@ impl<'p> Interpreter<'p> {
             }
             None => return,
         };
-        self.reactive_replace_dependencies(observer, &old, &frame.dependencies);
+        self.reactive_replace_dependencies(observer, &old, &dependencies);
         if let Some(state) = self.reactive_watchers.get_mut(&observer.callback) {
-            state.dependencies = frame.dependencies;
+            state.dependencies = dependencies;
             state.dependency_versions = dependency_versions;
         }
         if fiber_id == self.current_fiber {
@@ -14980,20 +15226,6 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     let function = vm.current_function_index();
     let index = vm.hot_pc as usize;
 
-    // Dependency collection must observe the baseline LoadField/LoadStaticField
-    // handlers. Traces compiled for ordinary execution remain valid and fast,
-    // but are never entered while a computed/watcher collector is active.
-    if vm.reactive_tracking_active {
-        let prepared = vm.current_prepared();
-        let handler = prepared
-            .jit_entry_handlers
-            .get_unchecked(index)
-            .unwrap_or(*prepared.handlers.get_unchecked(index));
-        let op = vm.hot_ops.add(index);
-        handler(vm, op);
-        return;
-    }
-
     let threshold = vm.jit_entry_threshold;
     if threshold == 0 || vm.jit.is_none() {
         // The tracing manager is temporarily removed from Interpreter while a
@@ -15597,7 +15829,11 @@ unsafe fn h_load_field(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x,value); }
+    if vm.reactive_skip_next_field_track {
+        vm.reactive_skip_next_field_track = false;
+    } else if vm.reactive_tracking_active {
+        vm.reactive_track_field(obj, ReactiveSourceKind::InstanceField, op.x, value);
+    }
     vm.set_reg(op.a,value.word());vm.advance(op)
 }
 unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15619,7 +15855,11 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active { vm.reactive_track_field(obj,ReactiveSourceKind::InstanceField,op.x,value); }
+    if vm.reactive_skip_next_field_track {
+        vm.reactive_skip_next_field_track = false;
+    } else if vm.reactive_tracking_active {
+        vm.reactive_track_field(obj, ReactiveSourceKind::InstanceField, op.x, value);
+    }
     vm.return_from_frame(value.word(),None)
 }
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15652,7 +15892,11 @@ unsafe fn h_load_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
             return;
         }
     }
-    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x,v);}
+    if vm.reactive_skip_next_field_track {
+        vm.reactive_skip_next_field_track = false;
+    } else if vm.reactive_tracking_active {
+        vm.reactive_track_field(class, ReactiveSourceKind::StaticField, op.x, v);
+    }
     vm.set_reg(op.a,v.word());vm.advance(op)
 }
 unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -15667,7 +15911,11 @@ unsafe fn h_load_static_field_return(vm:&mut Interpreter, ptr:*const PreparedOp)
             return;
         }
     }
-    if vm.reactive_tracking_active{vm.reactive_track_field(class,ReactiveSourceKind::StaticField,op.x,v);}
+    if vm.reactive_skip_next_field_track {
+        vm.reactive_skip_next_field_track = false;
+    } else if vm.reactive_tracking_active {
+        vm.reactive_track_field(class, ReactiveSourceKind::StaticField, op.x, v);
+    }
     vm.return_from_frame(v.word(),None)
 }
 unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -21314,7 +21562,7 @@ var result = first + second + third + computations;
             }));
             vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
             assert_eq!(source_result(&vm), 19.0, "jit={jit_enabled}");
-            let state = vm.reactive_computed.values().next().expect("computed state");
+            let state = vm.reactive_computed.iter().flatten().next().expect("computed state");
             assert!(state.initialized && !state.dirty, "jit={jit_enabled}: {state:?}");
             assert!(!state.dependencies.is_empty(), "jit={jit_enabled}");
         }

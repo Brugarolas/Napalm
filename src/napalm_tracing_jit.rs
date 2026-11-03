@@ -572,8 +572,8 @@ pub trait TraceRuntime {
     }
 
     /// Reactive class-field tracking is an interpreter/runtime side effect. When
-    /// enabled, field bytecodes must remain runtime leaves so native traces cannot
-    /// bypass dependency collection or invalidation.
+    /// enabled, field bytecodes remain runtime leaves while surrounding arithmetic
+    /// and control flow may still execute in native traces.
     fn trace_reactive_enabled(&self) -> bool { false }
     fn trace_reactive_tracking_active(&self) -> bool { false }
 
@@ -1244,11 +1244,11 @@ fn spread_method_for_arity(
 // Recorder helpers
 // =============================================================================
 
-/// Keep mixed traces from degenerating into a native-to-Rust call trampoline.
-/// The whitelist is intentionally small: leaf helpers are for occasional heap or
-/// module operations between larger native regions, not for replacing baseline
-/// dispatch one opcode at a time.
-const MAX_RUNTIME_LEAF_OPS_PER_TRACE: usize = 8;
+/// Reactive traces intentionally keep field accesses as precise runtime leaves
+/// while allowing surrounding arithmetic/control flow to remain native. Deep
+/// computed graphs can therefore contain substantially more leaf boundaries than
+/// ordinary traces without falling back to baseline dispatch for the whole body.
+const MAX_RUNTIME_LEAF_OPS_PER_TRACE: usize = 64;
 /// GC-capable same-frame helpers are slightly more expensive but can still be
 /// profitable inside collection-heavy traces because they preserve register SSA.
 const MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE: usize = 16;
@@ -2259,6 +2259,8 @@ impl<'a> TraceRecorder<'a> {
         // the callee. CallDirect keeps its existing generic call fallback here; its
         // calling convention is intentionally handled separately.
         let checkpoint = builder.clone();
+        // The inliner itself rejects reactive field loads while still allowing
+        // scalar/pure callees to inline in a reactive VM.
         match self.inline_call(runtime, program, op, builder) {
             Ok(step) => Ok(step),
             Err(
@@ -2681,7 +2683,7 @@ impl<'a> TraceRecorder<'a> {
         if op.opcode != Opcode::InvokeSpread {
             return Err(RecordingAbort::UnsupportedCall);
         }
-        if runtime.trace_reactive_tracking_active() {
+        if runtime.trace_reactive_enabled() {
             return Err(RecordingAbort::UnsupportedCall);
         }
 
@@ -4121,9 +4123,17 @@ impl<'a> TraceRecorder<'a> {
             }
 
             LoadField => {
-                // Reactive collectors never enter native traces (h_jit_entry
-                // falls back to baseline while tracking), so ordinary field
-                // reads can retain the native fast path even in a reactive VM.
+                // Reactive VMs keep field loads on the exact runtime leaf so the
+                // same compiled trace is valid both inside and outside dependency
+                // collection. Arithmetic/control-flow around the load remains in
+                // native code instead of disabling JIT entry for the whole computed.
+                if runtime.trace_reactive_enabled() {
+                    return self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    );
+                }
                 let object_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
@@ -4521,8 +4531,13 @@ impl<'a> TraceRecorder<'a> {
             }
 
             LoadStaticField => {
-                // See LoadField: tracking executions stay in baseline, while
-                // non-tracking executions keep this native absolute load.
+                if runtime.trace_reactive_enabled() {
+                    return self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    );
+                }
                 let class_word = runtime
                     .trace_read_slot(FrameSlot::General(Reg(op.b)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;

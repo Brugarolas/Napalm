@@ -3599,8 +3599,10 @@ impl<'a> Parser<'a> {
                 }
                 let body = self.function_body(Vec::new(), member_start)?;
                 if is_computed {
+                    let local_span = Span::empty(self.synthetic_span);
+                    self.synthetic_span += 1;
                     let (callback_field, cache_field, getter, initializer) =
-                        synthesize_computed_property(&member, body);
+                        synthesize_computed_property(&member, body, local_span);
                     fields.push(callback_field);
                     fields.push(cache_field);
                     methods.push(getter);
@@ -3991,13 +3993,28 @@ fn instance_field_expr(storage: &Ident) -> Expr {
 fn synthesize_computed_property(
     member: &Ident,
     body: FunctionBody,
+    local_span: Span,
 ) -> (ClassFieldDecl, ClassFieldDecl, MethodDecl, Stmt) {
     let callback_storage = hidden_reactive_field(member, "computed");
     let cache_storage = hidden_reactive_field(member, "computed_cache");
+    let callback_local = Spanned::new(
+        format!("<reactive:computed-local:{}>", member.value),
+        local_span,
+    );
     let span = member.span;
     let closure = Expr::new(ExprKind::Closure(body), span);
-    let callback = || instance_field_expr(&callback_storage);
+    let callback_field = || instance_field_expr(&callback_storage);
+    let callback = || Expr::new(ExprKind::Name(callback_local.clone()), span);
     let cache = || instance_field_expr(&cache_storage);
+
+    let callback_decl = Stmt {
+        kind: StmtKind::Variable {
+            name: callback_local.clone(),
+            annotation: None,
+            initializer: Some(callback_field()),
+        },
+        span,
+    };
 
     let begin = reactive_static_call("__beginComputed", vec![callback()], span);
     let evaluate = invoke(callback(), "call", Vec::new(), span);
@@ -4006,10 +4023,10 @@ fn synthesize_computed_property(
         vec![callback(), evaluate],
         span,
     );
-    // The native reactive state is the authoritative cache. This hidden field is
-    // written only to make the cached managed Value reachable from the owning
-    // instance for precise GC. Getters never read it, so it cannot become a
-    // reactive dependency or keep an otherwise dead instance alive globally.
+    // Native state owns dirty/version metadata and mirrors the current value here.
+    // The hidden field is both the precise-GC anchor and the getter's cache-hit
+    // return path; runtime brackets suppress this implementation-only read from
+    // the parent reactive dependency graph.
     let cache_anchor = Expr::new(
         ExprKind::Assign {
             target: Box::new(cache()),
@@ -4056,13 +4073,14 @@ fn synthesize_computed_property(
             params: Vec::new(),
             param_types: Vec::new(),
             kind: FunctionBodyKind::Statements(vec![
+                callback_decl,
                 guarded_eval,
+                // __beginComputed/__abortComputed arrange for this one hidden
+                // cache-anchor load to bypass dependency tracking. Returning the
+                // field directly removes a second native runtime call from every
+                // computed cache hit.
                 Stmt {
-                    kind: StmtKind::Return(Some(reactive_static_call(
-                        "__readComputed",
-                        vec![callback()],
-                        span,
-                    ))),
+                    kind: StmtKind::Return(Some(cache())),
                     span,
                 },
             ]),
@@ -4073,7 +4091,7 @@ fn synthesize_computed_property(
     let initializer = Stmt {
         kind: StmtKind::Expression(Expr::new(
             ExprKind::Assign {
-                target: Box::new(callback()),
+                target: Box::new(callback_field()),
                 value: Box::new(reactive_static_call("__registerComputed", vec![closure], span)),
             },
             span,
