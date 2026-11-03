@@ -1,0 +1,3313 @@
+# Napalm: Language Manual and Usage Reference
+
+Reference to the implementation in this repository, reviewed on
+**November 3, 2026**. Written for anyone who wants to **program in Napalm**:
+syntax, values, types, functions, objects, libraries, and examples.
+It does not describe the JIT implementation, bytecode, or optimizers.
+
+Napalm has syntax inspired by TypeScript, but **it is not JavaScript or
+TypeScript with a different executable**. It also does not provide Node.js, the
+DOM, or the complete standard library of those languages. A familiar-looking
+construct may have different semantics.
+
+This manual is based on the public parser, the installed library, observable
+interpreter operations, its language tests, and the programs in
+[scripts](scripts). Some comments and historical documents no longer describe
+current behavior; important differences are explained here instead of being
+presented as existing features.
+
+## Table of Contents
+
+1. [Getting Started and Running Programs](#1-getting-started-and-running-programs)
+2. [Basic Syntax and Literals](#2-basic-syntax-and-literals)
+3. [Values, Identity, and Conversions](#3-values-identity-and-conversions)
+4. [Variables, Scopes, and Constants](#4-variables-scopes-and-constants)
+5. [Operators and Precedence](#5-operators-and-precedence)
+6. [Control Flow](#6-control-flow)
+7. [Functions and Closures](#7-functions-and-closures)
+8. [Types and Persistent Contracts](#8-types-and-persistent-contracts)
+9. [Lists and Arrays](#9-lists-and-arrays)
+10. [Objects, Map, and Set](#10-objects-map-and-set)
+11. [Ranges and Custom Iteration](#11-ranges-and-custom-iteration)
+12. [Destructuring, Rest, and Spread](#12-destructuring-rest-and-spread)
+13. [List Comprehensions](#13-list-comprehensions)
+14. [Classes and Inheritance](#14-classes-and-inheritance)
+15. [Reactive Properties and Watchers](#15-reactive-properties-and-watchers)
+16. [Enums](#16-enums)
+17. [Decorators](#17-decorators)
+18. [Native Decorators](#18-native-decorators)
+19. [Exceptions and Cleanup](#19-exceptions-and-cleanup)
+20. [Async, Promise, and Timers](#20-async-promise-and-timers)
+21. [Concurrency with launch](#21-concurrency-with-launch)
+22. [Fibers](#22-fibers)
+23. [Modules, Imports, and Exports](#23-modules-imports-and-exports)
+24. [Strings](#24-strings)
+25. [Numbers and Randomness](#25-numbers-and-randomness)
+26. [System and Output](#26-system-and-output)
+27. [Dates](#27-dates)
+28. [Proxy](#28-proxy)
+29. [HTTP Client and fetch](#29-http-client-and-fetch)
+30. [HTTP Servers, Streaming, and SSE](#30-http-servers-streaming-and-sse)
+31. [FFI and External Functions](#31-ffi-and-external-functions)
+32. [Limitations and Differences from JavaScript](#32-limitations-and-differences-from-javascript)
+33. [Complete Recipes](#33-complete-recipes)
+34. [Example and Source Map](#34-example-and-source-map)
+35. [Current Performance](#35-current-performance)
+36. [Napalm System platform helpers](#35-system-platform-helpers)
+37. [Napalm nNative FFI](#35-native-ffi)
+
+### How to Read the Examples
+
+Unqualified `napalm` blocks are standalone programs: they can be saved to a
+file with the `.napalm` extension. Variables in one block do not depend on
+those in another.
+
+- `napalm compile-error`: an example deliberately rejected at compile time.
+- `napalm runtime-error`: an example deliberately rejected at runtime.
+- `napalm fragment`: part of a program or module; follow the accompanying
+  instructions.
+- `// ...` comments show results or explain a detail; they are not a
+  specification of JavaScript.
+
+Tables use `x?` to indicate an **overload with fewer arguments** when one
+exists in a native API. This does not mean Napalm supports default arguments
+in function declarations.
+
+## 1. Getting Started and Running Programs
+
+### 1.1 A First Program
+
+```napalm
+const language = "Napalm";
+function double(value: number): number {
+    return value * 2;
+}
+
+System.print(`Hola, ${language}!`);
+System.print(double(21)); // 42
+```
+
+From the repository root:
+
+```powershell
+cargo run --release -- .\scripts\complete.napalm
+cargo run --release -- .\scripts\module_import.napalm
+```
+
+For your own file, for example `hello.napalm`:
+
+```powershell
+cargo run --release -- .\hello.napalm
+```
+
+If it has already been compiled:
+
+```powershell
+.\target\release\napalm.exe .\hello.napalm
+```
+
+The CLI accepts **a single file**, not a list of program arguments. This
+implementation does not provide a REPL, `process.argv`, or an `-e` option.
+Do not infer those features from Cargo's capabilities.
+
+**Current extension:** use `.napalm`. Imports with an extension accept
+`.napalm`; imports without an extension look for the file and directory index
+with that extension. Older references to `.nap` or `.ts` in some texts do not
+describe the current resolver.
+
+### 1.2 Process Exit Codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The program completed successfully. |
+| `1` | Compilation error, including syntax errors or statically checked types. |
+| `2` | Incorrect CLI usage; this is also the current exit code for `--help`. |
+| `3` | I/O error while loading sources or emitting diagnostics. |
+| `4` | Uncaught runtime error or a module suspension that was not resumed. |
+
+An open HTTP listener, a periodic timer, or pending asynchronous work can keep
+the process alive after the module body has run. Close or cancel resources that
+are no longer needed.
+
+## 2. Basic Syntax and Literals
+
+### 2.1 Statements, Blocks, and Comments
+
+Semicolons and statements separated by line breaks are supported. Blocks use
+braces.
+
+```napalm
+// Comment through the end of the line.
+let x = 1;
+/* Block comment. */
+{
+    const increment = 2;
+    x += increment;
+}
+System.print(x); // 3
+```
+
+The public parser's `/* ... */` comments **do not nest**. Ordinary identifiers
+use ASCII letters, digits, `_`, and `$`; they cannot start with a digit.
+Strings do support Unicode.
+
+Do not rely on all of ECMAScript's automatic semicolon insertion rules. In
+particular:
+
+- `return` followed immediately by a line break returns `null`.
+- The expression in a `throw` statement must start on the same line.
+- Postfix `++` and `--` must stay next to their operand.
+- A continuation with `.`, `?.`, or a binary operator may cross a line break.
+- To return an object from an expression-bodied arrow, use `() => ({x: 1})`.
+
+### 2.2 Numbers
+
+```napalm
+const decimal = 1_000_000;
+const fractional = .25;
+const exponent = 1.5e2;
+const hex = 0xff;
+const binary = 0b1010;
+const octal = 0o17;
+System.print([decimal, fractional, exponent, hex, binary, octal]);
+// [1000000, 0.25, 150, 255, 10, 15]
+```
+
+Separators `_` can appear between digits, including in bases and exponents.
+The minus sign is an operator, not part of a literal.
+Language numbers use double-precision floating-point semantics; there is no
+`BigInt` literal or `n` suffix.
+
+### 2.3 Booleans and null
+
+The literals are `true`, `false`, and `null`. **There is no `undefined`**.
+Missing data, list holes, and returns without a value use `null`, although a
+non-nullable annotation may reject it.
+
+### 2.4 Strings and Templates
+
+```napalm
+const single = 'texto';
+const double = "otro texto";
+const name = "Ada";
+System.print(`${name}: ${6 * 7}`);
+System.print(`anidada: ${`valor ${2 + 3}`}`);
+System.print(`primera linea
+segunda linea`);
+System.print("50%"); // A percent sign does not start interpolation.
+System.print("\u{1f600}");
+```
+
+Only backticks interpolate `${expression}` and allow literal line breaks.
+Single and double quotes cannot contain a line break without escaping it.
+
+| Escape | Value |
+| --- | --- |
+| `\n`, `\r`, `\t` | Newline, carriage return, and tab. |
+| `\0`, `\b`, `\f`, `\v` | NUL, backspace, form feed, and vertical tab. |
+| `\\`, `\'`, `\"` | Backslash and quotes. |
+| `` \` ``, `\$` | Backtick and literal dollar sign. |
+| `\xHH` | Short hexadecimal code. |
+| `\uHHHH`, `\u{...}` | Unicode code point. |
+| Backslash followed by a line break | Continuation without adding that break to the value. |
+
+Unknown escapes and invalid Unicode codes are rejected.
+Do not assume a pair of UTF-16 surrogate escapes is automatically treated as
+a single character; use `\u{1f600}`, for example.
+
+## 3. Values, Identity, and Conversions
+
+### 3.1 Value Families
+
+| Family | Examples |
+| --- | --- |
+| Scalars | `null`, `true`, `42`, `"texto"`. |
+| Collections | List/Array, Map/object literal, Set. |
+| Ranges | `new Range(0, 5)`. |
+| Functions | Declarations, `function` expressions, arrows, and bar lambdas. |
+| User objects | Classes and their instances. |
+| Async control | Promise and Fiber. |
+| Native library | Date, Random, Proxy, Response, Headers, and FFI objects. |
+
+Assigning a list, Map, or instance to another variable copies the **reference**,
+not its contents. `const` does not change this rule.
+
+```napalm
+const original = {value: 1};
+const alias = original;
+alias.value = 2;
+System.print(original.value); // 2
+System.print(original === alias); // true
+System.print(original === {value: 2}); // false
+```
+
+### 3.2 Conditions and Falsy Values
+
+In conditions, ternaries, `&&`, and `||`, **only `false` and `null` are falsy**.
+`0`, `""`, `Num.nan`, `[]`, and `{}` are truthy.
+
+```napalm
+System.print(0 ? "verdadero" : "falso");  // true
+System.print("" ? "verdadero" : "falso"); // true
+System.print(null || "alternativa");     // alternativa
+System.print(0 || 99);                   // 0
+System.print(false ?? 99);               // false
+System.print(null ?? 99);                // 99
+```
+
+`&&` and `||` return an operand and short-circuit; they do not necessarily
+convert the result to a boolean. `??` replaces only `null`.
+
+**Caution with `!`:** it is a dispatch operation, not a universal conversion
+to boolean. It works with Bool and Null, and classes can overload it.
+For example, `!0` currently produces an undefined-method error.
+To convert an arbitrary condition to Bool, use `value ? true : false`; to
+negate it, use `value ? false : true`.
+
+### 3.3 Equality
+
+`==` and `===` represent the same operation without coercion. The same applies
+to `!=` and `!==`. There is no JavaScript-style loose equality.
+
+- Numbers: numeric comparison; `Num.nan == Num.nan` is false.
+- Strings: comparison by contents.
+- Booleans and null: comparison of their values.
+- Ordinary collections and objects: identity, not deep equality.
+- Instances with equality operators: may define their own comparison.
+
+There is a deliberate difference in **Map/Set key** equality: all NaN values
+are grouped as one key; `0` and `-0` are also grouped together.
+
+### 3.4 Conversion to Text
+
+Use interpolation or `value.toString()` for values that implement that
+protocol. Many builtins also retain the `value.toString` getter.
+Classes can implement `toString()` and participate in interpolation,
+concatenation, and `System.print`.
+
+Do not use `String(value)`, `Number(value)`, `Boolean(value)`, or
+`JSON.stringify` by analogy with JavaScript: equivalent APIs are not provided
+here. The textual output of Maps and lists is for presentation, **not JSON**.
+
+## 4. Variables, Scopes, and Constants
+
+### 4.1 Declarations
+
+```napalm
+let count = 0;
+var legacyName = "tambien tiene ambito de bloque";
+const limit = 3;
+let left = 1, right = 2;
+count += left + right;
+System.print([count, limit, legacyName]);
+```
+
+`let`, `var`, and `const` are lexical and have block scope. `var` does not gain
+JavaScript's function-scoping rules.
+**All variables require an initializer**, not just `const`.
+Declared class properties are the exception.
+
+```napalm compile-error
+let pending;
+```
+
+A local variable can shadow an outer one; the same name cannot be redeclared
+in the same scope.
+
+```napalm
+const value = 1;
+{
+    let value = 2;
+    value++;
+    System.print(value); // 3
+}
+System.print(value); // 1
+```
+
+### 4.2 const and Mutability
+
+`const` prevents replacing a binding's value, including through closures,
+compound assignments, or destructuring. It does not freeze an object.
+
+```napalm
+const items = [1];
+items.add(2);
+items[0] = 9;
+System.print(items); // [9, 2]
+// items = []; // Error: reassignment of a constant.
+```
+
+### 4.3 Inference
+
+The absence of an annotation **does not necessarily mean `any`**.
+The compiler retains types inferred from initializers when it can determine
+them.
+
+```napalm compile-error
+let amount = 10;
+amount = "diez";
+```
+
+To intentionally mix value families:
+
+```napalm
+let value: any = 10;
+value = "diez";
+value = null;
+System.print(value);
+
+let selected: number | null = null;
+selected = 42;
+System.print(selected);
+```
+
+This distinction matters especially when initializing a handle with `null`:
+declare it as `any` or with an appropriate union if it will later hold another
+type.
+
+## 5. Operators and Precedence
+
+### 5.1 Reference
+
+| Category | Operators |
+| --- | --- |
+| Access and call | `.`, `[]`, `()`, `?.`, `?.[]`, `?.()`. |
+| Update | `++x`, `--x`, `x++`, `x--`. |
+| Unary | `-`, `+`, `!`, `~`, `await`, `delete`, `launch` in its own syntax. |
+| Exponentiation | `**`, right-associative. |
+| Multiplicative | `*`, `/`, `%`. |
+| Additive | `+`, `-`. |
+| Shifts | `<<`, `>>`. |
+| Comparison | `<`, `<=`, `>`, `>=`, `in`, `instanceof`. |
+| Equality | `==`, `!=`, `===`, `!==`. |
+| Bitwise | `&`, `^`, `|`. |
+| Logical | `&&`, `||`, `??`. |
+| Conditional | `condition ? yes : no`. |
+| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `&&=`, `||=`, `??=`. |
+
+From highest to lowest, the parser gives precedence to member access/calls,
+updates, prefixes, exponentiation, multiplication, addition, shifts,
+comparisons, equality, `&`, `^`, `|`, `&&`, `||`/`??`, the ternary operator,
+and assignment. Use parentheses when mixing logical or nullish operators.
+
+Two differences are especially easy to miss:
+
+- `-2 ** 2` is currently parsed as `(-2) ** 2`, yielding `4`.
+  Write `-(2 ** 2)` to get `-4`.
+- Unary `+` is removed: it **does not convert** strings to numbers.
+  `+"12"` remains `"12"`.
+
+### 5.2 Arithmetic and Concatenation
+
+`+` adds numbers, concatenates strings, and concatenates lists.
+A string can be combined with another value through the `toString()` protocol;
+a class can define its own `operator +`.
+The other numeric operators do not automatically convert strings.
+
+```napalm
+System.print(2 ** 3 ** 2); // 512
+System.print(7 / 2);       // 3.5
+System.print(-7 % 3);      // -1
+System.print("valor: " + 42);
+System.print([1, 2] + [3]); // [1, 2, 3]
+```
+
+### 5.3 Bitwise Operators
+
+Bitwise operators work on **unsigned** 32-bit values.
+`>>` is a logical shift; it is not JS's arithmetic shift.
+`>>>` is not implemented.
+
+```napalm
+System.print(~0);       // 4294967295
+System.print(-1 >> 1);  // 2147483647
+System.print(1 << 4);   // 16
+System.print(10 & 3);   // 2
+```
+
+Numeric operands are converted to the 32-bit domain; the shift amount is reduced
+to its five lowest bits. Do not use these operators for exact 64-bit integer
+arithmetic.
+
+### 5.4 Short-Circuiting and Optional Access
+
+```napalm
+let selected: any = null;
+selected ??= {value: 7};
+selected.value *= 2;
+System.print(selected.value); // 14
+
+let skipped = 0;
+const absent = null;
+System.print(absent?.child?.[skipped++]); // null
+System.print(absent?.(++skipped));        // null
+System.print(skipped);                    // 0
+
+const object = {double: (n) => n * 2};
+System.print(object?.double(4)); // 8
+```
+
+`&&=`, `||=`, and `??=` evaluate the right-hand side only when appropriate. The
+receiver and key of a compound assignment are evaluated only once.
+`?.` short-circuits on `null`; it does not protect against a missing method on a
+non-null object or turn a missing key into a valid API.
+
+## 6. Control Flow
+
+### 6.1 if, while, and do...while
+
+```napalm
+let n = 0;
+while (n < 3) {
+    n++;
+}
+
+do {
+    n--;
+} while (n > 1);
+
+if (n === 1) {
+    System.print("uno");
+} else if (n === 2) {
+    System.print("dos");
+} else {
+    System.print("otro");
+}
+```
+
+`do...while` executes its body at least once. `if` and `while` use Napalm's
+truthiness rules, not JS's.
+
+### 6.2 Classic for
+
+```napalm
+let total = 0;
+for (let i = 0; i < 10; i++) {
+    if (i === 3) continue;
+    if (i === 8) break;
+    total += i;
+}
+System.print(total); // 25
+```
+
+All three parts of a `for` loop may be omitted, for example `for (;;)` .
+`continue` proceeds through the `for` increment; `break` ends the loop.
+There are no `break label`/`continue label` labels.
+
+**Closures:** a classic `for` binding is not recreated for each iteration as
+it is in JavaScript with `let`. To capture a different value each time, pass it
+to a function that creates the closure.
+
+### 6.3 for...of and for...in
+
+```napalm
+for (const value of [10, 20]) {
+    System.print(value);
+}
+
+const record = {b: 2, a: 1};
+for (const key in record) {
+    System.print(`${key}: ${record[key]}`);
+}
+
+for (const entry of record) {
+    System.print([entry.key, entry.value]);
+}
+```
+
+- `for (const x of collection)` traverses the `iterate`/`iteratorValue` protocol.
+- `for (const key in map)` traverses **the `map.keys` getter**.
+- The loop binding is declared with `let`, `var`, or `const`.
+- Destructuring patterns are supported in the binding.
+- `for...in` does not implement prototype enumeration or array indices.
+  The receiver must provide a `keys` getter.
+
+There is no `switch` or `for await...of` in this version.
+
+## 7. Functions and Closures
+
+### 7.1 Function Declaration Forms
+
+```napalm
+function add(a, b) { return a + b; }
+const multiply = function (a, b) { return a * b; };
+const increment = (x) => x + 1;
+const square = x => x * x;
+const compact = |x, y| x + y;
+const zero = | | 0;
+const objectFactory = () => ({answer: 42});
+
+System.print([add(2, 3), multiply(2, 3), increment(3), square(4)]);
+System.print([compact(1, 2), zero(), objectFactory().answer]);
+```
+
+The declaration keyword is **`function`**, not `fn`.
+The `|x| expression` and `|x| { statements }` lambda forms are supported.
+For zero parameters with bars, write `| |`, not `||`, which is OR.
+Destructured parameters are best written using the parenthesized
+`function` or arrow form.
+
+### 7.2 Return Values
+
+A function with a block body returns a value only with `return`.
+Falling through to the end or writing `return;` returns `null`.
+An expression-bodied arrow or lambda implicitly returns its expression.
+
+```napalm
+function noReturn() { 42; }
+const explicit = () => { return 42; };
+const implicit = () => 42;
+System.print([noReturn(), explicit(), implicit()]); // [null, 42, 42]
+```
+
+### 7.3 Lexical Scope and Recursion
+
+```napalm
+function counter(start) {
+    let current = start;
+    return () => ++current;
+}
+const next = counter(40);
+System.print(next()); // 41
+System.print(next()); // 42
+
+function factorial(n: number): number {
+    return n <= 1 ? 1 : n * factorial(n - 1);
+}
+System.print(factorial(5)); // 120
+```
+
+Closures retain captured bindings and observe changes to them.
+`this` is lexical too: a closure created inside a method retains that method's
+receiver.
+
+**There is no function hoisting:** the declaration installs the function when
+executed. Declare functions before calling code that uses them.
+Recursion is possible once the binding has been installed.
+
+### 7.4 Calls, Arity, and Missing Parameters
+
+Functions are called with `f(...)`; `f.call(...)` is also available.
+`f.arity` returns the number of declared parameters. `Fn.new(f)` preserves
+a closure as a function.
+
+```napalm
+function pair(a, b) { return [a, b]; }
+System.print(pair.arity);      // 2
+System.print(pair(1, 2));      // [1, 2]
+System.print(pair(1));         // [1, null]
+System.print(pair(1, 2, 3));   // [1, 2]
+System.print(pair.call(4, 5)); // [4, 5]
+```
+
+An ordinary closure call fills missing parameters with `null` and ignores
+excess arguments, up to the global limit of **16 arguments**. This does not
+implement optional or rest parameters:
+
+- A `b?: string` parameter retains the `string` annotation. Omitting it passes
+  `null` and may cause a fatal type error.
+- An unannotated parameter can receive that `null`.
+- Methods and constructors are looked up by **name and arity**; do not assume
+  they use the same rules as a closure.
+- `launch` requires exactly the declared arity.
+- There is no `function f(...args)` or `function f(x = 1)`.
+- If default values are needed, use a check in the body or a destructured
+  parameter with defaults inside the pattern.
+
+For a function that explicitly accepts absence:
+
+```napalm
+function label(name: string, suffix?: string | null) {
+    return name + (suffix ?? "");
+}
+System.print(label("Napalm"));      // Napalm
+System.print(label("Napalm", "!")); // Napalm!
+```
+
+`call` **does not accept a `thisArg`** like `Function.prototype.call`.
+There is no `apply`, `bind`, or standard `arguments` object.
+
+## 8. Types and Persistent Contracts
+
+### 8.1 What Is Actually Checked
+
+Napalm combines inference, static diagnostics, and runtime validation.
+It is not accurate to say that all its annotations are erased.
+
+| Surface | Current effect |
+| --- | --- |
+| Annotated variables or variables with known inferred types | Check assignments; a dynamic source is validated at runtime. |
+| Annotated parameters | Validated on function entry, including structural contracts. |
+| Annotated or inferred class fields | Constrain writes and reads of uninitialized fields. |
+| Interfaces, structural aliases, typed lists, generic Map/Set | Can install persistent contracts on objects. |
+| Return annotation | Accepted, but is not a return-value contract. |
+| `implements`, visibility modifiers, `override` | Do not by themselves implement access control or interface checking. |
+| `as T`, `<T>value`, `satisfies T`, `value!` | Syntax accepted without converting or checking the value at runtime. |
+| Function/class generics | Do not instantiate reified generic types. |
+
+A known violation can prevent compilation. A runtime contract violation
+produces **`Structural type error`** and terminates the program.
+**It cannot be recovered with `try/catch` or `Fiber.try`.**
+
+```napalm runtime-error
+function needsNumber(value: number) {
+    return value;
+}
+try {
+    needsNumber("no es un numero");
+} catch (error) {
+    System.print("este catch no recupera una infraccion de tipo");
+}
+```
+
+By contrast, a return annotation does not enforce the result:
+
+```napalm
+function documentedReturn(): number {
+    return "texto";
+}
+System.print(documentedReturn()); // texto
+```
+
+To validate a dynamic return, assign the result to an annotated variable.
+
+### 8.2 Recognized Types
+
+| Form | Meaning |
+| --- | --- |
+| `number`, `Number`, `num`, `Num` | Number. |
+| `string`, `String` | String. |
+| `boolean`, `Boolean`, `bool`, `Bool` | Boolean. |
+| `null` | Null only. |
+| `any` | No type restriction on the binding. |
+| `never` | No value can satisfy it. |
+| `T[]`, `Array<T>`, `List<T>` | List of T elements. |
+| `Map<K, V>` | Map with key and value contracts. |
+| `Set<T>` | Set with an element contract. |
+| `A \| B` | Union of alternatives. |
+| `(x: T) => U`, `Function`, `Fn` | Closure value; this annotation does not validate a complete signature. |
+| Interface/alias name | Schema declared in the same module. |
+| Known class name | Class identity, not a literal object with the same fields. |
+| `{ x: number; }` | Inline structural schema. |
+| `Range`, `Fiber`, `Map`, `Set`, `List` | Native families recognized by the type resolver. |
+
+Additional syntax is accepted as type information, but it is not equivalent
+to TypeScript's type system:
+
+- Type literals are widened: `"yes"` constrains to string, not just `"yes"`;
+  `42` constrains to number.
+- `[number, string]` is treated as a list of the union of its elements, not as
+  a fixed-length tuple with distinct positions.
+- `ReadonlyArray`, `ReadonlyMap`, and `ReadonlySet` retain content types but do
+  not make the collection immutable.
+- `Record<K, V>` is classified as a Map; it does not replace the contract of
+  `Map<K, V>`.
+- Unresolved type names in some annotations may degrade to `any`. In declared
+  interfaces and aliases, unsupported or unresolved types are diagnosed.
+- Writing `Promise<T>` or `Date` as an annotation does not by itself install a
+  complete contract on those native APIs.
+
+### 8.3 Interfaces: Open Objects
+
+```napalm
+interface Position {
+    x: number;
+    y: number;
+}
+interface Named {
+    name: string;
+}
+interface Player extends Named {
+    readonly id: number;
+    position: Position;
+    scores: number[];
+    nickname?: string;
+}
+
+const raw = {
+    id: 1,
+    name: "Ada",
+    position: {x: 0, y: 0},
+    scores: [10],
+    extra: true
+};
+const player: Player = raw;
+player.position.x += 1;
+player.scores.add(20);
+player.nickname = "A";
+delete player.nickname;
+player.other = 7; // An interface allows additional fields.
+System.print([player.position.x, player.scores, player.nickname]);
+```
+
+An interface requires its declared fields but allows additional ones.
+Its declarations have module scope and can refer to other declarations that
+appear later, provided they do not form recursive schemas.
+
+- `extends A, B` combines multiple compatible schemas.
+- Duplicate fields and incompatible inherited definitions are rejected.
+- `field?: T` allows **absence**, not an explicit `null` unless T includes it.
+- Reading an absent optional property returns `null`.
+- A required field cannot be deleted or removed with `clear()`.
+- A `readonly` field cannot be changed or deleted after the contract is
+  installed. The protection is shallow: a contained object can still be
+  mutable.
+- `method(): number` in an interface describes a closure field. It does not
+  check its arity or return value.
+- Structural interfaces describe **Maps/object literals**, not class
+  instances. `class X implements I` does not change this rule.
+
+### 8.4 type: Closed Objects
+
+Aliases **do have an effect** in this implementation. A structural object
+alias produces a **closed** contract: additional keys are not allowed,
+either initially or later.
+
+```napalm
+type Point = {x: number; y: number};
+type MaybePoint = Point | null;
+type Names = string[];
+
+const point: Point = {x: 1, y: 2};
+point.x = 3;
+const names: Names = ["Ada"];
+names.add("Lin");
+System.print([point.x, names]);
+```
+
+```napalm compile-error
+type Point = {x: number};
+const point: Point = {x: 1};
+point.extra = 2;
+```
+
+`type Closed = SomeInterface` closes the object bound as `Closed`.
+It does not recursively change the semantics of a child declared with another
+open interface. Structural alternatives in an alias union are also closed
+where applicable.
+
+Generic aliases retain their shape, but **do not fully substitute their type
+arguments**:
+
+```napalm
+type Box<T> = {value: T};
+const box: Box<number> = {value: "admitido actualmente"};
+System.print(box.value);
+```
+
+Here the T placeholder is erased to `any`; the `value` key remains part of the
+closed schema. For a real constraint, use a non-generic alias with
+`value: number`, or a native generic Map/Set when appropriate.
+
+### 8.5 The Contract Belongs to the Object
+
+Contracts do not belong only to the variable that installed them:
+
+```napalm runtime-error
+interface Counter { value: number; }
+const original = {value: 1};
+const checked: Counter = original;
+const alias: any = original;
+alias.value = "invalido";
+```
+
+Mutations through properties, brackets, collection methods, closures, and
+aliases created before the contract are checked. An `any` alias does not remove
+the protection.
+
+Other important effects:
+
+1. Existing contents are validated before the contract is installed.
+2. Contracts for nested objects and lists propagate to those references.
+3. Replacing a child validates and protects the new child.
+4. Removing a reference does not unprotect the object it used to contain.
+5. If an object receives multiple contracts, it must satisfy all of them.
+6. For unions of mutable objects/lists, the first alternative that matched
+   when bound is retained.
+7. A shallow spread copy creates another container but shares children that
+   remain subject to their contracts.
+
+### 8.6 Class Fields and Exact Types
+
+A `value: number;` field can be left without an initializer in the
+declaration, but reading it before assigning a number produces an error; this
+does not permit treating it as `number | null`.
+
+Class contracts are based on known concrete classes, not an entire structural
+hierarchy. Do not assume a `Base` annotation automatically accepts every
+`Derived` instance, even when `derived instanceof Base` is true.
+
+### 8.7 Type Syntax Without Executable Code
+
+Among other forms, the following are accepted:
+
+- Generic parameters on functions and classes, and type arguments in calls.
+- Overload signatures without bodies, followed by the implementation.
+- `abstract class`, `abstract` or `declare` members.
+- `declare function`, `declare const/let/var`, `declare class`,
+  `declare namespace`, and `declare module`.
+- `import type` and type exports.
+- `name!` and `name?` properties.
+
+`declare` declarations do not create values or load libraries.
+Signatures without bodies do not create an executable overload.
+`abstract` should not be interpreted as a complete guarantee that the class
+cannot be instantiated. Type imports do not carry contracts between modules.
+
+## 9. Lists and Arrays
+
+### 9.1 Creating Lists
+
+```napalm
+const literal = [1, 2, 3];
+const sparse = [1, , 3];
+const slots = Array(3);
+const otherSlots = new Array(2);
+const zeros = new Array<Number>(3);
+const filled = List.filled(3, "x");
+System.print([literal, sparse, slots, otherSlots, zeros, filled]);
+```
+
+- `[]` is an empty list.
+- Holes and `Array(n)` are filled with `null`.
+- `new Array<Number>(n)` and `Array<number>(n)` are filled with zero and install
+  a numeric contract.
+- Array constructors with a size require exactly one argument.
+- Only `Number`/`number`/`Num` and `any` are supported as types for these
+  generic sized constructors; not `new Array<string>(3)`.
+- `new List(n)` and `List.new(n)` expose the same native list with null slots.
+- `List.filled(n, value)` repeats **the same reference** if value is an object.
+
+Array and List are not separate collection identities. `Array` is syntactic
+sugar for construction, not a replacement for all JavaScript `Array` APIs.
+
+### 9.2 Indices, Growth, and length
+
+```napalm
+const values: any[] = [10, 20, 30];
+System.print(values[-1]); // 30
+System.print(values[99]); // null
+values[5] = 60;
+System.print(values);     // [10, 20, 30, null, null, 60]
+values.setLength(2);
+System.print(values);     // [10, 20]
+values.setLength(4);
+System.print(values);     // [10, 20, null, null]
+```
+
+Indices are integers. A negative index counts from the end.
+An out-of-range read returns `null`; an excessively negative write fails.
+Writing to a positive index beyond the current size expands the list and fills
+the gap with null.
+
+Growth of a typed list also validates those null values. Therefore, a
+`number[]` list cannot grow through `setLength` or an out-of-range write if
+that operation introduces null; `length` is read-only. Use
+`add`/`push`/`insert` to add numbers.
+
+### 9.3 List API
+
+| Member | Result and effect |
+| --- | --- |
+| `count`, `length` | Number of elements. |
+| `length()` | Equivalent historical form. |
+| `isEmpty` | Bool; use as a property. |
+| `add(value)` | Adds an element and returns that element. |
+| `push(value)` | Adds an element and returns the new size. |
+| `pop()` | Removes the last element; null if empty. |
+| `shift()` | Removes the first element; null if empty. |
+| `unshift(value)` | Inserts at the beginning and returns the new size. |
+| `insert(index, value)` | Inserts at a position and returns value; `-1` inserts at the end. |
+| `removeAt(index)` | Removes and returns the element; supports valid negative indices. |
+| `remove(value)` | Removes the first `==` match; returns the element or null. |
+| `clear()` | Empties the list and returns null. |
+| `setLength(n)` | Truncates or grows with null; returns n. |
+| `fill(value)` | Replaces all elements and returns the list. |
+| `map(callback)` | New list; calls `callback(element)` once per element. |
+| `filter(callback)` | New list with elements whose condition is truthy. |
+| `reduce(callback, initial)` | Accumulates through `callback(accumulator, element)`. |
+| `+ otherList` | New shallow concatenation. |
+| `[range]` | New list with the selected segment. |
+| `iterate(cursor)`, `iteratorValue(cursor)` | Iteration protocol. |
+| `toString`, `toString()` | Text representation. |
+
+`push`, `add`, and `unshift` accept **a single element**, not a variable
+number of elements. map/filter callbacks do not automatically receive an
+index or collection. `reduce` requires an initial value.
+
+```napalm
+const source = [1, 2, 3, 4];
+System.print(source.map(x => x * 2));       // [2, 4, 6, 8]
+System.print(source.filter(x => x > 2));    // [3, 4]
+System.print(source.reduce((a, x) => a + x, 0)); // 10
+System.print(source);                      // [1, 2, 3, 4]
+```
+
+`forEach`, `find`, `findIndex`, `sort`, `splice`, and the complete JS Array
+catalog are not installed. Use a loop or compose the available operations.
+Do not modify the source list inside callbacks while assuming ECMAScript's
+exact rules.
+
+### 9.4 Shallow Copies and Limits
+
+`[...list]`, `list + other`, and slices create a new container but retain
+inner references.
+
+Sized construction, `List.filled`, `setLength`, and index-based growth have a
+size limit of **16,777,216** elements.
+Do not interpret this limit as a promise of available memory or as a uniform
+quota for all list operations.
+
+## 10. Objects, Map, and Set
+
+### 10.1 Object Literals Are Maps
+
+```napalm
+const name = "Ada";
+const key = "score";
+const person = {
+    name,
+    [key]: 42,
+    "display-name": "A",
+    double: (n) => n * 2
+};
+System.print(person.name);
+System.print(person["display-name"]);
+System.print(person.double(21));
+person.score++;
+System.print("score" in person); // true
+delete person.score;
+System.print(person.score);      // null
+```
+
+Named, string, and numeric keys, computed keys `[expression]`, and the
+`{name}` shorthand are supported.
+To store a function, use `method: (...) => ...` or
+`method: function (...) {...}`; do not assume support for JS object method
+shorthand syntax.
+
+`obj.key` resolves as a key when a builtin member does not take precedence.
+**Bracket notation always accesses the key.**
+
+```napalm
+const obj = {size: "dato", count: "otro", keys: "contenido"};
+System.print(obj.size);     // 3: Map property
+System.print(obj["size"]); // dato
+System.print(obj["keys"]); // contenido
+```
+
+Functions stored in Maps can be called with `obj.fn(...)`.
+They do not automatically receive the Map as `this`; they remain lexical
+closures.
+
+### 10.2 Map API
+
+```napalm
+const scores = new Map<string, number>();
+scores.set("Ada", 42).set("Lin", 7);
+System.print(scores.get("Ada"));
+System.print(scores.has("Lin"));
+System.print(scores.size);
+scores.delete("Lin");
+```
+
+| Member | Result |
+| --- | --- |
+| `new Map()` | Empty Map; does not accept an initial iterable. |
+| `get(key)`, `[key]` | Value or null if absent. |
+| `set(key, value)` | Inserts/updates and returns the Map. |
+| `[key] = value` | Writes an entry. |
+| `has(key)`, `containsKey(key)`, `key in map` | Whether the key exists, even if its value is null. |
+| `delete(key)`, `delete map.key`, `delete map[key]` | Bool indicating whether it existed. |
+| `remove(key)` | Returns the removed value or null. |
+| `clear()` | Empties the Map; returns null; preserves contracts. |
+| `size`, `count` | Number of entries. |
+| `isEmpty` | Bool. |
+| `keys` | Live iterable view of keys in insertion order. |
+| `keys()` | New list of keys sorted by their textual representation. |
+| `values()` | New list of values, in the same order as `keys()`. |
+| `entries()` | New list of `[key, value]` pairs, in that order. |
+| `iterate`, `iteratorValue` | Iteration in insertion order. |
+| `toString`, `toString()` | Presentation representation, not JSON. |
+
+**`map.keys` and `map.keys()` are not equivalent.**
+This distinction also affects `for...in`.
+
+```napalm
+const map = {z: 1, a: 2};
+const live = map.keys;
+const snapshot = map.keys();
+map.m = 3;
+System.print([...live]);       // [z, a, m]
+System.print(snapshot);        // [a, z]
+System.print(map.entries());   // [[a, 2], [m, 3], [z, 1]]
+for (const entry of map) {
+    System.print([entry.key, entry.value]); // z, a, m
+}
+```
+
+Updating an existing key preserves its insertion position.
+Deleting it and inserting it again moves it to the end.
+There is no guarantee of JavaScript iterator behavior when mutating during
+iteration.
+
+### 10.3 Keys and MapEntry
+
+Map accepts keys of different types. `"1"` and `1` are different keys.
+Strings are compared by contents; other objects by identity.
+All NaN values represent one key, as do signed zeros.
+
+`for...of map` returns `MapEntry` objects with `.key` and `.value` getters,
+**not list pairs**. To destructure pairs, use `map.entries()`.
+
+```napalm
+const map = new Map();
+const objectKey = {id: 1};
+map.set(objectKey, "dato");
+map.set(null, 7);
+for (const [key, value] of map.entries()) {
+    System.print(value);
+}
+System.print(map.get(objectKey)); // dato
+System.print(map.get({id: 1}));   // null
+```
+
+### 10.4 Set
+
+```napalm
+const names = new Set<string>();
+names.add("Ada").add("Lin").add("Ada");
+System.print(names.size); // 2
+System.print([...names]); // [Ada, Lin]
+System.print(names.has("Ada"));
+System.print(names.delete("Ada")); // true
+```
+
+| Member | Result |
+| --- | --- |
+| `new Set()` | Empty Set; does not accept an initial iterable. |
+| `add(value)` | Inserts if absent; returns the Set. |
+| `has(value)` | Bool. |
+| `delete(value)` | Bool indicating whether it was present. |
+| `clear()` | Empties and returns null. |
+| `size`, `count`, `isEmpty` | Size and state. |
+| `keys()`, `values()` | Return the Set itself as an iterable, not a new list. |
+| `iterate`, `iteratorValue` | Iteration protocol. |
+
+Set preserves insertion order and uses Map key equality.
+To get an independent list, use `[...set]` or `[...set.values()]`.
+There is no `new Set(list)`; add elements in a loop.
+
+### 10.5 Generic Collections
+
+`new Map<K, V>()`, `new Set<T>()`, and equivalent annotations install
+persistent contracts. These include nested contents, unions, and structural
+schemas.
+
+```napalm
+interface Item { value: number; }
+const items = new Set<Item>();
+items.add({value: 42});
+const groups = new Map<string, Set<Item>>();
+groups.set("items", items);
+System.print(groups.get("items").size); // 1
+```
+
+An invalid write through `any` is still fatal.
+Do not confuse these native generics with the erased placeholders of a
+user-defined generic class or alias.
+
+## 11. Ranges and Custom Iteration
+
+### 11.1 Range
+
+```napalm
+const exclusive = new Range(1, 4);
+const inclusive = new Range(1, 4, true);
+System.print([...exclusive]); // [1, 2, 3]
+System.print([...inclusive]); // [1, 2, 3, 4]
+System.print([...new Range(3, 0)]); // [3, 2, 1]
+```
+
+The step is `+1` or `-1` depending on direction. Finite fractional endpoints
+can be used; for example, `new Range(0.5, 2.5, true)` produces `0.5, 1.5, 2.5`.
+There is no step parameter.
+
+| Getter | Meaning |
+| --- | --- |
+| `from`, `to` | Original endpoints. |
+| `min`, `max` | Smaller and larger endpoint. |
+| `isInclusive` | Whether the final endpoint is included. |
+| `count` | Count for traversal in steps of one. |
+| `toString` / `toString()` | Range representation. |
+
+Use finite endpoints to ensure iteration terminates. Wren operators
+`1..5` and `1...5` **are not part of the current public syntax**.
+
+### 11.2 List Slices
+
+```napalm
+const trees = ["cedar", "birch", "oak", "willow"];
+System.print(trees[new Range(1, 3)]);       // [birch, oak]
+System.print(trees[new Range(1, 3, true)]); // [birch, oak, willow]
+System.print(trees[new Range(-1, 0, true)]);// [willow, oak, birch, cedar]
+```
+
+Slice endpoints must be integers. Negative values are normalized relative to
+the size, reverse traversal is allowed, and a shallow copy is created. There
+is no assignment to a full range as a slice.
+A range outside the supported bounds produces an error, not necessarily
+`Array.slice`'s silent clipping behavior in JS.
+
+The public syntax for matrices is `matrix[row][column]`, not
+`matrix[row, column]`, even though internal tests cover historical forms.
+
+### 11.3 Iteration Protocol
+
+The consumer starts with a `null` cursor, calls `iterate(cursor)`, and ends
+when it receives a value that is falsy according to Napalm. For each valid
+cursor it calls `iteratorValue(cursor)`.
+
+```napalm
+class Countdown {
+    top;
+    constructor(top) { this.top = top; }
+    iterate(cursor) {
+        const next = cursor == null ? this.top : cursor - 1;
+        return next >= 0 ? next : false;
+    }
+    iteratorValue(cursor) { return cursor; }
+}
+
+System.print([...new Countdown(3)]); // [3, 2, 1, 0]
+for (const n of new Countdown(2)) {
+    System.print(n);
+}
+```
+
+The cursor `0` is valid because it is truthy in Napalm.
+`Symbol.iterator`, `{done, value}` objects, and generators are not used.
+Lists, strings, ranges, Maps, key views, and Sets implement the protocol.
+List and call spread also use it.
+
+## 12. Destructuring, Rest, and Spread
+
+### 12.1 List Patterns
+
+```napalm
+const [first, , third = 30, ...tail] = [10, 20, null, 40, 50];
+System.print([first, third, tail]); // [10, 30, [40, 50]]
+let a = 1;
+let b = 2;
+[a, b] = [b, a];
+System.print([a, b]); // [2, 1]
+```
+
+Holes are skipped, missing values are null, and a default is evaluated only if
+the selected value is null. Therefore, the default also applies to an
+**explicit** null, but not to false, zero, or an empty string.
+
+### 12.2 Object Patterns
+
+```napalm
+const dynamicKey = "name";
+const {
+    [dynamicKey]: title,
+    settings: {enabled = true},
+    ...remaining
+} = {name: "Napalm", settings: {}, version: 1};
+
+System.print([title, enabled, remaining.version]);
+```
+
+Aliases, computed keys, nesting, and defaults are supported.
+The source and each computed key are evaluated once.
+The rest is stored in a new Map without the extracted keys.
+
+### 12.3 Parameters and Loops
+
+```napalm
+function describe({name, scores: [best = 0, ...others]}) {
+    return `${name}: ${best}; restantes ${others}`;
+}
+System.print(describe({name: "Ada", scores: [42, 21, 7]}));
+for (const [name, score] of [["Ada", 42], ["Lin", 7]]) {
+    System.print(`${name}: ${score}`);
+}
+```
+
+An inner default in a pattern does not make the entire argument optional:
+`describe(null)` still fails because the pattern requires a Map.
+
+### 12.4 Spread
+
+```napalm
+const input = [2, 3];
+const expanded = [1, ...input, ...new Range(4, 6), ..."ab"];
+const original = {x: 1, nested: [2]};
+const changed = {...original, x: 9};
+changed.nested.add(3);
+function sum(a, b, c) { return a + b + c; }
+System.print(expanded);          // [1, 2, 3, 4, 5, a, b]
+System.print([original.x, changed.x, original.nested]);
+System.print(sum(1, ...input));  // 6
+```
+
+Spread is also available in method, constructor, and `super` calls.
+Arguments are expanded from left to right.
+After expansion, they are still limited to 16.
+An expanded call that is too long produces a recoverable error.
+
+Rules and limits:
+
+- Rest must appear at the end of the pattern; a comma after it is not allowed.
+- Destructuring lists requires a List, and destructuring objects requires a
+  Map. This is not a general adapter for iterables or class instances.
+- Even `const [] = null` and `const {} = null` fail.
+- List and call spread require an iterable.
+- Object spread copies Maps and also uses Proxy traps. Spreading `null`
+  currently produces a runtime error; it is not ignored.
+- Rest/spread containers are independent; their children are shared.
+- Later keys overwrite earlier keys in an object literal.
+- Rest in patterns does not imply support for **rest parameters**.
+- Spread is not supported across the `launch` boundary.
+
+## 13. List Comprehensions
+
+A comprehension builds a list from one or more traversals:
+
+```napalm
+const numbers = [1, 2, 3, 4, 5];
+const squares = [n * n for n in numbers if n % 2 == 1];
+const pairs = [
+    [x, y]
+    for x in [1, 2]
+    for y in [10, 20]
+    if x + y > 11
+];
+System.print(squares); // [1, 9, 25]
+System.print(pairs);   // [[1, 20], [2, 10], [2, 20]]
+```
+
+The expression comes first, followed by the `for name in iterable` clauses.
+Each clause can have multiple `if` filters and can depend on earlier bindings.
+Do not write `let`, `const`, or `of` in this syntax.
+
+**Here `in` means traversing values through the iteration protocol**; it does
+not mean keys as in `for (const key in map)`.
+A comprehension over a Map receives MapEntry values, as `for...of` does.
+Clause bindings are local to the comprehension.
+Comprehensions are not lazy generators: the result is a materialized list.
+Each clause binding is a simple identifier, not a pattern.
+
+## 14. Classes and Inheritance
+
+### 14.1 Fields, Constructor, and Methods
+
+```napalm
+class Counter {
+    value: number;
+    history = [];
+    static created = 0;
+
+    constructor(start: number) {
+        this.value = start;
+        Counter.created++;
+    }
+
+    add(amount: number) {
+        this.value += amount;
+        this.history.add(this.value);
+        return this.value;
+    }
+
+    get doubled() { return this.value * 2; }
+    set doubled(value) { this.value = value / 2; }
+    toString() { return `Counter(${this.value})`; }
+}
+
+const counter = new Counter(10);
+counter.add(2);
+counter.doubled = 30;
+System.print(counter);         // Counter(15)
+System.print(Counter.created); // 1
+```
+
+Instance field initializers run for each construction; a list declared as
+`items = []` is not shared across instances.
+Fields without initializers are usually assigned in the constructor.
+A base class without an explicit constructor can be constructed without
+arguments.
+
+Always use `this.member` in methods. `function method(...) {...}` is also
+accepted inside a class; `fn` is not.
+
+Instances are not open Maps. Do not assume that `object.extra = value` adds an
+arbitrary field or that all instances have `keys()`, `values()`, `entries()`,
+or `size`. Declare the fields that make up their API.
+
+### 14.2 Inheritance and super
+
+```napalm
+class Shape {
+    name;
+    constructor(name) { this.name = name; }
+    describe() { return this.name; }
+}
+class Rectangle extends Shape {
+    width;
+    height;
+    constructor(width, height) {
+        super("rectangle");
+        this.width = width;
+        this.height = height;
+    }
+    get area() { return this.width * this.height; }
+    describe() { return `${super.describe()}: ${this.area}`; }
+}
+const rectangle = new Rectangle(6, 7);
+System.print(rectangle.describe());       // rectangle: 42
+System.print(rectangle instanceof Shape); // true
+```
+
+`extends` provides single inheritance.
+`super(...)` initializes the same instance; `super.method(...)` calls the
+superclass implementation.
+
+**Write an explicit derived constructor with `super(...)`** when relying on
+base-class initialization. Do not assume an empty derived class automatically
+forwards all arguments or runs all initializers.
+When derived initializers are present, the parser requires a direct call to
+super before inserting them.
+
+`instanceof` is useful for user class hierarchies. Do not use it as a universal
+`typeof` for builtins: for example, a list is not reliably identified by
+`list instanceof List` in the current implementation.
+
+### 14.3 Static Members and static Blocks
+
+```napalm
+class Registry {
+    static count = 0;
+    static {
+        Registry.count = 10;
+    }
+    static next() {
+        return ++Registry.count;
+    }
+}
+System.print(Registry.next()); // 11
+```
+
+Static initializers and blocks run once when the class declaration executes.
+Use the class name to access its static members.
+Do not assume inheritance of static methods/factories: `Derived.factory()`
+does not necessarily find `Base.factory()`.
+
+### 14.4 Parameter Properties
+
+```napalm
+class User {
+    constructor(public name: string, private readonly id: number) {}
+    describe() { return `${this.id}: ${this.name}`; }
+}
+const user = new User("Ada", 1);
+System.print(user.describe());
+```
+
+Constructor parameter modifiers can synthesize the property.
+Do not confuse this with access security: class `public`, `private`,
+`protected`, `readonly`, and `override` are erased as visibility or
+immutability controls. **Interface** `readonly` is part of a contract.
+There are no ECMAScript `#private` fields.
+
+### 14.5 Functions Stored as Fields
+
+```napalm
+class Bag {
+    callback = (n) => n + 1;
+    makeReader() { return () => this.callback; }
+}
+const bag = new Bag();
+System.print((bag.callback)(41)); // 42
+```
+
+The parentheses in `(bag.callback)(...)` force a field read followed by a call
+to that function. `bag.callback(...)` selects method dispatch and is not
+necessarily equivalent to calling the field.
+Reading a method should not be assumed to produce a receiver-bound function
+as in other libraries.
+
+### 14.6 Overloads and Operators
+
+Methods can be defined with the same name and different arities.
+The public syntax allows only one constructor implementation.
+
+```napalm
+class Vector {
+    x;
+    constructor(x) { this.x = x; }
+    operator +(other) { return new Vector(this.x + other.x); }
+    operator -() { return new Vector(-this.x); }
+    operator ==(other) { return this.x == other.x; }
+    toString() { return `Vector(${this.x})`; }
+}
+const a = new Vector(2);
+const b = new Vector(3);
+System.print(a + b);                // Vector(5)
+System.print(-a);                   // Vector(-2)
+System.print(a == new Vector(2));   // true
+```
+
+Operators allowed with `operator`:
+
+- Unary: `!`, `~`, `-`, with no parameters.
+- Binary: `+`, `-`, `*`, `**`, `/`, `%`, `<<`, `>>`, `&`, `^`, `|`,
+  `<`, `<=`, `>`, `>=`, `==`/`===`, `!=`/`!==`, with one parameter.
+
+These are concrete, synchronous instance methods; they cannot be `static`,
+`async`, `foreign`, `abstract`, or decorated.
+`&&`, `||`, `??`, assignment, and subscripts cannot be overloaded using an
+`operator []` declaration.
+
+## 15. Reactive Properties and Watchers
+
+### 15.1 computed
+
+```napalm
+let evaluations = 0;
+class Vector {
+    x = 2;
+    y = 3;
+    computed magnitude2() {
+        evaluations++;
+        return this.x * this.x + this.y * this.y;
+    }
+}
+const vector = new Vector();
+System.print(vector.magnitude2); // 13
+System.print(vector.magnitude2); // 13, usa cache
+vector.x = 4;
+System.print(vector.magnitude2); // 25, vuelve a calcular
+System.print(evaluations);       // 2
+```
+
+`computed name() {...}` declares a **property**, read without parentheses.
+It is evaluated lazily and retains its result until tracked dependencies
+change. Dependencies are discovered by reading fields during evaluation,
+including reads through other computed properties.
+Reevaluation can change the set of dependencies.
+
+Use computed properties for derivations without side effects. The counter in
+the example only demonstrates when evaluation occurs.
+Do not assume that every global, List element, or Map entry is observed: the
+implemented tracking focuses on field accesses.
+Also do not assume deep comparison or that assigning an equal value never
+invalidates.
+
+### 15.2 watch
+
+```napalm
+const observations = [];
+class Model {
+    value = 1;
+    watch report() {
+        observations.add(this.value);
+    }
+}
+const model = new Model();
+await Timer.microtask(() => null);
+model.value = 2;
+model.value = 3;
+await Timer.microtask(() => null);
+System.print(observations); // [1, 3]
+```
+
+A watcher is registered during construction, after ordinary initializers, and
+runs its first evaluation as a microtask.
+When a dependency changes, it is scheduled again. Multiple changes before it
+runs may be grouped into a single execution.
+It is not called synchronously and immediately when the field is written.
+
+Both computed and watch:
+
+- They are concrete, synchronous, parameterless instance members.
+- They do not allow the `function` prefix, decorators, `static`, `async`, or
+  `foreign`.
+- They do not imply a general signals, UI, or observables library.
+- No public subscribe/unsubscribe API is exposed here; `__Reactive` functions
+  are internal support, not an application API.
+
+## 16. Enums
+
+```napalm
+enum Color { Red, Green, Blue }
+enum Status { Pending = 10, Running, Failed = -1, Done = 20 }
+enum Direction { Up = "up", Down = "down" }
+enum Flags { Read = 1, Write = 2, Both = Read | Write }
+
+System.print([Color.Red, Color.Green, Color.Blue]); // [0, 1, 2]
+System.print(Status.Running);                     // 11
+System.print(Color[2]);                           // Blue
+System.print(Direction.Up);                       // up
+System.print(Flags.Both);                         // 3
+```
+
+Enums are real Map-based values:
+
+- Without an initializer, the first numeric member is zero.
+- Subsequent members can auto-increment after a constant numeric member.
+- After a string or non-constant numeric initializer, explicitly specify the
+  next value.
+- Numeric members create a direct `Name -> value` entry and a reverse
+  `value -> Name` entry.
+- String members do not create an automatic reverse entry.
+- Initializers can refer to earlier members.
+- Local and exported enums are allowed; their initializers run when the
+  declaration is reached.
+- The enum binding is constant; the Map is not automatically frozen.
+- There is no TypeScript `const enum` or a new runtime enum-value class.
+
+If a numeric value is repeated, the last reverse entry for that key overwrites
+the previous one, as in any Map.
+
+## 17. Decorators
+
+### 17.1 Form and Order
+
+`@decorator`, `@namespace.decorator`, and `@factory(...)` are supported on
+functions, classes, methods, getters, setters, and fields, including static
+members.
+
+```napalm
+function suffix(text) {
+    return (value, context) => {
+        return (name) => value(name) + text;
+    };
+}
+@suffix("A")
+@suffix("B")
+function greet(name) { return `Hola ${name}:`; }
+System.print(greet("Ada")); // Hola Ada:BA
+```
+
+Decorator expressions/factories are evaluated from top to bottom in their
+lexical scope.
+Decorators are applied from bottom to top. Each receives `(value, context)`.
+Returning null, including by falling through to the end of the function,
+preserves the current value.
+
+### 17.2 Context and Signatures
+
+| `context.kind` | Received value | Expected replacement |
+| --- | --- | --- |
+| `"function"` | Original function. | Function with the original arguments. |
+| `"class"` | Original class. | Replacement class. |
+| `"method"` | Method callable. | Function `(receiver, arguments...)`. |
+| `"getter"` | Getter callable. | Function `(receiver)`. |
+| `"setter"` | Setter callable. | Function `(receiver, nextValue)`. |
+| `"field"` | null. | Transformer `(receiver, initialValue)`. |
+
+`arguments...` is table notation, **not rest-parameter syntax**.
+Non-null replacements for functions/members must be functions; class
+replacements must be classes. An invalid result produces a recoverable error.
+
+`context.name` is the declared name.
+Members receive `context.static` and `context.private`; the latter is
+currently false because visibility modifiers do not create privacy.
+
+### 17.3 Explicit Member Receiver
+
+```napalm
+function plusOne(original, context) {
+    return (receiver, amount) => original(receiver, amount) + 1;
+}
+class Counter {
+    value = 10;
+    @plusOne
+    add(amount) { return this.value + amount; }
+}
+System.print(new Counter().add(2)); // 13
+```
+
+Wrappers do not receive a dynamic JavaScript `this`: the receiver is the first
+explicit argument. This reduces the number of ordinary arguments to a
+decorated method to **15**, reserving one for the receiver.
+
+### 17.4 Field and Initializer Transformation
+
+```napalm
+function doubleField(value, context) {
+    context.addInitializer((receiver) => {
+        System.print(receiver.amount);
+    });
+    return (receiver, initialValue) => initialValue * 2;
+}
+class Invoice {
+    @doubleField
+    amount = 21;
+}
+const invoice = new Invoice(); // The callback prints 42.
+System.print(invoice.amount); // 42
+```
+
+`context.addInitializer(fn)` can only be called **while the decorator is
+executing**:
+
+- For a function/class, the callback takes no arguments.
+- For a member, it receives the receiver.
+- The final function/class binding is installed before its callbacks run.
+- Instance method/getter/setter callbacks run for each construction, after
+  `super` in derived classes and before ordinary fields.
+- Static equivalents run once before static fields and blocks.
+- Transformers for a stacked field run from top to bottom.
+- A field without an initializer passes null to the transformer.
+- Extra callbacks for that field run after it is assigned.
+- Callbacks run in registration order; an error aborts the remaining ones.
+
+Place decorators **before `export`**.
+Decorators are not supported on parameters, constructors, static blocks,
+operators, computed/watch members, or foreign/abstract/declare members.
+There is no `context.access`, auto-accessors, or complete implementation of
+all JavaScript decorator proposals.
+
+## 18. Native Decorators
+
+### 18.1 Catalog
+
+All durations are expressed in **milliseconds**.
+
+| Decorator | Function |
+| --- | --- |
+| `@memoize` | Cache by the complete argument tuple. |
+| `@memoizeExpiring(ttl)` | Cache by key with expiration measured from insertion. |
+| `@once` | Reuses the first successful return, regardless of later arguments. |
+| `@delay(wait)` | Schedules each call independently and returns a Promise. |
+| `@debounce(wait, options?)` | Groups a burst of calls and uses the latest arguments. |
+| `@throttle(wait, options?)` | Limits invocations per time window. |
+
+They apply to functions and callable members, not classes or field
+transformers. They preserve the explicit receiver of members.
+
+### 18.2 Caching
+
+```napalm
+let evaluations = 0;
+@memoize
+function multiply(a, b) {
+    evaluations++;
+    return a * b;
+}
+System.print(multiply(6, 7));
+System.print(multiply(6, 7));
+System.print(evaluations); // 1
+
+@once
+function initialize(value) { return {value}; }
+const first = initialize(1);
+System.print(initialize(9) === first); // true
+```
+
+The key includes all arguments and, for a method, the receiver.
+Strings are compared by contents and objects by identity, not by deep
+serialization.
+
+Caveats:
+
+- Mutating an argument does not invalidate its entry.
+- Globals and captured variables are not part of the key.
+- References to arguments and results are retained; an unbounded cache can
+  retain a large amount of memory.
+- A synchronous error is not cached.
+- A returned Promise is **cached immediately**, even if it is later rejected.
+- `once` on a member has separate state for each receiver.
+- `memoizeExpiring` hits do not renew the TTL; with a TTL of zero, there is no
+  durable reuse.
+
+### 18.3 delay, debounce, and throttle
+
+```napalm
+let saves = 0;
+@debounce(10)
+function save(value) {
+    saves++;
+    return value;
+}
+const first = save(1);
+const second = save(2);
+const third = save(3);
+System.print(await Promise.all([first, second, third])); // [3, 3, 3]
+System.print(saves); // 1
+```
+
+Options:
+
+| Option | debounce | throttle |
+| --- | --- | --- |
+| `leading` | false by default. | true by default. |
+| `trailing` | true by default. | true by default. |
+| `maxWait` | Limits postponement of a continuous burst. | Do not use it as an additional throttle contract. |
+
+Pass options as an object:
+`@debounce(100, {leading: true, trailing: false})`.
+`options = {...}` would be an assignment, not a named argument.
+Disabling both edges is invalid. Durations for these decorators must be finite,
+non-negative, and no greater than `2,147,483,647` ms.
+
+The three timing decorators:
+
+- Always return Promises, even when decorating a synchronous function.
+- Adopt the result if the decorated function returns another Promise.
+- Convert scheduled exceptions into rejections.
+- Group the result of calls that correspond to the same invocation.
+- Keep timing state separate by receiver for members.
+
+With leading and trailing enabled, a single call does not trigger a duplicate
+trailing execution. Later calls in the window receive the trailing result.
+If trailing is disabled, suppressed calls share the leading result.
+`delay` does not group calls: it schedules each one.
+
+## 19. Exceptions and Cleanup
+
+### 19.1 throw, try, catch, and finally
+
+```napalm
+function divide(a, b) {
+    if (b == 0) throw {message: "division no permitida", divisor: b};
+    return a / b;
+}
+try {
+    divide(10, 0);
+} catch (error) {
+    System.print(error.message);
+} finally {
+    System.print("limpieza");
+}
+```
+
+Any value can be thrown, not just an Error instance.
+Do not assume a global `Error` constructor with the JS API.
+Ordinary runtime errors, such as a missing method or invalid index, can also
+enter `catch`.
+
+`catch { ... }` without a binding is allowed.
+`try` must have `catch`, `finally`, or both.
+An error can be rethrown with `throw error`.
+`finally` runs on normal exit, throw, return, or control-flow jump; a return or
+throw inside finally can replace the pending one.
+
+Compilation errors and fatal type contracts are not exceptions that can be
+recovered through this mechanism.
+
+### 19.2 defer
+
+```napalm
+function work() {
+    let value = 1;
+    defer System.print(`ultimo: ${value}`);
+    defer {
+        System.print("primero");
+    }
+    value = 7;
+    return value;
+}
+System.print(work());
+// primero
+// ultimo: 7
+// 7
+```
+
+`defer statement` and `defer { block }` register cleanup for scope exit. They
+run in **reverse order** of registration.
+They do not run when the defer is declared and observe bindings at cleanup
+time.
+Only defers whose declaration point was reached are registered.
+Inside a loop body, they can clean up each iteration, including on
+break/continue.
+
+### 19.3 errdefer
+
+```napalm
+function work(fail) {
+    defer System.print("siempre");
+    errdefer System.print("solo en error");
+    errdefer |error| System.print(`detalle: ${error}`);
+    if (fail) throw "boom";
+    return 42;
+}
+System.print(work(false));
+try {
+    work(true);
+} catch (error) {
+    System.print(`capturado: ${error}`);
+}
+```
+
+`errdefer` runs only when a scope is exited because of an error.
+The optional binding uses **bars**: `errdefer |error| ...`.
+The form `errdefer (error)` is invalid, even if it appears in an old script.
+Do not rely on defer/errdefer to recover from fatal errors, forced process
+termination, or native-code failures.
+
+## 20. Async, Promise, and Timers
+
+### 20.1 async and await
+
+```napalm
+async function answer() {
+    await Timer.delay(1);
+    return 42;
+}
+const plusOne = async (n) => {
+    return (await Promise.resolve(n)) + 1;
+};
+const task = answer();
+System.print(await task);        // 42
+System.print(await plusOne(41)); // 42
+System.print(await Promise.resolve(7)); // 7
+```
+
+Async functions, methods, arrows, and lambdas are supported.
+An async call immediately returns a Promise; its work is scheduled as a
+cooperative task. **Do not assume its body runs synchronously up to the first
+await as it does in JavaScript.**
+
+`await` is allowed at module level and inside async/concurrent functions.
+It is rejected in an ordinary function without those qualifiers.
+Awaiting a rejected Promise throws its reason. `await` requires a Promise;
+awaiting an ordinary value produces a runtime error.
+
+Async does not mean parallel CPU execution: use `concurrent`/`launch` for that.
+A long synchronous computation can delay other tasks and timers.
+
+### 20.2 Promise API
+
+| API | Effect |
+| --- | --- |
+| `Promise.resolve(value)` | Resolved Promise; adopts values/Promises through the adoption mechanism. |
+| `Promise.reject(reason)` | Rejected Promise. |
+| `Promise.all(list)` | Results in input order; fails if any entry fails. |
+| `Promise.any(list)` | First fulfillment; AggregateError if all fail. |
+| `Promise.race(list)` | First settled result, success or failure. |
+| `promise.cancel()` | Requests cancellation; true if the state changed, false if it could no longer change. |
+| `isPending`, `isFulfilled`, `isRejected`, `isCancelled` | State getters. |
+
+Combinators accept **a List**, not any iterable, and allow ordinary values to
+be mixed with Promises.
+
+```napalm
+const results = await Promise.all([
+    Timer.delay(1, () => 10),
+    Promise.resolve(20),
+    3
+]);
+System.print(results); // [10, 20, 3]
+
+try {
+    await Promise.any([Promise.reject("A"), Promise.reject("B")]);
+} catch (error) {
+    System.print(error.name);   // AggregateError
+    System.print(error.errors); // [A, B]
+}
+```
+
+Empty cases:
+
+- `Promise.all([])` fulfills with `[]`.
+- `Promise.any([])` rejects with AggregateError and an empty error list.
+- `Promise.race([])` remains pending.
+
+The public constructors `new Promise(executor)`, `Promise(executor)`,
+`Deferred()`, `.then()`, `.catch()`, `.finally()`, and `allSettled` are not
+installed. Use async/await and try/catch/finally.
+Do not assume a combinator automatically cancels competing work; explicitly
+cancel tasks that are no longer needed.
+
+### 20.3 Timer
+
+| API | Effect |
+| --- | --- |
+| `Timer.delay(ms)` | Promise that fulfills after the delay. |
+| `Timer.delay(ms, callback)` | Runs the callback with no arguments and resolves with its result. |
+| `Timer.microtask(callback)` | Schedules after the current work; returns a Promise. |
+| `Timer.every(ms, callback)` | Cancelable, non-overlapping periodic timer. |
+| `setTimeout(callback, ms)` | Global alias for a one-shot timer. |
+
+Delays are **finite, non-negative milliseconds**.
+`Timer.every` requires a delay greater than zero.
+A zero delay does not mean the callback runs inline.
+
+```napalm
+const timer = setTimeout(() => System.print("no se ejecuta"), 1000);
+System.print(timer.cancel());      // true
+System.print(timer.cancel());      // false
+System.print(timer.isCancelled);   // true
+System.print(await Timer.delay(0, () => 42)); // 42
+```
+
+Intervals do not overlap callback executions, even if the callback returns
+a Promise. Cancel them so the program can terminate:
+
+```napalm
+let ticks = 0;
+let interval: any = null;
+interval = Timer.every(1, () => {
+    ticks++;
+    System.print(ticks);
+    if (ticks >= 3) interval.cancel();
+});
+```
+
+Cancellation does not roll back effects that have already occurred.
+For a timer, it prevents pending callbacks; for an async task, the result
+depends on its state. There is no standard `clearTimeout`: use the returned
+Promise and `cancel`.
+`Date.sleep` is blocking and does not replace `await Timer.delay`.
+
+## 21. Concurrency with launch
+
+### 21.1 Running CPU Work in Parallel
+
+```napalm
+concurrent function sumTo(limit: number) {
+    let total = 0;
+    for (let i = 0; i <= limit; i++) total += i;
+    return total;
+}
+const first = launch sumTo(100);
+const second = launch sumTo(200);
+System.print(await Promise.all([first, second])); // [5050, 20100]
+```
+
+`concurrent function` declares a function that can run in isolated workers.
+`launch f(args)` returns a Promise.
+Launch all tasks before awaiting them to allow concurrency.
+`await launch f(...)` is useful for a single task, but doing so inside a loop
+can serialize the work.
+
+The `concurrent (...) => ...`, `concurrent function (...) {...}`, and
+`concurrent |x| ...` closure forms are also available.
+`async concurrent` is not allowed: the launch boundary is already asynchronous.
+
+### 21.2 Target Restrictions
+
+- The target must be a function declared `concurrent`.
+- It cannot be called directly with `f(...)`; use launch.
+- Launch accepts a direct call to a function value, not arbitrary method
+  dispatch.
+- Exactly the declared parameters must be passed.
+- Argument spread is not allowed in launch.
+- It cannot capture lexical state; pass that state as arguments.
+- It cannot read/write module globals arbitrarily.
+- It can use builtins and synchronous, capture-free helper functions that the
+  runtime can materialize as code in the worker.
+- Nested launch from a worker is not allowed.
+
+Do not assume that importing a stateful function or using a helper that
+depends on globals shares that state with the worker.
+
+### 21.3 Copying Data, Not Sharing Mutable Memory
+
+```napalm
+concurrent function incrementCopy(object) {
+    object.value++;
+    return object;
+}
+const original = {value: 4};
+const changed = await launch incrementCopy(original);
+System.print([original.value, changed.value]); // [4, 5]
+```
+
+The following can cross the boundary:
+
+- null, Bool, numbers, and strings.
+- Nested acyclic Lists and Maps.
+- Map keys that are null, Bool, number, or string.
+
+Functions, captures, Promises, Fibers, instances/classes, Proxy, Set, Range,
+Date, Random, Response/Headers, FFI libraries/functions/pointers, and external
+objects cannot cross.
+Neither can Maps with object keys or cyclic graphs.
+The maximum depth is 256.
+
+Arguments are snapshotted at launch and the result is materialized in the
+receiver. Repeated references within the transferred graph are preserved as
+aliases in the new graph, not as references to the original.
+Do not assume that all contracts installed on the source are transferred;
+annotate boundaries that need data validation.
+
+Worker errors reject the Promise with a `ConcurrentError` reason.
+`cancel()` requests cancellation; it does not reverse external effects already
+performed and does not guarantee immediate interruption of a blocking native
+call.
+The number of workers and the speedup depend on the machine; five tasks do not
+imply a fivefold speedup.
+
+## 22. Fibers
+
+Fibers are explicit-transfer coroutines. They are not threads or Promises.
+
+```napalm
+const fiber = new Fiber((first) => {
+    const resumed = Fiber.yield(first + 1);
+    return resumed + 2;
+});
+System.print(fiber.call(10)); // 11
+System.print(fiber.call(20)); // 22
+System.print(fiber.isDone);   // true
+```
+
+The first call passes the initial argument. `yield` passes a value to the
+caller and suspends the Fiber. The next call returns its argument as the result
+of that yield.
+
+| API | Effect |
+| --- | --- |
+| `new Fiber(body)`, `Fiber.new(body)` | Creates a Fiber from a closure. |
+| `Fiber.current` | Current Fiber; in async tasks it does not expose the internal handle and returns null. |
+| `fiber.call(value?)` | Activates/resumes while saving the caller. |
+| `fiber.try(value?)` | Like call, but returns the recoverable error if the Fiber fails. |
+| `fiber.error` | Stored error. |
+| `fiber.isDone` | Whether it finished or aborted. |
+| `Fiber.yield(value?)` | Returns control to the caller. |
+| `fiber.transfer(value?)` | Peer-to-peer transfer, without creating the same caller link as call. |
+| `fiber.transferError(error)` | Transfers control while delivering an error. |
+| `Fiber.abort(error)` | Aborts with an error; `abort(null)` is a no-op. |
+| `Fiber.suspend()` | Suspends to the host embedding the interpreter. |
+
+```napalm
+const failed = new Fiber(() => {
+    throw "boom";
+});
+System.print(failed.try()); // boom
+System.print(failed.error); // boom
+System.print(failed.isDone);
+```
+
+The root Fiber cannot be activated with `call` like a new Fiber.
+`Fiber.suspend()` requires the host to resume the VM; in the ordinary
+executable, a final module suspension is a runtime error.
+Fiber control operations are unavailable inside async tasks. Do not mix the
+two models as if they were equivalent.
+Fatal contracts do not become recoverable with `fiber.try()` either.
+
+## 23. Modules, Imports, and Exports
+
+### 23.1 Exporting and Importing
+
+Module files have their own scope.
+Only explicitly exported names are public.
+The executable example in the repository is
+[module_import.napalm](scripts/module_import.napalm).
+
+File `maths.napalm`:
+
+```napalm fragment
+export const Answer = 42;
+export function add(a, b) { return a + b; }
+export class Calculator {
+    static multiply(a, b) { return a * b; }
+}
+export default Calculator;
+```
+
+File `main.napalm` in the same directory:
+
+```napalm fragment
+import DefaultCalculator, {Answer, add as sum} from "./maths";
+System.print(Answer);
+System.print(sum(20, 22));
+System.print(DefaultCalculator.multiply(6, 7));
+```
+
+Supported forms:
+
+| Form | Use |
+| --- | --- |
+| `import "./setup";` | Run module side effects. |
+| `import {name, other as local} from "./dep";` | Named imports. |
+| `import value from "./dep";` | Default import. |
+| `import value, {name} from "./dep";` | Both in one declaration. |
+| `export const/let/var ...` | Export declared bindings. |
+| `export function/class/enum ...` | Export a declaration with a runtime value. |
+| `export {local as publicName};` | Publish local bindings. |
+| `export {name as renamed} from "./dep";` | Named re-export. |
+| `export default expression;` | Default value. |
+| `export default function (...) {...}` | Default function, which can be anonymous. |
+| `export default class {...}` | Default class, which can be anonymous. |
+
+Imports are non-reassignable bindings.
+Do not assume ECMAScript live bindings: values are read when the import is
+executed; imported objects retain shared identity, but a later reassignment by
+the exporter does not necessarily update the imported binding.
+
+`import * as ns`, `export *`, dynamic imports `import(...)`, `require`, and a
+`node_modules` resolver are not implemented.
+Specifiers are static strings, not interpolated templates.
+
+### 23.2 Path Resolution
+
+For `import "./util"`, the following are searched in this order:
+
+1. `util.napalm`.
+2. `util/index.napalm`.
+
+An explicit extension must be `.napalm`.
+A name without a prefix such as `"util"` is relative to the importer, not an
+npm package. Relative paths are resolved from the importing file, not from
+the process working directory.
+
+| Prefix | Roots |
+| --- | --- |
+| `@lib/package[/subpath]` | `.napalm/packages`, paths in `NAPALM_LIB_PATH`, and `NAPALM_HOME/packages`. |
+| `@std/name[/subpath]` | `.napalm/std`, paths in `NAPALM_STD_PATH`, `NAPALM_HOME/std`, and locations beside the executable. |
+
+Project-root discovery recognizes `napalm.toml`, `Napalm.toml`, `.napalm`, or
+`.git`. These markers do not imply that a package manager exists to install
+dependencies automatically.
+Path environment variables accept lists according to the operating system
+(`;` on Windows).
+
+For `@lib` and `@std`, `..` and escaping the configured root through symbolic
+links are rejected. Modules are identified by canonical path and initialized
+once per execution. Cyclic graphs can be discovered, but do not depend on
+values that a module in the cycle has not yet initialized.
+
+### 23.3 Types Across Modules
+
+Type-only import/export syntax is accepted and erased.
+An interface or alias contract is not imported to check another module.
+Declare locally any schemas that should apply to received data.
+A `declare` is neither an import nor a call to a native library.
+
+## 24. Strings
+
+### 24.1 Unicode and Indices
+
+Public length and indexing operations work with **Unicode scalar values**,
+not UTF-8 bytes or UTF-16 code units.
+An emoji represented by one scalar value occupies one position.
+A grapheme composed of multiple scalar values can occupy several positions.
+
+```napalm
+const text = "caf\u00e9";
+System.print(text.length);          // 4
+System.print(text[-1]);             // e with acute accent
+System.print(text.indexOf("\u00e9"));// 3
+System.print(text.slice(3));        // e with acute accent
+System.print("a\u{1f600}".length);   // 2
+System.print(text[99]);             // null
+```
+
+Strings are immutable. Transforming one produces another string.
+Negative indices in `text[index]` count from the end.
+
+### 24.2 Complete Installed API
+
+| Member | Use |
+| --- | --- |
+| `count`, `length` | Length in Unicode scalar values. |
+| `isEmpty` | Whether it is empty. |
+| `[index]` | One-scalar string, or null out of range. |
+| `+ value` | Concatenation through textual conversion. |
+| `contains(text)` | Searches for a substring. |
+| `startsWith(text, position?)` | Prefix from the specified position. |
+| `endsWith(text, endPosition?)` | Suffix up to the specified endpoint. |
+| `indexOf(text, start?)` | First index or `-1`. |
+| `lastIndexOf(text, position?)` | Last index no later than the position. |
+| `slice(start, end?)` | Segment with an exclusive end; negatives are relative to the end. |
+| `substring(start, end?)` | Clamps negatives to zero and swaps reversed endpoints. |
+| `trim()`, `trimStart()`, `trimEnd()` | Removes Unicode whitespace at the corresponding ends. |
+| `toUpperCase()`, `toLowerCase()` | Unicode uppercase/lowercase conversion. |
+| `toString`, `toString()` | The string itself. |
+| `iterate`, `iteratorValue` | Iteration by scalar value. |
+| `String.fromCodePoint(number)` | String from a valid Unicode code point. |
+
+```napalm
+const text = "napalm";
+System.print([text.slice(-3), text.slice(4, 1)]); // [alm, ]
+System.print(text.substring(4, 1));              // apa
+System.print(text.contains("pal"));              // true
+System.print(" \tNapalm\n ".trim().toLowerCase());// napalm
+System.print([..."abc"]);                        // [a, b, c]
+```
+
+Explicit positions must be integers; there is no general argument conversion
+as in JS. `slice`/`substring` operations clamp their endpoints according to
+their rules; `indexOf` returns `-1` if no match is found.
+Uppercase conversion can change the length.
+
+`includes`, `concat`, `split`, `replace`, `replaceAll`, `padStart`, `padEnd`,
+`repeat`, regular expressions, and regular-expression methods are not
+provided, even if some appear in a historical example.
+
+## 25. Numbers and Randomness
+
+### 25.1 Math Getters
+
+The following are **properties**, not calls:
+
+| Getter | Result |
+| --- | --- |
+| `abs` | Absolute value. |
+| `floor`, `ceil` | Rounding toward negative/positive infinity. |
+| `round` | Rounds to nearest integer; ties are rounded away from zero. |
+| `sqrt` | Square root. |
+| `sin`, `cos`, `tan` | Trigonometry in radians. |
+| `log` | Natural logarithm. |
+| `exp` | Exponential with base e. |
+| `isInteger` | Finite and without a fractional part. |
+| `isNan` | Whether it is NaN; this is the exact capitalization. |
+| `isInfinity` | Whether it is positive or negative infinity. |
+| `toString` | Text representation; also `toString()`. |
+
+```napalm
+const value = -2.5;
+System.print([value.abs, value.floor, value.ceil, value.round]);
+System.print((9).sqrt);       // 3
+System.print(Num.pi);
+System.print(Num.tau);
+System.print(Num.fromString(" 42.5 ")); // 42.5
+System.print(Num.fromString("no"));    // null
+System.print((0 / 0).isNan);          // true
+System.print((1 / 0).isInfinity);     // true
+```
+
+Num static API: `fromString(text)`, `pi`, `tau`, `infinity`, `nan`.
+`fromString` uses textual numeric conversion; it is not a radix-based
+`parseInt`.
+There is no standard `Math` namespace, `parseInt`, `parseFloat`, `BigInt`, or
+exact decimal arithmetic.
+Division by zero and invalid mathematical domains can produce Infinity/NaN
+instead of throwing an exception.
+Arbitrary integers above `2^53 - 1` can lose precision.
+
+### 25.2 Random
+
+```napalm
+const random = new Random();
+const digit = random.int(10); // 0 <= digit < 10
+const die = random.int(1, 7); // 1 <= die < 7
+System.print([digit, die]);
+```
+
+`new Random()` takes no arguments.
+`int(upper)` uses zero as the lower bound.
+`int(lower, upper)` includes lower and excludes upper.
+Bounds must be finite safe integers, with lower less than upper.
+There is no public seed API or cryptographic guarantee for these numbers.
+
+## 26. System and Output
+
+| API | Behavior |
+| --- | --- |
+| `System.print(value)` | Prints with a line break; uses the text protocol and returns value. |
+| `System.print()` | Prints an empty line; returns null. |
+| `System.write(value)` | Prints without a line break and flushes stdout; returns value. |
+| `print(value)` | Global one-argument shortcut. |
+| `System.clock` | Monotonic seconds elapsed since host creation. |
+| `System.os()` | Build system, e.g. `"windows"`, `"linux"`, `"macos"`. |
+| `System.arch()` | Architecture, e.g. `"x86_64"` or `"aarch64"`. |
+| `System.gc()` | Requests explicit garbage collection. |
+
+```napalm
+const started = System.clock;
+System.write("Hola");
+System.print(" Napalm");
+System.print([System.os(), System.arch()]);
+System.print(`Transcurridos: ${(System.clock - started) * 1000} ms`);
+```
+
+**`System.clock` is in seconds**, not milliseconds, despite some benchmark
+labels. For wall-clock time in milliseconds, use `Date.now()`.
+
+`System.print` participates in user-defined `toString()`; the `print` shortcut
+and `System.write` use the native formatter. To ensure custom conversion,
+use `System.print(value)` or prepare a string through interpolation.
+`console.log`, stdin, filesystem, and environment variables are not provided
+as general language APIs.
+
+Napalm value memory is managed automatically. `System.gc()` does not close
+servers, libraries, or memory obtained through a C API; those resources have
+their own rules.
+
+## 27. Dates
+
+Date is a native builtin; it does not need a special module import.
+It stores a timestamp in **milliseconds since the Unix epoch**.
+
+### 27.1 Constructors and Static Methods
+
+| API | Use |
+| --- | --- |
+| `new Date()` | Current time. |
+| `new Date(milliseconds)` | Timestamp. |
+| `new Date(text)` | Parses a supported date. |
+| `new Date(otherDate)` | Copies the timestamp. |
+| `new Date(year, month, day?, hours?, minutes?, seconds?, ms?)` | Components in the local time zone. |
+| `Date.UTC(year, month, day?, hours?, minutes?, seconds?, ms?)` | Timestamp from UTC components. |
+| `Date.parse(text)` | Timestamp or NaN. |
+| `Date.now()`, `Date.now` | Current timestamp in ms. |
+| `Date.nowMs()`, `Date.nowMs` | Alias in ms. |
+| `Date.sleep(ms)` | Blocks the current thread; returns null. |
+
+Months start at **zero**; days of the month start at one.
+Omitted components default to day 1 and hour/minute/second/ms 0.
+Years 0..99 in component-based construction retain the historical adjustment
+to 1900..1999. Component overflows are normalized.
+
+```napalm
+const date = new Date(Date.UTC(2024, 1, 29, 13, 45, 30, 250));
+System.print(date.toISOString()); // 2024-02-29T13:45:30.250Z
+System.print(date.getUTCMonth()); // 1
+date.setUTCMonth(11, 25);
+System.print(date.toISOString()); // 2024-12-25T13:45:30.250Z
+```
+
+### 27.2 Getters
+
+All of the following are calls with no arguments:
+
+| Local | UTC | Data |
+| --- | --- | --- |
+| `getFullYear()` | `getUTCFullYear()` | Full year. |
+| `getMonth()` | `getUTCMonth()` | Month 0..11. |
+| `getDate()` | `getUTCDate()` | Day of month. |
+| `getDay()` | `getUTCDay()` | Day of week, Sunday 0. |
+| `getHours()` | `getUTCHours()` | Hour. |
+| `getMinutes()` | `getUTCMinutes()` | Minutes. |
+| `getSeconds()` | `getUTCSeconds()` | Seconds. |
+| `getMilliseconds()` | `getUTCMilliseconds()` | Milliseconds. |
+
+Also: `getTime()` and `valueOf()` return the timestamp;
+`getTimezoneOffset()` returns the offset in minutes according to the Date
+convention; `getYear()` is the historical year minus 1900 form.
+
+### 27.3 Setters
+
+They return the resulting timestamp:
+
+| Local / UTC | Arguments |
+| --- | --- |
+| `setFullYear` / `setUTCFullYear` | `year, month?, day?` |
+| `setMonth` / `setUTCMonth` | `month, day?` |
+| `setDate` / `setUTCDate` | `day` |
+| `setHours` / `setUTCHours` | `hour, minute?, second?, ms?` |
+| `setMinutes` / `setUTCMinutes` | `minute, second?, ms?` |
+| `setSeconds` / `setUTCSeconds` | `second, ms?` |
+| `setMilliseconds` / `setUTCMilliseconds` | `ms` |
+
+`setTime(timestamp)` and the historical `setYear(year)` are also available.
+
+### 27.4 Text, Parsing, and Invalid Dates
+
+Available methods:
+`toString()`, `toUTCString()`, `toGMTString()`, `toISOString()`,
+`toDateString()`, `toTimeString()`, `toLocaleString()`,
+`toLocaleDateString()`, `toLocaleTimeString()`, and `toJSON()`.
+The `toString` getter is also retained.
+
+Locale forms accept zero, one, or two arguments for compatibility, but do not
+implement Intl: explicit locale/options objects do not constitute a complete
+configurable formatting API. Local output depends on the host.
+`toJSON` also accepts one ignored argument.
+
+The parser supports, among others, ISO dates with UTC/offset, ISO dates without
+a time (treated as UTC), and the HTTP/RFC date formats used by the example.
+It does not promise to interpret every string accepted by a browser.
+The TimeClip limit of `8.64e15` ms is applied.
+
+```napalm
+const invalid = new Date("not a date");
+System.print(invalid.getTime().isNan); // true
+System.print(invalid.toString());      // Invalid Date
+System.print(invalid.toJSON());        // null
+try {
+    invalid.toISOString();
+} catch (error) {
+    System.print(error); // RangeError: Invalid time value
+}
+```
+
+Compare and subtract dates through `getTime()`; do not assume implicit
+conversion of Date in numeric operators.
+
+## 28. Proxy
+
+Proxy intercepts operations on an object. The supported practical case is a
+Map target and a Map handler with synchronous traps.
+
+```napalm
+const target = {value: 10};
+const events = [];
+const proxy = new Proxy(target, {
+    get: (object, key, receiver) => {
+        events.add(`get:${key}`);
+        return object[key];
+    },
+    set: (object, key, value, receiver) => {
+        events.add(`set:${key}`);
+        object[key] = value;
+        return true;
+    },
+    has: (object, key) => key in object,
+    deleteProperty: (object, key) => {
+        return delete object[key];
+    },
+    ownKeys: (object) => object.keys()
+});
+System.print(proxy.value);
+proxy.value = 20;
+System.print(target.value);
+System.print("value" in proxy);
+System.print(proxy.entries());
+System.print(events);
+```
+
+| Trap | Signature |
+| --- | --- |
+| `get` | `(target, key, receiver)` |
+| `set` | `(target, key, value, receiver)` |
+| `has` | `(target, key)` |
+| `deleteProperty` | `(target, key)` |
+| `ownKeys` | `(target)`; return a list of keys. |
+
+An absent or null trap uses the default behavior.
+A non-function or async/concurrent trap produces an error.
+Bracket reads and writes also pass through get/set.
+`keys()`, `values()`, `entries()`, and object spread use the traps.
+`ownKeys` preserves the order returned by the handler; ordinary Maps sort the
+results of their `keys()`/`values()`/`entries()` helpers.
+
+Limitations compared with JS Proxy:
+
+- There is no `Proxy.revocable`, `Reflect`, or complete list of traps
+  (`apply`, `construct`, descriptors, prototypes, etc.).
+- An intercepted assignment can return the result of `set`, not necessarily
+  the assigned value.
+- Fallbacks are Map-oriented; do not use Proxy as a universal transparent
+  wrapper for classes, lists, and functions.
+- Proxy builtin members should not be confused with intercepted keys.
+- Do not promise that a Proxy satisfies a structural Map contract.
+- A Proxy cannot cross a concurrent boundary.
+
+## 29. HTTP Client and fetch
+
+### 29.1 fetch
+
+`fetch(url, options?)` returns a Promise<Response>. It supports the native
+HTTP/HTTPS client, not a browser context.
+
+Recognized options:
+
+| Option | Values |
+| --- | --- |
+| `method` | String; defaults to GET. |
+| `headers` | Map of strings, list of `[name, value]` pairs, or Headers from another response. |
+| `body` | String, Map, List, or null. |
+| `redirect` | `"follow"` by default, `"manual"`, or `"error"`. |
+
+A String body defaults to `text/plain;charset=UTF-8`;
+Map/List is serialized as JSON and uses `application/json`, unless Content-Type
+was specified. GET and HEAD do not accept a body.
+CONNECT, TRACE, and TRACK are rejected.
+
+Self-contained example using a temporary local server:
+
+```napalm
+const server = listen "127.0.0.1:0" {
+    route "POST" ["/echo"] (request) => ({
+        body: request.body,
+        headers: {"Content-Type": "application/json"}
+    });
+};
+try {
+    const response = await fetch(`http://${http.address(server)}/echo`, {
+        method: "POST",
+        body: {name: "Ada", active: true}
+    });
+    System.print(response.status); // 200
+    System.print(response.ok);     // true
+    const data = await response.json();
+    System.print(data.name);       // Ada
+} finally {
+    http.close(server);
+}
+```
+
+HTTP error statuses resolve to a normal Response with `ok == false`;
+transport errors or invalid requests reject.
+Automatic redirect following is limited to 20.
+The response is fully buffered, with a limit of **64 MiB**.
+The returned Promise can be canceled.
+
+JSON bodies must be serializable data: scalars, lists, and Maps with string
+keys; not functions or cyclic graphs. Depth is limited.
+This does not provide a complete global `JSON` API.
+
+### 29.2 Response and Headers
+
+| Response member | Use |
+| --- | --- |
+| `status` | Numeric code. |
+| `statusText` | Status text. |
+| `ok` | Status from 200 to 299. |
+| `url` | Final URL. |
+| `redirected` | Whether a redirect was followed. |
+| `headers` | Stable Headers object. |
+| `bodyUsed` | Whether consumption/decoding has started. |
+| `data` | Decoded and cached view; JSON according to Content-Type or text. |
+| `json()` | Promise with decoded JSON. |
+| `text()` | Promise with text. |
+
+`headers.get(name)` returns a string or null.
+`headers.has(name)` returns Bool. Name lookup is case-insensitive.
+There is no general Headers constructor or complete mutation API.
+
+The body is consumed **only once**:
+
+- After `json()` or `text()`, another consumption call rejects.
+- `data` consumes the body on first access and caches it; subsequent reads
+  reuse the value.
+- If successful decoding has already occurred, `data` exposes that result.
+- After reading `data`, do not call `json()` expecting a second consumption.
+- A JSON parsing error also consumes the body.
+- `data` can throw synchronously; `json()`/`text()` report failure through
+  their Promise.
+
+There is no client ReadableStream, `arrayBuffer()`, `blob()`, `formData()`,
+`clone()`, AbortController, or promise of complete WHATWG Fetch compatibility.
+Undocumented options should not be assumed to be implemented.
+
+### 29.3 HTTP Helpers
+
+| Function | Expected result when awaited |
+| --- | --- |
+| `get(url, headers?)` | Map `{status, ok, body, headers}`. |
+| `getJSON(url, headers?)` | Lo anterior mas `json`. |
+| `postJSON(url, jsonText, headers?)` | POST and response with `json`. |
+
+These helpers return **Maps**, not Response.
+`postJSON` accepts an **already serialized** JSON string, unlike the Map/List
+body used by fetch. Invalid response JSON rejects.
+Response header names are normalized to lowercase.
+The helpers buffer the entire body, including a streaming response.
+
+## 30. HTTP Servers, Streaming, and SSE
+
+### 30.1 listen and route
+
+```napalm
+const server = listen "127.0.0.1:0" {
+    route "GET" ["/", "/hello"] (req) => {
+        return {status: 200, body: "Hello!"};
+    };
+    route "GET" ["/users/:id"] async (req) => {
+        await Timer.delay(1);
+        return {body: `User ${req.params.id}`};
+    };
+    route "POST" ["/echo"] (req) => ({
+        body: req.body,
+        headers: [["X-Echo", "1"]]
+    });
+};
+try {
+    const result = await get(`http://${http.address(server)}/users/42`);
+    System.print(result.body); // User 42
+} finally {
+    http.close(server);
+}
+```
+
+`listen address { ... }` is an expression that returns a numeric handle.
+It can also be used as a statement.
+Port zero requests an available port; `http.address(handle)` reports the
+actual `host:port`. `0.0.0.0` listens on all IPv4 interfaces; use
+`127.0.0.1` if it should be accessible only locally.
+Bind errors are recoverable with try/catch.
+
+The equivalent API for dynamically constructed routes is:
+
+```napalm
+const handler = (req) => ({body: "ok"});
+const server = http.listen("127.0.0.1:0", [
+    ["GET", ["/"], handler]
+]);
+try {
+    System.print((await get(`http://${http.address(server)}/`)).body);
+} finally {
+    http.close(server);
+}
+```
+
+### 30.2 Route Selection
+
+- Declaration order: the first match wins.
+- Methods are normalized to uppercase; `"*"` accepts any method.
+- Paths are case-sensitive and do not include the query.
+- `:name` captures a non-empty segment.
+- A final `*` captures the remainder as `req.params.wildcard`.
+- Duplicate method/path pairs are rejected.
+- No matching path: 404.
+- Existing path with the wrong method: 405 and `Allow`.
+- HEAD and OPTIONS require an explicit route or `"*"`.
+- There is no automatic HEAD->GET fallback or automatic CORS.
+
+Declare specific routes before parameters and wildcards.
+
+### 30.3 Request
+
+| Field | Contents |
+| --- | --- |
+| `method` | HTTP method. |
+| `path` | Path without query. |
+| `url` | Request target with query. |
+| `query` | Raw query without `?`. |
+| `params` | Path captures; not percent-decoded. |
+| `headers` | Map of lowercase names to strings; the last repetition wins. |
+| `body` | Buffered text, UTF-8 with invalid bytes replaced. |
+| `serverId`, `reqId` | Handles used for streaming. |
+
+The body is not automatically parsed as JSON, and `query` is not a parameter
+Map. There is no middleware, session, or authentication framework here.
+
+### 30.4 Handler Response
+
+A string can be returned, equivalent to status 200, or an object:
+
+```napalm fragment
+return {
+    status: 201,
+    body: "{\"created\":true}",
+    headers: [["Content-Type", "application/json"]]
+};
+```
+
+- Omitted status: 200; omitted body: empty string.
+- Status must be an integer from 200 to 599.
+- Body and header values must be strings.
+- Headers accepts a Map or list of pairs; pairs preserve repetitions.
+- Content-Type must be set explicitly for JSON, HTML, or SSE.
+- A Map is not automatically serialized as the response body.
+- Thrown errors, rejections, and invalid responses produce 500 without
+  revealing the exception to the client.
+- Other requests continue to be served after a handler error.
+
+Returning null or zero is valid only after starting a stream.
+Once started, normal returns are ignored; an exception terminates that stream.
+
+### 30.5 Streaming and SSE
+
+```napalm
+const server = listen "127.0.0.1:0" {
+    route "GET" ["/events"] (req) => {
+        http.startStream(req, 200, [
+            ["Content-Type", "text/event-stream"],
+            ["Cache-Control", "no-cache"]
+        ]);
+        setTimeout(() => {
+            http.streamWrite(req.serverId, req.reqId, "data: hello\n\n");
+            http.streamEnd(req.serverId, req.reqId);
+        }, 1);
+        return 0;
+    };
+};
+try {
+    const result = await get(`http://${http.address(server)}/events`);
+    System.print(result.body); // data: hello and two line breaks
+} finally {
+    http.close(server);
+}
+```
+
+| API | Effect |
+| --- | --- |
+| `http.startStream(req, status, headers)` | Sends headers once. |
+| `http.streamWrite(serverId, reqId, chunk)` | Queues a UTF-8 chunk. |
+| `http.streamEnd(serverId, reqId)` | Closes; returns whether it was open. |
+| `http.close(serverId)` | Stops accepting connections; true once, false if already closed/unknown. |
+| `http.address(serverId)` | Effective address. |
+
+A chunk is limited to **64 KiB**, and each stream allows up to **64 queued
+chunks**. A full queue throws a recoverable error: retry later using a
+timer/await, rather than spinning in a blocking loop.
+Empty chunks are ignored; writing to a closed/disconnected stream fails.
+
+The server manages Content-Length, Transfer-Encoding, Connection, Trailer, and
+Upgrade; do not supply those headers from the handler.
+Closing the listener does not force already-dispatched handlers or streams to
+finish.
+Also close streams and cancel timers that should terminate.
+
+### 30.6 Transport Limits
+
+HTTP/1.0 and HTTP/1.1 over TCP, one request per connection.
+There is no HTTPS listener, HTTP/2 server, or WebSockets.
+
+| Limit | Value |
+| --- | --- |
+| Buffered request body and normal response | 8 MiB. |
+| Active connections across VM listeners | 256. |
+| Headers per request | 100. |
+| Header/body read and handler wait | 30 s. |
+| Maximum connection lifetime, including streams | 5 min. |
+
+An oversized body receives 413, a body timeout 408, and a handler response
+timeout 504. A long synchronous handler blocks dispatch of other handlers and
+timers; async does not automatically make that computation parallel.
+
+## 31. FFI and External Functions
+
+### 31.1 Loading a C Library
+
+FFI allows calling C symbols from shared libraries.
+It does not import headers or infer signatures.
+
+Example portable across common Windows/Linux/macOS installations
+(requires that library to exist on the system):
+
+```napalm
+const os = System.os();
+const libraryName = os == "windows" ? "ucrtbase.dll"
+    : os == "macos" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6";
+const library = FFI.open(libraryName);
+const length = library.function("strlen", "usize", ["cstring"]);
+System.print(length.call("Napalm")); // 6
+```
+
+Do not copy an approximate function signature: **an incorrect ABI signature
+can corrupt memory or terminate the process**. Napalm type validation cannot
+detect that the actual C symbol has a different signature.
+
+### 31.2 API
+
+| Object | Member |
+| --- | --- |
+| FFI | `open(path)`, getter `null`, getter `lastError`. |
+| Library | `name` getter; `function(symbol, resultType, argumentTypes)`. |
+| Native function | `name` getter; `call(...)` with 0 to 16 arguments. |
+| Pointer | `isNull` getter; `offset(bytes)`; `readCString()`; `toString`/`toString()`. |
+
+A library remains loaded until the interpreter is destroyed; there is no
+manual library close. `FFI.null` is ordinary null.
+A returned C NULL pointer is also converted to null, not a wrapper with
+`isNull == true`.
+
+`FFI.lastError` captures errno/GetLastError immediately after the call.
+Check it only when that function's contract indicates an error occurred:
+success does not necessarily clear the previous value.
+
+### 31.3 Supported Types
+
+| FFI type | Napalm value |
+| --- | --- |
+| `void` | Return only; produces null. |
+| `bool` | Bool; one-byte C boolean. |
+| `i8`, `u8`, `i16`, `u16`, `i32`, `u32` | In-range integer Num. |
+| `i64`, `u64`, `isize`, `usize` | Integer Num, only if exactly representable. |
+| `char`, `unsigned char`, `short`, `unsigned short` | Num with the corresponding ABI size. |
+| `int`, `unsigned int`, `long`, `unsigned long` | Num with the corresponding ABI size. |
+| `long long`, `unsigned long long` | Exact Num. |
+| `f32`/`float`, `f64`/`double` | Num. |
+| `pointer` | Opaque pointer or null. |
+| `cstring` | Copied NUL-terminated C string, or null. |
+
+Aliases such as `int32_t`, `uint64_t`, `size_t`, `ssize_t`,
+`intptr_t`, `uintptr_t`, `c_int`, `c_long`, `ptr`, `void*`, `char*`, and
+`const char*`.
+
+Integer arguments must be finite, integral, in range, and exactly
+representable. Integer results that would lose precision are rejected.
+A pointer is not converted to a 64-bit Num.
+
+### 31.4 Memory Lifetime and Strings
+
+- For a cstring argument, temporary memory valid during the call is created.
+- Strings containing embedded NUL are rejected.
+- Do not retain a pointer returned by the native function into that temporary
+  memory. Declare a cstring return to copy it immediately when appropriate.
+- A cstring result is copied; ownership of native memory is not automatically
+  transferred and `free` is not called.
+- For memory the caller must free: receive a pointer, read/copy it, and call
+  the deallocator provided by the same library.
+- `offset(bytes)` only computes an address; it does not check whether valid
+  memory exists there.
+- `readCString()` copies up to NUL, with a 16 MiB limit. An invalid pointer
+  remains unsafe.
+- `defer` can organize normal deallocation, but cannot fix an incorrect ABI.
+
+There are no C->Napalm callbacks, variadic calls, structs/unions by value,
+direct access to the Napalm heap, header parser, C++ methods, or manual
+unloading.
+FFI calls are synchronous and are not automatically sent to a worker.
+
+### 31.5 foreign Is a Separate Integration
+
+`foreign class` and `foreign` methods describe extension points that can be
+implemented by the **host embedding Napalm**. They do not automatically call
+`FFI.open` or resolve a library symbol. In the ordinary CLI, a foreign
+declaration without a supporting host does not provide an implementation.
+See [README_FFI.md](README_FFI.md) for the complete C contract.
+
+## 32. Limitations and Differences from JavaScript
+
+### 32.1 Practical Summary
+
+| Do not assume | In Napalm |
+| --- | --- |
+| Any `.ts` file is executable. | Only supported syntax; modules use `.napalm`. |
+| `0`, `""`, or NaN are falsy. | Only null/false are falsy in conditions. |
+| `!!value` converts any value. | `!` requires an operation defined on the receiver. |
+| `===` is stricter than `==`. | They are the same operation. |
+| `+text` converts to a number. | Prefix `+` does not convert. |
+| `var` has function scope. | It is lexical/block-scoped. |
+| `let x;` is a valid declaration. | Variables require an initializer. |
+| No annotation means any. | Inference can be restrictive. |
+| All types are erased. | Variables, parameters, fields, and contracts can be validated. |
+| A return annotation guarantees the return value. | That annotation is not currently checked. |
+| `as` converts or validates. | It does not change the value. |
+| Structural `interface` and `type` are interchangeable. | Interface is open; object alias is closed. |
+| `implements` lets an instance pass as an interface. | Structural interfaces require Maps. |
+| Class `const` or private/readonly freezes a value. | No; structural readonly is a different case. |
+| `Array(n)` creates zeros. | It creates null; `Array<Number>(n)` creates zeros. |
+| `map.keys` and `map.keys()` are the same. | Live insertion-order view vs. sorted list. |
+| Map iterates `[key, value]`. | It iterates MapEntry; `entries()` produces pairs. |
+| All JS array/string methods exist. | Only those listed in this manual. |
+| An empty derived constructor is equivalent to JS. | Use an explicit constructor and super. |
+| A closure has dynamic this. | `this` is lexical. |
+| async means parallel CPU work. | Use launch with concurrent functions for that. |
+| Promise has then/catch/executor. | Use async/await and installed factories/combinators. |
+| `System.clock` measures ms. | It measures seconds; timers and Date use ms. |
+| A broken contract is caught. | Contract errors are fatal. |
+
+### 32.2 Unsupported or Non-Public Syntax
+
+Do not use the following as though they were available features:
+
+- `switch`, generators, `yield` as generator syntax, regex literals,
+  JSX, executable namespaces, and `const enum`.
+- `typeof`, `void` as an operator, `>>>`, and the `|>` pipeline.
+- Rest parameters and full default-initializer parameters.
+- The general comma operator and `matrix[x, y]` subscripts.
+- Namespace imports, export-star, dynamic import, and require.
+- `#private` fields, object descriptors, and the JS prototype API.
+- Wren syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
+  on calls, and imports such as `import "x" for Name`.
+- `fn` declarations, `else unless`, and Deferred APIs from old scripts.
+
+The presence of a token or internal test does not mean the public parser
+accepts it as a Napalm program.
+
+### 32.3 Structural Limits
+
+| Limit | Value or rule |
+| --- | --- |
+| Normal parameters and arguments | 16. |
+| Ordinary arguments to a decorated method | 15, plus explicit receiver. |
+| Parsing depth | 256. |
+| Interpolation nesting | Frontend-limited; depth constant 8. |
+| Concurrent transfer | Transferable acyclic graphs, depth 256. |
+| Recursive interfaces/aliases | Not resolved as recursive contracts. |
+| Interface imports as contracts | Not implemented. |
+| User generics | No complete substitution/reification. |
+| Browser/Node runtime | Not provided. |
+| SQLite/UI | No public API is installed merely because files or internal dependencies are present. |
+
+The names `Object`, `Class`, `Bool`, `Null`, etc. are part of the environment's
+builtin values, but do not imply constructors/converters or every static
+function on the JavaScript object with the same name.
+Do not rely on helpers prefixed with `__` as a public API.
+
+## 33. Complete Recipes
+
+### 33.1 Transforming Data with a Closed Schema
+
+```napalm
+type Person = {name: string; age: number};
+const people: Person[] = [
+    {name: "Alice", age: 22},
+    {name: "Bob", age: 40},
+    {name: "Charlie", age: 55},
+    {name: "Dave", age: 14}
+];
+const adults = [
+    {name: person.name, age: person.age}
+    for person in people
+    if person.age >= 30
+];
+System.print(adults.map(person => person.name)); // [Bob, Charlie]
+```
+
+### 33.2 Capturing a Value per Iteration
+
+```napalm
+function capture(value) {
+    return () => value;
+}
+const callbacks = [];
+for (let i = 0; i < 3; i++) {
+    callbacks.add(capture(i));
+}
+System.print(callbacks.map(callback => callback())); // [0, 1, 2]
+```
+
+### 33.3 Deduplicating While Preserving Order
+
+```napalm
+function unique(values) {
+    const seen = new Set();
+    for (const value of values) seen.add(value);
+    return [...seen];
+}
+System.print(unique(["b", "a", "b", "c"])); // [b, a, c]
+```
+
+### 33.4 Recoverable Input Validation
+
+A contract annotation is fatal if violated. To report a recoverable business
+error, perform explicit validation and throw a value:
+
+```napalm
+function requireName(input) {
+    if (input.name == null || input.name == "") {
+        throw {code: "MISSING_NAME", message: "Falta el nombre"};
+    }
+    return input.name;
+}
+try {
+    System.print(requireName({}));
+} catch (error) {
+    System.print(error.code); // MISSING_NAME
+}
+```
+
+This function assumes an input that supports object access; it is not a
+universal validator for every value. Keep business validation, data contracts,
+and transport errors separate.
+
+### 33.5 Bounded Asynchronous Retry
+
+```napalm
+let attempts = 0;
+async function operation() {
+    attempts++;
+    if (attempts < 3) throw "temporal";
+    return 42;
+}
+async function retry() {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            if (attempt == 2) throw error;
+            await Timer.delay(1);
+        }
+    }
+}
+System.print(await retry()); // 42
+```
+
+Do not indiscriminately catch errors to return fictitious success.
+Fatal contract errors do not fit this retry pattern.
+
+## 34. Example and Source Map
+
+### 34.1 Useful Scripts as Guides
+
+The scripts were reviewed for their language content. A benchmark is neither a
+semantic specification nor a universal performance test.
+
+| File | Content and notes |
+| --- | --- |
+| [basic.napalm](scripts/basic.napalm) | Variables, addition, and output. |
+| [bool.napalm](scripts/bool.napalm) | Booleans, equality, and control flow. |
+| [builtins.napalm](scripts/builtins.napalm) | System, interpolation, and closures. |
+| [complete.napalm](scripts/complete.napalm) | Tour of functions, classes, ranges, async, and Fiber; its opening comment about erased types is historical. |
+| [comprehensions.napalm](scripts/comprehensions.napalm) | Filtering people with a comprehension and structural alias. |
+| [concurrent.napalm](scripts/concurrent.napalm) | launch and Promise.all benchmark; its ms labels do not convert System.clock from seconds to ms. |
+| [date.napalm](scripts/date.napalm) | Constructors, getters/setters, parsing, and invalid dates; Date is already a builtin, not an auto-imported module. |
+| [decorators.napalm](scripts/decorators.napalm) | Executable tests of all decorator targets and application order. |
+| [native_decorators.napalm](scripts/native_decorators.napalm) | Tests for caching, TTL, once, delay, debounce, and throttle. |
+| [destructuring_spread.napalm](scripts/destructuring_spread.napalm) | Patterns, defaults, rest, spread, and calls. |
+| [enums.napalm](scripts/enums.napalm) | Numeric and string enums, reverse mapping, and local enum. |
+| [interfaces.napalm](scripts/interfaces.napalm) | Open contracts, aliases, and valid mutation. |
+| [intrinsics.napalm](scripts/intrinsics.napalm) | Arrays, lambdas, Unicode, strings, nullish operations, and optional chaining. |
+| [map.napalm](scripts/map.napalm) | Map, Set, and native generics. |
+| [proxy.napalm](scripts/proxy.napalm) | Traps and enumeration/spread. |
+| [reactive.napalm](scripts/reactive.napalm) | Accessors and cached computed properties. |
+| [spread.napalm](scripts/spread.napalm) | Object destructuring/rest/spread. |
+| [import.napalm](scripts/import.napalm) | Named and side-effect imports. |
+| [module_import.napalm](scripts/module_import.napalm) | Default import combined with named imports. |
+| [module_exports.napalm](scripts/module_exports.napalm) | Auxiliary module with exports. |
+| [math.napalm](scripts/math.napalm), [other.napalm](scripts/other.napalm) | Auxiliary modules with functions and classes. |
+| [server.napalm](scripts/server.napalm) | Service with routes, local clients, and SSE; continues listening. |
+| [server_simple.napalm](scripts/server_simple.napalm) | Minimal server; continues listening. |
+| [fetch.napalm](scripts/fetch.napalm) | POST example; the external endpoint is illustrative, not a reproducible local test. |
+| [lev.napalm](scripts/lev.napalm) | Algorithm using strings, arrays, and loops. |
+| [trees.napalm](scripts/trees.napalm) | Recursion and nested objects. |
+| [fib.napalm](scripts/fib.napalm) | Recursion and timing; benchmark workload, not a minimal example. |
+| [runtime.napalm](scripts/runtime.napalm) | Loops of list/string operations; benchmark workload. |
+| [gc.napalm](scripts/gc.napalm) | Mutation through aliases and GC request; learning the collector is not required to use the language. |
+
+You do not need to examine [jit.napalm](scripts/jit.napalm) or
+[jit_entries.napalm](scripts/jit_entries.napalm) to learn language features;
+they are engine-specific benchmarks.
+
+### 34.2 Historical Material Not to Copy Literally
+
+| File | Observed difference |
+| --- | --- |
+| [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, pipeline, uninstalled JS methods, Promise executor, and Deferred. It does not compile as a current program. |
+| [trycatch.napalm](scripts/trycatch.napalm) | Uses `fn` declarations; the manual's exception examples use `function`. |
+| [defer.napalm](scripts/defer.napalm) | The `errdefer (error)` binding must be written with bars. |
+| [types.napalm](scripts/types.napalm) | Attempts to pass class instances to a structural-interface list. The current contract rejects that mixture; later blocks do not make fatal violations recoverable. |
+
+Those programs have not been modified to hide differences. This manual
+documents the available language and shows usable alternatives.
+
+### 34.3 Semantic Sources
+
+| Source | Surface consulted |
+| --- | --- |
+| [napalm_front_main.rs](src/napalm_front_main.rs) | Public parser: syntax, declarations, enums, types, optional chaining, classes, decorators, and limits. |
+| [napalm_front.rs](src/napalm_front.rs) | Shared AST/limit definitions; its historical parser alone does not determine public syntax. |
+| [napalm_lowerer.rs](src/napalm_lowerer.rs) | Relevant language rules: inference, parameters, fields, contracts, and launch restrictions. |
+| [napalm_builtin.rs](src/napalm_builtin.rs) | Effective API catalog and primitive semantics. |
+| [napalm_interpreter.rs](src/napalm_interpreter.rs) | Observable behavior: values, calls, errors, async/Fiber, Proxy, reactivity, transfers, and fetch. |
+| [napalm_interfaces.rs](src/napalm_interfaces.rs) | Validation of open/closed schemas and mutation protection. |
+| [napalm_collection_ops.rs](src/napalm_collection_ops.rs) | Collection copies and validation, destructuring, and spread. |
+| [napalm_modules.rs](src/napalm_modules.rs) | Actual resolution of extensions, namespaces, and exports. |
+| [napalm_native.rs](src/napalm_native.rs) | Native decorator semantics and validation. |
+| [napalm_concurrent.rs](src/napalm_concurrent.rs) | Concurrent work boundary and cancellation. |
+| [napalm_fetch.rs](src/napalm_fetch.rs) | Client transport, redirects, and limits. |
+| [napalm_http.rs](src/napalm_http.rs), [napalm_http_vm.rs](src/napalm_http_vm.rs) | HTTP API and transport. |
+| [napalm_ffi.rs](src/napalm_ffi.rs), [README_FFI.md](README_FFI.md) | Types and ownership at the C boundary. |
+| [main.rs](src/main.rs) | CLI and exit codes. |
+| [napalm_tests.rs](src/tests/napalm_tests.rs) | Public-language regressions. |
+| [napalm_collections_tests.rs](src/tests/napalm_collections_tests.rs) | Collections and contracts. |
+| [napalm_http_tests.rs](src/tests/napalm_http_tests.rs) | Routes and local clients. |
+
+Historical tests in [src/tests](src/tests) and inside the interpreter use a
+different frontend. Their programs were checked against the public parser
+before bringing any syntax form into this manual.
+
+Supplementary documents:
+[interfaces](docs/INTERFACES.md), [collections](docs/COLLECTIONS.md),
+[HTTP](docs/HTTP.md) and [platform](README_SYSTEM_PLATFORM.md).
+Some describe earlier revisions: parameter types, closed aliases, extensions,
+and `keys()` in particular should be read with the qualifications in this
+reference.
+
+### 34.4 Verification Scope
+
+Standalone examples are checked against the local release executable; blocks
+marked as errors must fail, not pass.
+The manual's HTTP examples use loopback and ephemeral ports and close the
+listener. The FFI example depends on the specified platform library.
+The illustrative external POST is not run, and example servers are not left
+open.
+
+Useful filters for existing tests include:
+
+```powershell
+cargo test napalm_decorators -- --test-threads=1
+cargo test native_decorators -- --test-threads=1
+cargo test napalm_collections -- --test-threads=1
+cargo test napalm_http -- --test-threads=1
+```
+
+These commands are entry points to regression tests, not a claim that the
+entire historical suite passes on every revision. A backend test using old
+syntax does not replace checking a `.napalm` file with the current CLI.
+
+## 35. Current Performance
+
+Current engine, as of 02-Nov-2026, shows an impressive performance that can compete against V8 and JSC. Although there are not a lot of benchmarks right now, these are the numbers of the existing benchmarks as of today.
+
+
+| Test | Napalm performance | Node performance | Bun Performance |
+| --- | --- | --- | --- |
+| `jit` | 0.198551s | 0.187731s | 0.223191s |
+| `jit_entries` | 0.002747s |  0.005001s | 0.004753s |
+| `lev` | 0.000217s | 0.000710s | 0.001525s |
+| `trees` | 0.004445s | 0.005114s | 0.003302s |
+| `fib` | 0.000122s | 69.66374s | 32.97240s |
+
+(Note: the impressive results in Fibonacci test are due to one of Napalm HIR optimization: the auto-memoization of pure functions with simple arguments).
+
+## 36. Napalm System platform helpers
+
+Adds two Napalm-specific zero-argument methods to `System`:
+
+```typescript
+System.os()
+System.arch()
+```
+
+They return the Rust target constants from `std::env::consts` as Napalm strings.
+
+Typical values include:
+
+- OS: `linux`, `windows`, `macos`, `freebsd`, `android`, `ios`, ...
+- architecture: `x86_64`, `aarch64`, `x86`, `arm`, `riscv64`, ...
+
+The values describe the platform Napalm was compiled for, which is the correct
+behavior for cross-compiled binaries.
+
+No parser, IR, bytecode, JIT, GC, or FFI changes are required.
+
+## 37. Napalm native FFI
+
+Napalm includes a small typed C FFI built on `libloading` + `libffi`.
+It is separate from Napalm's existing embedding/`foreign` mechanism:
+
+- **`foreign` methods / `Host::call_foreign`** let the application embedding Napalm provide native methods.
+- **`FFI`** lets Napalm code open a shared library and call an exported C ABI symbol directly.
+
+### 37.1 Basic API
+
+```typescript
+const libc = FFI.open("libc.so.6")
+const strlen = libc.function("strlen", "usize", ["cstring"])
+
+System.print(strlen.call("hello")) // 5
+```
+
+`library.function(symbol, resultType, argumentTypes)` resolves the symbol once and returns a callable native-function object. Prepared libffi CIFs are cached by signature **per OS thread**, so functions sharing a signature reuse the same call-interface description without moving libffi's non-`Send` descriptors between scheduler workers.
+
+A native function exposes `call(...)` overloads from 0 through 16 arguments, matching Napalm's existing maximum method arity.
+
+### 37.2 Core objects
+
+#### 37.2.1 `FFI`
+
+```typescript
+FFI.open(path)       // -> native library
+FFI.null             // -> null (explicit spelling for pointer arguments)
+FFI.lastError        // -> errno/GetLastError snapshot from the last FFI call
+```
+
+`FFI.lastError` is captured immediately after `ffi_call`, before Napalm allocation or formatting can overwrite the OS error state. As with C itself, inspect it only when the called function's contract says an error occurred; successful C functions are not required to clear an old errno/last-error value.
+
+#### 37.2.2 Native library
+
+```typescript
+library.name
+library.function(symbol, resultType, argumentTypes)
+```
+
+Libraries remain mapped until the interpreter is destroyed. Napalm deliberately does not expose `close()` in v1: bound function pointers must never dangle, and MMTk worker threads must not accidentally execute library unload/finalizer code.
+
+#### 37.2.3 Native function
+
+```typescript
+function.name
+function.call(...)
+```
+
+#### 37.2.4 Native pointer
+
+A non-null `pointer` result becomes an opaque FFI pointer object. A native null pointer becomes ordinary Napalm `null`.
+
+```typescript
+pointer.isNull          // normally false; native NULL is normalized to Napalm null
+pointer.offset(bytes)   // address arithmetic only; does not dereference memory
+pointer.readCString()   // copies at most 16 MiB, stopping at NUL
+pointer.toString        // hexadecimal address
+```
+
+Pointers can be passed back to arguments declared as `pointer`. Napalm never exposes a raw address as `Num`, because a 64-bit pointer cannot in general be represented exactly by IEEE-754 `f64`.
+
+### 37.3 Supported types
+
+Canonical spellings are shown first; several C aliases are accepted.
+
+| Napalm FFI type | C / ABI meaning | Napalm value |
+| --- | --- | --- |
+| `void` | no result | `null` |
+| `bool` | 1-byte C boolean | `Bool` |
+| `i8`, `u8` | fixed 8-bit integer | `Num` |
+| `i16`, `u16` | fixed 16-bit integer | `Num` |
+| `i32`, `u32` | fixed 32-bit integer | `Num` |
+| `i64`, `u64` | fixed 64-bit integer | `Num`, only when exact |
+| `isize`, `usize` | pointer-sized integer | `Num`, only when exact |
+| `char` | target C `char` | `Num` |
+| `unsigned char` | C `unsigned char` | `Num` |
+| `short`, `unsigned short` | C short | `Num` |
+| `int`, `unsigned int` | C int | `Num` |
+| `long`, `unsigned long` | C long | `Num`, only when exact |
+| `long long`, `unsigned long long` | C long long | `Num`, only when exact |
+| `f32` / `float` | C float | `Num` |
+| `f64` / `double` | C double | `Num` |
+| `pointer` | `void*` | opaque pointer or `null` |
+| `cstring` | NUL-terminated `char*` | copied Napalm String or `null` |
+
+Recognized aliases also include common names such as `int32_t`, `uint64_t`, `size_t`, `ssize_t`, `intptr_t`, `uintptr_t`, `c_int`, `c_long`, `ptr`, `void*`, `char*`, and `const char*`.
+
+`void` is valid only as a return type.
+
+### 37.4 Integer precision
+
+Napalm numbers are IEEE-754 doubles. Napalm therefore refuses to silently corrupt wide integer values:
+
+- integer arguments must be finite, integral, in range, and exactly representable by the source Napalm `Num`;
+- integer results are converted to `Num` only if conversion is exact;
+- otherwise the call reports a runtime error.
+
+This still permits large exactly representable values (for example powers of two above `2^53`), while rejecting arbitrary 64-bit values whose low bits would be lost. Napalm can later grow first-class `i64/u64` source values without changing the native signature model.
+
+### 37.5 C strings
+
+For a `cstring` argument, Napalm creates an owned `CString` before entering native code. Therefore:
+
+- moving/collecting the Napalm String cannot invalidate the pointer during the call;
+- embedded NUL bytes are rejected;
+- the pointer is valid only for the duration of that call unless the C API explicitly copies it.
+
+If a C function returns a pointer *into* one of its `cstring` arguments (for example a `strchr`-style API), declare the result as `cstring` when you want an immediate copy. Declaring such an interior result as `pointer` and retaining it after the call would outlive Napalm's temporary CString and is therefore invalid.
+
+For a `cstring` result, Napalm immediately copies the bytes into a Napalm String. The native pointer is not retained.
+
+If the native API returns an allocated string that the caller owns, declare it as `pointer`, call `readCString()`, and then pass the pointer to the API's deallocator.
+
+### 37.6 Example: caller-owned native memory
+
+```typescript
+const libc = FFI.open("libc.so.6")
+const malloc = libc.function("malloc", "pointer", ["usize"])
+const free = libc.function("free", "void", ["pointer"])
+
+const p = malloc.call(4096)
+if (p == null) Fiber.abort("malloc failed")
+
+System.print(p.toString)
+free.call(p)
+```
+
+### 37.7 Safety boundary
+
+The FFI validates Napalm values against the **declared** signature. It cannot prove that the declaration matches the actual C symbol. A wrong native signature can still corrupt memory or crash the process; that is inherent to a low-level C FFI.
+
+Likewise, opaque pointer lifetime is owned by the native API. `offset()` performs integer address arithmetic only, but passing an invalid/stale pointer to C or calling `readCString()` on one is unsafe.
+
+### 37.8 Deliberately not in v1
+
+- callbacks from C into Napalm;
+- variadic functions;
+- structs/unions passed by value;
+- direct Napalm heap pointers;
+- automatic header parsing;
+- C++ name mangling / methods;
+- asynchronous/blocking-native-call offload;
+- manual library unload.
+
+Callbacks deserve a separate design because a callback may arrive on an arbitrary OS thread and therefore must coordinate with Napalm's GC safepoints, isolate ownership and future N:M scheduler. Struct support should similarly be added with explicit ABI layout objects rather than guessed layouts.
+
+### 37.9 Dependencies
+
+```toml
+libffi = "5.2.0"
+libloading = "0.9.0"
+```
+
+`libffi` uses its bundled libffi build by default. If a deployment deliberately uses a system libffi, enable the crate's `system` feature instead.

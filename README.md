@@ -4,6 +4,8 @@
 
 Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dynamic runtime. WrenJIT remains the frozen Wren-syntax project. This repository builds the `napalm` executable.
 
+For the complete, current language reference and runnable examples, see [DOCUMENTATION.md](DOCUMENTATION.md).
+
 Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
 
 ## Run
