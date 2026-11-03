@@ -62,6 +62,27 @@ The analysis can:
 
 This is not merely a local "stack allocation" pass: non-escaping objects can disappear completely.
 
+### Shared constant literals
+
+`SharedConstantLiterals` (`src/shared_constant_literals.rs`) is a whole-program finalizer that runs after `AutoMemoization`, once direct calls are known. It targets map literals whose initializing stores use only constant string keys and scalar constant values, such as the `{left: null, right: null}` leaves of a binary tree.
+
+Each such site receives one bit in an interprocedural may-hold analysis. Bits flow through moves, block parameters, `CallDirect`/`TailCallDirect` arguments and returns, read-only getters and property loads, and the initializing stores of other fresh literals. A site is shared only if every operand that may hold it sits in a read-only position:
+
+- a read-only getter;
+- a property or map read;
+- a guard;
+- a branch;
+- a direct call into analyzable code;
+- an equality comparison against a constant.
+
+Mutation, list/global storage, unknown calls, non-constant identity comparisons, async returns and module-body returns all reject the site. Any function that returns the object must also be reachable only through direct calls: it has no captures, is bound once by its module body, is never read as a first-class value, is never bound as a method, and is not imported.
+
+Accepted sites become `LoadModuleVar` from a hidden module slot. That slot is initialized at the very beginning of the module body, before any function of the module can exist. `ModuleInfo::hidden_variable_count` records these trailing optimizer-owned slots, and `source_variable_count()` returns the source-visible prefix.
+
+Programs with concurrent functions or `launch` are skipped, because isolated workers do not run module bodies. So are programs that bind methods to non-literal classes, where a Map getter might be user code.
+
+On `scripts/trees.napalm` the pass removes all leaf allocations: one shared leaf replaces half of the nodes. Median release time drops from about 18.4 ms to 12.4 ms.
+
 ### Aggressive HIR mode
 
 A throughput-oriented pipeline is available for hot/AOT-style use and benchmarks. It additionally pays for global analyses such as dominator-based CSE and repeats cleanup/SROA to a bounded fixed point.
@@ -223,6 +244,16 @@ Important design choices:
 - GC workers can process tracing/copy work in parallel according to collector configuration;
 - `System.gc()` requests an explicit full collection.
 
+### Handle-log sweeping
+
+Every managed object owns a stable handle and needs cleanup when it dies: the handle is released and generation-bumped, contracts and the JIT sidecar view are cleared, and native resources are dropped. Rather than registering each new object in a per-object tracked list, which was a measurable share of allocation-heavy code, managed descriptors are marked `id_swept`:
+
+- `Heap` pulls handles from the global table in batches and appends them to the mutator's per-thread handle log. Allocation only advances a cursor in that log, so the consumed prefix is exactly the set of handles allocated since the last collection, at no per-object registration cost.
+- At the stop-the-world rendezvous the consumed prefix is moved to the collector; unconsumed cached handles stay with the mutator, and `Heap` returns them to the free list on drop.
+- During weak processing the collector resolves each handle through the handle table. Handle slots are traced, so a live object's entry already holds its post-copy address and is reachable; a dead object's entry still holds its old, unmarked address and is cleaned up, including external-byte accounting. Address 0 means "allocated but not published yet" and is carried over to the next collection.
+- Survivors move to a mature handle list that only full collections sweep, mirroring the nursery/mature split of the tracked list. The tracked list remains for finalizers and non-handle native owners.
+- The per-object cleanup only drops the payload. The dead handles of one sweep are then released together: their sidecar entries are cleared and linked into one local chain, which is spliced onto the global free list with a single CAS, and the live counter is adjusted once. Recycling a handle bumps its generation with a plain load+store, since the successful pop already gives the mutator exclusive ownership.
+
 Current collector tuning is configurable through environment variables such as heap size, worker count and external-memory threshold in the GC integration.
 
 ## 7. Tracing JIT with Cranelift
@@ -251,6 +282,16 @@ Each guard/exit knows exactly which architectural values must be reconstructed. 
 The tier supports hot loop traces and hot acyclic entry traces. Repeated side exits may grow child side traces. Eligible edges can be **stitched native-to-native**, avoiding a manager/interpreter round-trip after the child is installed.
 
 Side-trace depth is bounded to prevent uncontrolled trace-tree growth.
+
+### Whole-function tier coordination
+
+Direct synchronous bytecode calls also consider whole-function compilation before
+the callee's tracing entry hook. Its hotness threshold matches the configured
+entry threshold, with a minimum of 64 calls; an entry threshold of zero disables
+both entry tiers. This avoids compiling a short-lived entry trace immediately
+before eligible recursive functions switch to whole-function native code.
+Rejected functions and functions awaiting sufficient runtime profiles retain
+their normal tracing entry and loop paths.
 
 ### Bounded language-call inlining
 

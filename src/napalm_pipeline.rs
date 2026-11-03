@@ -12,6 +12,226 @@ use crate::napalm_ir::Program;
 use crate::napalm_ir_optimizer::Optimize;
 use crate::napalm_ir_optimizing::optimization_passes;
 
+#[cfg(debug_assertions)]
+mod debug_dump {
+    use super::*;
+    use crate::napalm_bytecode::disassemble;
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufWriter, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    const LOG_PATH: &str = "run_log.txt";
+
+    static LOG: OnceLock<Mutex<Option<BufWriter<File>>>> = OnceLock::new();
+    static COMPILATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn log() -> &'static Mutex<Option<BufWriter<File>>> {
+        LOG.get_or_init(|| {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(LOG_PATH);
+
+            match file {
+                Ok(file) => Mutex::new(Some(BufWriter::new(file))),
+                Err(error) => {
+                    eprintln!("failed to create {LOG_PATH}: {error}");
+                    Mutex::new(None)
+                }
+            }
+        })
+    }
+
+    fn with_log(write: impl FnOnce(&mut BufWriter<File>)) {
+        let mut guard = log()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(writer) = guard.as_mut() else {
+            return;
+        };
+
+        write(writer);
+        // Runtime debugging often terminates the process immediately after an
+        // error. Flush every stage so the latest compiler state survives.
+        let _ = writer.flush();
+    }
+
+    pub fn next_compilation_id() -> u64 {
+        COMPILATION_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn dump_hir(compilation_id: u64, stage: &str, hir: &Program) {
+        with_log(|writer| {
+            let _ = writeln!(
+                writer,
+                "\n================================================================================"
+            );
+            let _ = writeln!(writer, "COMPILATION #{compilation_id}: {stage}");
+            let _ = writeln!(
+                writer,
+                "functions={} modules={} classes={}",
+                hir.functions.len(),
+                hir.modules.len(),
+                hir.classes.len()
+            );
+            let _ = writeln!(
+                writer,
+                "================================================================================"
+            );
+
+            for (index, function) in hir.functions.iter().enumerate() {
+                let _ = writeln!(
+                    writer,
+                    "\n--- HIR function index={index} id={:?} module={:?} kind={:?} async={} concurrent={} memoization={:?} field_owner={:?} ---",
+                    function.id,
+                    function.module,
+                    function.kind,
+                    function.is_async,
+                    function.is_concurrent,
+                    function.memoization,
+                    function.field_owner
+                );
+                let _ = writeln!(writer, "{function}");
+            }
+        });
+    }
+
+    pub fn dump_bytecode(compilation_id: u64, program: &BytecodeProgram) {
+        with_log(|writer| {
+            let _ = writeln!(
+                writer,
+                "\n================================================================================"
+            );
+            let _ = writeln!(writer, "COMPILATION #{compilation_id}: BYTECODE");
+            let _ = writeln!(
+                writer,
+                "functions={} methods={} strings={}",
+                program.functions.len(),
+                program.metadata.methods.len(),
+                program.metadata.strings.len()
+            );
+            let _ = writeln!(
+                writer,
+                "================================================================================"
+            );
+
+            let _ = writeln!(writer, "\n--- Runtime method table ---");
+            for (index, signature) in program.metadata.methods.iter().enumerate() {
+                let name = program
+                    .metadata
+                    .string(signature.name)
+                    .unwrap_or("<invalid-string>");
+                let _ = writeln!(
+                    writer,
+                    "MethodSymbol#{index}: name={name:?} kind={:?} arity={}",
+                    signature.kind,
+                    signature.arity
+                );
+            }
+
+            for (index, function) in program.functions.iter().enumerate() {
+                let name = program
+                    .metadata
+                    .string(function.name)
+                    .unwrap_or("<invalid-function-name>");
+
+                let _ = writeln!(
+                    writer,
+                    "\n--------------------------------------------------------------------------------"
+                );
+                let _ = writeln!(
+                    writer,
+                    "BYTECODE FUNCTION index={index} id={:?} name={name:?}",
+                    function.id
+                );
+                let _ = writeln!(
+                    writer,
+                    "module={:?} kind={:?} async={} concurrent={} memoization={:?} field_owner={:?}",
+                    function.module,
+                    function.kind,
+                    function.is_async,
+                    function.is_concurrent,
+                    function.memoization,
+                    function.field_owner
+                );
+                let _ = writeln!(
+                    writer,
+                    "arity={} captures={} gprs={} return_kind={:?}",
+                    function.arity,
+                    function.capture_count,
+                    function.frame.general_register_count,
+                    function.frame.return_kind
+                );
+                let _ = writeln!(writer, "frame.parameters = {:#?}", function.frame.parameters);
+                let _ = writeln!(writer, "frame.captures = {:#?}", function.frame.captures);
+
+                let _ = writeln!(writer, "constants = {:#?}", function.chunk.constants);
+
+                let _ = writeln!(writer, "inline_caches:");
+                for (cache_index, cache) in function.chunk.inline_caches.iter().enumerate() {
+                    let signature = program.metadata.method(cache.method);
+                    let method_name = signature
+                        .and_then(|signature| program.metadata.string(signature.name))
+                        .unwrap_or("<invalid-method>");
+                    let _ = writeln!(
+                        writer,
+                        "  [{cache_index}] site={:?} method={:?} name={method_name:?} signature={signature:?} home_class={:?}",
+                        cache.site,
+                        cache.method,
+                        cache.home_class
+                    );
+                }
+
+                let _ = writeln!(writer, "type_guards = {:#?}", function.chunk.type_guards);
+                let _ = writeln!(writer, "class_guards = {:#?}", function.chunk.class_guards);
+                let _ = writeln!(writer, "switch_tables = {:#?}", function.chunk.switch_tables);
+                let _ = writeln!(writer, "deopts = {:#?}", function.chunk.deopts);
+                let _ = writeln!(writer, "safepoints = {:#?}", function.chunk.safepoints);
+                let _ = writeln!(writer, "live_registers = {:#?}", function.chunk.live_registers);
+                let _ = writeln!(writer, "resume_points = {:#?}", function.chunk.resume_points);
+                let _ = writeln!(writer, "source_map = {:#?}", function.chunk.source_map);
+                let _ = writeln!(
+                    writer,
+                    "profile_counters = {:#?}",
+                    function.chunk.profile_counters
+                );
+                let _ = writeln!(
+                    writer,
+                    "exception_handlers = {:#?}",
+                    function.chunk.exception_handlers
+                );
+
+                let _ = writeln!(writer, "\nDISASSEMBLY:");
+                match disassemble(function) {
+                    Ok(disassembly) => {
+                        let _ = write!(writer, "{disassembly}");
+                    }
+                    Err(error) => {
+                        let _ = writeln!(writer, "<disassembly failed: {error:?}>");
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn dump_compile_error(compilation_id: u64, error: &CompileError) {
+        with_log(|writer| {
+            let _ = writeln!(
+                writer,
+                "\n================================================================================"
+            );
+            let _ = writeln!(writer, "COMPILATION #{compilation_id}: BYTECODE COMPILATION FAILED");
+            let _ = writeln!(writer, "{error:?}");
+            let _ = writeln!(
+                writer,
+                "================================================================================"
+            );
+        });
+    }
+}
+
 pub struct CompilationPipeline {
     optimizations: Optimize,
     bytecode: BytecodeCompiler,
@@ -48,8 +268,27 @@ impl CompilationPipeline {
         &mut self,
         hir: &mut Program,
     ) -> Result<CompilationOutput, CompileError> {
+        #[cfg(debug_assertions)]
+        let debug_compilation_id = {
+            let id = debug_dump::next_compilation_id();
+            debug_dump::dump_hir(id, "HIR BEFORE OPTIMIZATIONS", hir);
+            id
+        };
+
         self.optimizations.optimize_program(hir);
-        self.bytecode.compile_with_stats(hir)
+
+        #[cfg(debug_assertions)]
+        debug_dump::dump_hir(debug_compilation_id, "HIR AFTER OPTIMIZATIONS", hir);
+
+        let output = self.bytecode.compile_with_stats(hir);
+
+        #[cfg(debug_assertions)]
+        match &output {
+            Ok(output) => debug_dump::dump_bytecode(debug_compilation_id, &output.program),
+            Err(error) => debug_dump::dump_compile_error(debug_compilation_id, error),
+        }
+
+        output
     }
 }
 

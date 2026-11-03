@@ -39,6 +39,7 @@ System.print(twice(Answer));
 - `let`, `const` and `var`, including multiple declarations. Bindings are block-scoped; `const` requires an initializer and rejects reassignment, including from a closure. Objects held by a constant remain mutable.
 - `function name(...) { ... }`, anonymous `function (...) { ... }`, arrow functions, direct calls `fn(...)`, and lexical closures. Functions are initialized when their declaration executes; there is no JavaScript hoisting.
 - `class`, `constructor(...)`, `new Class(...)`, `extends`, `super(...)`, `super.method(...)`, declared instance/static fields, methods, `get` and `set`. Field initializers run for each construction; static initializers run once when the declaration executes. Use `this.member` explicitly.
+- Decorators on functions, classes, methods, getters, setters and fields, including static members: `@decorator`, `@namespace.decorator` and `@factory(...)`. See [decorator semantics](#decorators) and the [executable decorator example](scripts/decorators.napalm).
 - Optional variable annotations and object interfaces with required/optional fields, `readonly`, `extends`, unions, nested interfaces and typed lists. Interface violations terminate execution, including inside `try/catch`. Parameter/return annotations, `type` aliases, generic parameters, `implements`, `as Type` and class visibility/readonly modifiers remain erased; see [interface scope and limits](docs/INTERFACES.md).
 - `if`/`else`, `while`, `for (let i = 0; i < n; i++)`, `for (const item of collection)`, `break`, `continue` and `return`.
 - Arithmetic, comparisons, `==`/`!=` and `===`/`!==`, bitwise operators, `&&`, `||`, conditional expressions, assignment, `+=`, `-=`, `*=`, `/=`, `%=`, and prefix/postfix `++`/`--`. `instanceof` replaces Wren's `is` operator.
@@ -49,8 +50,108 @@ System.print(twice(Answer));
 - Named/default/side-effect imports; named/default declaration exports, `export { local as public }`, and named re-exports with `from`. Only explicit exports are public.
 - `async function`, async methods/arrows, `await`, `throw`, `try`/`catch`/`finally`, plus Napalm's `defer` and `errdefer` extensions.
 - Semicolons and line-separated statements. Braced function bodies always contain statements; only expression-bodied arrows return implicitly. Napalm does not implement every ECMAScript automatic-semicolon-insertion edge case.
+- HTTP services with `listen "127.0.0.1:3000" { route "GET" ["/"] (req) => ({body: "Hello!"}); }`, async handlers, path parameters, streaming/SSE and simple HTTP clients. See [HTTP services](docs/HTTP.md) and [the server example](scripts/server.napalm).
 
 Examples are in [scripts/complete.nap](scripts/complete.nap), [scripts/module_import.nap](scripts/module_import.nap), [scripts/builtins.nap](scripts/builtins.nap) and [scripts/destructuring_spread.nap](scripts/destructuring_spread.nap).
+
+## Decorators
+
+Each decorator receives `(value, context)`. `context.name` is the declaration/member name,
+and `context.kind` identifies its target. Decorator expressions/factories are evaluated
+top-down in the declaration's lexical scope and decorators are applied bottom-up.
+Returning `null` (including falling off the end) preserves a function, class or method.
+Other results must be a class for a class decorator or a function for other targets;
+invalid values produce catchable runtime errors.
+
+Napalm preserves lexical `this`. Member callables therefore use an **explicit receiver**
+as their first argument instead of JavaScript's dynamic `this` / `Function.call(thisArg, ...)`.
+
+| `context.kind` | Value passed to the decorator | Replacement signature |
+| --- | --- | --- |
+| `"function"` | Original function | Same arguments as the original |
+| `"class"` | Original class | Return the replacement class |
+| `"method"` | Callable for the original method | `(receiver, ...originalArguments)` |
+| `"getter"` | Callable for the original getter | `(receiver)` |
+| `"setter"` | Callable for the original setter | `(receiver, nextValue)` |
+| `"field"` | `null` | `(receiver, initialValue) => transformedValue` |
+
+The `...` above denotes the signature convention, not supported rest-parameter syntax:
+write each parameter explicitly. Decorated methods accept at most 15 ordinary arguments,
+leaving one slot for the receiver. Members also receive `context.static` and `context.private`.
+`private` is currently `false`: Napalm erases TypeScript visibility modifiers and does not
+implement ECMAScript `#private` fields.
+
+`context.addInitializer(fn)` accepts zero-argument callbacks for functions/classes and
+one-argument `(receiver)` callbacks for members. It can only be called while that decorator
+is executing, even if the decorator throws. The original function/class's final binding
+is installed before its callbacks run. Member decoration runs once per class declaration:
+
+- Instance method/getter/setter callbacks run for each construction, after `super()` in
+  derived classes and before ordinary field initialization.
+- Static method/getter/setter callbacks run once, before static fields and blocks.
+- Field transformers run top-down for each instance (once for static fields), using `null`
+  when there is no initializer. Each field's extra callbacks run after that field is assigned.
+- Extra callbacks run in registration order. An error aborts initialization and propagates;
+  later callbacks do not run.
+
+This is a Napalm extension inspired by standard JavaScript decorators, not full proposal
+compatibility: `context.access`, metadata, auto-accessors, constructor decorators, computed/watch
+decorators, foreign/abstract/declare member decorators and operator decorators are unsupported.
+Place decorators before `export` for exported declarations.
+
+The [decorators example](scripts/decorators.napalm) includes assertions for all six targets,
+stacking, static members, initializers and hot-loop dispatch with GC. A failed assertion throws:
+
+```powershell
+cargo run -- scripts\decorators.napalm
+cargo test napalm_decorators -- --test-threads=1
+```
+
+### Native decorators
+
+The following globals provide Rust-backed caching and scheduling. Use the options as
+an object literal, for example `@debounce(1000, {leading: false, trailing: true})`;
+`options = {...}` is an assignment expression, not a named-argument syntax.
+All time arguments, including `maxWait` and cache expiration, are **milliseconds**.
+
+| Decorator | Behavior |
+| --- | --- |
+| `@memoize` | Cache successful return values by the complete argument tuple. |
+| `@memoizeExpiring(ttl)` | Memoize each key for `ttl` milliseconds from insertion; hits do not renew its lifetime. |
+| `@once` | Invoke until the first successful return, then reuse that result regardless of subsequent arguments. |
+| `@delay(wait)` | Schedule every call independently after `wait` milliseconds; return a Promise for its result. |
+| `@debounce(wait, options)` | Group a burst of calls; invoke using the latest arguments after a quiet period. Defaults: `leading: false`, `trailing: true`. Optional `maxWait` limits postponement during a continuous burst. |
+| `@throttle(wait, options)` | Limit execution to a time window, retaining the latest arguments for its trailing edge. Defaults: `leading: true`, `trailing: true`. |
+
+These decorators support functions and callable class members, not classes or field
+transformers. The explicit member receiver is preserved. Memoization includes the
+receiver in its key; `once`, debounce and throttle maintain separate state per receiver.
+
+Caches reuse the runtime's AES-backed hasher and compare complete keys rather than
+treating a hash as a unique identity. Strings compare by content, objects by identity,
+and numeric signed zero compares as one key. Objects are not deep-hashed: mutating an
+argument does not invalidate its cached result. Captured state and global variables
+are not part of the key, so memoize only functions whose result is appropriate to reuse.
+
+Memoization and `once` preserve the original synchronous/async return convention.
+Synchronous exceptions are not cached; a returned Promise is cached immediately,
+including its eventual rejection. Caches retain the managed arguments/results needed
+by their entries; avoid unbounded memoization of an unlimited argument space.
+
+Delay, debounce and throttle always return Promises and adopt an async function's
+result. Calls grouped into the same invocation share its outcome. With both leading
+and trailing enabled, a lone leading call does not produce a duplicate trailing call;
+later calls in that window receive the trailing outcome. With trailing disabled,
+suppressed calls share the leading invocation's outcome. Disabling both edges is
+invalid. Scheduled exceptions reject the corresponding Promise instead of disappearing
+inside the timer callback.
+
+Run the [native decorator example/test](scripts/native_decorators.napalm):
+
+```powershell
+cargo run -- scripts\native_decorators.napalm
+cargo test native_decorators -- --test-threads=1
+```
 
 ## Migration from WrenJIT
 
@@ -87,7 +188,7 @@ The standard library retains its existing API (`System.print`, `list.add`, `list
 
 Destructuring currently operates on Lists and Maps, including empty patterns; it rejects `null` and other receiver types. Rest parameters (`function f(...args)`), defaults for whole parameters and omitted optional arguments remain unsupported; defaults inside destructured parameters are supported. Parameter arity is still fixed.
 
-Other limits include `switch`, generators, regular-expression literals, namespace imports/exports, JSX, enums, decorators and user-defined operator/subscript declarations. Use explicit constructors and `super(...)` in derived classes, and normal named methods in place of operator declarations. Methods can still be overloaded by arity as an engine extension.
+Other limits include `switch`, generators, regular-expression literals, namespace imports/exports, JSX, enums and user-defined operator/subscript declarations. Use explicit constructors and `super(...)` in derived classes, and normal named methods in place of operator declarations. Methods can still be overloaded by arity as an engine extension.
 
 For class fields containing functions, use `(object.callback)(...)` to call the stored function; `object.method(...)` selects method dispatch. `private`, `protected`, `public`, `readonly` and `override` are erased modifiers, not runtime access controls. There is no function hoisting or per-iteration rebinding of a captured C-style `for` variable.
 

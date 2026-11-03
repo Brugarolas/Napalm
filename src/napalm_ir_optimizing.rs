@@ -18,6 +18,9 @@ use crate::napalm_ir_optimizer::{
 #[path = "typed_object_specialization.rs"]
 mod typed_object_specialization;
 pub use typed_object_specialization::TypedObjectSpecialization;
+#[path = "shared_constant_literals.rs"]
+mod shared_constant_literals;
+pub use shared_constant_literals::SharedConstantLiterals;
 
 /// Interpreter-oriented WIR optimization pipeline.
 ///
@@ -32,6 +35,7 @@ pub fn optimization_passes() -> Optimize {
     Optimize::new()
         .with_function_pass(InterpreterOptimizationBundle::default())
         .with_program_finalizer(AutoMemoization::default())
+        .with_program_finalizer(SharedConstantLiterals::default())
 }
 
 /// Optimize independent WIR functions concurrently using one optimizer instance
@@ -117,6 +121,8 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
     // whole-program call graph and therefore runs once after all workers join.
     let mut memoization = AutoMemoization::default();
     let _ = memoization.optimize_program(program);
+    // Literal sharing needs the direct call graph produced by memoization.
+    let _ = SharedConstantLiterals.optimize_program(program);
 }
 
 /// Static auto-memoization for scalar-key pure functions.
@@ -125,13 +131,16 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
 /// `Invoke("call")` protocol, including recursion through module bindings. This
 /// pass therefore reconstructs immutable module-function bindings and a small
 /// pure call graph instead of relying on `CallDirect` alone. Runtime caching is
-/// conditional on scalar arguments/results, so `any` parameters remain safe.
+/// conditional on scalar arguments, so `any` parameters remain safe. Allocating
+/// functions additionally need the global literal-sharing analysis to prove
+/// that every map they allocate has unobservable identity and mutation.
 #[derive(Default)]
 pub struct AutoMemoization;
 
 #[derive(Clone, Debug, Default)]
 struct MemoCandidate {
     locally_pure: bool,
+    allocates: bool,
     callees: Vec<FuncId>,
 }
 
@@ -271,12 +280,13 @@ fn resolve_direct_call_callee(
 
 fn analyze_auto_memoization(program: &mut Program) -> bool {
     let module_functions = discover_module_function_bindings(program);
+    let shareable_maps = shared_constant_literals::memoizable_map_operations(program);
     let mut summaries: HashMap<FuncId, MemoCandidate> = HashMap::default();
 
     for function in &program.functions {
         summaries.insert(
             function.id,
-            analyze_memo_candidate(program, function, &module_functions),
+            analyze_memo_candidate(program, function, &module_functions, &shareable_maps),
         );
     }
 
@@ -301,12 +311,27 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
 
     let mut changed = false;
     let recursive = recursive_memo_functions(&pure, &summaries);
+    let mut allocating: HashSet<FuncId> = pure.iter().copied()
+        .filter(|id| summaries[id].allocates).collect();
+    loop {
+        let additional: Vec<_> = pure.iter().copied().filter(|id| {
+            !allocating.contains(id)
+                && summaries[id].callees.iter().any(|callee| allocating.contains(callee))
+        }).collect();
+        if additional.is_empty() { break; }
+        allocating.extend(additional);
+    }
     for function in &mut program.functions {
         let next = if pure.contains(&function.id) {
-            if recursive.contains(&function.id) {
-                MemoizationKind::Recursive
-            } else {
-                MemoizationKind::Pure
+            match (recursive.contains(&function.id), allocating.contains(&function.id)) {
+                (true, true) => MemoizationKind::RecursiveShared,
+                // Allocating purity is useful for proving recursive producers,
+                // but is not by itself a reason to cache a function. In
+                // particular, keep ordinary factories and their callers eligible
+                // for native compilation/inlining instead of installing a cache.
+                (false, true) => MemoizationKind::None,
+                (true, false) => MemoizationKind::Recursive,
+                (false, false) => MemoizationKind::Pure,
             }
         } else {
             MemoizationKind::None
@@ -391,6 +416,7 @@ fn analyze_memo_candidate(
     program: &Program,
     function: &Function,
     module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
+    shareable_maps: &HashSet<(FuncId, InstId)>,
 ) -> MemoCandidate {
     // Receiver-bearing methods and closures with captures have hidden inputs that
     // are not represented by the explicit scalar memo key. Async/concurrent code
@@ -405,10 +431,16 @@ fn analyze_memo_candidate(
     }
 
     let mut callees = Vec::new();
+    let mut allocates = false;
     for block in &function.blocks {
         for &id in &block.insts {
             let inst = &function.nodes[id.0 as usize].kind;
             match inst {
+                Inst::AllocMap | Inst::MapSet { .. }
+                    if shareable_maps.contains(&(function.id, id)) =>
+                {
+                    allocates |= matches!(inst, Inst::AllocMap);
+                }
                 Inst::Jump { .. }
                 | Inst::Branch { .. }
                 | Inst::Switch { .. }
@@ -480,7 +512,7 @@ fn analyze_memo_candidate(
 
     callees.sort_unstable_by_key(|id| id.0);
     callees.dedup();
-    MemoCandidate { locally_pure: true, callees }
+    MemoCandidate { locally_pure: true, allocates, callees }
 }
 
 fn is_scalar_pure_method(name: &str, kind: MethodKind, arity: u8) -> bool {
@@ -2198,6 +2230,9 @@ impl FunctionOptimization for ControlFlowCleanup {
             changed = true;
         }
 
+        #[cfg(debug_assertions)]
+        debug_assert_reachable_block_param_uses(function, &reachable);
+
         if changed {
             let live = live_node_bitmap(function);
             function
@@ -2229,6 +2264,35 @@ impl FunctionOptimization for ControlFlowCleanup {
         }
 
         changed
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_reachable_block_param_uses(function: &Function, reachable: &[bool]) {
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        if !reachable.get(block_index).copied().unwrap_or(false) {
+            continue;
+        }
+        for &inst in &block.insts {
+            let Some(node) = function.node(inst) else {
+                continue;
+            };
+            for operand in node.kind.operands() {
+                let Some(value) = function.value(operand) else {
+                    continue;
+                };
+                let ValueDef::BlockParam(owner, _) = value.def else {
+                    continue;
+                };
+                debug_assert!(
+                    reachable.get(owner.0 as usize).copied().unwrap_or(false),
+                    "reachable block {:?} uses {:?}, a block parameter owned by unreachable block {:?}",
+                    block.id,
+                    operand,
+                    owner,
+                );
+            }
+        }
     }
 }
 
@@ -2494,7 +2558,7 @@ impl FunctionOptimization for CopyPropagation {
                 };
                 let result = ValueId(index as u32);
                 if matches!(function.values[index].def, ValueDef::BlockParam(_, _))
-                    && can_substitute(function, source, result)
+                    && can_eliminate_identity_block_param(function, source, result)
                 {
                     alias[index] = source;
                     added = true;
@@ -2577,6 +2641,34 @@ impl FunctionOptimization for CopyPropagation {
         }
 
         changed
+    }
+}
+
+/// Returns whether an identity block parameter can be replaced globally by its
+/// incoming SSA value without making a later CFG rewrite invalidate dominance.
+///
+/// A block parameter owned by an intermediate predecessor is only available after
+/// entering that predecessor. Copying it into a successor is valid while that
+/// predecessor remains on every path, but `ControlFlowCleanup` may subsequently
+/// thread the predecessor away. The replacement would then leave uses referring
+/// to a value defined in an unreachable block. Entry parameters are stable because
+/// the entry block is never bypassed; instruction results are handled by the normal
+/// substitution/type checks below.
+fn can_eliminate_identity_block_param(
+    function: &Function,
+    source: ValueId,
+    result: ValueId,
+) -> bool {
+    if !can_substitute(function, source, result) {
+        return false;
+    }
+
+    let Some(source_value) = function.value(source) else {
+        return false;
+    };
+    match source_value.def {
+        ValueDef::BlockParam(owner, _) => owner == function.entry,
+        ValueDef::InstResult(_, _) | ValueDef::CaptureParam(_) => true,
     }
 }
 
@@ -3050,6 +3142,71 @@ mod typed_object_tests {
 
         let _ = AutoMemoization.optimize_program(&mut program);
         assert_eq!(program.functions[id.0 as usize].memoization, MemoizationKind::None);
+    }
+
+
+    #[test]
+    fn copy_propagation_does_not_leave_block_param_from_threaded_bridge() {
+        let mut program = Program::new();
+        let module = program.add_module("copy_cfg", 0);
+        let mut builder = Builder::new(
+            &mut program,
+            module,
+            "bridge_phi",
+            FunctionKind::Closure,
+            vec![Type::Bool, Type::Num, Type::Num],
+            Type::Num,
+        );
+
+        let condition = builder.param(0);
+        let left_value = builder.param(1);
+        let right_value = builder.param(2);
+        let left = builder.new_block(&[]);
+        let right = builder.new_block(&[]);
+        let bridge = builder.new_block(&[Type::Num]);
+        let join = builder.new_block(&[Type::Num]);
+
+        builder.branch(condition, left, vec![], right, vec![]);
+
+        builder.position_at(left);
+        builder.jump(bridge, vec![left_value]);
+
+        builder.position_at(right);
+        builder.jump(bridge, vec![right_value]);
+
+        builder.position_at(bridge);
+        let bridge_param = builder.block_param(bridge, 0);
+        builder.jump(join, vec![bridge_param]);
+
+        builder.position_at(join);
+        let join_param = builder.block_param(join, 0);
+        builder.ret(join_param);
+
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+
+        // The bridge parameter has conflicting incoming values, while the join
+        // parameter has the bridge parameter as its single incoming value. The old
+        // copy propagation pass globally rewrote `join_param -> bridge_param`; CFG
+        // cleanup then threaded `bridge` away and left the return using a value
+        // defined in an unreachable block.
+        let _ = CopyPropagation.optimize_function(function);
+        assert!(ControlFlowCleanup.optimize_function(function));
+
+        let join_block = function.block(join).expect("join block must remain live");
+        let return_inst = *join_block.insts.last().expect("join block must terminate");
+        let returned = match function.node(return_inst).map(|node| &node.kind) {
+            Some(Inst::Return(value)) => *value,
+            other => panic!("expected Return in join block, got {other:?}"),
+        };
+
+        assert_eq!(returned, join_param);
+        assert_ne!(returned, bridge_param);
+        assert!(matches!(
+            function.value(returned).map(|value| value.def),
+            Some(ValueDef::BlockParam(owner, _)) if owner == join
+        ));
+        crate::napalm_ir::verify_function(function).unwrap();
     }
 
 }

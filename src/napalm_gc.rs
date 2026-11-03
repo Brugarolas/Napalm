@@ -276,6 +276,11 @@ pub struct Descriptor {
     /// forwarding pointer. Runs at STW on the winning copy worker. Must not
     /// allocate, inspect children, or retain references into the payload.
     pub after_move: Option<unsafe fn(Object)>,
+    /// The object owns an id handed out through `Mutator::take_logged_id`, and
+    /// the registered id resolver maps that id to its current address. Cleanup
+    /// is then driven by the per-thread id log instead of a per-object tracked
+    /// entry, which keeps allocation free of any registration work.
+    pub id_swept: bool,
 }
 
 #[repr(C, align(16))]
@@ -372,6 +377,11 @@ pub struct Collector {
     weak: Mutex<Vec<Weak<AtomicUsize>>>,
     tracked: Mutex<Vec<Tracked>>,
     mature_tracked: Mutex<Vec<Tracked>>,
+    /// Ids consumed since the last collection, plus consumed ids whose object
+    /// was not published yet when that collection ran.
+    swept_ids: Mutex<Vec<u32>>,
+    mature_swept_ids: Mutex<Vec<u32>>,
+    id_sweeper: OnceLock<IdSweeper>,
     pending: Mutex<Vec<Arc<RootStorage>>>,
     keep_roots: Mutex<Vec<Arc<RootStorage>>>,
     keep_providers: Mutex<Vec<Arc<dyn RootProvider>>>,
@@ -413,6 +423,10 @@ struct ThreadRecord {
     // the stop-the-world rendezvous, when the owner is Parked/Native. This keeps
     // cleanup/finalizer registration completely lock-free on the allocation path.
     tracked: UnsafeCell<Vec<Tracked>>,
+    /// Same ownership rules as `tracked`. `ids[..id_cursor]` were handed out
+    /// to objects; the remainder is still an unconsumed per-thread cache.
+    ids: UnsafeCell<Vec<u32>>,
+    id_cursor: UnsafeCell<usize>,
 }
 // The owner accesses context while Running; GC accesses it only after rendezvous.
 // World membership prevents destruction until all GC work has completed.
@@ -479,6 +493,9 @@ impl Collector {
             weak: Mutex::new(Vec::new()),
             tracked: Mutex::new(Vec::new()),
             mature_tracked: Mutex::new(Vec::new()),
+            swept_ids: Mutex::new(Vec::new()),
+            mature_swept_ids: Mutex::new(Vec::new()),
+            id_sweeper: OnceLock::new(),
             pending: Mutex::new(Vec::new()),
             keep_roots: Mutex::new(Vec::new()),
             keep_providers: Mutex::new(Vec::new()),
@@ -513,6 +530,8 @@ impl Collector {
             roots: Mutex::new(Vec::new()),
             owner: std::thread::current().id(),
             tracked: UnsafeCell::new(Vec::new()),
+            ids: UnsafeCell::new(Vec::new()),
+            id_cursor: UnsafeCell::new(0),
         });
         let context = mm::bind_mutator(self.mmtk, record.token());
         unsafe {
@@ -611,6 +630,66 @@ fn drain_thread_tracked(gc: &Collector, record: &ThreadRecord) {
         return;
     }
     gc.tracked.lock().append(local);
+}
+
+fn drain_thread_ids(gc: &Collector, record: &ThreadRecord) {
+    // SAFETY: same exclusivity argument as drain_thread_tracked.
+    let ids = unsafe { &mut *record.ids.get() };
+    let cursor = unsafe { &mut *record.id_cursor.get() };
+    if *cursor == 0 {
+        return;
+    }
+    gc.swept_ids.lock().extend(ids.drain(..*cursor));
+    *cursor = 0;
+}
+
+/// Runtime hooks for `Descriptor::id_swept` objects.
+pub struct IdSweeper {
+    /// Current object address for a consumed id, or 0 while it is unpublished.
+    pub resolve: fn(u32) -> usize,
+    /// Returns the ids of objects whose cleanup already ran, once per sweep, so
+    /// the runtime can recycle them with batched rather than per-object atomics.
+    pub release: fn(&[u32]),
+}
+
+/// Reclaims dead id-swept objects. Unpublished ids (address 0) are kept for the
+/// next collection; survivors are appended to `survivors` when provided.
+fn sweep_ids(
+    ids: &mut Vec<u32>,
+    mut survivors: Option<&mut Vec<u32>>,
+    sweeper: &IdSweeper,
+    dead: &mut Vec<u32>,
+) {
+    let mut released_external = 0usize;
+    ids.retain(|&id| {
+        let address = (sweeper.resolve)(id);
+        if address == 0 {
+            return survivors.is_some();
+        }
+        let object = unsafe { Object::from_address(address) };
+        if object.0.is_reachable() {
+            match survivors.as_deref_mut() {
+                Some(survivors) => {
+                    survivors.push(id);
+                    false
+                }
+                None => true,
+            }
+        } else {
+            let header = unsafe { object.header() };
+            released_external += header.external_bytes.load(Ordering::Relaxed);
+            if let Some(cleanup) = header.descriptor.cleanup {
+                unsafe { cleanup(object) };
+            }
+            dead.push(id);
+            false
+        }
+    });
+    if released_external != 0 {
+        gc().counters
+            .external_bytes
+            .fetch_sub(released_external, Ordering::Relaxed);
+    }
 }
 
 fn gc() -> &'static Collector {
@@ -895,7 +974,7 @@ impl Mutator {
 
         let context = unsafe { self.pointer.as_mut() };
         mm::post_alloc(context, object.0, bytes, AllocationSemantics::Default);
-        if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
+        if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
             unsafe { &mut *self.record.tracked.get() }.push(Tracked {
                 object,
                 finalized: false,
@@ -1012,7 +1091,7 @@ impl Mutator {
             bytes,
             AllocationSemantics::Default,
         );
-        if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
+        if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
             // SAFETY: only this thread mutates its record while Running. GC
             // drains the vector only after all Running mutators have parked.
             unsafe { &mut *self.record.tracked.get() }.push(Tracked {
@@ -1086,7 +1165,7 @@ impl Mutator {
             );
         }
         mm::post_alloc(context, object.0, bytes, semantics);
-        if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
+        if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
             // SAFETY: only this thread mutates its record while Running. GC
             // drains the vector only after all Running mutators have parked.
             unsafe { &mut *self.record.tracked.get() }.push(Tracked {
@@ -1165,6 +1244,37 @@ impl Mutator {
             .memory_region_copy(source, target);
     }
 
+    /// Installs the process-wide hooks for `Descriptor::id_swept` objects.
+    /// Repeated calls must pass the same hooks.
+    pub fn set_id_sweeper(&self, sweeper: IdSweeper) {
+        let _ = self.gc.id_sweeper.set(sweeper);
+    }
+
+    /// Hands out the next cached id. Consumption is recorded by the cursor
+    /// itself, so allocation does no per-object registration.
+    #[inline(always)]
+    pub fn take_logged_id(&mut self) -> Option<u32> {
+        // SAFETY: only the owning Running mutator touches its id log.
+        let ids = unsafe { &*self.record.ids.get() };
+        let cursor = unsafe { &mut *self.record.id_cursor.get() };
+        let id = *ids.get(*cursor)?;
+        *cursor += 1;
+        Some(id)
+    }
+
+    /// Appends ids to this thread's cache. Each must be exclusively owned by the
+    /// caller and be consumed through `take_logged_id` by an `id_swept` object.
+    pub fn log_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
+        unsafe { &mut *self.record.ids.get() }.extend(ids);
+    }
+
+    /// Removes the ids that were cached but never handed out.
+    pub fn take_unconsumed_ids(&mut self) -> Vec<u32> {
+        let ids = unsafe { &mut *self.record.ids.get() };
+        let cursor = unsafe { *self.record.id_cursor.get() };
+        ids.split_off(cursor)
+    }
+
     /// Updates external-memory accounting for a tracked native-resource owner.
     /// # Safety
     /// The object must be live and have a cleanup callback. `bytes` must reflect
@@ -1216,6 +1326,7 @@ impl Drop for Mutator {
             .lock()
             .extend(self.record.roots.lock().drain(..));
         drain_thread_tracked(self.gc, &self.record);
+        drain_thread_ids(self.gc, &self.record);
         unsafe {
             mm::destroy_mutator(self.pointer.as_mut());
             (*self.record.context.get()).take();
@@ -1442,6 +1553,9 @@ impl vm::VMBinding for Binding {
     type VMMemorySlice = ReferenceSlice;
     const MIN_ALIGNMENT: usize = WORD;
     const MAX_ALIGNMENT: usize = MAX_ALIGNMENT;
+    // Precise descriptor tracing never reads alignment gaps. MMTk's default
+    // debug fill (0xab) otherwise disables fixed_fast_allocation_info entirely.
+    const ALIGNMENT_VALUE: u8 = 0;
     const USE_ALLOCATION_OFFSET: bool = false;
     const ALLOC_END_ALIGNMENT: usize = WORD;
 }
@@ -1620,6 +1734,11 @@ impl vm::Scanning<Binding> for Scanning {
                 true
             } else {
                 let header = unsafe { entry.object.header() };
+                // Finalizable id-swept objects are only tracked for their
+                // finalizer; the id sweep owns their cleanup and accounting.
+                if header.descriptor.id_swept {
+                    return false;
+                }
                 let external = header.external_bytes.load(Ordering::Relaxed);
                 if let Some(cleanup) = header.descriptor.cleanup {
                     unsafe {
@@ -1636,6 +1755,17 @@ impl vm::Scanning<Binding> for Scanning {
         // native-resource owner again on the next nursery collection.
         gc().mature_tracked.lock().append(&mut tracked);
         drop(tracked);
+        if let Some(sweeper) = gc().id_sweeper.get() {
+            let mut dead = Vec::new();
+            let mut mature = gc().mature_swept_ids.lock();
+            if !gc().mmtk.get_plan().generational().unwrap().is_current_gc_nursery() {
+                sweep_ids(&mut mature, None, sweeper, &mut dead);
+            }
+            sweep_ids(&mut gc().swept_ids.lock(), Some(&mut mature), sweeper, &mut dead);
+            if !dead.is_empty() {
+                (sweeper.release)(&dead);
+            }
+        }
         gc().weak.lock().retain(|weak| {
             if let Some(cell) = weak.upgrade() {
                 let address = cell.load(Ordering::Relaxed);
@@ -1695,6 +1825,7 @@ impl vm::Collection<Binding> for Collection {
         // is race-free and does not penalize normal allocation.
         for record in &records {
             drain_thread_tracked(gc, record);
+            drain_thread_ids(gc, record);
         }
         for record in records {
             let pointer = unsafe { record.context_ptr() };

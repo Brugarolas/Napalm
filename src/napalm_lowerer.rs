@@ -29,7 +29,7 @@ use crate::napalm_front::{
 use crate::napalm_ir::{
     self as ir, BlockId, Builder, BuiltinBinding, BuiltinId, CaptureMode, ClassId, ClassSet, FieldSlot,
     FuncId, FunctionKind, Inst, MethodKind, MethodSymbol, ModuleExport, ModuleId, ModuleSlot, SourceSpan,
-    StaticFieldSlot, Type, ValueId,
+    StaticFieldSlot, Type, ValueId, WorkerFunctionBinding,
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -772,8 +772,9 @@ impl<'ast> Analyzer<'ast> {
         let this_binding = analyzer.declare_synthetic_this(method.span);
         analyzer.analysis.nodes[0].this_binding = Some(this_binding);
         let mut param_bindings = Vec::new();
-        for param in &formal_params {
-            param_bindings.push(analyzer.declare(param));
+        for (index, param) in formal_params.iter().enumerate() {
+            let source_type = body.param_types.get(index).cloned().flatten();
+            param_bindings.push(analyzer.declare_typed(param, source_type));
         }
         analyzer.analysis.nodes[0].param_bindings = param_bindings;
         analyzer.visit_function_body_contents(&body);
@@ -1197,8 +1198,9 @@ impl<'ast> Analyzer<'ast> {
         self.push_scope();
 
         let mut params = Vec::new();
-        for param in &body.params {
-            params.push(self.declare(param));
+        for (index, param) in body.params.iter().enumerate() {
+            let source_type = body.param_types.get(index).cloned().flatten();
+            params.push(self.declare_typed(param, source_type));
         }
         self.analysis.nodes[id.0].param_bindings = params;
         self.visit_function_body_contents(body);
@@ -1335,6 +1337,9 @@ struct ModuleLowerer<'p, 's, 'a> {
     import_ids: HashMap<CompactString, ir::StringId>,
     closure_functions: HashMap<(usize, usize), FuncId>,
     method_functions: HashMap<Span, FuncId>,
+    /// Synchronous module-level closures are immutable code identities for
+    /// isolated workers. Their managed closure objects are never transferred.
+    worker_function_names: HashSet<String>,
 }
 
 impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
@@ -1348,6 +1353,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     ) -> Self {
         let source_file = program.intern_string(source_name);
         let line_starts = source_line_starts(source);
+        let worker_function_names: HashSet<String> = ast
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StmtKind::Variable {
+                    name,
+                    initializer: Some(Expr { kind: ExprKind::Closure(_), .. }),
+                    ..
+                } => Some(name.value.clone()),
+                _ => None,
+            })
+            .collect();
         Self {
             program,
             source_name,
@@ -1371,6 +1388,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             import_ids: HashMap::default(),
             closure_functions: HashMap::default(),
             method_functions: HashMap::default(),
+            worker_function_names,
         }
     }
 
@@ -1385,7 +1403,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .into_iter()
             .filter_map(|builtin| {
                 self.module_layout
-                    .get(builtin.name())
+                    .get(builtin.binding_name())
                     .map(|slot| BuiltinBinding { slot, builtin })
             })
             .collect();
@@ -1402,6 +1420,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let (analysis, analyzer_diagnostics) = Analyzer::module(self.ast, self.options.warn_shadowing);
         self.diagnostics.extend(analyzer_diagnostics);
         self.compile_closure_descendants(module_id, &analysis, FunctionNodeId(0), None);
+        self.install_worker_function_bindings(module_id, &analysis);
 
         let spec = FunctionSpec {
             name: format!("<module {}>", self.module_name),
@@ -1470,7 +1489,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         for builtin in BuiltinId::ALL {
             self.module_layout
                 .slots
-                .insert(builtin.name().to_owned(), ModuleSlot(next));
+                .insert(builtin.binding_name().to_owned(), ModuleSlot(next));
             next += 1;
         }
 
@@ -2231,6 +2250,59 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
     }
 
+    fn install_worker_function_bindings(&mut self, module: ModuleId, analysis: &RootAnalysis<'_>) {
+        let analysis_key = analysis as *const _ as usize;
+        let mut bindings = Vec::new();
+
+        for statement in &self.ast.statements {
+            let StmtKind::Variable {
+                name,
+                initializer: Some(Expr { kind: ExprKind::Closure(body), .. }),
+                ..
+            } = &statement.kind
+            else {
+                continue;
+            };
+
+            if !self.worker_function_names.contains(&name.value) {
+                continue;
+            }
+            let Some(slot) = self.module_layout.get(&name.value) else {
+                continue;
+            };
+            let Some(node_id) = analysis.closure_map.get(&body.span).copied() else {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-L105",
+                    format!("missing function metadata for worker-callable function '{}'", name.value),
+                    name.span,
+                ));
+                continue;
+            };
+            let Some(function) = self
+                .closure_functions
+                .get(&(analysis_key, node_id.0))
+                .copied()
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-L105",
+                    format!("worker-callable function '{}' was not compiled", name.value),
+                    name.span,
+                ));
+                continue;
+            };
+
+            // A code-only worker binding must never carry a closure environment.
+            // Module globals are deliberately not lexical captures; attempts to
+            // read them are rejected at worker runtime instead.
+            if analysis.nodes[node_id.0].captures.is_empty() {
+                bindings.push(WorkerFunctionBinding { slot, function });
+            }
+        }
+
+        self.program
+            .set_module_worker_function_bindings(module, bindings);
+    }
+
     fn compile_function_node(
         &mut self,
         module: ModuleId,
@@ -2349,6 +2421,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             module,
             module_layout: &self.module_layout,
             module_binding_types: &self.module_binding_types,
+            worker_function_names: &self.worker_function_names,
             interface_types: &self.interface_types,
             top_level_classes: &self.top_level_classes,
             implicit_this: self.ast.exports.is_none(),
@@ -2490,6 +2563,7 @@ struct FunctionCompilerContext<'a> {
     module: ModuleId,
     module_layout: &'a ModuleLayout,
     module_binding_types: &'a HashMap<String, StaticBindingType>,
+    worker_function_names: &'a HashSet<String>,
     top_level_classes: &'a HashMap<String, ClassId>,
     interface_types: &'a HashMap<String, Type>,
     implicit_this: bool,
@@ -2605,11 +2679,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         )
     }
 
-    /// Loop backedges have not been lowered yet. Only runtime-enforced binding
-    /// contracts are safe here: ordinary annotations reject known mismatches,
-    /// but still allow dynamic values. The initializer's type is not an invariant
-    /// either (in particular for `any` and uninitialized locals). SSA propagation
-    /// can recover stronger types after all incoming edges are available.
+    /// Preserve a declared non-`any` type across loop backedges once the current
+    /// SSA value satisfies it. All writes to typed bindings pass through
+    /// `check_binding_assignment`, which inserts a runtime validation when the
+    /// incoming value is dynamic, so the annotation is a real CFG invariant.
     fn binding_flow_type(
         &self,
         binding: BindingId,
@@ -2622,7 +2695,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Some(Storage::Value(_)) | None => {}
         }
         if let Some(binding_type) = self.binding_types.get(&binding) {
-            if requires_runtime_contract(&binding_type.expected)
+            if !matches!(binding_type.expected, Type::Top)
                 && matches!(env.get(&binding), Some(Storage::Value(value))
                     if binding_type.expected.accepts(self.builder.value_type(*value)))
             {
@@ -2698,13 +2771,25 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn bind_interface(&mut self, value: ValueId, expected: &Type) -> ValueId {
-        if requires_runtime_contract(expected) {
-            let layout = self.builder.intern_structural_layout(expected);
-            self.builder.emit1(
-                Inst::BindInterface { value, expected: expected.clone(), layout },
-                expected.clone(),
-            )
-        } else { value }
+        if matches!(expected, Type::Top) {
+            return value;
+        }
+
+        let actual = self.builder.value_type(value).clone();
+        let needs_validation = requires_runtime_contract(expected) || !expected.accepts(&actual);
+        if !needs_validation {
+            return value;
+        }
+
+        // BindInterface is also the checked source-language type boundary. For
+        // heap structural types it installs the persistent write contract; for
+        // scalar types it validates the tagged value and returns the same value
+        // with a refined WIR type. This is intentionally not a speculative guard.
+        let layout = self.builder.intern_structural_layout(expected);
+        self.builder.emit1(
+            Inst::BindInterface { value, expected: expected.clone(), layout },
+            expected.clone(),
+        )
     }
 
     fn check_binding_assignment(&mut self, binding: BindingId, value: ValueId, span: Span) -> ValueId {
@@ -3923,7 +4008,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
         if let Some(slot) = self.context.module_layout.get(&name.value) {
             if self.context.is_concurrent
-                && !BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value)
+                && !BuiltinId::ALL.iter().any(|builtin| builtin.binding_name() == name.value)
+                && !self.context.worker_function_names.contains(&name.value)
             {
                 self.error(
                     "NAPALM-L045",
@@ -3945,6 +4031,20 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 },
                 ty,
             );
+        }
+        if let Some(builtin) = BuiltinId::ALL
+            .into_iter()
+            .find(|builtin| builtin.is_native_decorator() && builtin.name() == name.value)
+        {
+            if let Some(slot) = self.context.module_layout.get(builtin.binding_name()) {
+                return self.builder.emit1(
+                    Inst::LoadModuleVar {
+                        module: self.context.module,
+                        slot,
+                    },
+                    Type::Top,
+                );
+            }
         }
         self.error(
             "NAPALM-L018",
@@ -4534,6 +4634,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
         }
 
+        // Keep source-level operators as semantic Invoke nodes even when static
+        // analysis proves both operands are Number. The baseline VM requires
+        // Napalm-visible numeric values to remain tagged across bytecode and
+        // deoptimization boundaries; the tracing JIT already specializes the
+        // stock Num Invoke target to raw F64 internally and boxes the result before
+        // publishing it back to an architectural GPR. Keeping representation
+        // lowering inside the JIT prevents raw/internal numeric state from leaking
+        // into baseline execution while retaining the precise result type below.
+
         let result_type = match operator {
             BinaryOp::Less
             | BinaryOp::LessEqual
@@ -5117,7 +5226,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
                     let _ = self.builder.invoke(receiver, setter, vec![value]);
                 } else if let Some(slot) = self.context.module_layout.get(&name.value) {
-                    if BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value) {
+                    if BuiltinId::ALL.iter().any(|builtin| builtin.binding_name() == name.value) {
                         self.error(
                             "NAPALM-L038",
                             format!("cannot assign to core global '{}'", name.value),
@@ -6909,6 +7018,123 @@ class Child is Parent {
     }
 
     #[test]
+    fn typed_function_parameters_are_retained_and_refined() {
+        let source = r#"
+            function multiply(value: Number, factor: Number): Number {
+                let state: Number = value;
+                return state * factor;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("typed-params.nap", source, "typed-params", &module);
+        assert!(
+            !output.has_errors(),
+            "lower diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let multiply = output
+            .program
+            .functions
+            .iter()
+            .find(|function| {
+                function.signature.params.len() == 2
+                    && function.nodes.iter().filter(|node| {
+                        matches!(&node.kind, Inst::BindInterface { expected: Type::Num, .. })
+                    }).count() == 2
+            })
+            .expect("typed multiply closure");
+
+        let num_bindings = multiply
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.kind, Inst::BindInterface { expected: Type::Num, .. }))
+            .count();
+        assert_eq!(num_bindings, 2, "both dynamic call-boundary parameters must be validated");
+    }
+
+    #[test]
+    fn typed_numeric_loop_binding_keeps_number_flow_type() {
+        let source = r#"
+            function heavyLoad(seed: Number, iterations: Number): Number {
+                let state: Number = seed;
+                let accumulator: Number = 0;
+                for (let i: Number = 0; i < iterations; i = i + 1) {
+                    state = (state * 48271 + 1) % 2147483647;
+                    accumulator = accumulator + (state % 1009);
+                }
+                return accumulator + state;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("typed-loop.nap", source, "typed-loop", &module);
+        assert!(
+            !output.has_errors(),
+            "lower diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let function = output
+            .program
+            .functions
+            .iter()
+            .find(|function| {
+                function.signature.params.len() == 2
+                    && function.nodes.iter().any(|node| matches!(&node.kind, Inst::BindInterface { expected: Type::Num, .. }))
+            })
+            .expect("heavyLoad closure");
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.params)
+                .filter_map(|value| function.value(*value))
+                .any(|value| value.ty == Type::Num),
+            "typed numeric loop-carried values must not degrade to Top"
+        );
+        assert!(
+            function.nodes.iter().all(|node| !matches!(
+                &node.kind,
+                Inst::NumToF64 { .. }
+                    | Inst::F64ToNum { .. }
+                    | Inst::F64Bin { .. }
+                    | Inst::CmpF64 { .. }
+            )),
+            "source Number operators must stay semantic Invoke nodes; representation lowering belongs to the JIT"
+        );
+    }
+
+    #[test]
+    fn concurrent_function_can_reference_synchronous_module_functions_as_code() {
+        let source = r#"
+            function double(value) { return value * 2; }
+            function addOne(value) { return double(value) + 1; }
+            concurrent function compute(value) { return addOne(value); }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("concurrent-code.nap", source, "concurrent-code", &module);
+        assert!(
+            !output.has_errors(),
+            "lower diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let module = output
+            .program
+            .modules
+            .iter()
+            .find(|module| output.program.string(module.name) == Some("concurrent-code"))
+            .expect("lowered module metadata");
+        assert_eq!(module.worker_function_bindings.len(), 2);
+        for binding in &module.worker_function_bindings {
+            let function = output.program.function(binding.function).expect("worker function");
+            assert!(!function.is_async);
+            assert!(!function.is_concurrent);
+            assert!(function.captures.is_empty());
+        }
+    }
+
+    #[test]
     fn explicit_variable_type_rejects_incompatible_assignment() {
         let source = r#"
             let count: number = 1;
@@ -7181,6 +7407,9 @@ class Child is Parent {
         let module = parse_typescript(source);
         let mut program = ir::Program::new();
         let manifest = crate::napalm_builtin::install_hir_builtins(&mut program);
+        // Builtins (e.g. native decorator wrappers) may install closures of
+        // their own; only count the ones produced by lowering this module.
+        let builtin_functions = program.functions.len();
         let output = lower_module(&mut program, "comprehensions.napalm", source, "comprehensions", &module);
         assert!(!output.has_errors(), "{:#?}", output.diagnostics);
         for function in &program.functions {
@@ -7189,7 +7418,7 @@ class Child is Parent {
 
         // A comprehension lowers directly to iterator/ListAppend control flow;
         // it does not synthesize callback closures or map/filter intermediates.
-        let closure_count = program.functions.iter()
+        let closure_count = program.functions[builtin_functions..].iter()
             .filter(|function| matches!(function.kind, FunctionKind::Closure))
             .count();
         // The source-declared `run` function is itself one closure; the

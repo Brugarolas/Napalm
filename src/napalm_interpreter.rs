@@ -45,6 +45,10 @@ use self::napalm_ffi::{
 };
 #[path = "napalm_fetch.rs"]
 mod fetch_backend;
+#[path = "napalm_http.rs"]
+mod http_backend;
+#[path = "napalm_http_vm.rs"]
+mod http_vm;
 use self::fetch_backend::{
     FetchCompletion, FetchId, FetchRequest, FetchResponse, FetchRuntime, RedirectMode,
 };
@@ -58,6 +62,8 @@ mod collection_ops;
 #[path = "napalm_interfaces.rs"]
 mod interfaces;
 use self::interfaces::h_bind_interface;
+#[path = "napalm_native.rs"]
+mod native_decorators;
 #[path = "napalm_function_jit.rs"]
 mod function_jit;
 use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
@@ -1816,6 +1822,7 @@ struct ReactiveWatcherState {
 
 #[derive(Clone, Copy, Debug)]
 enum PromiseWaiter {
+    HttpResponse { server: u64, request: u64 },
     Resume {
         fiber: u32,
         fiber_object: Value,
@@ -1831,6 +1838,60 @@ enum PromiseWaiter {
         promise: Value,
         timer: EventId,
     },
+    /// One input edge for Promise.all(). The aggregate Promise keeps the result
+    /// buffer and remaining-count in its own pending state.
+    All {
+        promise: Value,
+        index: usize,
+    },
+    /// One input edge for Promise.any(). Rejections/cancellations are collected
+    /// by input position so the final AggregateError preserves source order.
+    Any {
+        promise: Value,
+        index: usize,
+    },
+    /// One input edge for Promise.race(). The first delivered outcome wins.
+    Race {
+        promise: Value,
+    },
+}
+
+#[derive(Debug)]
+enum PromiseAggregate {
+    All {
+        remaining: usize,
+        values: Vec<Value>,
+    },
+    Any {
+        remaining: usize,
+        errors: Vec<Value>,
+    },
+}
+
+impl PromiseAggregate {
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        match self {
+            Self::All { values, .. } => values.capacity() * std::mem::size_of::<Value>(),
+            Self::Any { errors, .. } => errors.capacity() * std::mem::size_of::<Value>(),
+        }
+    }
+
+    #[inline]
+    fn visit_values(&self, mut visit: impl FnMut(Value)) {
+        match self {
+            Self::All { values, .. } => {
+                for &value in values {
+                    visit(value);
+                }
+            }
+            Self::Any { errors, .. } => {
+                for &value in errors {
+                    visit(value);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1848,6 +1909,10 @@ enum RuntimeEvent {
     ReactiveWatcher {
         callback: Value,
     },
+    NativeDecoratorFire {
+        state: Value,
+        token: u64,
+    },
 }
 
 impl RuntimeEvent {
@@ -1857,9 +1922,13 @@ impl RuntimeEvent {
                 visit(promise);
                 visit(outcome.value());
                 match waiter {
+                    PromiseWaiter::HttpResponse { .. } => {},
                     PromiseWaiter::Resume { fiber_object, .. } => visit(fiber_object),
                     PromiseWaiter::Forward { promise }
-                    | PromiseWaiter::IntervalTick { promise, .. } => visit(promise),
+                    | PromiseWaiter::IntervalTick { promise, .. }
+                    | PromiseWaiter::All { promise, .. }
+                    | PromiseWaiter::Any { promise, .. }
+                    | PromiseWaiter::Race { promise } => visit(promise),
                 }
             }
             RuntimeEvent::TimerFire { promise, callback, .. } => {
@@ -1867,6 +1936,7 @@ impl RuntimeEvent {
                 if let Some(callback) = callback { visit(callback); }
             }
             RuntimeEvent::ReactiveWatcher { callback } => visit(callback),
+            RuntimeEvent::NativeDecoratorFire { state, .. } => visit(state),
         }
     }
 }
@@ -1876,6 +1946,7 @@ enum PromiseState {
     Pending {
         producer: Option<Value>,
         waiters: Vec<PromiseWaiter>,
+        aggregate: Option<PromiseAggregate>,
         cancel: Option<CancelHandle>,
         cancel_requested: bool,
     },
@@ -2008,6 +2079,8 @@ enum HeapObject {
     ModuleObject {
         module_slot: u32,
     },
+    /// Native decorator sidecar captured by decorator wrapper closures.
+    NativeDecorator(Box<native_decorators::NativeDecorator>),
 }
 
 // -----------------------------------------------------------------------------
@@ -2190,7 +2263,10 @@ impl HandleTable {
                 let entry = self.entry(handle);
                 entry.next_free.store(FREE_HANDLE_NONE, Ordering::Relaxed);
                 debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
-                self.generation_entry(handle).fetch_add(1, Ordering::Relaxed);
+                // The successful CAS made this handle exclusively ours, so a
+                // plain load+store is enough; concurrent readers only load.
+                let generation = self.generation_entry(handle);
+                generation.store(generation.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
                 out.push(handle);
             }
             return count;
@@ -2469,17 +2545,35 @@ impl HandleTable {
     }
 
     fn release(&self, handle: u32) {
-        let entry = self.entry(handle);
-        unsafe { Self::drop_contracts(entry); }
-        entry.clear_jit_view();
-        entry.address.store(0, Ordering::Relaxed);
-        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.release_batch(&[handle]);
+    }
+
+    /// Releases dead handles after GC cleanup: their entries are cleared and
+    /// linked into one local chain, which is spliced onto the free list with a
+    /// single CAS, and `live` is adjusted once for the whole batch.
+    fn release_batch(&self, dead: &[u32]) {
+        let Some((&first, _)) = dead.split_first() else {
+            return;
+        };
+        let mut previous: Option<&HandleEntry> = None;
+        for &handle in dead {
+            let entry = self.entry(handle);
+            unsafe { Self::drop_contracts(entry); }
+            entry.clear_jit_view();
+            entry.address.store(0, Ordering::Relaxed);
+            if let Some(previous) = previous {
+                previous.next_free.store(handle + 1, Ordering::Relaxed);
+            }
+            previous = Some(entry);
+        }
+        let last = previous.unwrap();
+        self.live.fetch_sub(dead.len(), Ordering::Relaxed);
         loop {
             let head = self.free_head.load(Ordering::Acquire);
-            entry.next_free.store(head, Ordering::Relaxed);
+            last.next_free.store(head, Ordering::Relaxed);
             if self
                 .free_head
-                .compare_exchange_weak(head, handle + 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(head, first + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -2498,6 +2592,14 @@ impl HandleTable {
 }
 
 static HANDLE_TABLE: OnceLock<HandleTable> = OnceLock::new();
+
+/// Id resolver for the GC's handle-log sweep: the handle slot is traced, so a
+/// live object's entry already holds its post-copy address.
+fn resolve_handle_address(handle: u32) -> usize {
+    handles()
+        .existing_entry(handle)
+        .map_or(0, |entry| entry.address.load(Ordering::Relaxed))
+}
 
 #[inline(always)]
 fn handles() -> &'static HandleTable {
@@ -2537,6 +2639,17 @@ fn visit_value(value: Value, visitor: &mut dyn FnMut(GcSlot)) {
 #[inline(always)]
 fn visit_word(word: RegisterWord, visitor: &mut dyn FnMut(GcSlot)) {
     visit_value(Value::from_word(word), visitor);
+}
+
+unsafe fn trace_native_decorator(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::NativeDecorator(decorator) = &managed.object {
+        let visitor = std::cell::RefCell::new(visitor);
+        decorator.visit_references(
+            |value| visit_value(value, &mut **visitor.borrow_mut()),
+            |handle| visit_handle(handle, &mut **visitor.borrow_mut()),
+        );
+    }
 }
 
 unsafe fn trace_list(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
@@ -2685,15 +2798,22 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let HeapObject::Promise { state } = &managed.object else { return; };
     // SAFETY: GC invokes custom tracing only while all mutators are stopped.
     match unsafe { state.get() } {
-        PromiseState::Pending { producer, waiters, .. } => {
+        PromiseState::Pending { producer, waiters, aggregate, .. } => {
             if let Some(value) = producer {
                 visit_value(*value, visitor);
             }
+            if let Some(aggregate) = aggregate {
+                aggregate.visit_values(|value| visit_value(value, visitor));
+            }
             for waiter in waiters {
                 match *waiter {
+                    PromiseWaiter::HttpResponse { .. } => {},
                     PromiseWaiter::Resume { fiber_object, .. } => visit_value(fiber_object, visitor),
                     PromiseWaiter::Forward { promise }
-                    | PromiseWaiter::IntervalTick { promise, .. } => visit_value(promise, visitor),
+                    | PromiseWaiter::IntervalTick { promise, .. }
+                    | PromiseWaiter::All { promise, .. }
+                    | PromiseWaiter::Any { promise, .. }
+                    | PromiseWaiter::Race { promise } => visit_value(promise, visitor),
                 }
             }
         }
@@ -2743,10 +2863,15 @@ unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     unsafe { trace_fiber_state(state.get(), trace_metadata, visitor) };
 }
 
+/// Managed descriptors are `id_swept`: the GC calls this for each dead object
+/// and then returns all dead handles at once through `release_swept_handles`.
 unsafe fn cleanup_managed_object(object: GcObject) {
     let managed = unsafe { managed_object_mut(object) };
-    handles().release(managed.handle);
     unsafe { std::ptr::drop_in_place(managed) };
+}
+
+fn release_swept_handles(dead: &[u32]) {
+    handles().release_batch(dead);
 }
 
 
@@ -2757,7 +2882,7 @@ macro_rules! gc_descriptor {
             trace: $trace,
             cleanup: Some(cleanup_managed_object),
             finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: true,
         };
     };
 }
@@ -2785,6 +2910,7 @@ gc_descriptor!(GC_PROMISE, "Napalm.Promise", GcTraceLayout::Custom(trace_promise
 gc_descriptor!(GC_RESPONSE, "Napalm.Response", GcTraceLayout::Custom(trace_response));
 gc_descriptor!(GC_ASYNC_TASK, "Napalm.AsyncTask", GcTraceLayout::Custom(trace_async_task));
 gc_descriptor!(GC_FIBER, "Napalm.Fiber", GcTraceLayout::Custom(trace_fiber));
+gc_descriptor!(GC_NATIVE_DECORATOR, "Napalm.NativeDecorator", GcTraceLayout::Custom(trace_native_decorator));
 
 #[inline(always)]
 fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
@@ -2812,6 +2938,26 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::AsyncTaskObject { .. } => &GC_ASYNC_TASK,
         HeapObject::FiberObject { .. } => &GC_FIBER,
         HeapObject::ModuleObject { .. } => &GC_MODULE,
+        HeapObject::NativeDecorator(_) => &GC_NATIVE_DECORATOR,
+    }
+}
+
+#[inline]
+fn pending_promise_external_bytes(
+    waiters: &Vec<PromiseWaiter>,
+    aggregate: &Option<PromiseAggregate>,
+) -> usize {
+    waiters.capacity() * std::mem::size_of::<PromiseWaiter>()
+        + aggregate.as_ref().map_or(0, PromiseAggregate::external_bytes)
+}
+
+#[inline]
+fn promise_state_external_bytes(state: &PromiseState) -> usize {
+    match state {
+        PromiseState::Pending { waiters, aggregate, .. } => {
+            pending_promise_external_bytes(waiters, aggregate)
+        }
+        PromiseState::Fulfilled(_) | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => 0,
     }
 }
 
@@ -2842,17 +2988,14 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::Headers(_) => 0,
         HeapObject::Promise { state } => {
             // SAFETY: this is queried by the owning mutator.
-            match unsafe { state.get() } {
-                PromiseState::Pending { waiters, .. } =>
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                PromiseState::Fulfilled(_) | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => 0,
-            }
+            promise_state_external_bytes(unsafe { state.get() })
         }
         HeapObject::AsyncTaskObject { state, .. } | HeapObject::FiberObject { state, .. } => {
             // SAFETY: this is queried by the owning mutator before publication or
             // while it has exclusive VM access. GC workers never call this helper.
             fiber_state_external_bytes(unsafe { state.get() })
         }
+        HeapObject::NativeDecorator(decorator) => decorator.external_bytes(),
         _ => 0,
     }
 }
@@ -2976,6 +3119,13 @@ fn collect_fiber_state_handles(
 
 fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
     match object {
+        HeapObject::NativeDecorator(decorator) => {
+            let roots = std::cell::RefCell::new(roots);
+            decorator.visit_references(
+                |value| push_value_handle(value, &mut roots.borrow_mut()),
+                |handle| roots.borrow_mut().push(handle),
+            );
+        }
         HeapObject::Proxy { target, handler } => {
             push_value_handle(*target, roots);
             push_value_handle(*handler, roots);
@@ -3017,13 +3167,20 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::Promise { state } => {
             // SAFETY: allocation root collection runs on the owning mutator.
             match unsafe { state.get() } {
-                PromiseState::Pending { producer, waiters, .. } => {
+                PromiseState::Pending { producer, waiters, aggregate, .. } => {
                     if let Some(value) = producer { push_value_handle(*value, roots); }
+                    if let Some(aggregate) = aggregate {
+                        aggregate.visit_values(|value| push_value_handle(value, roots));
+                    }
                     for waiter in waiters {
                         match *waiter {
+                            PromiseWaiter::HttpResponse { .. } => {},
                             PromiseWaiter::Resume { fiber_object, .. } => push_value_handle(fiber_object, roots),
                             PromiseWaiter::Forward { promise }
-                            | PromiseWaiter::IntervalTick { promise, .. } => push_value_handle(promise, roots),
+                            | PromiseWaiter::IntervalTick { promise, .. }
+                            | PromiseWaiter::All { promise, .. }
+                            | PromiseWaiter::Any { promise, .. }
+                            | PromiseWaiter::Race { promise } => push_value_handle(promise, roots),
                         }
                     }
                 }
@@ -3078,8 +3235,8 @@ struct Heap {
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
     map_shapes: MapShapeTable,
-    /// Recycled stable handles are pulled from the global Treiber stack in small
-    /// batches, amortizing the CAS/generation traffic on allocation-heavy code.
+    /// Scratch buffer for pulling stable handles from the global table in small
+    /// batches; they are then appended to the mutator's swept handle log.
     recycled_handles: Vec<u32>,
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
@@ -3115,6 +3272,10 @@ impl Default for Heap {
         let collector = GcCollector::initialize(napalm_gc_config());
         let handle_table = handles();
         let mut mutator = collector.attach();
+        mutator.set_id_sweeper(crate::napalm_gc::IdSweeper {
+            resolve: resolve_handle_address,
+            release: release_swept_handles,
+        });
         let allocation_roots = Arc::new(AllocationRootBuffer::new());
         let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
         let allocation_root_registration = mutator.register_roots(provider);
@@ -3136,10 +3297,9 @@ impl Default for Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        for handle in self.recycled_handles.drain(..) {
+        for handle in self.mutator.take_unconsumed_ids() {
             self.handle_table.return_unused(handle);
         }
-
     }
 }
 
@@ -3186,7 +3346,6 @@ impl Heap {
             Ordering::Release,
         );
         self.handle_table.live.fetch_add(1, Ordering::Relaxed);
-        self.remember_stack_owner();
         let value = Value::from_heap(handle);
         #[cfg(test)]
         self.allocations.push(value);
@@ -3204,6 +3363,10 @@ impl Heap {
         };
         let value = self.initialize_inline_map_object(object, handle, shape, values);
         self.allocation_roots.clear();
+        // Only the allocating slow path can collect and clear the fiber's
+        // remembered bit. A reserved TLAB commit cannot safepoint, so it inherits
+        // the barrier established at the last VM/GC boundary.
+        self.remember_stack_owner();
         value
     }
 
@@ -3231,19 +3394,29 @@ impl Heap {
 
     #[inline]
     fn allocate_handle_fast(&mut self) -> u32 {
-        if let Some(handle) = self.recycled_handles.pop() {
+        if let Some(handle) = self.mutator.take_logged_id() {
             return handle;
         }
-        self.handle_table
-            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        if let Some(handle) = self.recycled_handles.pop() {
-            return handle;
-        }
+        self.refill_handle_cache()
+    }
 
-        self.handle_table
-            .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        self.recycled_handles
-            .pop()
+    /// Managed objects are reclaimed by sweeping the consumed prefix of the
+    /// mutator's handle log, so every handle must enter through that log.
+    #[cold]
+    fn refill_handle_cache(&mut self) -> u32 {
+        debug_assert!(self.recycled_handles.is_empty());
+        if self
+            .handle_table
+            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH)
+            == 0
+        {
+            self.handle_table
+                .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
+        }
+        // Batches are stacked for pop(); the log is consumed front to back.
+        self.mutator.log_ids(self.recycled_handles.drain(..).rev());
+        self.mutator
+            .take_logged_id()
             .expect("fresh handle reservation returned an empty batch")
     }
 
@@ -4085,6 +4258,26 @@ pub struct HostContext<'a> {
 }
 
 impl HostContext<'_> {
+    pub(crate) fn check_decorator_value(&self, value: Value, kind: &str) -> Result<Value, RuntimeError> {
+        let valid = match kind {
+            "class" => value.is_null() || matches!(self.heap.get(value), Some(HeapObject::ClassObject { .. })),
+            "function" => value.is_null() || matches!(self.heap.get(value), Some(HeapObject::Closure { .. })),
+            "decorator" => match self.heap.get(value) {
+                Some(HeapObject::Closure { .. }) => true,
+                Some(HeapObject::BuiltinClass { builtin }) => builtin.is_native_decorator(),
+                Some(HeapObject::NativeDecorator(decorator)) => decorator.is_configured(),
+                _ => false,
+            },
+            "initializer" => matches!(self.heap.get(value), Some(HeapObject::Closure { .. })),
+            _ => return Err(RuntimeError::new("invalid internal decorator validation kind")),
+        };
+        if valid {
+            Ok(value)
+        } else {
+            Err(RuntimeError::new(format!("invalid {kind} decorator value")))
+        }
+    }
+
     /// Keep `value` alive across subsequent HostContext allocations. Scalars are
     /// returned in a zero-cost guard with no collector registration.
     pub fn root(&mut self, value: Value) -> HostRoot {
@@ -4553,6 +4746,7 @@ impl HostContext<'_> {
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
+            Some(HeapObject::NativeDecorator(_)) => "<decorator>".into(),
             Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
             None => "<dead object>".to_owned(),
         }
@@ -5675,6 +5869,9 @@ pub enum NativeBuiltin {
     FiberIsDone,
     PromiseResolve,
     PromiseReject,
+    PromiseAll,
+    PromiseAny,
+    PromiseRace,
     PromiseCancel,
     PromiseIsPending,
     PromiseIsFulfilled,
@@ -5690,6 +5887,16 @@ pub enum NativeBuiltin {
     ReactiveFinishComputed,
     ReactiveAbortComputed,
     FetchCall,
+    HttpListen,
+    HttpClose,
+    HttpAddress,
+    HttpStartStream,
+    HttpStreamWrite,
+    HttpStreamEnd,
+    HttpGet,
+    HttpGetJson,
+    HttpPostJson,
+    SetTimeout,
     ResponseStatus,
     ResponseStatusText,
     ResponseOk,
@@ -5716,6 +5923,12 @@ pub enum NativeBuiltin {
     SystemOs,
     SystemArch,
     SystemGc,
+    DecoratorBuiltinCall(BuiltinId),
+    DecoratorApply,
+    DecoratorEnter,
+    DecoratorRun,
+    DecoratorStore,
+    DecoratorStoreList,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -5746,9 +5959,11 @@ pub enum BuiltinClass {
     /// Heap-backed JavaScript-style transparent proxy. Appended so Set and all
     /// previous receiver-class numeric identities remain stable.
     Proxy,
+    /// Configured native decorator factory result such as `debounce(100)`.
+    NativeDecorator,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 22;
+const BUILTIN_CLASS_COUNT: usize = 23;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -5774,6 +5989,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64),
         HeapObject::Proxy { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Proxy as u64),
+        HeapObject::NativeDecorator(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::NativeDecorator as u64),
         HeapObject::MapEntry { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapEntry as u64),
         HeapObject::MapKeys { .. } =>
@@ -6280,6 +6497,12 @@ struct FiberState {
     async_promise: Option<Value>,
     /// Promise whose settlement will make this execution runnable again.
     awaiting_promise: Option<Value>,
+    /// Raw bytecode pc of the pending `await`, used to locate a `try` handler
+    /// when the awaited Promise rejects.
+    await_raw_pc: u32,
+    /// The awaited Promise rejected inside a `try`; `error` holds the reason to
+    /// throw at the await site when this execution is scheduled again.
+    throw_on_resume: bool,
     /// Active dependency collectors for computed properties and watchers. Most
     /// fibers keep this empty; field handlers only inspect a single VM boolean
     /// unless reactive evaluation is actually running.
@@ -6303,6 +6526,8 @@ impl FiberState {
             suspend_dst: None,
             async_promise: None,
             awaiting_promise: None,
+            await_raw_pc: NO_INDEX,
+            throw_on_resume: false,
             reactive_stack: Vec::with_capacity(4),
             last_value: Value::NULL,
             error: Value::NULL,
@@ -6434,7 +6659,7 @@ impl MemoTable {
             self.hits = self.hits.saturating_add(1);
             return MemoProbe::Hit(entry.value);
         }
-        if self.policy == MemoizationKind::Pure
+        if !self.policy.is_recursive()
             && self.probes >= 256
             && self.hits.saturating_mul(10) < self.probes
         {
@@ -6472,6 +6697,11 @@ impl MemoTable {
 
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
+    /// Shared trace heat/code domain for this immutable program. It exists only
+    /// when the program contains concurrent entrypoints, allowing the parent VM's
+    /// warm-up traces to be adopted directly by isolated workers.
+    shared_jit_profile: Option<Arc<SharedJitProfile>>,
+    shared_jit_repository: Option<Arc<SharedJitRepository>>,
     /// Whole-function Cranelift tier for hot call/recursion-heavy functions.
     /// Auto-memoized functions are permanently excluded by the tier itself.
     whole_function_jit: Option<Box<WholeFunctionJit>>,
@@ -6504,6 +6734,8 @@ pub struct Interpreter<'p> {
     /// Microtasks and timer deadlines. Runtime events hold managed Values and are
     /// therefore included in both active and persistent GC root snapshots.
     event_loop: NapalmEventLoop<RuntimeEvent>,
+    /// Prepared function indexes of the per-arity native decorator wrappers.
+    native_decorator_wrappers: Vec<u32>,
     /// Reactive support is opt-in per VM. Ordinary programs keep this false, so
     /// field loads/stores pay only one well-predicted branch and keep their native
     /// JIT fast paths. Registration invalidates old field-specialized traces once.
@@ -6517,6 +6749,9 @@ pub struct Interpreter<'p> {
     /// Managed Promise values never cross into the HTTP runtime.
     fetch: Option<FetchRuntime>,
     pending_fetches: FastMap<FetchId, Value>,
+    simple_fetches: FastMap<FetchId, bool>,
+    http: Option<http_backend::HttpRuntime>,
+    http_routes: FastMap<u64, Vec<http_vm::Route>>,
     /// Lazily created isolated N:M worker pool. No managed Value crosses this
     /// boundary; only ConcurrentValue snapshots do.
     concurrent: Option<ConcurrentRuntime>,
@@ -6545,8 +6780,8 @@ pub struct Interpreter<'p> {
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
     megamorphic_cache: FastMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
     profile_counters: Vec<Vec<u64>>,
-    /// Per-function scalar memo tables. Managed Values are intentionally excluded
-    /// from keys/results, so these tables require no GC root registration.
+    /// Per-function scalar-key memo tables. Proven shareable results are rooted
+    /// by both the active provider and the persistent idle snapshot.
     memo_tables: Vec<Option<MemoTable>>,
     roots: Vec<Option<Value>>,
     free_roots: Vec<u32>,
@@ -6556,6 +6791,10 @@ pub struct Interpreter<'p> {
     persistent_roots: Arc<HandleRootSet>,
     _persistent_root_registration: GcRootRegistration,
     gc_enabled: bool,
+    /// Main/standalone VMs perform one final exhaustive collection. Concurrent
+    /// workers skip it because they share the process collector and are joined
+    /// before the owning VM performs the single final collection.
+    collect_full_on_drop: bool,
     /// Amortizes the cross-thread collection-request poll in allocation-free loops.
     gc_backedge_poll: u8,
     last_gc_collections: u64,
@@ -6603,6 +6842,7 @@ unsafe impl GcRootProvider for VmRootProvider {
         for &value in &vm.strings { root(value); }
         for &value in &vm.builtin_values { root(value); }
         for value in vm.roots.iter().filter_map(|slot| *slot) { root(value); }
+        vm.visit_memoized_values(&mut root);
         for class in &vm.classes {
             root(class.class_value);
             for &value in &class.static_fields { root(value); }
@@ -6654,6 +6894,7 @@ unsafe impl GcRootProvider for VmRootProvider {
 
         vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
         for &promise in vm.pending_fetches.values() { root(promise); }
+        for route in vm.http_routes.values().flatten() { root(route.handler); }
         for &promise in vm.pending_concurrent.values() { root(promise); }
         root(vm.cancelled_error);
         root(vm.result);
@@ -6666,16 +6907,34 @@ impl Drop for Interpreter<'_> {
             self.native_shadow_top.is_null(),
             "dropping Interpreter with an active whole-function JIT shadow frame"
         );
-        // Remove every VM-owned strong root and force a full collection while
-        // the mutator and its native resources are still alive. Managed fibers
-        // and closures are self-contained (Arc/Box-backed), so externally rooted
-        // objects may survive this VM; this collection primarily releases the
-        // ordinary VM-owned heap promptly and recycles stable handle IDs.
+
+        // Concurrent workers attach mutators to the same process-wide collector.
+        // Shutdown must happen before this VM requests its final collection; otherwise
+        // sleeping worker mutators cannot rendezvous and ConcurrentRuntime::drop() is
+        // never reached because Interpreter::drop() runs before field destruction.
+        // Mark the owner mutator Native while joining: a worker may itself reach a GC
+        // safepoint while unwinding, and a Running owner blocked in join() would then
+        // deadlock that rendezvous in the opposite direction.
+        if let Some(mut concurrent) = self.concurrent.take() {
+            unsafe {
+                self.heap.mutator.with_native(move || {
+                    concurrent.shutdown();
+                    drop(concurrent);
+                });
+            }
+        }
+
+        // Remove every VM-owned strong root while its mutator is still attached.
+        // Worker VMs deliberately skip an exhaustive collection: after their roots
+        // disappear and their mutators detach, the owning main VM performs one global
+        // full collection instead of creating an N-worker shutdown collection storm.
         self.persistent_roots.replace(Vec::new());
         self.roots.clear();
         self.heap.clear_stack_owner();
         self.heap.allocation_roots.clear();
-        self.heap.collect_full();
+        if self.collect_full_on_drop {
+            self.heap.collect_full();
+        }
     }
 }
 
@@ -6796,8 +7055,22 @@ impl<'p> Interpreter<'p> {
                 let original = function.original_ops[index];
                 let Some(opcode) = bytecode[original.raw_pc as usize].opcode() else { continue; };
                 if !matches!(opcode, Opcode::LoadModuleVar | Opcode::StoreModuleVar) { continue; }
-                let module = unsafe { modules.get_unchecked_mut(original.x as usize) };
-                let pointer = unsafe { module.variables.as_mut_ptr().add(original.y as usize) } as usize as u64;
+                let module_index = original.x as usize;
+                let slot = original.y;
+                if opcode == Opcode::LoadModuleVar {
+                    let info = unsafe { program.metadata.modules.get_unchecked(module_index) };
+                    let worker_readable = info
+                        .builtin_bindings
+                        .iter()
+                        .any(|binding| binding.slot.0 == slot)
+                        || info
+                            .worker_function_bindings
+                            .iter()
+                            .any(|binding| binding.slot.0 == slot);
+                    function.ops[index].cache = worker_readable as u32;
+                }
+                let module = unsafe { modules.get_unchecked_mut(module_index) };
+                let pointer = unsafe { module.variables.as_mut_ptr().add(slot as usize) } as usize as u64;
                 function.ops[index].x = pointer as u32;
                 function.ops[index].y = (pointer >> 32) as u32;
             }
@@ -6874,7 +7147,20 @@ impl<'p> Interpreter<'p> {
         ))));
         init_roots.push(cancelled_error);
         let last_gc_collections = heap.collection_count();
-        let jit = Box::new(TracingJit::default());
+        let concurrency_capable = program.functions.iter().any(|function| function.is_concurrent);
+        let shared_jit_profile = concurrency_capable
+            .then(|| Arc::new(SharedJitProfile::new(program)));
+        let shared_jit_repository = concurrency_capable
+            .then(|| Arc::new(SharedJitRepository::new()));
+        let mut jit = Box::new(TracingJit::default());
+        if let Some(profile) = shared_jit_profile.as_ref() {
+            jit.set_shared_profile(Some(profile.clone()));
+        }
+        if let Some(repository) = shared_jit_repository.as_ref() {
+            // The parent VM participates in the same repository as workers. Worker
+            // IDs are dense from zero; u32::MAX is reserved here for the owner VM.
+            jit.set_shared_repository(Some(repository.clone()), u32::MAX);
+        }
         let jit_entry_threshold = jit.options().hot_entry_threshold;
         let whole_function_jit = WholeFunctionJit::new(
             prepared.functions.len(),
@@ -6900,6 +7186,8 @@ impl<'p> Interpreter<'p> {
         let (external_wake_tx, external_wake_rx) = mpsc::channel();
         Ok(Self {
             jit: Some(jit),
+            shared_jit_profile,
+            shared_jit_repository,
             whole_function_jit,
             native_shadow_top: std::ptr::null_mut(),
             jit_entry_threshold,
@@ -6919,6 +7207,7 @@ impl<'p> Interpreter<'p> {
             free_fibers: Vec::new(),
             ready_async: VecDeque::new(),
             event_loop: NapalmEventLoop::default(),
+            native_decorator_wrappers: Vec::new(),
             reactive_enabled,
             reactive_tracking_active: false,
             reactive_dependents: FastMap::default(),
@@ -6926,6 +7215,9 @@ impl<'p> Interpreter<'p> {
             reactive_watchers: FastMap::default(),
             fetch: None,
             pending_fetches: FastMap::default(),
+            simple_fetches: FastMap::default(),
+            http: None,
+            http_routes: FastMap::default(),
             concurrent: None,
             pending_concurrent: FastMap::default(),
             concurrent_manifest: None,
@@ -6950,6 +7242,7 @@ impl<'p> Interpreter<'p> {
             persistent_roots: init_roots,
             _persistent_root_registration: persistent_root_registration,
             gc_enabled: true,
+            collect_full_on_drop: true,
             gc_backedge_poll: 0,
             last_gc_collections,
             hot_frame: std::ptr::null_mut(),
@@ -6973,11 +7266,91 @@ impl<'p> Interpreter<'p> {
         self.concurrent_manifest = Some(manifest);
     }
 
-    pub(crate) fn set_concurrent_worker(&mut self, worker: bool) {
+    pub(crate) fn set_concurrent_worker(&mut self, worker: bool) -> Result<(), RuntimeError> {
         self.is_concurrent_worker = worker;
+        self.collect_full_on_drop = !worker;
+        if !worker {
+            return Ok(());
+        }
+
+        // Whole-function native compilation lowers immutable bytecode directly and
+        // therefore bypasses prepared-op module guards. Keep it disabled in an
+        // isolated worker for now. The tracing JIT remains enabled: a forbidden
+        // module-data path cannot be recorded because its guarded baseline load
+        // fails before the recorder can observe a successful operation.
+        self.whole_function_jit = None;
+
+        // Workers receive immutable bytecode, never the parent VM's managed
+        // module state. Recreate only explicitly marked zero-capture function
+        // closures in the worker heap so ordinary synchronous helpers can be
+        // called without sharing their defining environment.
+        let bindings = self
+            .program
+            .metadata
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .worker_function_bindings
+                    .iter()
+                    .copied()
+                    .map(move |binding| (module.id, binding))
+            })
+            .collect::<Vec<_>>();
+
+        for (module_id, binding) in bindings {
+            let module_slot = *self
+                .prepared
+                .module_by_id
+                .get(&module_id)
+                .ok_or_else(|| RuntimeError::new(format!(
+                    "concurrent worker is missing module {:?}",
+                    module_id
+                )))? as usize;
+            let function_index = *self
+                .prepared
+                .function_by_id
+                .get(&binding.function)
+                .ok_or_else(|| RuntimeError::new(format!(
+                    "concurrent worker is missing function {:?}",
+                    binding.function
+                )))?;
+            let function = self
+                .prepared
+                .functions
+                .get(function_index as usize)
+                .ok_or_else(|| RuntimeError::new("concurrent worker function index is invalid"))?;
+            if function.capture_count != 0 || function.is_async || function.is_concurrent {
+                return Err(RuntimeError::new(format!(
+                    "worker-callable function {:?} must be synchronous, non-concurrent, and capture-free",
+                    binding.function
+                )));
+            }
+            let reference_indices = function.capture_reference_indices.clone();
+            let closure = self.heap.alloc(HeapObject::Closure {
+                function_index,
+                captures: Vec::<RegisterWord>::new().into_boxed_slice(),
+                reference_indices,
+            });
+            let variables = &mut self
+                .modules
+                .get_mut(module_slot)
+                .ok_or_else(|| RuntimeError::new("concurrent worker module slot is invalid"))?
+                .variables;
+            let target = variables
+                .get_mut(binding.slot.0 as usize)
+                .ok_or_else(|| RuntimeError::new("concurrent worker function binding slot is invalid"))?;
+            *target = closure;
+        }
+
+        // Publish the freshly materialized module roots before any worker code can
+        // allocate or trigger a collection.
+        self.sync_persistent_roots();
+        Ok(())
     }
 
     pub(crate) fn set_shared_jit_profile(&mut self, profile: Arc<SharedJitProfile>) {
+        self.shared_jit_profile = Some(profile.clone());
         if let Some(jit) = self.jit.as_mut() {
             jit.set_shared_profile(Some(profile));
         }
@@ -6988,6 +7361,7 @@ impl<'p> Interpreter<'p> {
         repository: Arc<SharedJitRepository>,
         worker_id: u32,
     ) {
+        self.shared_jit_repository = Some(repository.clone());
         if let Some(jit) = self.jit.as_mut() {
             jit.set_shared_repository(Some(repository), worker_id);
         }
@@ -7019,6 +7393,7 @@ impl<'p> Interpreter<'p> {
         for &value in &self.strings { push(value); }
         for &value in &self.builtin_values { push(value); }
         for value in self.roots.iter().filter_map(|slot| *slot) { push(value); }
+        self.visit_memoized_values(&mut push);
         for class in &self.classes {
             push(class.class_value);
             for &value in &class.static_fields { push(value); }
@@ -7043,6 +7418,7 @@ impl<'p> Interpreter<'p> {
         }
         self.event_loop.for_each_payload(|event| (*event).visit_values(&mut push));
         for &promise in self.pending_fetches.values() { push(promise); }
+        for route in self.http_routes.values().flatten() { push(route.handler); }
         for &promise in self.pending_concurrent.values() { push(promise); }
         push(self.cancelled_error);
         push(self.result);
@@ -7780,12 +8156,20 @@ impl<'p> Interpreter<'p> {
         &self,
         op: &PreparedOp,
     ) -> Option<(usize, PreparedExceptionHandler)> {
-        let fiber = self.fiber(self.current_fiber);
+        self.find_structured_handler_in(self.current_fiber, op.raw_pc)
+    }
+
+    fn find_structured_handler_in(
+        &self,
+        fiber: u32,
+        raw_pc: u32,
+    ) -> Option<(usize, PreparedExceptionHandler)> {
+        let fiber = self.fiber(fiber);
         if fiber.frames.is_empty() {
             return None;
         }
 
-        let mut probe_pc = op.raw_pc;
+        let mut probe_pc = raw_pc;
         for depth in (0..fiber.frames.len()).rev() {
             let frame = &fiber.frames[depth];
             let function = &self.prepared.functions[frame.function as usize];
@@ -7818,7 +8202,18 @@ impl<'p> Interpreter<'p> {
         thrown: Option<Value>,
         runtime_error: Option<RuntimeError>,
     ) -> bool {
-        let Some((target_depth, handler)) = self.find_structured_handler(op) else {
+        self.unwind_to_structured_handler_at(op.raw_pc, thrown, runtime_error)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unwind_to_structured_handler_at(
+        &mut self,
+        raw_pc: u32,
+        thrown: Option<Value>,
+        runtime_error: Option<RuntimeError>,
+    ) -> bool {
+        let Some((target_depth, handler)) = self.find_structured_handler_in(self.current_fiber, raw_pc) else {
             return false;
         };
 
@@ -8409,7 +8804,18 @@ impl<'p> Interpreter<'p> {
             let state = self.fiber_mut(id);
             state.status = FiberStatus::Running;
             state.awaiting_promise = None;
+            let rejection = std::mem::take(&mut state.throw_on_resume)
+                .then(|| (std::mem::replace(&mut state.error, Value::NULL), state.await_raw_pc));
             self.refresh_hot_frame();
+            if let Some((reason, raw_pc)) = rejection {
+                if !self.unwind_to_structured_handler_at(raw_pc, Some(reason), None) {
+                    self.fail_execution_from_promise(id, reason, false);
+                    if self.run_state == RunState::Failed {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             self.run_state = RunState::Running;
             return true;
         }
@@ -8420,6 +8826,7 @@ impl<'p> Interpreter<'p> {
     /// converted into Promise settlements; their continuation edges then enter
     /// the ordinary microtask queue before another execution is selected.
     fn schedule_next_ready(&mut self) -> bool {
+        self.drain_http_requests();
         self.drain_fetch_completions();
         self.drain_concurrent_completions();
         self.drain_runtime_microtasks();
@@ -8470,9 +8877,12 @@ impl<'p> Interpreter<'p> {
     /// timer deadline arrives without polling.
     fn drive_event_loop_until_runnable(&mut self) -> bool {
         loop {
+            // Consume wake signals before queues: draining them afterwards can
+            // lose a notification arriving between queue inspection and sleep.
+            while self.external_wake_rx.try_recv().is_ok() {}
+            self.drain_http_requests();
             self.drain_fetch_completions();
             self.drain_concurrent_completions();
-            while self.external_wake_rx.try_recv().is_ok() {}
             self.drain_runtime_microtasks();
             if self.run_state == RunState::Failed {
                 return false;
@@ -8487,6 +8897,7 @@ impl<'p> Interpreter<'p> {
             }
 
             let external_pending = self.fetch.as_ref().is_some_and(FetchRuntime::has_pending)
+                || self.http.as_ref().is_some_and(http_backend::HttpRuntime::has_pending)
                 || self.concurrent.as_ref().is_some_and(ConcurrentRuntime::has_pending);
             if external_pending {
                 match self.event_loop.time_until_next() {
@@ -8535,6 +8946,7 @@ impl<'p> Interpreter<'p> {
         let promise = self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         });
@@ -8650,7 +9062,8 @@ impl<'p> Interpreter<'p> {
         let cacheable = match prepared.return_kind {
             RegisterKind::Value => {
                 let value = Value::from_word(value);
-                !value.is_heap() && (value.is_null() || value.is_bool() || value.is_num())
+                value.is_null() || value.is_bool() || value.is_num()
+                    || (prepared.memoization.allows_heap_results() && value.is_heap())
             }
             RegisterKind::Int32 | RegisterKind::F64 => true,
             RegisterKind::RawPtr => false,
@@ -8658,6 +9071,18 @@ impl<'p> Interpreter<'p> {
         if !cacheable { return; }
         if let Some(Some(table)) = self.memo_tables.get_mut(function as usize) {
             table.insert(key, value);
+        }
+    }
+
+    fn visit_memoized_values(&self, visit: &mut impl FnMut(Value)) {
+        for (index, table) in self.memo_tables.iter().enumerate() {
+            // Raw numeric register words must never be interpreted as Values.
+            if !self.prepared.functions[index].memoization.allows_heap_results()
+                || self.prepared.functions[index].return_kind != RegisterKind::Value
+            { continue; }
+            if let Some(table) = table {
+                for entry in table.entries.values() { visit(Value::from_word(entry.value)); }
+            }
         }
     }
 
@@ -8904,9 +9329,23 @@ impl<'p> Interpreter<'p> {
                 let state = unsafe { cell.get() };
                 state.object == fiber_object && state.awaiting_promise == Some(promise)
             });
-        if valid {
-            self.reject_execution(fiber, reason);
+        if !valid {
+            return;
         }
+        let raw_pc = self.fiber(fiber).await_raw_pc;
+        if raw_pc != NO_INDEX && self.find_structured_handler_in(fiber, raw_pc).is_some() {
+            // Resume the execution by throwing at its `await`, so `try` can catch it.
+            self.heap.remember_if_reference(fiber_object, reason);
+            let state = self.fiber_mut(fiber);
+            state.error = reason;
+            state.throw_on_resume = true;
+            state.awaiting_promise = None;
+            state.suspend_dst = None;
+            state.status = FiberStatus::Ready;
+            self.ready_async.push_back(fiber);
+            return;
+        }
+        self.reject_execution(fiber, reason);
     }
 
     fn cancel_promise_waiter(
@@ -8977,6 +9416,276 @@ impl<'p> Interpreter<'p> {
             });
         }
         Ok(())
+    }
+
+    /// Attach one aggregate reaction to an input. Non-Promise values are treated
+    /// exactly like Promise.resolve(value), while already-settled Promises still
+    /// deliver through the microtask queue instead of re-entering aggregate code.
+    fn attach_promise_combinator_waiter(
+        &mut self,
+        source: Value,
+        waiter: PromiseWaiter,
+    ) -> Result<(), RuntimeError> {
+        let Some(cell) = (match self.heap.get(source) {
+            Some(HeapObject::Promise { state }) => Some(state.clone()),
+            _ => None,
+        }) else {
+            self.event_loop.enqueue_microtask(RuntimeEvent::PromiseWaiter {
+                promise: source,
+                waiter,
+                outcome: PromiseOutcome::Fulfilled(source),
+            });
+            return Ok(());
+        };
+
+        let outcome = match unsafe { cell.get_mut() } {
+            PromiseState::Pending { waiters, aggregate, .. } => {
+                self.heap.remember_owner(source);
+                waiters.push(waiter);
+                self.heap
+                    .set_external_bytes(source, pending_promise_external_bytes(waiters, aggregate));
+                return Ok(());
+            }
+            PromiseState::Fulfilled(value) => PromiseOutcome::Fulfilled(*value),
+            PromiseState::Rejected(value) => PromiseOutcome::Rejected(*value),
+            PromiseState::Cancelled(value) => PromiseOutcome::Cancelled(*value),
+        };
+
+        self.event_loop.enqueue_microtask(RuntimeEvent::PromiseWaiter {
+            promise: source,
+            waiter,
+            outcome,
+        });
+        Ok(())
+    }
+
+    fn promise_input_list(&self, input: Value, method: &str) -> Result<Vec<Value>, RuntimeError> {
+        match self.heap.get(input) {
+            Some(HeapObject::List(values)) => Ok(values.clone()),
+            _ => Err(RuntimeError::new(format!(
+                "TypeError: Promise.{method} expects an Array"
+            ))),
+        }
+    }
+
+    fn promise_all(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "all")?;
+        if inputs.is_empty() {
+            let values = self.heap.alloc(HeapObject::List(Vec::new()));
+            let values_root = self.add_root(values);
+            let promise = self.allocate_promise(PromiseState::Fulfilled(values));
+            self.release_root(values_root);
+            return Ok(promise);
+        }
+
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            aggregate: Some(PromiseAggregate::All {
+                remaining: inputs.len(),
+                values: vec![Value::NULL; inputs.len()],
+            }),
+            cancel: None,
+            cancel_requested: false,
+        });
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().enumerate().try_for_each(|(index, source)| {
+            self.attach_promise_combinator_waiter(
+                source,
+                PromiseWaiter::All { promise, index },
+            )
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn promise_any(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "any")?;
+        if inputs.is_empty() {
+            let reason = self.allocate_promise_any_aggregate_error(Vec::new())?;
+            let reason_root = self.add_root(reason);
+            let promise = self.allocate_promise(PromiseState::Rejected(reason));
+            self.release_root(reason_root);
+            return Ok(promise);
+        }
+
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            aggregate: Some(PromiseAggregate::Any {
+                remaining: inputs.len(),
+                errors: vec![Value::NULL; inputs.len()],
+            }),
+            cancel: None,
+            cancel_requested: false,
+        });
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().enumerate().try_for_each(|(index, source)| {
+            self.attach_promise_combinator_waiter(
+                source,
+                PromiseWaiter::Any { promise, index },
+            )
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn promise_race(&mut self, input: Value) -> Result<Value, RuntimeError> {
+        let inputs = self.promise_input_list(input, "race")?;
+        let promise = self.allocate_pending_promise();
+        let promise_root = self.add_root(promise);
+
+        let attached = inputs.into_iter().try_for_each(|source| {
+            self.attach_promise_combinator_waiter(source, PromiseWaiter::Race { promise })
+        });
+        self.release_root(promise_root);
+        attached?;
+        Ok(promise)
+    }
+
+    fn allocate_promise_any_aggregate_error(
+        &mut self,
+        errors: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let errors = self.heap.alloc(HeapObject::List(errors));
+        let errors_root = self.add_root(errors);
+        let error = self.heap.alloc(HeapObject::Map(NapalmMap::default()));
+        let error_root = self.add_root(error);
+
+        let name = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            &b"AggregateError"[..],
+        ))));
+        let name_root = self.add_root(name);
+        let message = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            &b"All promises were rejected"[..],
+        ))));
+        let message_root = self.add_root(message);
+
+        let result = (|| -> Result<(), RuntimeError> {
+            let fields: [(&[u8], Value); 3] = [
+                (&b"name"[..], name),
+                (&b"message"[..], message),
+                (&b"errors"[..], errors),
+            ];
+            for (key, value) in fields {
+                self.heap.remember_if_reference(error, value);
+                let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(key)));
+                let structural = self.heap.map_set_encoded(error, key, value, None)?;
+                if structural {
+                    if let Some(bytes) = self.heap.map_external_bytes(error) {
+                        self.heap.set_external_bytes(error, bytes);
+                    }
+                    self.heap.refresh_jit_view(error);
+                }
+            }
+            Ok(())
+        })();
+
+        self.release_root(message_root);
+        self.release_root(name_root);
+        self.release_root(error_root);
+        self.release_root(errors_root);
+        result?;
+        Ok(error)
+    }
+
+    fn handle_promise_all_input(
+        &mut self,
+        promise: Value,
+        index: usize,
+        outcome: PromiseOutcome,
+    ) {
+        match outcome {
+            PromiseOutcome::Rejected(reason) => {
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(reason));
+                return;
+            }
+            PromiseOutcome::Cancelled(reason) => {
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                return;
+            }
+            PromiseOutcome::Fulfilled(value) => {
+                self.heap.remember_if_reference(promise, value);
+                let values = {
+                    let Ok(cell) = self.promise_cell(promise) else { return; };
+                    let PromiseState::Pending { aggregate, .. } = (unsafe { cell.get_mut() }) else {
+                        return;
+                    };
+                    let Some(PromiseAggregate::All { remaining, values }) = aggregate.as_mut() else {
+                        return;
+                    };
+                    if *remaining == 0 || index >= values.len() {
+                        return;
+                    }
+                    values[index] = value;
+                    *remaining -= 1;
+                    if *remaining != 0 {
+                        return;
+                    }
+                    values.clone()
+                };
+
+                let promise_root = self.add_root(promise);
+                let values = self.heap.alloc(HeapObject::List(values));
+                let values_root = self.add_root(values);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(values));
+                self.release_root(values_root);
+                self.release_root(promise_root);
+            }
+        }
+    }
+
+    fn handle_promise_any_input(
+        &mut self,
+        promise: Value,
+        index: usize,
+        outcome: PromiseOutcome,
+    ) {
+        if let PromiseOutcome::Fulfilled(value) = outcome {
+            let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(value));
+            return;
+        }
+
+        let reason = outcome.value();
+        self.heap.remember_if_reference(promise, reason);
+        let errors = {
+            let Ok(cell) = self.promise_cell(promise) else { return; };
+            let PromiseState::Pending { aggregate, .. } = (unsafe { cell.get_mut() }) else {
+                return;
+            };
+            let Some(PromiseAggregate::Any { remaining, errors }) = aggregate.as_mut() else {
+                return;
+            };
+            if *remaining == 0 || index >= errors.len() {
+                return;
+            }
+            errors[index] = reason;
+            *remaining -= 1;
+            if *remaining != 0 {
+                return;
+            }
+            errors.clone()
+        };
+
+        let promise_root = self.add_root(promise);
+        match self.allocate_promise_any_aggregate_error(errors) {
+            Ok(error) => {
+                let error_root = self.add_root(error);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(error));
+                self.release_root(error_root);
+            }
+            Err(error) => self.fail(error),
+        }
+        self.release_root(promise_root);
+    }
+
+    #[inline]
+    fn handle_promise_race_input(&mut self, promise: Value, outcome: PromiseOutcome) {
+        let _ = self.settle_promise_outcome(promise, outcome);
     }
 
     fn set_promise_cancel_handle(
@@ -9090,6 +9799,7 @@ impl<'p> Interpreter<'p> {
                     return Ok(false);
                 }
                 self.pending_fetches.remove(&id);
+                self.simple_fetches.remove(&id);
                 let reason = self.cancellation_reason();
                 let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
                 Ok(true)
@@ -9130,6 +9840,13 @@ impl<'p> Interpreter<'p> {
     fn fetch_headers_from_value(&self, value: Value) -> Result<Vec<(String, String)>, RuntimeError> {
         if value.is_null() {
             return Ok(Vec::new());
+        }
+        if let Some(HeapObject::List(entries)) = self.heap.get(value) {
+            return entries.iter().map(|&entry| {
+                let Some(HeapObject::List(pair)) = self.heap.get(entry) else { return Err(RuntimeError::new("HTTP header must be [name, value]")); };
+                if pair.len() != 2 { return Err(RuntimeError::new("HTTP header must be [name, value]")); }
+                Ok((self.fetch_string(pair[0], "HTTP header name")?, self.fetch_string(pair[1], "HTTP header value")?))
+            }).collect();
         }
         if let Some(HeapObject::Headers(headers)) = self.heap.get(value) {
             let response = headers.response;
@@ -9416,6 +10133,10 @@ impl<'p> Interpreter<'p> {
     }
 
     fn start_fetch(&mut self, request: FetchRequest) -> Value {
+        self.start_fetch_mode(request, None)
+    }
+
+    fn start_fetch_mode(&mut self, request: FetchRequest, simple: Option<bool>) -> Value {
         if self.fetch.is_none() {
             match FetchRuntime::new_with_waker(self.external_wake_tx.clone()) {
                 Ok(fetch) => self.fetch = Some(fetch),
@@ -9431,6 +10152,7 @@ impl<'p> Interpreter<'p> {
         let promise = self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         });
@@ -9443,11 +10165,13 @@ impl<'p> Interpreter<'p> {
         match spawned {
             Ok(id) => {
                 self.pending_fetches.insert(id, promise);
+                if let Some(json) = simple { self.simple_fetches.insert(id, json); }
                 if let Err(error) = self.set_promise_cancel_handle(promise, Some(CancelHandle::Fetch(id))) {
                     if let Some(fetch) = self.fetch.as_mut() {
                         fetch.cancel(id);
                     }
                     self.pending_fetches.remove(&id);
+                    self.simple_fetches.remove(&id);
                     let _ = self.settle_promise_outcome(
                         promise,
                         PromiseOutcome::Rejected(Value::NULL),
@@ -9476,11 +10200,17 @@ impl<'p> Interpreter<'p> {
         };
         let promise_root = self.add_root(promise);
         self.pending_fetches.remove(&completion.id);
+        let simple = self.simple_fetches.remove(&completion.id);
 
         let outcome = match completion.result {
             Ok(response) => {
-                let value = self.allocate_response(response);
-                PromiseOutcome::Fulfilled(value)
+                match simple {
+                    Some(json) => match self.http_client_response(response, json) {
+                        Ok(value) => PromiseOutcome::Fulfilled(value),
+                        Err(error) => PromiseOutcome::Rejected(self.http_string(&error.message)),
+                    },
+                    None => PromiseOutcome::Fulfilled(self.allocate_response(response)),
+                }
             }
             Err(error) => {
                 let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
@@ -9869,6 +10599,9 @@ impl<'p> Interpreter<'p> {
             Some(HeapObject::FiberObject { .. }) | Some(HeapObject::AsyncTaskObject { .. }) => {
                 return Err(RuntimeError::new("Fibers/tasks cannot cross a concurrent boundary"));
             }
+            Some(HeapObject::NativeDecorator(_)) => {
+                return Err(RuntimeError::new("native decorators cannot cross a concurrent boundary"));
+            }
             Some(HeapObject::Response(_)) | Some(HeapObject::Headers(_)) => {
                 return Err(RuntimeError::new("HTTP Response/Headers objects cannot cross a concurrent boundary"));
             }
@@ -10065,10 +10798,20 @@ impl<'p> Interpreter<'p> {
             let manifest = self.concurrent_manifest.clone().ok_or_else(|| RuntimeError::new(
                 "concurrent runtime requires the stock builtin manifest to be installed",
             ))?;
+            let shared_jit_profile = self.shared_jit_profile.clone().ok_or_else(|| {
+                RuntimeError::new("concurrent program is missing its shared JIT profile")
+            })?;
+            let shared_jit_repository = self.shared_jit_repository.clone().ok_or_else(|| {
+                RuntimeError::new("concurrent program is missing its shared JIT repository")
+            })?;
+            let jit_options = self.jit.as_ref().map(|jit| jit.options().clone());
             self.concurrent = Some(ConcurrentRuntime::new(
                 self.program.clone(),
                 manifest,
                 self.external_wake_tx.clone(),
+                jit_options,
+                shared_jit_profile,
+                shared_jit_repository,
             )?);
         }
 
@@ -10594,6 +11337,7 @@ impl<'p> Interpreter<'p> {
         self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            aggregate: None,
             cancel: None,
             cancel_requested: false,
         })
@@ -10657,13 +11401,11 @@ impl<'p> Interpreter<'p> {
     ) -> Result<(), RuntimeError> {
         let cell = self.promise_cell(tick)?;
         match unsafe { cell.get_mut() } {
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.heap.remember_owner(tick);
                 waiters.push(PromiseWaiter::IntervalTick { promise: interval, timer });
-                self.heap.set_external_bytes(
-                    tick,
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                );
+                self.heap
+                    .set_external_bytes(tick, pending_promise_external_bytes(waiters, aggregate));
                 Ok(())
             }
             PromiseState::Fulfilled(value) => {
@@ -10728,6 +11470,7 @@ impl<'p> Interpreter<'p> {
         outcome: PromiseOutcome,
     ) {
         match waiter {
+            PromiseWaiter::HttpResponse { server, request } => self.http_handler_finished((server, request), outcome),
             PromiseWaiter::Resume { fiber, fiber_object, dst } => match outcome {
                 PromiseOutcome::Fulfilled(value) => {
                     self.resume_promise_waiter(promise, fiber, fiber_object, dst, value)
@@ -10745,6 +11488,15 @@ impl<'p> Interpreter<'p> {
             PromiseWaiter::IntervalTick { promise: interval, timer } => {
                 self.handle_interval_tick(interval, timer, outcome);
             }
+            PromiseWaiter::All { promise: aggregate, index } => {
+                self.handle_promise_all_input(aggregate, index, outcome);
+            }
+            PromiseWaiter::Any { promise: aggregate, index } => {
+                self.handle_promise_any_input(aggregate, index, outcome);
+            }
+            PromiseWaiter::Race { promise: aggregate } => {
+                self.handle_promise_race_input(aggregate, outcome);
+            }
         }
     }
 
@@ -10752,6 +11504,9 @@ impl<'p> Interpreter<'p> {
         match fired.payload {
             RuntimeEvent::PromiseWaiter { promise, waiter, outcome } => {
                 self.deliver_promise_waiter(promise, waiter, outcome);
+            }
+            RuntimeEvent::NativeDecoratorFire { state, token } => {
+                self.fire_native_decorator(state, token, fired.id);
             }
             RuntimeEvent::ReactiveWatcher { callback } => {
                 let Some(identity) = self.heap.identity(callback) else { return; };
@@ -10860,13 +11615,11 @@ impl<'p> Interpreter<'p> {
             PromiseState::Cancelled(reason) => {
                 self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(*reason))
             }
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.heap.remember_owner(value);
                 waiters.push(PromiseWaiter::Forward { promise });
-                self.heap.set_external_bytes(
-                    value,
-                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                );
+                self.heap
+                    .set_external_bytes(value, pending_promise_external_bytes(waiters, aggregate));
 
                 // Replace the completed task as the outer Promise's dependency.
                 // This keeps the adopted inner Promise alive until forwarding fires.
@@ -10922,12 +11675,15 @@ impl<'p> Interpreter<'p> {
                 self.advance(op);
             },
             PromiseState::Rejected(reason) => {
-                self.fail_awaited_promise(op, *reason, false);
+                let reason = *reason;
+                if !self.raise_value_exception(op, reason) {
+                    self.fail_awaited_promise(op, reason, false);
+                }
             }
             PromiseState::Cancelled(reason) => {
                 self.fail_awaited_promise(op, *reason, true);
             }
-            PromiseState::Pending { waiters, .. } => {
+            PromiseState::Pending { waiters, aggregate, .. } => {
                 self.mark_gc_point(op);
                 unsafe { self.advance(op); }
                 self.flush_hot_pc();
@@ -10936,8 +11692,8 @@ impl<'p> Interpreter<'p> {
                 let fiber_object = self.fiber(current).object;
                 self.heap.remember_owner(promise);
                 waiters.push(PromiseWaiter::Resume { fiber: current, fiber_object, dst });
-                let external = waiters.capacity() * std::mem::size_of::<PromiseWaiter>();
-                self.heap.set_external_bytes(promise, external);
+                self.heap
+                    .set_external_bytes(promise, pending_promise_external_bytes(waiters, aggregate));
 
                 // The suspended execution object may already be mature while the
                 // Promise is young. The Promise becomes an outgoing edge of the
@@ -10946,6 +11702,7 @@ impl<'p> Interpreter<'p> {
                 let state = self.fiber_mut(current);
                 state.status = FiberStatus::Suspended;
                 state.awaiting_promise = Some(promise);
+                state.await_raw_pc = op.raw_pc;
                 state.suspend_dst = Some(dst);
 
                 if !self.schedule_next_ready() {
@@ -12463,6 +13220,22 @@ impl Interpreter<'_> {
                 let promise = self.allocate_promise(PromiseState::Rejected(reason));
                 unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
             }
+            NativeBuiltin::PromiseAll | NativeBuiltin::PromiseAny | NativeBuiltin::PromiseRace => {
+                let input = arg(0);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let result = match native {
+                    NativeBuiltin::PromiseAll => self.promise_all(input),
+                    NativeBuiltin::PromiseAny => self.promise_any(input),
+                    NativeBuiltin::PromiseRace => self.promise_race(input),
+                    _ => unreachable!(),
+                };
+                let promise = match result {
+                    Ok(promise) => promise,
+                    Err(error) => self.allocate_rejected_promise_message(error.message),
+                };
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
             NativeBuiltin::PromiseCancel => {
                 let promise = Value::from_word(receiver);
                 if !matches!(self.heap.get(promise), Some(HeapObject::Promise { .. })) {
@@ -12574,6 +13347,12 @@ impl Interpreter<'_> {
                     Err(error) => self.fail_at(op, error.message),
                 }
             }
+            NativeBuiltin::DecoratorBuiltinCall(builtin) => self.native_decorator_builtin_call(op, builtin, args),
+            NativeBuiltin::DecoratorApply => self.native_decorator_apply(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorEnter => self.native_decorator_enter(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorRun => self.native_decorator_run(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorStore => self.native_decorator_store(op, Value::from_word(receiver), args),
+            NativeBuiltin::DecoratorStoreList => self.native_decorator_store_list(op, Value::from_word(receiver), arg(0), arg(1)),
             NativeBuiltin::FetchCall => {
                 let request = self.parse_fetch_request(
                     arg(0),
@@ -12589,6 +13368,18 @@ impl Interpreter<'_> {
                     )),
                 };
                 unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::HttpListen | NativeBuiltin::HttpClose | NativeBuiltin::HttpAddress
+            | NativeBuiltin::HttpStartStream | NativeBuiltin::HttpStreamWrite | NativeBuiltin::HttpStreamEnd
+            | NativeBuiltin::HttpGet | NativeBuiltin::HttpGetJson | NativeBuiltin::HttpPostJson
+            | NativeBuiltin::SetTimeout => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let values: Vec<_> = args.iter().map(|word| Value::from_word(*word)).collect();
+                match self.http_native(native, &values) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
             }
             NativeBuiltin::ResponseStatus => {
                 let status = match self.heap.get(Value::from_word(receiver)) {
@@ -13388,6 +14179,38 @@ impl Interpreter<'_> {
         self.run_state = RunState::Suspended;
     }
 
+    /// An uncaught throw inside an async task rejects the task's Promise instead
+    /// of terminating the VM, mirroring `finish_fiber` for normal returns.
+    fn reject_current_async_task(&mut self, current: u32, promise: Value, error: Value) {
+        self.reactive_finish_watcher_task(current);
+        {
+            self.heap.remember_if_reference(self.fiber(current).object, error);
+            let task = self.fiber_mut(current);
+            task.status = FiberStatus::Failed;
+            task.error = error;
+            task.awaiting_promise = None;
+            task.suspend_dst = None;
+            task.frames.clear();
+            task.memo_keys.clear();
+            task.register_top = 0;
+        }
+        if let Err(error) = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(error)) {
+            self.fail_terminal(error);
+            return;
+        }
+        if self.run_state == RunState::Failed || self.schedule_next_ready() {
+            return;
+        }
+        self.switch_current_fiber(0);
+        if self.fiber(0).status == FiberStatus::Done {
+            self.run_state = RunState::Returned;
+        } else {
+            self.result = self.fiber(0).awaiting_promise.unwrap_or(Value::NULL);
+            self.run_state = RunState::Suspended;
+        }
+        self.clear_hot_frame();
+    }
+
     fn abort_current_fiber(&mut self, op: &PreparedOp, error: Value) {
         let current = self.current_fiber;
         if current == 0 {
@@ -13409,6 +14232,10 @@ impl Interpreter<'_> {
         self.fiber_mut(current).suspend_dst = None;
         let link = self.fiber_mut(current).link.take();
         let Some(link) = link else {
+            if let Some(promise) = self.fiber(current).async_promise {
+                self.reject_current_async_task(current, promise, error);
+                return;
+            }
             self.fail_terminal(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
             return;
         };
@@ -13965,7 +14792,11 @@ unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
                         return;
                     }
                 }
-                vm.fail_at(&op,error.message);return;
+                let message = format!(
+                    "{} (receiver={receiver_value:?}, receiver_class={class:?})",
+                    error.message
+                );
+                vm.fail_at(&op,message);return;
             }
         },
     };
@@ -14517,9 +15348,35 @@ unsafe fn module_slot_ptr(op: &PreparedOp) -> *mut Value {
     (((op.y as u64) << 32) | op.x as u64) as usize as *mut Value
 }
 
-unsafe fn h_load_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*module_slot_ptr(op);vm.set_reg(op.a,v.word());vm.advance(op)}
-unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*module_slot_ptr(op);vm.return_from_frame(v.word(),None)}
-unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.a));*module_slot_ptr(op)=value;vm.advance(op)}
+unsafe fn h_load_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker && op.cache == 0 {
+        vm.fail_at(op,"concurrent worker cannot read module data; pass the value through launch arguments");
+        return;
+    }
+    let v=*module_slot_ptr(op);
+    vm.set_reg(op.a,v.word());
+    vm.advance(op)
+}
+unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker && op.cache == 0 {
+        vm.fail_at(op,"concurrent worker cannot read module data; pass the value through launch arguments");
+        return;
+    }
+    let v=*module_slot_ptr(op);
+    vm.return_from_frame(v.word(),None)
+}
+unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    if vm.is_concurrent_worker {
+        vm.fail_at(op,"concurrent worker cannot write module data; return the value or pass state explicitly");
+        return;
+    }
+    let value=Value::from_word(vm.reg(op.a));
+    *module_slot_ptr(op)=value;
+    vm.advance(op)
+}
 
 unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Cell(Box::new(vm.reg(op.b))));vm.set_reg(op.a,value.word());vm.advance(op)}
 unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,**value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
@@ -15155,6 +16012,7 @@ impl Interpreter<'_> {
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module:{}>", self.program.metadata.string(self.modules[*module_slot as usize].name).unwrap_or("module")),
             Some(HeapObject::Cell(_)) => "<cell>".into(),
+            Some(HeapObject::NativeDecorator(_)) => "<decorator>".into(),
             None => "<invalid value>".into(),
         }
     }
@@ -15680,6 +16538,9 @@ impl TraceRuntime for Interpreter<'_> {
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
+            if opcode == Opcode::LoadModuleVar {
+                op.cache = prepared_op.cache;
+            }
         }
         if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent) {
             op.cache = self.current_prepared().ops[self.hot_pc as usize].cache;
@@ -16403,7 +17264,7 @@ mod tests {
 
     fn simple_program(chunk: crate::napalm_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new() });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new(), hidden_variable_count: 0 });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
@@ -16467,12 +17328,14 @@ mod tests {
 
     #[test]
     fn recursive_memo_table_stays_enabled_under_initial_misses() {
-        let mut table = MemoTable::new(MemoizationKind::Recursive, 0);
-        for value in 0..512u64 {
-            let key = MemoKey { words: [value, 0, 0, 0] };
-            assert!(matches!(table.probe(key, 0), MemoProbe::Miss(_)));
+        for policy in [MemoizationKind::Recursive, MemoizationKind::RecursiveShared] {
+            let mut table = MemoTable::new(policy, 0);
+            for value in 0..512u64 {
+                let key = MemoKey { words: [value, 0, 0, 0] };
+                assert!(matches!(table.probe(key, 0), MemoProbe::Miss(_)));
+            }
+            assert!(!table.disabled);
         }
-        assert!(!table.disabled);
     }
 
     #[test]
@@ -16516,6 +17379,37 @@ mod tests {
             &parsed.module,
         );
         assert!(!lowered.has_errors(), "lowering diagnostics: {:#?}", lowered.diagnostics);
+        let entry = lowered
+            .lowered
+            .as_ref()
+            .expect("module should lower successfully")
+            .entry;
+        let bytecode = compile_program(&mut hir).expect("compilation pipeline should succeed");
+        (bytecode, entry, manifest)
+    }
+
+    fn compile_typescript_module(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {
+        let parsed = crate::napalm_front_main::parse("typed_runtime_test.napalm", source);
+        assert!(
+            !parsed.has_errors(),
+            "TypeScript parse diagnostics: {:#?}",
+            parsed.diagnostics
+        );
+
+        let mut hir = Program::new();
+        let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+        let lowered = lower_module(
+            &mut hir,
+            "typed_runtime_test.napalm",
+            source,
+            "typed_runtime_test",
+            &parsed.module,
+        );
+        assert!(
+            !lowered.has_errors(),
+            "TypeScript lowering diagnostics: {:#?}",
+            lowered.diagnostics
+        );
         let entry = lowered
             .lowered
             .as_ref()
@@ -17221,13 +18115,119 @@ var result = Runner.run()
         ))
     }
 
-    fn source_result(vm: &Interpreter<'_>) -> f64 {
-        vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
+    /// Last source-level binding of the entry module, skipping optimizer-owned
+    /// hidden slots such as shared constant literals.
+    fn last_source_variable(vm: &Interpreter<'_>) -> Value {
+        let info = vm.program.metadata.modules.last().unwrap();
+        vm.modules.last().unwrap().variables[info.source_variable_count() as usize - 1]
     }
+
+    fn source_result(vm: &Interpreter<'_>) -> f64 {
+        last_source_variable(vm).as_num().unwrap()
+    }
+
+    #[test]
+    fn typescript_typed_numeric_parameters_execute_heavy_loop_without_dynamic_dispatch_failure() {
+        let source = r#"
+function heavyLoad(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        state = (state * 48271 + 1) % 2147483647;
+        accumulator = accumulator + (state % 1009);
+        if ((i % 64) == 0) {
+            state = (state + (accumulator % 65521)) % 2147483647;
+        }
+    }
+    return accumulator + state;
+}
+let result = heavyLoad(17, 1000);
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+
+        let mut state = 17.0f64;
+        let mut accumulator = 0.0f64;
+        for i in 0..1000usize {
+            state = (state * 48271.0 + 1.0) % 2147483647.0;
+            accumulator += state % 1009.0;
+            if i % 64 == 0 {
+                state = (state + accumulator % 65521.0) % 2147483647.0;
+            }
+        }
+        let expected = accumulator + state;
+
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 2,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected module return")
+            };
+            assert_eq!(source_result(&vm), expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_function_can_execute_capture_free_synchronous_helper() {
+        let source = r#"
+function heavyLoad(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        state = (state * 48271 + 1) % 2147483647;
+        accumulator = accumulator + (state % 1009);
+    }
+    return accumulator + state;
+}
+
+concurrent function concurrentHeavyLoad(seed: Number, iterations: Number): Number {
+    return heavyLoad(seed, iterations);
+}
+
+let p1 = launch concurrentHeavyLoad(101, 200);
+let p2 = launch concurrentHeavyLoad(102, 200);
+let p3 = launch concurrentHeavyLoad(103, 200);
+let p4 = launch concurrentHeavyLoad(104, 200);
+let p5 = launch concurrentHeavyLoad(105, 200);
+let r1: Number = await p1;
+let r2: Number = await p2;
+let r3: Number = await p3;
+let r4: Number = await p4;
+let r5: Number = await p5;
+let result = r1 + r2 + r3 + r4 + r5;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+
+        let reference = |seed: f64| {
+            let mut state = seed;
+            let mut accumulator = 0.0f64;
+            for _ in 0..200 {
+                state = (state * 48271.0 + 1.0) % 2147483647.0;
+                accumulator += state % 1009.0;
+            }
+            accumulator + state
+        };
+        let expected = (101..=105).map(|seed| reference(seed as f64)).sum::<f64>();
+
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+            panic!("expected module return after concurrent jobs settle")
+        };
+        assert_eq!(source_result(&vm), expected);
+    }
+
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
+    include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
+    include!("tests/napalm_shared_literal_tests.rs");
+    include!("tests/napalm_auto_memo_tests.rs");
+    include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
 
     #[test]
@@ -17711,7 +18711,7 @@ var result = Runner.run()
             let (program, entry, manifest) = compile_napalm_module(&format!("var result = {expression}\n"));
             let mut vm = source_vm(&program, &manifest);
             vm.run_module(entry).unwrap();
-            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let value = last_source_variable(&vm);
             let context = HostContext { heap: &mut vm.heap };
             assert_eq!(context.format_value(value), expected, "{expression}");
         }
@@ -17845,7 +18845,7 @@ var result = Runner.run()
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
             }
@@ -17923,7 +18923,7 @@ var result = Runner.run()
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
             }
@@ -17977,7 +18977,7 @@ var result = Runner.run()
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18050,7 +19050,7 @@ var result = Runner.run()
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18114,7 +19114,7 @@ var result = Runner.run()
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 let error = vm.run_module(entry).err().expect(expression);
                 assert!(error.message.contains(expected), "{expression}, jit={jit_enabled}: {error:?}");
-                let matrix = *vm.modules.last().unwrap().variables.last().unwrap();
+                let matrix = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(matrix), "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]");
             }
@@ -18169,7 +19169,7 @@ var result = Runner.run()
                 let mut vm = source_vm(&program, &manifest);
                 vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -18232,7 +19232,7 @@ var result = Runner.run()
                     vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
                     let error = vm.run_module(entry).err().expect(expression);
                     assert!(error.message.contains(expected), "{expression}{suffix}, jit={jit_enabled}: {error:?}");
-                    let data = *vm.modules.last().unwrap().variables.last().unwrap();
+                    let data = last_source_variable(&vm);
                     let context = HostContext { heap: &mut vm.heap };
                     assert_eq!(context.map_len(data), Some(4));
                     let HeapObject::Map(map) = context.heap.get(data).unwrap() else { panic!("expected Map") };
@@ -18334,7 +19334,7 @@ var result = Runner.run()
                     ..Default::default()
                 }));
                 vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
-                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let value = last_source_variable(&vm);
                 let context = HostContext { heap: &mut vm.heap };
                 assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
             }
@@ -19060,18 +20060,18 @@ var result = CallLoop.run()
         use crate::napalm_gc::{Descriptor, Field, TraceLayout, RAW_CODEC};
         static LEAF: Descriptor = Descriptor {
             name: "test.leaf", trace: TraceLayout::Leaf, cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         static FIELDS: [Field; 1] = [Field { offset: 0, codec: &RAW_CODEC }];
         static PARENT: Descriptor = Descriptor {
             name: "test.parent", trace: TraceLayout::Fields(&FIELDS), cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         static CLEANED: AtomicUsize = AtomicUsize::new(0);
         unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.resource", trace: TraceLayout::Leaf, cleanup: Some(cleanup), finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -19134,12 +20134,12 @@ var result = CallLoop.run()
         }
         static RESOURCE: Descriptor = Descriptor {
             name: "test.finalizable", trace: TraceLayout::Leaf,
-            cleanup: Some(cleanup), finalizer: Some(finalize), after_move: None,
+            cleanup: Some(cleanup), finalizer: Some(finalize), after_move: None, id_swept: false,
         };
         static ARRAY: Descriptor = Descriptor {
             name: "test.large", trace: TraceLayout::Words { offset: 0, codec: &RAW_CODEC },
             cleanup: None, finalizer: None,
-            after_move: None,
+            after_move: None, id_swept: false,
         };
         let mut asm = Assembler::new();
         asm.emit_a(Opcode::LoadNull, 0);
@@ -19233,6 +20233,49 @@ var result = CallLoop.run()
             assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
             vm.release_root(root);
         }
+    }
+
+    #[test]
+    fn handle_log_sweep_reclaims_dead_objects_and_keeps_survivors() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let string = |vm: &mut Interpreter, text: String| {
+            vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(text.as_bytes()))))
+        };
+        let identity = |value: Value| {
+            let handle = value.heap_handle().unwrap();
+            (handle, handles().generation(handle).unwrap())
+        };
+        let kept = string(&mut vm, "kept".into());
+        let kept_root = vm.add_root(kept);
+        let kept_identity = identity(kept);
+        // Span several handle-log refills so consumed and cached ids coexist.
+        let dead: Vec<_> = (0..HANDLE_RECYCLE_BATCH * 3 + 5)
+            .map(|i| identity(string(&mut vm, format!("dead{i}"))))
+            .collect();
+        vm.heap.mutator.collect();
+        // Recycling bumps the generation, so a concurrent test reusing a
+        // released handle cannot make this identity match again.
+        for &(handle, generation) in &dead {
+            assert!(!handles().identity_matches(handle, generation), "dead handle {handle} was not reclaimed");
+        }
+        assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
+        // The survivor now lives in the mature id list, which full collections sweep.
+        let late = string(&mut vm, "late".into());
+        let late_root = vm.add_root(late);
+        for _ in 0..2 {
+            vm.collect_garbage();
+            assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
+            assert!(matches!(vm.heap.get(kept), Some(HeapObject::String(text)) if &text[..] == b"kept"));
+            assert!(matches!(vm.heap.get(late), Some(HeapObject::String(text)) if &text[..] == b"late"));
+        }
+        vm.release_root(kept_root);
+        vm.collect_garbage();
+        assert!(!handles().identity_matches(kept_identity.0, kept_identity.1), "dead mature handle was not reclaimed");
+        vm.release_root(late_root);
     }
 
     #[test]
@@ -19609,6 +20652,101 @@ var result = first && !second && work.isCancelled ? 42 : -1
     }
 
     #[test]
+    fn promise_all_preserves_input_order_and_accepts_plain_values() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var delayed = Timer.delay(0) { return 10 }
+    var immediate = Promise.resolve(20)
+    var values = await Promise.all([delayed, immediate, 3])
+    return values[0] * 100 + values[1] * 10 + values[2]
+  }
+}
+var result = await PromiseTest.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 1203.0);
+    }
+
+    #[test]
+    fn promise_any_returns_first_fulfillment_and_collects_rejections() {
+        let source = r#"
+class PromiseTest {
+  static async firstFulfilled() {
+    return await Promise.any([
+      Promise.reject("first"),
+      Promise.resolve(42),
+      Promise.reject("third")
+    ])
+  }
+
+  static async allRejected() {
+    try {
+      await Promise.any([Promise.reject("first"), Promise.reject("second")])
+      return -1
+    } catch (error) {
+      if (error.name != "AggregateError") { return -2 }
+      if (error.errors.length != 2) { return -3 }
+      if (error.errors[0] != "first") { return -4 }
+      if (error.errors[1] != "second") { return -5 }
+      return 8
+    }
+  }
+}
+var first = await PromiseTest.firstFulfilled()
+var second = await PromiseTest.allRejected()
+var result = first + second
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 50.0);
+    }
+
+    #[test]
+    fn promise_race_uses_first_settled_input_and_empty_race_stays_pending() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var winner = await Promise.race([Promise.resolve(11), Promise.resolve(22)])
+    var empty = Promise.race([])
+    return winner + (empty.isPending ? 31 : -100)
+  }
+}
+var result = await PromiseTest.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn promise_all_empty_fulfills_with_empty_array_and_any_empty_rejects() {
+        let source = r#"
+class PromiseTest {
+  static async run() {
+    var empty = await Promise.all([])
+    if (empty.length != 0) { return -1 }
+    try {
+      await Promise.any([])
+      return -2
+    } catch (error) {
+      return error.name == "AggregateError" && error.errors.length == 0 ? 42 : -3
+    }
+  }
+}
+var result = await PromiseTest.run()
+"#;
+        let (program, entry, manifest) = compile_napalm_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
     fn timer_every_is_non_overlapping_and_can_cancel_in_flight() {
         let source = r#"
 var interval = null
@@ -19664,7 +20802,7 @@ var result = first + "|" + second + "|" + third + "|" + fourth + "|" + explicit 
             let mut vm = source_vm(&program, &manifest);
             vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
             vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
-            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let value = last_source_variable(&vm);
             let context = HostContext { heap: &mut vm.heap };
             assert_eq!(
                 context.format_value(value),

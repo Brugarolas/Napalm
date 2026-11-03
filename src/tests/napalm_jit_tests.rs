@@ -48,7 +48,7 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     }
     let mut program = BytecodeProgram::new();
     program.metadata.strings = vec!["main".into(), "héllo".into(), "method".into()];
-    program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 2, exports: vec![], builtin_bindings: vec![] });
+    program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 2, exports: vec![], builtin_bindings: vec![], worker_function_bindings: vec![], hidden_variable_count: 0 });
     program.metadata.methods.push(MethodSignature { name: StringId(2), kind: MethodKind::Method, arity: 0 });
     for id in 0..2 {
         program.metadata.classes.push(ClassInfo { id: ClassId(id), module: ModuleId(0), name: StringId(0), superclass: (id == 1).then_some(ClassId(0)), own_instance_field_count: 1, static_field_count: 1, is_foreign: opcode == AllocForeign, own_instance_field_types: vec![Type::Num], static_field_types: vec![Type::Num] });

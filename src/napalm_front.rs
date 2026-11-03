@@ -344,10 +344,10 @@ enum RawTokenKind {
     RawString,
     #[token("\"", lex_normal_string, priority = 3)]
     String,
-    #[regex(r"0x[0-9a-fA-F]+", priority = 3)]
+    #[regex(r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*", priority = 3)]
     Number,
     #[regex(
-        r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]*)?",
+        r"[0-9](?:_?[0-9])*(\.[0-9](?:_?[0-9])*)?([eE][+-]?[0-9](?:_?[0-9])*)?",
         lex_decimal_number,
         priority = 2
     )]
@@ -1248,6 +1248,9 @@ impl OperatorName {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FunctionBody {
     pub params: Vec<Ident>,
+    /// Source-visible parameter annotations, aligned with `params`. Legacy syntax
+    /// has no parameter type grammar, so its entries are always `None`.
+    pub param_types: Vec<Option<TypeAnnotation>>,
     pub kind: FunctionBodyKind,
     pub span: Span,
 }
@@ -2617,6 +2620,7 @@ impl<'a> Parser<'a> {
         if self.match_kind(TokenKind::RightBrace) {
             let end = self.previous().span.end;
             return Ok(FunctionBody {
+                param_types: vec![None; params.len()],
                 params,
                 kind: FunctionBodyKind::Statements(Vec::new()),
                 span: Span::new(start, end),
@@ -2644,6 +2648,7 @@ impl<'a> Parser<'a> {
                 "expected `}` after function body",
             )?;
             return Ok(FunctionBody {
+                param_types: vec![None; params.len()],
                 params,
                 kind: FunctionBodyKind::Statements(statements),
                 span: Span::new(start, close.span.end),
@@ -2657,6 +2662,7 @@ impl<'a> Parser<'a> {
             "single-line function bodies may contain only one expression",
         )?;
         Ok(FunctionBody {
+            param_types: vec![None; params.len()],
             params,
             kind: FunctionBodyKind::Expression(Box::new(expression)),
             span: Span::new(start, close.span.end),
@@ -3738,8 +3744,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_number_token(&mut self, token: Token) -> PResult<f64> {
-        let text = self.slice(token.span);
-        let value = if text.starts_with("0x") {
+        let source = self.slice(token.span);
+        let normalized;
+        let text = if source.as_bytes().contains(&b'_') {
+            normalized = source.replace('_', "");
+            normalized.as_str()
+        } else {
+            source
+        };
+        let value = if text.starts_with("0x") || text.starts_with("0X") {
             u64::from_str_radix(&text[2..], 16).ok().map(|value| value as f64)
         } else {
             text.parse::<f64>().ok()

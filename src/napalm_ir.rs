@@ -478,14 +478,33 @@ pub enum BuiltinId {
     /// JavaScript-style transparent object interception. Appended so existing
     /// builtin IDs (notably Set) remain stable across the Proxy addition.
     Proxy = 20,
+    /// Native Rust decorators. Their module bindings use hidden names (see
+    /// `binding_name`) so user declarations named `memoize`, `delay`, ... keep
+    /// working and simply shadow the core decorator.
+    Memoize = 21,
+    Once = 22,
+    MemoizeExpiring = 23,
+    Delay = 24,
+    Debounce = 25,
+    Throttle = 26,
+    Http = 27,
+    HttpGet = 28,
+    HttpGetJson = 29,
+    HttpPostJson = 30,
+    SetTimeout = 31,
+    Print = 32,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 33] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
         Self::Timer, Self::FFI, Self::Fetch, Self::Reactive, Self::Set, Self::Proxy,
+        Self::Memoize, Self::Once, Self::MemoizeExpiring, Self::Delay, Self::Debounce,
+        Self::Throttle,
+        Self::Http, Self::HttpGet, Self::HttpGetJson, Self::HttpPostJson,
+        Self::SetTimeout, Self::Print,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -503,7 +522,38 @@ impl BuiltinId {
             Self::Reactive => "__Reactive",
             Self::Set => "Set",
             Self::Proxy => "Proxy",
+            Self::Memoize => "memoize",
+            Self::Once => "once",
+            Self::MemoizeExpiring => "memoizeExpiring",
+            Self::Delay => "delay",
+            Self::Debounce => "debounce",
+            Self::Throttle => "throttle",
+            Self::Http => "http",
+            Self::HttpGet => "get",
+            Self::HttpGetJson => "getJSON",
+            Self::HttpPostJson => "postJSON",
+            Self::SetTimeout => "setTimeout",
+            Self::Print => "print",
         }
+    }
+    /// Module-layout key reserving this builtin. Native decorators use a hidden
+    /// key; `lower_name` falls back to it only when no user binding exists.
+    #[inline] pub const fn binding_name(self) -> &'static str {
+        match self {
+            Self::Memoize => "<native:memoize>",
+            Self::Once => "<native:once>",
+            Self::MemoizeExpiring => "<native:memoizeExpiring>",
+            Self::Delay => "<native:delay>",
+            Self::Debounce => "<native:debounce>",
+            Self::Throttle => "<native:throttle>",
+            _ => self.name(),
+        }
+    }
+    #[inline] pub const fn is_native_decorator(self) -> bool {
+        matches!(
+            self,
+            Self::Memoize | Self::Once | Self::MemoizeExpiring | Self::Delay | Self::Debounce | Self::Throttle
+        )
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
 }
@@ -529,6 +579,15 @@ pub struct ModuleExport {
     pub slot: ModuleSlot,
 }
 
+/// Code-only module binding copied into isolated concurrent workers. The binding
+/// carries no managed state: workers materialize a fresh zero-capture Closure
+/// pointing at the same immutable bytecode function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WorkerFunctionBinding {
+    pub slot: ModuleSlot,
+    pub function: FuncId,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
     pub id: ModuleId,
@@ -542,6 +601,27 @@ pub struct ModuleInfo {
     pub exports: Vec<ModuleExport>,
     /// Slots preinitialized by the VM with engine-provided core class objects.
     pub builtin_bindings: Vec<BuiltinBinding>,
+    /// Synchronous top-level functions that may be referenced by isolated
+    /// concurrent workers without transferring the owning module's data state.
+    pub worker_function_bindings: Vec<WorkerFunctionBinding>,
+    /// Trailing slots appended by whole-program optimizations (for example
+    /// shared constant literals). They follow every source-visible binding.
+    pub hidden_variable_count: u32,
+}
+
+impl ModuleInfo {
+    /// Number of leading slots that belong to source-level bindings.
+    pub fn source_variable_count(&self) -> u32 {
+        self.variable_count - self.hidden_variable_count
+    }
+
+    /// Reserve a trailing optimizer-owned slot.
+    pub fn add_hidden_slot(&mut self) -> ModuleSlot {
+        let slot = ModuleSlot(self.variable_count);
+        self.variable_count = self.variable_count.checked_add(1).expect("module slot overflow");
+        self.hidden_variable_count += 1;
+        slot
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -736,8 +816,8 @@ pub enum CallConv {
 
 /// Static auto-memoization decision produced by the WIR optimizer.
 ///
-/// Runtime memoization is deliberately restricted to scalar call keys/results, so
-/// this metadata is safe to carry through bytecode without rooting managed values.
+/// Keys are always scalar. Shared-result policies additionally require a
+/// whole-program proof of unobservable object identity and GC-rooted results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MemoizationKind {
     #[default]
@@ -746,6 +826,8 @@ pub enum MemoizationKind {
     Pure,
     /// Pure for scalar arguments and recursive (directly or through a pure SCC).
     Recursive,
+    /// Recursive pure allocation with globally shareable results.
+    RecursiveShared,
 }
 
 impl MemoizationKind {
@@ -756,7 +838,12 @@ impl MemoizationKind {
 
     #[inline]
     pub const fn is_recursive(self) -> bool {
-        matches!(self, Self::Recursive)
+        matches!(self, Self::Recursive | Self::RecursiveShared)
+    }
+
+    #[inline]
+    pub const fn allows_heap_results(self) -> bool {
+        matches!(self, Self::RecursiveShared)
     }
 }
 
@@ -2308,6 +2395,8 @@ impl Program {
             variable_count,
             exports: Vec::new(),
             builtin_bindings: Vec::new(),
+            worker_function_bindings: Vec::new(),
+            hidden_variable_count: 0,
         };
         let index = self.modules.len();
         self.modules.push(info);
@@ -2345,6 +2434,29 @@ impl Program {
             assert!(binding.slot.0 < module.variable_count, "builtin module slot {:?} out of range for {:?}", binding.slot, id);
         }
         module.builtin_bindings = bindings;
+    }
+
+    pub fn set_module_worker_function_bindings(
+        &mut self,
+        id: ModuleId,
+        bindings: Vec<WorkerFunctionBinding>,
+    ) {
+        let index = *self.module_index.get(&id).unwrap_or_else(|| panic!("unknown module {id:?}"));
+        let variable_count = self.modules[index].variable_count;
+        for binding in &bindings {
+            assert!(
+                binding.slot.0 < variable_count,
+                "worker function module slot {:?} out of range for {:?}",
+                binding.slot,
+                id
+            );
+            assert!(
+                self.function_index.contains_key(&binding.function),
+                "worker function binding references unknown function {:?}",
+                binding.function
+            );
+        }
+        self.modules[index].worker_function_bindings = bindings;
     }
 
     pub fn add_class(

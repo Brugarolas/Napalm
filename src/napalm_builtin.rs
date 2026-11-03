@@ -7,7 +7,7 @@
 use crate::napalm_interpreter::{
     fast_random_seed, num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
-use crate::napalm_ir::{Builder, BuiltinId, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
+use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,6 +42,8 @@ pub struct BuiltinManifest {
     string_add: Option<(MethodSymbol, FuncId)>,
     string_right_add: Option<FuncId>,
     system_print: Option<(MethodSymbol, FuncId)>,
+    /// Native decorator wrapper closure bodies, indexed by decorated arity.
+    decorator_wrappers: Vec<FuncId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -288,6 +290,7 @@ enum BuiltinPrimitive {
     SystemPrint,
     SystemWrite,
     SystemClock,
+    DecoratorCheck,
 
     DateNew,
     DateUtc,
@@ -339,6 +342,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Headers,
         BuiltinClass::Module,
         BuiltinClass::Date,
+        BuiltinClass::NativeDecorator,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
@@ -982,6 +986,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // owns suspended continuation edges and participates directly in scheduling.
     manifest.register_native(program, static_(BuiltinId::Promise), "resolve", MethodKind::Method, 1, NativeBuiltin::PromiseResolve);
     manifest.register_native(program, static_(BuiltinId::Promise), "reject", MethodKind::Method, 1, NativeBuiltin::PromiseReject);
+    manifest.register_native(program, static_(BuiltinId::Promise), "all", MethodKind::Method, 1, NativeBuiltin::PromiseAll);
+    manifest.register_native(program, static_(BuiltinId::Promise), "any", MethodKind::Method, 1, NativeBuiltin::PromiseAny);
+    manifest.register_native(program, static_(BuiltinId::Promise), "race", MethodKind::Method, 1, NativeBuiltin::PromiseRace);
     manifest.register_native(program, instance(BuiltinClass::Promise), "cancel", MethodKind::Method, 0, NativeBuiltin::PromiseCancel);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isPending", MethodKind::Getter, 0, NativeBuiltin::PromiseIsPending);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isFulfilled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsFulfilled);
@@ -1058,6 +1065,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
 
     // System is static-only; Date also owns heap-backed instance methods.
     let system = static_(BuiltinId::System);
+    manifest.register(program, system, "__checkDecorator", MethodKind::Method, 2, BuiltinPrimitive::DecoratorCheck);
     manifest.register(program, system, "print", MethodKind::Method, 0, BuiltinPrimitive::SystemPrint);
     let print_method = manifest.register(program, system, "print", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
     let print_primitive = manifest.bindings.last().expect("System.print primitive was just registered").primitive;
@@ -1195,11 +1203,111 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         manifest.register(program, instance(BuiltinClass::Random), "int", MethodKind::Method, arity, BuiltinPrimitive::RandomInt);
     }
 
+    install_native_decorators(program, &mut manifest);
+    for (name, arity, native) in [
+        ("listen", 2, NativeBuiltin::HttpListen),
+        ("close", 1, NativeBuiltin::HttpClose),
+        ("address", 1, NativeBuiltin::HttpAddress),
+        ("startStream", 3, NativeBuiltin::HttpStartStream),
+        ("streamWrite", 3, NativeBuiltin::HttpStreamWrite),
+        ("streamEnd", 2, NativeBuiltin::HttpStreamEnd),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Http), name, MethodKind::Method, arity, native);
+    }
+    for (id, native, arities) in [
+        (BuiltinId::HttpGet, NativeBuiltin::HttpGet, &[1, 2][..]),
+        (BuiltinId::HttpGetJson, NativeBuiltin::HttpGetJson, &[1, 2][..]),
+        (BuiltinId::HttpPostJson, NativeBuiltin::HttpPostJson, &[2, 3][..]),
+        (BuiltinId::SetTimeout, NativeBuiltin::SetTimeout, &[2][..]),
+    ] {
+        for &arity in arities { manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native); }
+    }
+    manifest.register(program, static_(BuiltinId::Print), "call", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
+
     manifest
+}
+
+/// Native decorators (`@memoize`, `@debounce(100)`, ...). Applying one returns a
+/// real closure with the decorated arity whose body consults the captured
+/// native state:
+///
+/// ```text
+/// fn(args) { r = state.__enter(args); if r === state { return state.__store(state.__run(args), args) } return r }
+/// ```
+fn install_native_decorators(program: &mut Program, manifest: &mut BuiltinManifest) {
+    let decorator = BuiltinTarget::Instance(BuiltinClass::NativeDecorator);
+    for builtin in BuiltinId::ALL.into_iter().filter(|builtin| builtin.is_native_decorator()) {
+        for arity in [1, 2] {
+            manifest.register_native(
+                program,
+                BuiltinTarget::Static(builtin),
+                "call",
+                MethodKind::Method,
+                arity,
+                NativeBuiltin::DecoratorBuiltinCall(builtin),
+            );
+        }
+    }
+    manifest.register_native(program, decorator, "call", MethodKind::Method, 2, NativeBuiltin::DecoratorApply);
+
+    let module = program.add_module("<core:decorators>", 0);
+    let max_arity = crate::napalm_bytecode::ARGUMENT_REGISTER_COUNT as u8;
+    // `__store` receives the result plus every argument. At the register limit
+    // the arguments are passed as one list instead.
+    manifest.register_native(program, decorator, "__storeList", MethodKind::Method, 2, NativeBuiltin::DecoratorStoreList);
+    let store_list = program.intern_method("__storeList", MethodKind::Method, 2);
+    for arity in 0..=max_arity {
+        manifest.register_native(program, decorator, "__enter", MethodKind::Method, arity, NativeBuiltin::DecoratorEnter);
+        manifest.register_native(program, decorator, "__run", MethodKind::Method, arity, NativeBuiltin::DecoratorRun);
+        let enter = program.intern_method("__enter", MethodKind::Method, arity);
+        let run = program.intern_method("__run", MethodKind::Method, arity);
+        let store = (arity < max_arity).then(|| {
+            manifest.register_native(program, decorator, "__store", MethodKind::Method, arity + 1, NativeBuiltin::DecoratorStore);
+            program.intern_method("__store", MethodKind::Method, arity + 1)
+        });
+
+        let mut b = Builder::new(
+            program,
+            module,
+            format!("<native decorator/{arity}>"),
+            FunctionKind::Closure,
+            vec![Type::Top; arity as usize],
+            Type::Top,
+        );
+        let state = b.add_capture(Type::Top, CaptureMode::ByValue);
+        let params: Vec<_> = (0..arity as usize).map(|index| b.param(index)).collect();
+        let entered = b.invoke(state, enter, params.clone());
+        let miss = b.emit1(Inst::RefEq { left: entered, right: state }, Type::Bool);
+        let call = b.new_block(&[]);
+        let hit = b.new_block(&[]);
+        b.branch(miss, call, vec![], hit, vec![]);
+        b.position_at(hit);
+        b.ret(entered);
+        b.position_at(call);
+        let result = b.invoke(state, run, params.clone());
+        let stored = match store {
+            Some(store) => {
+                let mut store_args = vec![result];
+                store_args.extend(params);
+                b.invoke(state, store, store_args)
+            }
+            None => {
+                let capacity = b.const_i32(i32::from(arity));
+                let list = b.emit1(Inst::AllocList { capacity: Some(capacity) }, Type::List(None));
+                for value in params {
+                    b.emit0(Inst::ListAppend { list, value });
+                }
+                b.invoke(state, store_list, vec![result, list])
+            }
+        };
+        b.ret(stored);
+        manifest.decorator_wrappers.push(b.finish());
+    }
 }
 
 /// Connects the already-reserved manifest to a concrete interpreter.
 pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &BuiltinManifest) {
+    interpreter.bind_native_decorator_wrappers(&manifest.decorator_wrappers);
     if let Some(function) = manifest.string_right_add {
         interpreter.bind_string_right_add_function(function);
     }
@@ -2047,6 +2155,12 @@ fn execute_primitive(
 
     let this = receiver(args)?;
     match op {
+        DecoratorCheck => {
+            let value = argument(args, 0)?;
+            let kind = context.string_utf8(argument(args, 1)?)
+                .ok_or_else(|| RuntimeError::new("decorator validation kind must be a string"))?;
+            context.check_decorator_value(value, kind)
+        }
         RandomNew => {
             Ok(context.allocate_random(fast_random_seed()))
         }

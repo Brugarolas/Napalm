@@ -11,6 +11,43 @@ fn whole_function_program(source: &str) -> (BytecodeProgram, FuncId, BuiltinMani
 }
 
 #[test]
+fn napalm_whole_function_tiering_avoids_redundant_recursive_entry_traces() {
+    let (program, entry, manifest) = whole_function_program(r#"
+        function make(depth) {
+            if (depth > 0) return {left: make(depth - 1), right: make(depth - 1)};
+            return {left: null, right: null};
+        }
+        function count(node) {
+            if (node.left == null) return 1;
+            return 1 + count(node.left) + count(node.right);
+        }
+        // Keep this a native-recursion test: observing mutation makes the
+        // producer ineligible for automatic object memoization.
+        make(1).left = null;
+        const result = count(make(10));
+    "#);
+    for threshold in [0, 64, 96] {
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_entry_threshold: threshold,
+            ..Default::default()
+        }));
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 2047.0);
+        let stats = vm.whole_function_jit_stats().unwrap();
+        assert_eq!(stats.compiled_functions, if threshold == 0 { 0 } else { 2 }, "{stats:?}");
+        let traces = vm.jit_stats().unwrap();
+        assert_eq!(traces.entry_traces_compiled, 0, "{traces:?}");
+        if threshold == 0 {
+            assert_eq!(stats.compile_attempts, 0, "{stats:?}");
+        } else {
+            assert!(stats.native_recursive_calls > 1000, "{stats:?}");
+        }
+        assert!(vm.native_shadow_top.is_null());
+    }
+}
+
+#[test]
 fn napalm_whole_function_trees_survive_gc_and_shape_bailouts() {
     let (program, entry, manifest) = whole_function_program(r#"
         function make(depth) {
@@ -43,6 +80,7 @@ fn napalm_whole_function_trees_survive_gc_and_shape_bailouts() {
             let stats = vm.whole_function_jit_stats().unwrap();
             assert!(stats.compiled_functions >= 2, "{stats:?}");
             assert!(stats.native_recursive_calls > 1000, "{stats:?}");
+            assert!(stats.inlined_recursive_sites >= 4, "{stats:?}");
         }
         assert!(vm.native_shadow_top.is_null());
     }
@@ -66,7 +104,7 @@ fn napalm_whole_function_identity_guards_preserve_other_equality() {
     "#);
     let mut vm = source_vm(&program, &manifest);
     vm.run_module(entry).unwrap();
-    let value = *vm.modules.last().unwrap().variables.last().unwrap();
+    let value = last_source_variable(&vm);
     assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[800, 1, 0, 1, 0, 0]");
     assert!(vm.whole_function_jit_stats().unwrap().compiled_functions > 0);
 }
@@ -91,7 +129,7 @@ fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
         let mut vm = source_vm(&program, &manifest);
         if !native { vm.set_jit_options(None); }
         vm.run_module(entry).unwrap();
-        let value = *vm.modules.last().unwrap().variables.last().unwrap();
+        let value = last_source_variable(&vm);
         assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[301, 161, 0x]");
         assert!(vm.native_shadow_top.is_null());
         if native { assert!(vm.whole_function_jit_stats().unwrap().native_recursive_calls > 0); }
@@ -111,4 +149,76 @@ fn napalm_inline_maps_grow_promote_and_keep_live_sidecars() {
         }
         const result = [sum, map.a.value, map.e, map[7]];
     "#, "[4100, 41, 5, seven]", true);
+}
+
+#[test]
+fn napalm_whole_function_read_only_recursion_replays_deep_and_changed_shapes() {
+    let (program, entry, manifest) = whole_function_program(r#"
+        function make(depth) {
+            if (depth > 0) return {next: make(depth - 1)};
+            return {next: null};
+        }
+        function count(node) {
+            if (node == null) return 0;
+            return 1 + count(node.next);
+        }
+        const short = make(20);
+        let total = 0;
+        for (let i = 0; i < 100; i++) total += count(short);
+        const deep = make(300);
+        System.gc();
+        const deepCount = count(deep);
+        short.next.next = {extra: 42, next: {next: null}};
+        System.gc();
+        const result = [total, deepCount, count(short)];
+    "#);
+    for native in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        if !native { vm.set_jit_options(None); }
+        vm.run_module(entry).unwrap();
+        let value = last_source_variable(&vm);
+        assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[2100, 301, 4]");
+        assert!(vm.native_shadow_top.is_null());
+        if native {
+            assert!(vm.whole_function_jit_stats().unwrap().compiled_functions >= 2);
+            assert!(vm.whole_function_jit_stats().unwrap().native_recursive_calls > 1000);
+            assert!(vm.whole_function_jit_stats().unwrap().inlined_recursive_sites >= 2);
+        }
+    }
+}
+
+#[test]
+fn napalm_whole_function_literal_slots_preserve_duplicates_and_dynamic_keys() {
+    let (program, entry, manifest) = whole_function_program(r#"
+        function make(key, value) {
+            return {b: value, [key]: value + 1, b: value + 2, c: value + 3};
+        }
+        let sum = 0;
+        for (let i = 0; i < 500; i++) {
+            const object = make('a', i);
+            if (i % 25 == 0) System.gc();
+            sum += object.a + object.b + object.c;
+        }
+        const changed = make('c', 10);
+        System.gc();
+        const result = [sum, changed.b, changed.c, changed.a];
+    "#);
+    for native in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        if !native { vm.set_jit_options(None); }
+        vm.run_module(entry).unwrap();
+        let value = last_source_variable(&vm);
+        assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[377250, 12, 13, null]");
+        if native { assert!(vm.whole_function_jit_stats().unwrap().compiled_functions > 0); }
+    }
+}
+
+#[test]
+fn napalm_whole_function_small_maps_enable_tlab_allocation() {
+    let mut heap = Heap::default();
+    let info = heap.inline_map_fast_allocation_info()
+        .expect("small managed objects must support direct TLAB allocation");
+    assert!(!info.cursor.is_null() && !info.limit.is_null());
+    assert!(info.bytes >= std::mem::size_of::<ManagedObject>());
+    assert!(info.alignment.is_power_of_two());
 }
