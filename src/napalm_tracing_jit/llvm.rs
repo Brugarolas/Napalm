@@ -37,6 +37,9 @@ use std::fmt::Write as _;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
 
+/// Trace-tree regions (several linked traces in one LLVM function).
+pub(super) mod region;
+
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
 use inkwell::memory_buffer::MemoryBuffer;
@@ -277,6 +280,10 @@ pub(super) struct LlvmJob {
     pub(super) pipeline: String,
     pub(super) slp_vectorize: bool,
     pub(super) dump: bool,
+    /// Trace-tree region: when non-empty, `region[0]` is this job's trace (the
+    /// single entry) and the others are reachable through native links. All of
+    /// them become one LLVM function whose internal links are direct branches.
+    pub(super) region: Vec<region::RegionMemberJob>,
 }
 
 pub(super) struct LlvmDone {
@@ -284,6 +291,8 @@ pub(super) struct LlvmDone {
     pub(super) ticket: u64,
     /// LLVM itself could not be loaded or initialized; stop requesting the tier.
     pub(super) unavailable: bool,
+    /// The job was a trace-tree region (several traces in one function).
+    pub(super) region: bool,
     pub(super) result: Result<LlvmCode, String>,
 }
 
@@ -476,7 +485,13 @@ fn llvm_worker_main(
             };
             pending.fetch_sub(1, Ordering::AcqRel);
             if done
-                .send(LlvmDone { trace: job.trace_id, ticket: job.ticket, unavailable, result })
+                .send(LlvmDone {
+                    trace: job.trace_id,
+                    ticket: job.ticket,
+                    unavailable,
+                    region: job.region.len() > 1,
+                    result,
+                })
                 .is_err()
             {
                 break;
@@ -504,7 +519,7 @@ fn effective_optimization_pipeline(requested: &str) -> String {
     // SROA/CFG folding opportunities before vectorization and loop transforms.
     // After O3, finish with a second scalar cleanup to remove instructions
     // made redundant by loop and CFG transformations.
-    "function(sroa,early-cse,instcombine,simplifycfg),default<O3>,function(aggressive-instcombine,gvn,dse,instcombine,simplifycfg)".to_owned()
+    "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg),default<O3>,function(aggressive-instcombine,gvn,dse,instcombine<no-verify-fixpoint>,simplifycfg)".to_owned()
 }
 
 fn compile_job(
@@ -515,15 +530,19 @@ fn compile_job(
     engines: &mut Vec<(Module<'static>, ExecutionEngine<'static>)>,
 ) -> Result<LlvmCode, String> {
     let started = std::time::Instant::now();
-    let ir = lower_trace_profiled(
-        &job.trace,
-        &job.exits,
-        job.binding_slots.clone(),
-        job.native_budget,
-        &job.symbol,
-        host,
-        job.profile.as_ref(),
-    )?;
+    let ir = if job.region.len() > 1 {
+        region::lower_region(&job.region, job.native_budget, &job.symbol, host)?
+    } else {
+        lower_trace_profiled(
+            &job.trace,
+            &job.exits,
+            job.binding_slots.clone(),
+            job.native_budget,
+            &job.symbol,
+            host,
+            job.profile.as_ref(),
+        )?
+    };
     if job.dump {
         eprintln!("[napalm-llvm] generated {}:\n{ir}", job.symbol);
     }
@@ -880,6 +899,13 @@ struct LlvmLowering<'p> {
     /// Numbered `!prof` metadata (ids from PGO_METADATA_BASE), deduplicated.
     prof_metadata: Vec<(u32, String)>,
     prof_weight_ids: HashMap<(u32, u32), u32>,
+    /// `!invariant.load` is a whole-function fact. In a trace-tree region it is
+    /// allowed only if *no* member crosses a runtime/GC epoch boundary.
+    invariant_loads: bool,
+    /// Trace-tree region membership (None: an ordinary single-trace function).
+    region: Option<region::RegionMember>,
+    /// First block after `entry` (the region's head start block).
+    entry_branch_target: String,
 }
 
 /// PGO metadata ids live far above TBAA/identity ids.
@@ -925,7 +951,21 @@ pub(super) fn lower_trace_profiled(
 ) -> Result<String, String> {
     // A profile without executions carries no information.
     let profile = profile.filter(|profile| profile.entries > 0);
-    let mut state = LlvmLowering {
+    let mut state = LlvmLowering::new(trace, exit_plans, vm_binding_slots, native_budget, profile);
+    state.lower_function(native_budget)?;
+    Ok(state.finish_module(symbol, host))
+}
+
+impl<'p> LlvmLowering<'p> {
+    fn new(
+        trace: &'p Trace,
+        exit_plans: &'p [CompiledExitPlan],
+        vm_binding_slots: HashMap<VmBindingKey, u32>,
+        native_budget: u32,
+        profile: Option<&'p TraceProfile>,
+    ) -> Self {
+        let epoch_free_trace = !trace_has_heap_epoch_boundary(trace);
+        LlvmLowering {
         trace,
         exit_plans,
         entry: String::with_capacity(1024),
@@ -971,16 +1011,18 @@ pub(super) fn lower_trace_profiled(
         method_epoch_value: None,
         native_budget_remaining: None,
         native_budget_initial: native_budget,
-        epoch_free_trace: !trace_has_heap_epoch_boundary(trace),
+        epoch_free_trace,
         nonescaping_stack_slots: Vec::new(),
         allow_fp_contract: std::env::var("NAPALM_LLVM_ALLOW_FMA").ok().as_deref() == Some("1"),
         profile,
         in_preheader: true,
         prof_metadata: Vec::new(),
         prof_weight_ids: HashMap::default(),
-    };
-    state.lower_function(native_budget)?;
-    Ok(state.finish_module(symbol, host))
+        invariant_loads: epoch_free_trace,
+        region: None,
+        entry_branch_target: "start".to_owned(),
+        }
+    }
 }
 
 impl LlvmLowering<'_> {
@@ -1061,6 +1103,15 @@ impl LlvmLowering<'_> {
     }
 
     fn ret(&mut self, code: u32) {
+        // The manager attributes a result to `next_trace`. Inside a region the
+        // function may return from any member, so name it (a link names its
+        // child itself).
+        if code != TRACE_RESULT_LINK {
+            if let Some(member) = self.region.as_ref().map(|region| region.trace) {
+                let activation = Self::activation();
+                self.store_at(&V::i32(member.0 as i32), &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
+            }
+        }
         // No stack-slot address ever leaves this function. Each slot is used
         // only by the local loop-phi/budget loads and stores, so its lifetime
         // ends at every native return (including deoptimization side exits).
@@ -1255,7 +1306,7 @@ impl LlvmLowering<'_> {
         // bytes are immutable while their string allocation is live; however,
         // a runtime/GC boundary may recycle a raw address, so only use the
         // stronger string fact inside a synchronization-free native trace.
-        let invariant = mem == Mem::Binding || (mem == Mem::Str && self.epoch_free_trace);
+        let invariant = mem == Mem::Binding || (mem == Mem::Str && self.invariant_loads);
         self.load_aligned_tagged(ty, ptr, mem.tag(), align, invariant)
     }
 
@@ -1353,6 +1404,12 @@ impl LlvmLowering<'_> {
     /// The successful path of a guard establishes the inequality. Each epoch
     /// gets *fresh* scopes: after a runtime call a handle can be recycled.
     fn prove_distinct(&mut self, a: TraceValueId, b: TraceValueId) {
+        // Scoped noalias metadata is static. Region members are re-entered
+        // with new entry values within one invocation, so an "invariant"
+        // identity root is no longer invariant there: no scopes in regions.
+        if self.region.is_some() {
+            return;
+        }
         let (a, b) = Self::identity_pair(a, b);
         if a == b || !self.active_identity_proofs.insert((a, b)) {
             return;
@@ -1563,7 +1620,11 @@ impl LlvmLowering<'_> {
         if let Some(value) = &self.vm_bindings_base {
             return value.clone();
         }
-        let value = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, vm_bindings));
+        // Only the region head is entered with its own table in `vm_bindings`.
+        let value = match self.region.as_ref().and_then(|region| region.bindings.clone()) {
+            Some(table) => table,
+            None => self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, vm_bindings)),
+        };
         self.vm_bindings_base = Some(value.clone());
         value
     }
@@ -1624,6 +1685,14 @@ impl LlvmLowering<'_> {
     }
 
     fn method_epoch_value(&mut self) -> V {
+        if self.region.is_some() {
+            // Runtime helpers refresh `method_epoch`; a region member may run
+            // after another member's runtime call within the same invocation.
+            // Load at the use (never cached: no dominance assumptions); GVN
+            // merges loads between runtime boundaries.
+            let activation = Self::activation();
+            return self.load_at(Ty::I64, &activation, offset_of!(TraceActivation, method_epoch) as i64, Mem::Act);
+        }
         if let Some(value) = &self.method_epoch_value {
             return value.clone();
         }
@@ -1996,7 +2065,13 @@ impl LlvmLowering<'_> {
         if !plan.native_linkable {
             return self.materialize_side_exit(plan);
         }
-        let links = Self::links();
+        // A link to another member of this region is a direct branch.
+        if let ExitTarget::Trace(child) = plan.target {
+            if let Some(start) = self.region.as_ref().and_then(|region| region.start_of(child)) {
+                return self.materialize_region_link(plan, child, &start);
+            }
+        }
+        let links = self.region.as_ref().map_or_else(Self::links, |region| region.links.clone());
         let child = self.load_at(Ty::I32, &links, plan.id.0 as i64 * 4, Mem::Links);
         let linked = self.icmp("ne", &child, &V::i32(-1));
         let linked_block = self.new_block();
@@ -2034,6 +2109,16 @@ impl LlvmLowering<'_> {
 
     fn materialize_native_link(&mut self, plan: &CompiledExitPlan, child: &V) -> Result<(), String> {
         self.store_completed_iterations();
+        self.store_link_writes(plan)?;
+        let activation = Self::activation();
+        self.store_at(child, &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
+        self.ret(TRACE_RESULT_LINK);
+        Ok(())
+    }
+
+    /// Frame writes that turn this exit's state into the linked child's entry
+    /// state (dynamic values and reconstructible constants).
+    fn store_link_writes(&mut self, plan: &CompiledExitPlan) -> Result<(), String> {
         for write in &plan.writes {
             let word = match write.source {
                 ExitWriteSource::Dynamic(index) => {
@@ -2054,9 +2139,6 @@ impl LlvmLowering<'_> {
             };
             self.store_frame_word(write.slot, &word);
         }
-        let activation = Self::activation();
-        self.store_at(child, &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
-        self.ret(TRACE_RESULT_LINK);
         Ok(())
     }
 
@@ -3146,7 +3228,7 @@ impl LlvmLowering<'_> {
                 // can move/recycle the allocation within this native trace.
                 let slot = self.gep8(&captures, *index as i64 * 8);
                 let value = self.load_aligned_tagged(
-                    Ty::I64, &slot, Mem::Capture.tag(), 8, self.epoch_free_trace
+                    Ty::I64, &slot, Mem::Capture.tag(), 8, self.invariant_loads
                 );
                 self.cache_value(self.one_result(node)?, value);
             }
@@ -3391,9 +3473,12 @@ impl LlvmLowering<'_> {
         let native_budget_enabled =
             native_budget != 0 && matches!(trace.terminator, TraceTerminator::LoopBack);
 
-        // `start` is the first non-entry block.
-        let _ = writeln!(self.body, "start:");
-        self.current = "start".to_owned();
+        // `start` is the first non-entry block. Region members prefix every
+        // fixed label and stack slot (`m{k}_start`, `%m{k}_phi0`, ...).
+        let prefix = self.region.as_ref().map_or(String::new(), |region| region.prefix.clone());
+        let start_label = format!("{prefix}start");
+        let loop_label = format!("{prefix}loop");
+        self.begin(&start_label);
 
         for index in 0..trace.values.len() {
             let value = &trace.values[index];
@@ -3463,7 +3548,7 @@ impl LlvmLowering<'_> {
         let mut phi_slots = Vec::with_capacity(trace.loop_phis.len());
         for (index, phi) in trace.loop_phis.iter().enumerate() {
             let ty = Ty::of_rep(phi.rep);
-            let slot = format!("%phi{index}");
+            let slot = format!("%{prefix}phi{index}");
             let _ = writeln!(self.entry, "  {slot} = alloca {}, align {}", ty.ir(), ty.align());
             let _ = writeln!(self.entry, "  call void @llvm.lifetime.start.p0(i64 {}, ptr {slot})", ty.align());
             self.nonescaping_stack_slots.push((slot.clone(), ty.align() as usize));
@@ -3481,17 +3566,18 @@ impl LlvmLowering<'_> {
             phi_slots.push((slot, ty));
         }
         let budget_slot = if native_budget_enabled {
-            let _ = writeln!(self.entry, "  %budget = alloca i64, align 8");
-            let _ = writeln!(self.entry, "  call void @llvm.lifetime.start.p0(i64 8, ptr %budget)");
-            self.nonescaping_stack_slots.push(("%budget".to_owned(), 8));
-            self.line(&format!("store i64 {native_budget}, ptr %budget, align 8"));
-            Some("%budget".to_owned())
+            let slot = format!("%{prefix}budget");
+            let _ = writeln!(self.entry, "  {slot} = alloca i64, align 8");
+            let _ = writeln!(self.entry, "  call void @llvm.lifetime.start.p0(i64 8, ptr {slot})");
+            self.nonescaping_stack_slots.push((slot.clone(), 8));
+            self.line(&format!("store i64 {native_budget}, ptr {slot}, align 8"));
+            Some(slot)
         } else {
             None
         };
 
-        self.br("loop");
-        self.begin("loop");
+        self.br(&loop_label);
+        self.begin(&loop_label);
         self.in_preheader = false;
 
         if trace.nodes.iter().any(|node| {
@@ -3547,12 +3633,12 @@ impl LlvmLowering<'_> {
                         }
                         None => MD_COLD_TRUE,
                     };
-                    self.cond_br(&exhausted, &stop, "loop", Some(latch_md));
+                    self.cond_br(&exhausted, &stop, &loop_label, Some(latch_md));
                     self.begin(&stop);
                     self.native_budget_remaining = Some(next_budget);
                     self.emit_unconditional_side_exit(exit)?;
                 } else {
-                    self.br("loop");
+                    self.br(&loop_label);
                 }
             }
             TraceTerminator::Exit(exit) => self.emit_unconditional_side_exit(*exit)?,
@@ -3616,7 +3702,7 @@ impl LlvmLowering<'_> {
         );
         out.push_str("entry:\n");
         out.push_str(&self.entry);
-        out.push_str("  br label %start\n");
+        let _ = writeln!(out, "  br label %{}", self.entry_branch_target);
         out.push_str(&self.body);
         out.push_str("}\n\n");
         let escape = |text: &str| text.replace('\\', "\\5C").replace('"', "\\22");
@@ -3704,6 +3790,12 @@ impl LlvmLowering<'_> {
         }
         if let Some(profile) = self.profile {
             Self::write_profile_metadata(&mut out, profile, &self.prof_metadata);
+        } else {
+            // Region members can carry measured weights even when the head has
+            // no profile; every referenced `!prof` node must still exist.
+            for (id, text) in &self.prof_metadata {
+                let _ = writeln!(out, "!{id} = {text}");
+            }
         }
         out
     }

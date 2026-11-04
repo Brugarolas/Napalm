@@ -975,6 +975,10 @@ pub struct TracingJitOptions {
     /// counts, per-exit frequencies) to LLVM as PGO metadata (`NAPALM_LLVM_PGO=0`
     /// disables it).
     pub llvm_pgo: bool,
+    /// Compile a hot trace together with every trace it reaches through
+    /// stitched native links (its trace-tree region) as one LLVM function, so
+    /// links become direct branches (`NAPALM_LLVM_REGIONS=0` disables it).
+    pub llvm_trace_regions: bool,
     /// Print the generated and the optimized LLVM IR.
     pub llvm_dump_ir: bool,
 }
@@ -988,18 +992,22 @@ pub struct TracingJitOptions {
 /// unswitching, loop distribution and runtime unrolling, plus a second
 /// GVN/InstCombine/SimplifyCFG round after vectorization. Measured: equal or
 /// better code than `default<O3>` at ~13% less compile time.
+///
+/// Textual `instcombine` verifies that it reached a fixpoint and otherwise
+/// calls `report_fatal_error`, aborting the whole process (seen on a trace-tree
+/// region). LLVM's own `default<On>` pipelines never verify; neither do we.
 pub const NAPALM_TRACE_PIPELINE: &str = concat!(
     "function(",
-    "sroa<modify-cfg>,early-cse<memssa>,instcombine,simplifycfg,",
-    "correlated-propagation,jump-threading,instcombine,reassociate,",
+    "sroa<modify-cfg>,early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,",
+    "correlated-propagation,jump-threading,instcombine<no-verify-fixpoint>,reassociate,",
     "loop-simplify,lcssa,",
     "loop-mssa(loop-rotate<header-duplication>,licm<allowspeculation>,simple-loop-unswitch<nontrivial>),",
-    "indvars,loop-deletion,loop-unroll-full,sroa,gvn,sccp,bdce,instcombine,",
+    "indvars,loop-deletion,loop-unroll-full,sroa,gvn,sccp,bdce,instcombine<no-verify-fixpoint>,",
     "jump-threading,correlated-propagation,adce,memcpyopt,dse,",
     "loop-mssa(licm<allowspeculation>),",
-    "simplifycfg<hoist-common-insts;sink-common-insts;speculate-blocks>,instcombine,",
+    "simplifycfg<hoist-common-insts;sink-common-insts;speculate-blocks>,instcombine<no-verify-fixpoint>,",
     "loop-simplify,lcssa,loop-rotate,loop-distribute,loop-vectorize,loop-load-elim,",
-    "instcombine,simplifycfg,loop-unroll<O3;runtime>,instcombine,",
+    "instcombine<no-verify-fixpoint>,simplifycfg,loop-unroll<O3;runtime>,instcombine<no-verify-fixpoint>,",
     "loop-mssa(licm<allowspeculation>),alignment-from-assumptions,loop-sink,",
     "instsimplify,div-rem-pairs,simplifycfg",
     ")"
@@ -1050,6 +1058,7 @@ impl Default for TracingJitOptions {
                 .unwrap_or_else(|_| NAPALM_TRACE_PIPELINE.to_owned()),
             llvm_slp_vectorize: std::env::var_os("NAPALM_LLVM_SLP").is_some(),
             llvm_pgo: std::env::var("NAPALM_LLVM_PGO").ok().as_deref() != Some("0"),
+            llvm_trace_regions: std::env::var("NAPALM_LLVM_REGIONS").ok().as_deref() != Some("0"),
             llvm_dump_ir: std::env::var_os("NAPALM_LLVM_DUMP").is_some(),
         }
     }
@@ -1123,6 +1132,10 @@ pub struct TracingJitStats {
     pub llvm_traces_requested: u64,
     /// LLVM entries installed over their Cranelift code.
     pub llvm_traces_installed: u64,
+    /// Of those, trace-tree regions (one function for several linked traces).
+    pub llvm_regions_installed: u64,
+    /// Traces compiled into installed regions, heads included.
+    pub llvm_region_members: u64,
     /// LLVM lowering/compilation failures (the Cranelift code stays in use).
     pub llvm_failures: u64,
     /// Total LLVM optimization + code generation time.
@@ -6369,6 +6382,12 @@ struct CompiledTrace {
     /// loop iterations reported by side exits. Drives the LLVM tier.
     tier_visits: u64,
     llvm: LlvmTierState,
+    /// LLVM code (single or region) has been installed for this trace once, so
+    /// a failed recompilation leaves working LLVM code behind.
+    llvm_has_code: bool,
+    /// A region headed by this trace failed to compile: compile it alone, and
+    /// never pull it into another region.
+    llvm_region_failed: bool,
     /// Worker-local profile written by the instrumented (Cranelift) code:
     /// `[entries, completed native iterations, exit 0 hits, exit 1 hits, ...]`.
     /// Exit hits include natively linked exits that never reach the manager.
@@ -6657,6 +6676,15 @@ impl CraneliftBackend {
                 offset_of!(TraceActivation, vm_bindings) as i32,
             );
 
+            // An LLVM trace-tree region follows its internal links itself and
+            // spends the same link budget, so the budget lives in the
+            // activation across the call.
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                remaining,
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
             // Pass the per-trace link table in SSA instead of storing it into
             // TraceActivation only for the callee to reload it on a side exit.
             let call = builder.ins().call_indirect(
@@ -6665,6 +6693,12 @@ impl CraneliftBackend {
                 &[activation, current_links],
             );
             let result = builder.inst_results(call)[0];
+            let remaining = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
             let linked = builder.ins().icmp_imm(
                 IntCC::Equal,
                 result,
@@ -7424,6 +7458,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
             debug_text: disassembly.or(clif_text),
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
+            llvm_has_code: false,
+            llvm_region_failed: false,
             profile,
         })
     }
@@ -10977,6 +11013,12 @@ pub struct TracingJit {
     /// The service could not start (no usable LLVM); stop trying.
     llvm_unavailable: bool,
     llvm_next_ticket: u64,
+    /// Members of the last region requested for each head trace.
+    llvm_regions: HashMap<TraceId, Vec<TraceId>>,
+    /// `(child, head)`: `child` was stitched to a member of `head`'s region
+    /// after that region was compiled; once `child` is hot the region is
+    /// recompiled with it.
+    llvm_region_watch: Vec<(TraceId, TraceId)>,
 }
 
 impl Default for TracingJit {
@@ -11066,6 +11108,8 @@ impl TracingJit {
             llvm_service: None,
             llvm_unavailable: false,
             llvm_next_ticket: 1,
+            llvm_regions: HashMap::default(),
+            llvm_region_watch: Vec::new(),
         }
     }
 
@@ -11187,16 +11231,26 @@ impl TracingJit {
     // -------------------------------------------------------------------------
 
     /// Account native visits of `id`. Once a trace reaches `llvm_hot_threshold`,
-    /// its whole trace tree (root plus stitched side traces, which execute as one
-    /// unit through native links) is queued for LLVM recompilation.
+    /// it is queued for LLVM recompilation together with every trace it reaches
+    /// through stitched native links (its trace-tree region, which executes as
+    /// one unit), as a single LLVM function. Without regions the whole tree is
+    /// queued trace by trace.
     fn note_native_visits(&mut self, id: TraceId, visits: u64) {
         let threshold = self.options.llvm_hot_threshold;
         if threshold == 0 || self.llvm_unavailable {
             return;
         }
+        if !self.llvm_region_watch.is_empty() {
+            self.poll_llvm_region_watch();
+        }
+        let regions = self.options.llvm_trace_regions;
         let Some(compiled) = self.compiled_mut(id) else { return; };
         compiled.tier_visits = compiled.tier_visits.saturating_add(visits);
         if compiled.llvm != LlvmTierState::Cold || compiled.tier_visits < threshold as u64 {
+            return;
+        }
+        if regions {
+            self.request_llvm(id);
             return;
         }
         let root = compiled.root_trace;
@@ -11219,6 +11273,72 @@ impl TracingJit {
         }
     }
 
+    /// The trace-tree region headed by `head`: `head` first, then, breadth
+    /// first, every trace reachable through exits that are already stitched
+    /// natively. Bounded in members and Trace IR nodes (compile time).
+    fn llvm_region_members(&self, head: TraceId) -> Vec<TraceId> {
+        const MAX_REGION_MEMBERS: usize = 16;
+        const MAX_REGION_NODES: usize = 8192;
+        let Some(compiled) = self.compiled(head) else { return vec![head]; };
+        let mut members = vec![head];
+        let mut nodes = compiled.trace.nodes.len();
+        let mut cursor = 0;
+        while cursor < members.len() {
+            let Some(compiled) = self.compiled(members[cursor]) else { break; };
+            cursor += 1;
+            for (index, plan) in compiled.exits.iter().enumerate() {
+                let ExitTarget::Trace(child) = plan.target else { continue; };
+                if !plan.native_linkable
+                    || compiled.native_links.get(index) != Some(&child.0)
+                    || members.contains(&child)
+                    || members.len() >= MAX_REGION_MEMBERS
+                {
+                    continue;
+                }
+                let Some(candidate) = self.compiled(child) else { continue; };
+                if candidate.llvm == LlvmTierState::Failed
+                    || candidate.llvm_region_failed
+                    || nodes + candidate.trace.nodes.len() > MAX_REGION_NODES
+                {
+                    continue;
+                }
+                nodes += candidate.trace.nodes.len();
+                members.push(child);
+            }
+        }
+        members
+    }
+
+    /// Recompile a region once a trace stitched to it after its compilation
+    /// is hot too (e.g. the side traces of a nested loop that appear late).
+    fn poll_llvm_region_watch(&mut self) {
+        let threshold = self.options.llvm_hot_threshold as u64;
+        let watch = std::mem::take(&mut self.llvm_region_watch);
+        let mut keep = Vec::with_capacity(watch.len());
+        let mut heads = Vec::new();
+        for (child, head) in watch {
+            let (Some(child_trace), Some(head_trace)) = (self.compiled(child), self.compiled(head)) else {
+                continue;
+            };
+            let included = self.llvm_regions.get(&head).is_some_and(|members| members.contains(&child));
+            if included || head_trace.llvm_region_failed || head_trace.llvm == LlvmTierState::Failed {
+                continue;
+            }
+            let entries = child_trace.profile.get(PROFILE_ENTRIES).map_or(0, |counter| counter.load(Ordering::Relaxed));
+            let hot = child_trace.llvm == LlvmTierState::Installed
+                || child_trace.tier_visits.saturating_add(entries) >= threshold;
+            if !hot || matches!(head_trace.llvm, LlvmTierState::Queued { .. }) {
+                keep.push((child, head));
+            } else if !heads.contains(&head) {
+                heads.push(head);
+            }
+        }
+        self.llvm_region_watch = keep;
+        for head in heads {
+            self.request_llvm(head);
+        }
+    }
+
     #[cfg(not(feature = "llvm-jit"))]
     fn request_llvm(&mut self, _id: TraceId) {}
 
@@ -11231,17 +11351,7 @@ impl TracingJit {
         options: &TracingJitOptions,
         ticket: u64,
     ) -> Result<llvm::LlvmJob, String> {
-        // LLVM code must address the relocation table already installed for this
-        // trace, slot for slot.
-        let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
-        if keys.len() != compiled.vm_binding_keys.len()
-            || keys
-                .iter()
-                .zip(compiled.vm_binding_keys.iter())
-                .any(|(lowered, installed)| lowered.kind != installed.kind)
-        {
-            return Err("VM-binding layout differs from the installed trace".to_owned());
-        }
+        let slots = Self::llvm_binding_slots(compiled)?;
         // Only data is cloned here; lowering, optimization and code generation
         // all run on the compiler workers.
         Ok(llvm::LlvmJob {
@@ -11256,6 +11366,36 @@ impl TracingJit {
             pipeline: options.llvm_pass_pipeline.clone(),
             slp_vectorize: options.llvm_slp_vectorize,
             dump: options.llvm_dump_ir,
+            region: Vec::new(),
+        })
+    }
+
+    /// LLVM code must address the relocation table already installed for the
+    /// trace, slot for slot.
+    #[cfg(feature = "llvm-jit")]
+    fn llvm_binding_slots(compiled: &CompiledTrace) -> Result<HashMap<VmBindingKey, u32>, String> {
+        let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
+        if keys.len() != compiled.vm_binding_keys.len()
+            || keys
+                .iter()
+                .zip(compiled.vm_binding_keys.iter())
+                .any(|(lowered, installed)| lowered.kind != installed.kind)
+        {
+            return Err(format!("VM-binding layout of {:?} differs from the installed trace", compiled.trace.id));
+        }
+        Ok(slots)
+    }
+
+    #[cfg(feature = "llvm-jit")]
+    fn prepare_llvm_region_member(
+        compiled: &CompiledTrace,
+        options: &TracingJitOptions,
+    ) -> Result<llvm::region::RegionMemberJob, String> {
+        Ok(llvm::region::RegionMemberJob {
+            trace: compiled.trace.clone(),
+            exits: compiled.exits.clone(),
+            binding_slots: Self::llvm_binding_slots(compiled)?,
+            profile: options.llvm_pgo.then(|| compiled.profile_snapshot()),
         })
     }
 
@@ -11275,7 +11415,27 @@ impl TracingJit {
         let ticket = self.llvm_next_ticket;
         self.llvm_next_ticket = self.llvm_next_ticket.wrapping_add(1);
         let Some(compiled) = self.compiled(id) else { return; };
-        let job = Self::prepare_llvm_job(compiled, &self.options, ticket);
+        let members = if self.options.llvm_trace_regions && !compiled.llvm_region_failed {
+            self.llvm_region_members(id)
+        } else {
+            vec![id]
+        };
+        let mut job = Self::prepare_llvm_job(compiled, &self.options, ticket);
+        if members.len() > 1 {
+            job = job.and_then(|mut job| {
+                job.symbol = format!("napalm_region_{}_{}", id.0, ticket);
+                job.region = members
+                    .iter()
+                    .map(|&member| {
+                        let compiled = self
+                            .compiled(member)
+                            .ok_or_else(|| format!("region member {member:?} disappeared"))?;
+                        Self::prepare_llvm_region_member(compiled, &self.options)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(job)
+            });
+        }
         let job = job.and_then(|job| self.llvm_service.as_mut().unwrap().submit(job));
         let Some(compiled) = self.compiled_mut(id) else { return; };
         match job {
@@ -11283,14 +11443,25 @@ impl TracingJit {
                 compiled.llvm = LlvmTierState::Queued { ticket };
                 self.stats.llvm_traces_requested = self.stats.llvm_traces_requested.saturating_add(1);
                 if jit_events_enabled() {
-                    eprintln!("[napalm-jit] LLVM tier requested for {id:?}");
+                    if members.len() > 1 {
+                        eprintln!("[napalm-jit] LLVM region requested for {id:?}: {members:?}");
+                    } else {
+                        eprintln!("[napalm-jit] LLVM tier requested for {id:?}");
+                    }
+                }
+                // Single traces are recorded too: a side trace stitched to
+                // them later regrows them into a region.
+                if self.options.llvm_trace_regions && !self.compiled(id).is_some_and(|c| c.llvm_region_failed) {
+                    self.llvm_regions.insert(id, members);
                 }
                 if !self.options.llvm_background_compile {
                     self.wait_llvm(id, ticket);
                 }
             }
             Err(error) => {
-                compiled.llvm = LlvmTierState::Failed;
+                // A recompilation that cannot even be prepared keeps the code
+                // that is already installed.
+                compiled.llvm = if compiled.llvm_has_code { LlvmTierState::Installed } else { LlvmTierState::Failed };
                 self.record_llvm_failure(id, error);
             }
         }
@@ -11350,6 +11521,7 @@ impl TracingJit {
                 compiled.entry = unsafe { std::mem::transmute::<usize, NativeTraceFn>(code.address) };
                 compiled.code_ptr = code.address as *const u8;
                 compiled.llvm = LlvmTierState::Installed;
+                compiled.llvm_has_code = true;
                 if let Some(text) = code.optimized_ir {
                     compiled.debug_text = Some(text);
                 }
@@ -11358,11 +11530,30 @@ impl TracingJit {
                 }
                 self.stats.llvm_traces_installed = self.stats.llvm_traces_installed.saturating_add(1);
                 self.stats.llvm_compile_micros = self.stats.llvm_compile_micros.saturating_add(code.micros);
+                if done.region {
+                    let members = self.llvm_regions.get(&done.trace).map_or(0, Vec::len) as u64;
+                    self.stats.llvm_regions_installed = self.stats.llvm_regions_installed.saturating_add(1);
+                    self.stats.llvm_region_members = self.stats.llvm_region_members.saturating_add(members);
+                }
                 if jit_events_enabled() {
                     eprintln!(
-                        "[napalm-jit] LLVM tier installed for {:?} ({} us)",
-                        done.trace, code.micros
+                        "[napalm-jit] LLVM {} installed for {:?} ({} us)",
+                        if done.region { "region" } else { "tier" },
+                        done.trace,
+                        code.micros
                     );
+                }
+            }
+            Err(error) if done.region && !done.unavailable => {
+                // Never retry this region; compile the head alone unless it
+                // already runs LLVM code (a failed regrowth).
+                compiled.llvm_region_failed = true;
+                let had_code = compiled.llvm_has_code;
+                compiled.llvm = if had_code { LlvmTierState::Installed } else { LlvmTierState::Cold };
+                self.llvm_regions.remove(&done.trace);
+                self.record_llvm_failure(done.trace, error);
+                if !had_code {
+                    self.request_llvm(done.trace);
                 }
             }
             Err(error) => {
@@ -11527,6 +11718,8 @@ impl TracingJit {
             debug_text,
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
+            llvm_has_code: false,
+            llvm_region_failed: false,
             profile,
         })
     }
@@ -12651,6 +12844,19 @@ impl TracingJit {
         if let Some(side_exit) = parent_trace.trace.exits.get_mut(exit_index) {
             side_exit.target = ExitTarget::Trace(child);
             side_exit.linked_trace = Some(child);
+        }
+
+        // A compiled region containing `parent` now reaches `child` only through
+        // the dispatcher; regrow it once `child` proves hot.
+        if native_linkable && self.options.llvm_trace_regions {
+            for (head, members) in &self.llvm_regions {
+                if members.contains(&parent)
+                    && !members.contains(&child)
+                    && !self.llvm_region_watch.contains(&(child, *head))
+                {
+                    self.llvm_region_watch.push((child, *head));
+                }
+            }
         }
 
         Ok(())
