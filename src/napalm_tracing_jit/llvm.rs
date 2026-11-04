@@ -708,6 +708,15 @@ impl Fwd {
     /// happen to reference the same object. Distinct object *kinds* are likewise
     /// disjoint, but distinct SSA entry pointers alone never prove distinctness.
     /// The representation is valid only inside one runtime/GC epoch.
+    fn entry(&self) -> &V {
+        match self {
+            Self::Field { entry, .. }
+            | Self::Cell { entry }
+            | Self::Indexed { entry, .. }
+            | Self::ShapedMap { entry, .. } => entry,
+        }
+    }
+
     fn may_alias(&self, write: &Self) -> bool {
         match (self, write) {
             (Self::Field { slot: a, .. }, Self::Field { slot: b, .. })
@@ -719,6 +728,35 @@ impl Fwd {
             _ => false,
         }
     }
+}
+
+/// The instruction's verified heap kind and its physical offset determine
+/// whether an identity comparison can remove an actual memory dependence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum IdentityAccess {
+    Instance(u32),
+    ShapedMap(u32),
+    Cell,
+    List,
+}
+
+#[derive(Clone, Debug)]
+struct SeenIdentityAccess {
+    root: TraceValueId,
+    entry: V,
+    writes: bool,
+}
+
+/// One dynamic epoch's proven inequality between two invariant heap handles.
+/// The metadata scopes only apply to accesses in this epoch after the proof.
+#[derive(Clone, Copy, Debug)]
+struct IdentityDisjointProof {
+    a: TraceValueId,
+    b: TraceValueId,
+    domain: u32,
+    epoch: u64,
+    a_scope: u32,
+    b_scope: u32,
 }
 
 struct LlvmLowering<'p> {
@@ -751,6 +789,16 @@ struct LlvmLowering<'p> {
     shaped_slot_tbaa: HashMap<u32, u32>,
     instance_slot_tbaa: HashMap<u32, u32>,
     next_tbaa: u32,
+    /// Keep identity evidence separate across calls, read barriers and GC epochs.
+    identity_epoch: u64,
+    active_identity_proofs: HashSet<(TraceValueId, TraceValueId)>,
+    identity_proofs: Vec<IdentityDisjointProof>,
+    seen_identity_accesses: HashMap<IdentityAccess, Vec<SeenIdentityAccess>>,
+    entry_identity_roots: HashMap<V, TraceValueId>,
+    identity_metadata_lists: Vec<(u32, Vec<u32>)>,
+    /// Bounded speculation is enabled only when the trace has useful accesses.
+    speculative_noalias: bool,
+    speculative_guards: usize,
     vm_binding_slots: HashMap<VmBindingKey, u32>,
     vm_binding_values: HashMap<u32, V>,
     vm_bindings_base: Option<V>,
@@ -803,6 +851,15 @@ pub(super) fn lower_trace(
         shaped_slot_tbaa: HashMap::default(),
         instance_slot_tbaa: HashMap::default(),
         next_tbaa: 100,
+        identity_epoch: 0,
+        active_identity_proofs: HashSet::default(),
+        identity_proofs: Vec::new(),
+        seen_identity_accesses: HashMap::default(),
+        entry_identity_roots: HashMap::default(),
+        identity_metadata_lists: Vec::new(),
+        speculative_noalias: std::env::var("NAPALM_LLVM_NOALIAS_GUARDS")
+            .ok().as_deref() != Some("0"),
+        speculative_guards: 0,
         vm_binding_slots,
         vm_binding_values: HashMap::default(),
         vm_bindings_base: None,
@@ -1082,6 +1139,233 @@ impl LlvmLowering<'_> {
             self.instance_slot_tbaa.insert(slot, tag);
         }
         tag
+    }
+
+    /// Stable identity, not object address: the GC may move payloads, but a
+    /// tagged heap handle identifies its sidecar until the next runtime epoch.
+    /// Loop phis and post-runtime loads are deliberately excluded, because
+    /// a single LLVM alias scope may cover different loop iterations.
+    fn invariant_identity_root(&self, value: TraceValueId) -> Option<TraceValueId> {
+        let mut value = self.trace.canonical_value(value);
+        for _ in 0..24 {
+            let info = self.trace.value(value)?;
+            match &info.origin {
+                TraceValueOrigin::EntrySlot { frame, .. }
+                    if frame.0 == 0 && matches!(info.rep, TraceRep::Tagged | TraceRep::HeapHandle) => {
+                        return Some(value);
+                    }
+                TraceValueOrigin::Constant(TraceConstant::StableTagged(word))
+                    if *word & TAG_HEAP_MASK == TAG_HEAP => return Some(value),
+                TraceValueOrigin::InstResult { node } => {
+                    let source = match &self.trace.nodes.get(*node)?.kind {
+                        TraceInst::GuardHeapObject { value, .. }
+                        | TraceInst::TaggedToHeapHandle { value, .. }
+                        | TraceInst::Copy { value }
+                        | TraceInst::GuardType { value, .. }
+                        | TraceInst::GuardClass { value, .. } => *value,
+                        _ => return None,
+                    };
+                    value = self.trace.canonical_value(source);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn identity_pair(a: TraceValueId, b: TraceValueId) -> (TraceValueId, TraceValueId) {
+        if a.0 < b.0 { (a, b) } else { (b, a) }
+    }
+
+    fn identity_known_distinct(&self, a: TraceValueId, b: TraceValueId) -> bool {
+        self.active_identity_proofs.contains(&Self::identity_pair(a, b))
+    }
+
+    /// The successful path of a guard establishes the inequality. Each epoch
+    /// gets *fresh* scopes: after a runtime call a handle can be recycled.
+    fn prove_distinct(&mut self, a: TraceValueId, b: TraceValueId) {
+        let (a, b) = Self::identity_pair(a, b);
+        if a == b || !self.active_identity_proofs.insert((a, b)) {
+            return;
+        }
+        let domain = self.next_tbaa;
+        let a_scope = domain + 1;
+        let b_scope = domain + 2;
+        self.next_tbaa += 3;
+        self.identity_proofs.push(IdentityDisjointProof {
+            a, b, domain, epoch: self.identity_epoch, a_scope, b_scope,
+        });
+    }
+
+    /// An already-executed RefEq(false) guard is an *exact* inequality proof.
+    /// Recognize both the raw Bool and its tagged Select(true, false) form.
+    fn refeq_operands(&self, result: TraceValueId) -> Option<(TraceValueId, TraceValueId)> {
+        let result = self.trace.canonical_value(result);
+        let TraceValueOrigin::InstResult { node } = &self.trace.value(result)?.origin else {
+            return None;
+        };
+        match &self.trace.nodes.get(*node)?.kind {
+            TraceInst::RefEq { lhs, rhs } => {
+                let lhs_rep = self.trace.value(self.trace.canonical_value(*lhs))?.rep;
+                let rhs_rep = self.trace.value(self.trace.canonical_value(*rhs))?.rep;
+                if lhs_rep == TraceRep::Tagged && rhs_rep == TraceRep::Tagged {
+                    Some((*lhs, *rhs))
+                } else {
+                    None
+                }
+            }
+            TraceInst::Select { condition, if_true, if_false } => {
+                let is_boolean = |v: TraceValueId, expected: bool| {
+                    let v = self.trace.canonical_value(v);
+                    matches!(self.trace.value(v).map(|v| &v.origin),
+                        Some(TraceValueOrigin::Constant(TraceConstant::Bool(b))) if *b == expected)
+                };
+                if is_boolean(*if_true, true) && is_boolean(*if_false, false) {
+                    self.refeq_operands(*condition)
+                } else {
+                    None
+                }
+            }
+            TraceInst::Copy { value } => self.refeq_operands(*value),
+            _ => None,
+        }
+    }
+
+    fn prove_refeq_false(&mut self, value: TraceValueId) {
+        let Some((a, b)) = self.refeq_operands(value) else { return; };
+        let (Some(a), Some(b)) = (self.invariant_identity_root(a), self.invariant_identity_root(b)) else {
+            return;
+        };
+        self.prove_distinct(a, b);
+    }
+
+    fn is_i32_zero(&self, v: TraceValueId) -> bool {
+        let v = self.trace.canonical_value(v);
+        matches!(self.trace.value(v).map(|v| &v.origin),
+            Some(TraceValueOrigin::Constant(TraceConstant::Int32(0))))
+    }
+
+    /// Sidecar inequality is checked only if two invariant operands have an
+    /// overlapping access family. On failure the *existing* access side exit
+    /// resumes the interpreter before the write (no unguarded llvm.assume).
+    /// No speculation for trace values varying across loop iterations.
+    fn observe_identity_access(
+        &mut self,
+        owner: TraceValueId,
+        entry: &V,
+        access: IdentityAccess,
+        writes: bool,
+        exit: SideExitId,
+    ) -> Result<(), String> {
+        let Some(root) = self.invariant_identity_root(owner) else { return Ok(()); };
+        self.entry_identity_roots.insert(entry.clone(), root);
+        let previous = self.seen_identity_accesses.get(&access).cloned().unwrap_or_default();
+        for seen in &previous {
+            if seen.root == root || self.identity_known_distinct(root, seen.root) {
+                continue;
+            }
+            if !self.speculative_noalias || !(writes || seen.writes)
+                || self.speculative_guards >= 8
+                || !self.trace_has_repeated_identity_access(root, seen.root, access)
+            {
+                continue;
+            }
+            // Sidecar addresses are unique for different *live* handles.
+            // Both operands have passed their heap-kind/liveness guards.
+            let equal = self.icmp("eq", entry, &seen.entry);
+            self.emit_side_exit(exit, &equal)?;
+            self.prove_distinct(root, seen.root);
+            self.speculative_guards += 1;
+        }
+        let seen = self.seen_identity_accesses.entry(access).or_default();
+        if let Some(old) = seen.iter_mut().find(|old| old.root == root) {
+            old.writes |= writes;
+        } else if seen.len() < 16 {
+            seen.push(SeenIdentityAccess { root, entry: entry.clone(), writes });
+        }
+        Ok(())
+    }
+
+    fn trace_has_repeated_identity_access(
+        &self,
+        a: TraceValueId,
+        b: TraceValueId,
+        access: IdentityAccess,
+    ) -> bool {
+        let mut a_count = 0;
+        let mut b_count = 0;
+        let mut any_write = false;
+        for node in &self.trace.nodes {
+            let item = match &node.kind {
+                TraceInst::HeapLoadField { object, slot, .. } => Some((*object, IdentityAccess::Instance(*slot), false)),
+                TraceInst::HeapStoreField { object, slot, .. } => Some((*object, IdentityAccess::Instance(*slot), true)),
+                TraceInst::HeapLoadCell { cell, .. } => Some((*cell, IdentityAccess::Cell, false)),
+                TraceInst::HeapStoreCell { cell, .. } => Some((*cell, IdentityAccess::Cell, true)),
+                TraceInst::HeapListGet { list, .. } => Some((*list, IdentityAccess::List, false)),
+                TraceInst::HeapListSet { list, .. } => Some((*list, IdentityAccess::List, true)),
+                TraceInst::HeapMapGetShaped { map, slot, .. } => Some((*map, IdentityAccess::ShapedMap(*slot), false)),
+                TraceInst::HeapMapSetShaped { map, slot, .. } => Some((*map, IdentityAccess::ShapedMap(*slot), true)),
+                TraceInst::HeapMapGetPic { map, entries, .. } => entries.first()
+                    .filter(|head| entries.iter().all(|item| item.slot == head.slot))
+                    .map(|head| (*map, IdentityAccess::ShapedMap(head.slot), false)),
+                _ => None,
+            };
+            let Some((owner, family, store)) = item else { continue; };
+            if access != family { continue; }
+            let Some(root) = self.invariant_identity_root(owner) else { continue; };
+            if root == a { a_count += 1; any_write |= store; }
+            if root == b { b_count += 1; any_write |= store; }
+        }
+        a_count >= 1 && b_count >= 1 && a_count + b_count >= 3 && any_write
+    }
+
+    /// Attach only scopes supported by dominating identity guards. An untagged
+    /// generic access retains ordinary LLVM aliasing with every object.
+    fn identity_access_metadata(&mut self, owner: TraceValueId) -> String {
+        let Some(root) = self.invariant_identity_root(owner) else { return String::new(); };
+        let mut alias = Vec::new();
+        let mut noalias = Vec::new();
+        for proof in self.identity_proofs.iter().rev() {
+            if proof.epoch != self.identity_epoch
+                || !self.active_identity_proofs.contains(&Self::identity_pair(proof.a, proof.b))
+            {
+                continue;
+            }
+            if root == proof.a {
+                alias.push(proof.a_scope);
+                noalias.push(proof.b_scope);
+            } else if root == proof.b {
+                alias.push(proof.b_scope);
+                noalias.push(proof.a_scope);
+            }
+        }
+        if alias.is_empty() { return String::new(); }
+        alias.sort_unstable();
+        noalias.sort_unstable();
+        let alias_id = self.next_tbaa;
+        let noalias_id = alias_id + 1;
+        self.next_tbaa += 2;
+        self.identity_metadata_lists.push((alias_id, alias));
+        self.identity_metadata_lists.push((noalias_id, noalias));
+        format!(", !alias.scope !{alias_id}, !noalias !{noalias_id}")
+    }
+
+    fn load_owned(&mut self, ty: Ty, ptr: &V, tag: u32, owner: TraceValueId) -> V {
+        let ptr = self.as_ptr(ptr);
+        let scope = self.identity_access_metadata(owner);
+        self.def(ty, &format!(
+            "load {}, ptr {}, align {}, !tbaa !{tag}{scope}",
+            ty.ir(), ptr.op, ty.align(),
+        ))
+    }
+
+    fn store_owned(&mut self, value: &V, ptr: &V, tag: u32, owner: TraceValueId) {
+        let ptr = self.as_ptr(ptr);
+        let scope = self.identity_access_metadata(owner);
+        self.line(&format!(
+            "store {} {}, ptr {}, align {}, !tbaa !{tag}{scope}",
+            value.ty.ir(), value.op, ptr.op, value.ty.align(),
+        ));
     }
 
     fn store_at(&mut self, value: &V, base: &V, offset: i64, mem: Mem) {
@@ -1891,13 +2175,26 @@ impl LlvmLowering<'_> {
         self.string_key_proofs.clear();
         self.forwarded_heap_loads.clear();
         self.forwarded_absolute_loads.clear();
+        self.identity_epoch = self.identity_epoch.wrapping_add(1);
+        self.active_identity_proofs.clear();
+        self.seen_identity_accesses.clear();
+        self.entry_identity_roots.clear();
+        self.speculative_guards = 0;
     }
 
     fn publish_heap_store(&mut self, location: Fwd, value: V) {
         // Precisely kill only locations which might overlap the stored word.
         // Same-kind, same-slot reads from other SSA object values are killed:
         // their handle identity has not been proven different.
-        self.forwarded_heap_loads.retain(|read, _| !read.may_alias(&location));
+        let writer_root = self.entry_identity_roots.get(location.entry()).copied();
+        let roots = &self.entry_identity_roots;
+        let distinct = &self.active_identity_proofs;
+        self.forwarded_heap_loads.retain(|read, _| {
+            if !read.may_alias(&location) { return true; }
+            let Some(writer) = writer_root else { return false; };
+            let Some(reader) = roots.get(read.entry()).copied() else { return false; };
+            distinct.contains(&Self::identity_pair(reader, writer))
+        });
         self.forwarded_heap_loads.insert(location, value);
         // An absolute address is arbitrary from the perspective of LLVM IR;
         // do not claim that it cannot refer to a mutated heap word.
@@ -2179,6 +2476,7 @@ impl LlvmLowering<'_> {
                 let falsey = self.tagged_falsey(&tagged);
                 let failure = self.not1(&falsey);
                 self.emit_side_exit(*exit, &failure)?;
+                self.prove_refeq_false(*value);
             }
 
             GuardNotNull { value, exit } => {
@@ -2236,6 +2534,8 @@ impl LlvmLowering<'_> {
                     self.icmp("ne", &lhs_value, &rhs_value)
                 };
                 self.emit_side_exit(*exit, &failure)?;
+                if self.is_i32_zero(*rhs) { self.prove_refeq_false(*lhs); }
+                if self.is_i32_zero(*lhs) { self.prove_refeq_false(*rhs); }
             }
 
             GuardSwitch { tag, observed, exit } => {
@@ -2252,6 +2552,7 @@ impl LlvmLowering<'_> {
                     TraceSwitchGuard::Case(0) if rep == TraceRep::Bool => {
                         let failure = self.cond(&tag_value);
                         self.emit_side_exit(*exit, &failure)?;
+                        self.prove_refeq_false(*tag);
                     }
                     TraceSwitchGuard::Case(1) if rep == TraceRep::Bool => {
                         let condition = self.cond(&tag_value);
@@ -2263,6 +2564,7 @@ impl LlvmLowering<'_> {
                             None => V { op: "true".to_owned(), ty: Ty::I1 },
                         };
                         self.emit_side_exit(*exit, &failure)?;
+                        if *case == 0 { self.prove_refeq_false(*tag); }
                     }
                     TraceSwitchGuard::Default { excluded } => {
                         let mut matches_any = V { op: "false".to_owned(), ty: Ty::I1 };
@@ -2273,6 +2575,9 @@ impl LlvmLowering<'_> {
                             }
                         }
                         self.emit_side_exit(*exit, &matches_any)?;
+                        if rep == TraceRep::Bool && excluded.contains(&1) {
+                            self.prove_refeq_false(*tag);
+                        }
                     }
                 }
             }
@@ -2578,6 +2883,7 @@ impl LlvmLowering<'_> {
                 let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(&entry);
                 self.guard_constant_index(&len, *slot, *exit)?;
+                self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), false, *exit)?;
                 let location = Fwd::Field { entry: entry.clone(), slot: *slot };
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
@@ -2586,7 +2892,7 @@ impl LlvmLowering<'_> {
                     let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
                     let tag = self.slot_tbaa(*slot, false);
-                    let value = self.load_slot(Ty::I64, &address, tag);
+                    let value = self.load_owned(Ty::I64, &address, tag, *object);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2602,20 +2908,22 @@ impl LlvmLowering<'_> {
                 let data = self.heap_entry_data(&entry);
                 let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
+                self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), true, *exit)?;
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
                 let tag = self.slot_tbaa(*slot, false);
-                self.store_slot(&tagged, &address, tag);
+                self.store_owned(&tagged, &address, tag, *object);
                 self.publish_heap_store(Fwd::Field { entry, slot: *slot }, tagged);
             }
 
             HeapLoadCell { cell, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
+                self.observe_identity_access(*cell, &entry, IdentityAccess::Cell, false, *exit)?;
                 let location = Fwd::Cell { entry: entry.clone() };
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
                 } else {
                     let data = self.heap_entry_data(&entry);
-                    let value = self.load(Ty::I64, &data, Mem::Cell);
+                    let value = self.load_owned(Ty::I64, &data, Mem::Cell.tag(), *cell);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2652,8 +2960,9 @@ impl LlvmLowering<'_> {
                 let tagged = self.word(&tagged);
                 let (entry, owner) = self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
                 let data = self.heap_entry_data(&entry);
+                self.observe_identity_access(*cell, &entry, IdentityAccess::Cell, true, *exit)?;
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &data, Mem::Cell);
+                self.store_owned(&tagged, &data, Mem::Cell.tag(), *cell);
                 self.publish_heap_store(Fwd::Cell { entry }, tagged);
             }
 
@@ -2687,13 +2996,14 @@ impl LlvmLowering<'_> {
             HeapListGet { list, index, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let index = self.validated_list_index(*list, *index, &entry, *exit)?;
+                self.observe_identity_access(*list, &entry, IdentityAccess::List, false, *exit)?;
                 let location = Fwd::Indexed { entry: entry.clone(), index: index.clone() };
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
                 } else {
                     let data = self.heap_entry_data(&entry);
                     let address = self.gep_words(&data, &index);
-                    let value = self.load(Ty::I64, &address, Mem::List);
+                    let value = self.load_owned(Ty::I64, &address, Mem::List.tag(), *list);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2718,8 +3028,9 @@ impl LlvmLowering<'_> {
                 let index = self.validated_list_index(*list, *index, &entry, *exit)?;
                 let data = self.heap_entry_data(&entry);
                 let address = self.gep_words(&data, &index);
+                self.observe_identity_access(*list, &entry, IdentityAccess::List, true, *exit)?;
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &address, Mem::List);
+                self.store_owned(&tagged, &address, Mem::List.tag(), *list);
                 self.publish_heap_store(Fwd::Indexed { entry, index }, tagged);
             }
 
@@ -2735,6 +3046,7 @@ impl LlvmLowering<'_> {
                 let (entry, owner, metadata) = self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_map_shape_once(*map, &metadata, *shape, *exit)?;
                 self.guard_string_bytes_once(*key, &tagged_key, expected_key, *exit)?;
+                self.observe_identity_access(*map, &entry, IdentityAccess::ShapedMap(*slot), false, *exit)?;
                 let location = Fwd::ShapedMap { entry: entry.clone(), slot: *slot };
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
@@ -2743,7 +3055,7 @@ impl LlvmLowering<'_> {
                     let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
                     let tag = self.slot_tbaa(*slot, true);
-                    let value = self.load_slot(Ty::I64, &address, tag);
+                    let value = self.load_owned(Ty::I64, &address, tag, *map);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2774,6 +3086,7 @@ impl LlvmLowering<'_> {
                 let miss = self.not1(&matched);
                 self.emit_side_exit(*exit, &miss)?;
                 let value = if let Some(slot) = uniform_slot {
+                    self.observe_identity_access(*map, &entry, IdentityAccess::ShapedMap(slot), false, *exit)?;
                     let location = Fwd::ShapedMap { entry: entry.clone(), slot };
                     if let Some(value) = self.forwarded_heap_loads.get(&location) {
                         value.clone()
@@ -2782,14 +3095,14 @@ impl LlvmLowering<'_> {
                         let index = self.vm_binding_word(VmBindingKind::DenseSlot, slot as u64)?;
                         let address = self.gep_words(&data, &index);
                         let tag = self.slot_tbaa(slot, true);
-                        let value = self.load_slot(Ty::I64, &address, tag);
+                        let value = self.load_owned(Ty::I64, &address, tag, *map);
                         self.forwarded_heap_loads.insert(location, value.clone());
                         value
                     }
                 } else {
                     let data = self.heap_entry_map_data(&entry, &owner);
                     let address = self.gep_words(&data, &selected);
-                    self.load(Ty::I64, &address, Mem::Map)
+                    self.load_owned(Ty::I64, &address, Mem::Map.tag(), *map)
                 };
                 self.cache_value(self.one_result(node)?, value);
             }
@@ -2804,9 +3117,10 @@ impl LlvmLowering<'_> {
                 let data = self.heap_entry_map_data(&entry, &owner);
                 let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
+                self.observe_identity_access(*map, &entry, IdentityAccess::ShapedMap(*slot), true, *exit)?;
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
                 let tag = self.slot_tbaa(*slot, true);
-                self.store_slot(&tagged, &address, tag);
+                self.store_owned(&tagged, &address, tag, *map);
                 self.publish_heap_store(Fwd::ShapedMap { entry, slot: *slot }, tagged);
             }
 
@@ -3033,6 +3347,7 @@ impl LlvmLowering<'_> {
     fn finish_module(self, symbol: &str, host: &HostInfo) -> String {
         let mut out = String::with_capacity(self.entry.len() + self.body.len() + 4096);
         let _ = writeln!(out, "; Napalm trace {:?} (LLVM tier)", self.trace.id);
+        let _ = writeln!(out, "; identity alias proof domains: {}", self.identity_proofs.len());
         let _ = writeln!(out, "source_filename = \"napalm\"");
         let _ = writeln!(out, "target datalayout = \"{}\"", host.data_layout);
         let _ = writeln!(out, "target triple = \"{}\"", host.triple);
@@ -3121,6 +3436,15 @@ impl LlvmLowering<'_> {
             let _ = writeln!(out, "!{} = !{{!\"napalm.{kind}.physical_slot.{slot}\", !{parent}, i64 0}}", tag - 1);
             let _ = writeln!(out, "!{tag} = !{{!{}, !{}, i64 0}}", tag - 1, tag - 1);
         }
+        for proof in &self.identity_proofs {
+            let _ = writeln!(out, "!{0} = distinct !{{!{0}, !\"napalm.identity.epoch\"}}", proof.domain);
+            let _ = writeln!(out, "!{0} = distinct !{{!{0}, !{1}, !\"napalm.identity.a\"}}", proof.a_scope, proof.domain);
+            let _ = writeln!(out, "!{0} = distinct !{{!{0}, !{1}, !\"napalm.identity.b\"}}", proof.b_scope, proof.domain);
+        }
+        for (id, scopes) in &self.identity_metadata_lists {
+            let members = scopes.iter().map(|id| format!("!{id}")).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(out, "!{id} = !{{{members}}}");
+        }
         out
     }
 }
@@ -3128,6 +3452,76 @@ impl LlvmLowering<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity_test_trace(with_guard: bool) -> Trace {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor {
+            kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)),
+        };
+        let mut builder = TraceBuilder::new(TraceId(12345), anchor);
+        let a = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let b = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Any, TraceRep::Tagged);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        if with_guard {
+            let equal = builder.emit1(
+                TraceInst::RefEq { lhs: a, rhs: b }, TraceType::Bool, TraceRep::Bool,
+            );
+            let when_true = builder.constant(TraceConstant::Bool(true));
+            let when_false = builder.constant(TraceConstant::Bool(false));
+            let tagged = builder.emit1(
+                TraceInst::Select { condition: equal, if_true: when_true, if_false: when_false },
+                TraceType::Bool, TraceRep::Tagged,
+            );
+            builder.emit0(TraceInst::GuardFalsey { value: tagged, exit });
+        }
+        builder.emit1(TraceInst::HeapLoadCell { cell: a, exit }, TraceType::Any, TraceRep::Tagged);
+        let null = builder.constant(TraceConstant::Null);
+        builder.emit0(TraceInst::HeapStoreCell { cell: b, value: null, exit });
+        builder.emit1(TraceInst::HeapLoadCell { cell: a, exit }, TraceType::Any, TraceRep::Tagged);
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        builder.finish().expect("identity trace is valid")
+    }
+
+    #[test]
+    fn existing_reference_inequality_guard_produces_noalias_metadata() {
+        let trace = identity_test_trace(true);
+        let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
+            .collect::<Vec<_>>();
+        let host = host_info().expect("LLVM host");
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "alias_guarded", host)
+            .expect("LLVM lowering with identity guards");
+        assert!(ir.contains("napalm.identity.epoch"), "{ir}");
+        assert!(ir.contains("!alias.scope !"), "{ir}");
+        assert!(ir.contains("!noalias !"), "{ir}");
+        let ctx = Context::create();
+        let module = ctx.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "alias_guarded"),
+        ).expect("valid generated LLVM IR");
+        module.verify().expect("valid metadata and CFG");
+    }
+
+    #[test]
+    fn speculative_identity_guard_is_safe_and_bounded() {
+        let trace = identity_test_trace(false);
+        let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
+            .collect::<Vec<_>>();
+        let host = host_info().expect("LLVM host");
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "alias_speculative", host)
+            .expect("LLVM lowering with speculative identity guards");
+        // Disabled mode remains available for A/B performance comparisons.
+        if std::env::var("NAPALM_LLVM_NOALIAS_GUARDS").ok().as_deref() == Some("0") {
+            assert!(!ir.contains("napalm.identity.epoch"));
+        } else {
+            assert!(ir.contains("napalm.identity.epoch"), "{ir}");
+            assert!(ir.contains("icmp eq ptr"), "{ir}");
+        }
+        let ctx = Context::create();
+        let module = ctx.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "alias_speculative"),
+        ).expect("valid generated LLVM IR");
+        module.verify().expect("valid speculative side exit and CFG");
+    }
 
     #[test]
     fn shape_aware_forwarding_only_invalidates_overlapping_locations() {
