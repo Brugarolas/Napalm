@@ -635,7 +635,13 @@ impl V {
     fn f64(value: f64) -> V { V::f64_bits(value.to_bits()) }
 }
 
-/// TBAA classes. Two accesses with different classes never touch the same bytes.
+/// Memory classes for Napalm's GC-managed, kind-discriminated payloads.
+///
+/// Broad Heap accesses (absolute VM values and profile counters) conservatively
+/// alias every payload class. Kind-specific children are safe only after a heap
+/// kind guard: a live object cannot simultaneously be a Map, List, Cell, etc.
+/// Physical map/instance slots receive narrower children under their respective
+/// kind (never under a specific shape ID, since shapes may transition).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mem {
     /// `TraceActivation` fields.
@@ -646,6 +652,16 @@ enum Mem {
     Sidecar,
     /// GC payload words, cells, VM Value slots and profile counters.
     Heap,
+    /// A shape-backed Map value (dynamic PIC slot).
+    Map,
+    /// A fixed-slot instance field (generic form).
+    Instance,
+    /// A List element (index may be dynamic).
+    List,
+    /// The payload word of a Cell.
+    Cell,
+    /// An immutable Closure capture word.
+    Capture,
     /// Immutable string bytes.
     Str,
     /// Per-trace VM relocation table (invariant for one native entry).
@@ -661,6 +677,11 @@ impl Mem {
             Mem::Reg => 12,
             Mem::Sidecar => 13,
             Mem::Heap => 14,
+            Mem::Map => 40,
+            Mem::Instance => 41,
+            Mem::List => 42,
+            Mem::Cell => 43,
+            Mem::Capture => 44,
             Mem::Str => 15,
             Mem::Binding => 16,
             Mem::Links => 17,
@@ -678,6 +699,26 @@ enum Fwd {
     Cell { entry: V },
     Indexed { entry: V, index: V },
     ShapedMap { entry: V, slot: u32 },
+}
+
+impl Fwd {
+    /// Determine whether a write can invalidate a forwarded load.
+    ///
+    /// Disjoint physical slots are distinct even when two different SSA values
+    /// happen to reference the same object. Distinct object *kinds* are likewise
+    /// disjoint, but distinct SSA entry pointers alone never prove distinctness.
+    /// The representation is valid only inside one runtime/GC epoch.
+    fn may_alias(&self, write: &Self) -> bool {
+        match (self, write) {
+            (Self::Field { slot: a, .. }, Self::Field { slot: b, .. })
+            | (Self::ShapedMap { slot: a, .. }, Self::ShapedMap { slot: b, .. }) => a == b,
+            (Self::Cell { .. }, Self::Cell { .. }) => true,
+            (Self::Indexed { .. }, Self::Indexed { .. }) => true,
+            // A heap kind guard proves distinct storage classes for the lifetime
+            // of the current epoch. All other pairs are different kinds.
+            _ => false,
+        }
+    }
 }
 
 struct LlvmLowering<'p> {
@@ -705,6 +746,11 @@ struct LlvmLowering<'p> {
     shared_constant_exit_blocks: HashMap<(u32, Option<V>), String>,
     forwarded_heap_loads: HashMap<Fwd, V>,
     forwarded_absolute_loads: HashMap<u64, V>,
+    /// Per-module TBAA leaves: two physical slots never overlap inside one
+    /// shaped Map/Instance, irrespective of the shape/class that selected them.
+    shaped_slot_tbaa: HashMap<u32, u32>,
+    instance_slot_tbaa: HashMap<u32, u32>,
+    next_tbaa: u32,
     vm_binding_slots: HashMap<VmBindingKey, u32>,
     vm_binding_values: HashMap<u32, V>,
     vm_bindings_base: Option<V>,
@@ -754,6 +800,9 @@ pub(super) fn lower_trace(
         shared_constant_exit_blocks: HashMap::default(),
         forwarded_heap_loads: HashMap::default(),
         forwarded_absolute_loads: HashMap::default(),
+        shaped_slot_tbaa: HashMap::default(),
+        instance_slot_tbaa: HashMap::default(),
+        next_tbaa: 100,
         vm_binding_slots,
         vm_binding_values: HashMap::default(),
         vm_bindings_base: None,
@@ -971,17 +1020,25 @@ impl LlvmLowering<'_> {
         self.def(Ty::Ptr, &format!("getelementptr i64, ptr {}, i64 {}", base.op, index.op))
     }
 
-    fn load_aligned(&mut self, ty: Ty, ptr: &V, mem: Mem, align: u32) -> V {
+    fn load_aligned_tagged(&mut self, ty: Ty, ptr: &V, tag: u32, align: u32, invariant: bool) -> V {
         let ptr = self.as_ptr(ptr);
-        let invariant = if mem == Mem::Binding { format!(", !invariant.load !{MD_EMPTY}") } else { String::new() };
+        let invariant = if invariant { format!(", !invariant.load !{MD_EMPTY}") } else { String::new() };
         self.def(
             ty,
-            &format!("load {}, ptr {}, align {align}, !tbaa !{}{invariant}", ty.ir(), ptr.op, mem.tag()),
+            &format!("load {}, ptr {}, align {align}, !tbaa !{tag}{invariant}", ty.ir(), ptr.op),
         )
+    }
+
+    fn load_aligned(&mut self, ty: Ty, ptr: &V, mem: Mem, align: u32) -> V {
+        self.load_aligned_tagged(ty, ptr, mem.tag(), align, mem == Mem::Binding)
     }
 
     fn load(&mut self, ty: Ty, ptr: &V, mem: Mem) -> V {
         self.load_aligned(ty, ptr, mem, ty.align())
+    }
+
+    fn load_slot(&mut self, ty: Ty, ptr: &V, tag: u32) -> V {
+        self.load_aligned_tagged(ty, ptr, tag, ty.align(), false)
     }
 
     fn load_at(&mut self, ty: Ty, base: &V, offset: i64, mem: Mem) -> V {
@@ -989,16 +1046,42 @@ impl LlvmLowering<'_> {
         self.load(ty, &ptr, mem)
     }
 
-    fn store(&mut self, value: &V, ptr: &V, mem: Mem) {
+    fn store_tagged(&mut self, value: &V, ptr: &V, tag: u32) {
         let ptr = self.as_ptr(ptr);
         self.line(&format!(
-            "store {} {}, ptr {}, align {}, !tbaa !{}",
-            value.ty.ir(),
-            value.op,
-            ptr.op,
-            value.ty.align(),
-            mem.tag()
+            "store {} {}, ptr {}, align {}, !tbaa !{tag}",
+            value.ty.ir(), value.op, ptr.op, value.ty.align(),
         ));
+    }
+
+    fn store(&mut self, value: &V, ptr: &V, mem: Mem) {
+        self.store_tagged(value, ptr, mem.tag());
+    }
+
+    fn store_slot(&mut self, value: &V, ptr: &V, tag: u32) {
+        self.store_tagged(value, ptr, tag);
+    }
+
+    /// A shape guard proves a *physical* slot, not a globally unique property
+    /// name. Use the slot number to define the alias class: two different
+    /// shapes can put different keys at the same physical address.
+    fn slot_tbaa(&mut self, slot: u32, shaped_map: bool) -> u32 {
+        let existing = if shaped_map {
+            self.shaped_slot_tbaa.get(&slot)
+        } else {
+            self.instance_slot_tbaa.get(&slot)
+        };
+        if let Some(&tag) = existing {
+            return tag;
+        }
+        let tag = self.next_tbaa + 1;
+        self.next_tbaa += 2;
+        if shaped_map {
+            self.shaped_slot_tbaa.insert(slot, tag);
+        } else {
+            self.instance_slot_tbaa.insert(slot, tag);
+        }
+        tag
     }
 
     fn store_at(&mut self, value: &V, base: &V, offset: i64, mem: Mem) {
@@ -1811,8 +1894,14 @@ impl LlvmLowering<'_> {
     }
 
     fn publish_heap_store(&mut self, location: Fwd, value: V) {
-        self.forwarded_heap_loads.clear();
+        // Precisely kill only locations which might overlap the stored word.
+        // Same-kind, same-slot reads from other SSA object values are killed:
+        // their handle identity has not been proven different.
+        self.forwarded_heap_loads.retain(|read, _| !read.may_alias(&location));
         self.forwarded_heap_loads.insert(location, value);
+        // An absolute address is arbitrary from the perspective of LLVM IR;
+        // do not claim that it cannot refer to a mutated heap word.
+        self.forwarded_absolute_loads.clear();
     }
 
     fn call_heap_barrier(&mut self, owner: &V) {
@@ -1985,6 +2074,9 @@ impl LlvmLowering<'_> {
                 let value = self.word(&value);
                 let pointer = self.vm_binding_word(VmBindingKind::ValueAddress, *address)?;
                 self.store(&value, &pointer, Mem::Heap);
+                // VM addresses are not a heap-kind proof. Stay conservative.
+                self.forwarded_heap_loads.clear();
+                self.forwarded_absolute_loads.clear();
                 self.forwarded_absolute_loads.insert(*address, value);
             }
 
@@ -1995,6 +2087,8 @@ impl LlvmLowering<'_> {
                 let incremented = self.bin("add", &current, &V::i64(1));
                 let next = self.select(&saturated, &current, &incremented);
                 self.store(&next, &pointer, Mem::Heap);
+                self.forwarded_heap_loads.clear();
+                self.forwarded_absolute_loads.clear();
             }
 
             IsInstanceObserved { value, class, expected_class, instance_classes, known_classes, exit } => {
@@ -2491,7 +2585,8 @@ impl LlvmLowering<'_> {
                     let data = self.heap_entry_data(&entry);
                     let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
-                    let value = self.load(Ty::I64, &address, Mem::Heap);
+                    let tag = self.slot_tbaa(*slot, false);
+                    let value = self.load_slot(Ty::I64, &address, tag);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2508,7 +2603,8 @@ impl LlvmLowering<'_> {
                 let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &address, Mem::Heap);
+                let tag = self.slot_tbaa(*slot, false);
+                self.store_slot(&tagged, &address, tag);
                 self.publish_heap_store(Fwd::Field { entry, slot: *slot }, tagged);
             }
 
@@ -2519,7 +2615,7 @@ impl LlvmLowering<'_> {
                     value.clone()
                 } else {
                     let data = self.heap_entry_data(&entry);
-                    let value = self.load(Ty::I64, &data, Mem::Heap);
+                    let value = self.load(Ty::I64, &data, Mem::Cell);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2545,9 +2641,9 @@ impl LlvmLowering<'_> {
                 let out_of_range = self.icmp("ule", &count, &V::i32(*index as i32));
                 self.emit_side_exit(*exit, &out_of_range)?;
                 let captures = self.heap_entry_data(&entry);
-                // Capture words are VM Value words: TBAA heap class.
+                // Captures are immutable after allocation, in a Closure-only payload.
                 let slot = self.gep8(&captures, *index as i64 * 8);
-                let value = self.load(Ty::I64, &slot, Mem::Heap);
+                let value = self.load(Ty::I64, &slot, Mem::Capture);
                 self.cache_value(self.one_result(node)?, value);
             }
 
@@ -2557,7 +2653,7 @@ impl LlvmLowering<'_> {
                 let (entry, owner) = self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
                 let data = self.heap_entry_data(&entry);
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &data, Mem::Heap);
+                self.store(&tagged, &data, Mem::Cell);
                 self.publish_heap_store(Fwd::Cell { entry }, tagged);
             }
 
@@ -2597,7 +2693,7 @@ impl LlvmLowering<'_> {
                 } else {
                     let data = self.heap_entry_data(&entry);
                     let address = self.gep_words(&data, &index);
-                    let value = self.load(Ty::I64, &address, Mem::Heap);
+                    let value = self.load(Ty::I64, &address, Mem::List);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2623,7 +2719,7 @@ impl LlvmLowering<'_> {
                 let data = self.heap_entry_data(&entry);
                 let address = self.gep_words(&data, &index);
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &address, Mem::Heap);
+                self.store(&tagged, &address, Mem::List);
                 self.publish_heap_store(Fwd::Indexed { entry, index }, tagged);
             }
 
@@ -2646,7 +2742,8 @@ impl LlvmLowering<'_> {
                     let data = self.heap_entry_map_data(&entry, &owner);
                     let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
-                    let value = self.load(Ty::I64, &address, Mem::Heap);
+                    let tag = self.slot_tbaa(*slot, true);
+                    let value = self.load_slot(Ty::I64, &address, tag);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
                 };
@@ -2658,20 +2755,42 @@ impl LlvmLowering<'_> {
                 let (entry, owner, metadata) = self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_string_bytes_once(*key, &tagged_key, expected_key, *exit)?;
                 let shape = self.heap_metadata_payload(&metadata);
+                // Family members may have different shapes but the *same*
+                // physical offset. In that common case avoid a per-alternative
+                // slot select and use exact shaped-slot TBAA/forwarding instead.
+                let uniform_slot = entries.first().map(|first| first.slot)
+                    .filter(|&slot| entries.iter().all(|candidate| candidate.slot == slot));
                 let mut matched = V { op: "false".to_owned(), ty: Ty::I1 };
                 let mut selected = V::i64(0);
                 for candidate in entries {
                     let expected_shape = self.vm_binding_i32(VmBindingKind::ShapeId, candidate.shape)?;
                     let is_shape = self.icmp("eq", &shape, &expected_shape);
                     matched = self.or1(&matched, &is_shape);
-                    let slot = self.vm_binding_word(VmBindingKind::DenseSlot, candidate.slot as u64)?;
-                    selected = self.select(&is_shape, &slot, &selected);
+                    if uniform_slot.is_none() {
+                        let slot = self.vm_binding_word(VmBindingKind::DenseSlot, candidate.slot as u64)?;
+                        selected = self.select(&is_shape, &slot, &selected);
+                    }
                 }
                 let miss = self.not1(&matched);
                 self.emit_side_exit(*exit, &miss)?;
-                let data = self.heap_entry_map_data(&entry, &owner);
-                let address = self.gep_words(&data, &selected);
-                let value = self.load(Ty::I64, &address, Mem::Heap);
+                let value = if let Some(slot) = uniform_slot {
+                    let location = Fwd::ShapedMap { entry: entry.clone(), slot };
+                    if let Some(value) = self.forwarded_heap_loads.get(&location) {
+                        value.clone()
+                    } else {
+                        let data = self.heap_entry_map_data(&entry, &owner);
+                        let index = self.vm_binding_word(VmBindingKind::DenseSlot, slot as u64)?;
+                        let address = self.gep_words(&data, &index);
+                        let tag = self.slot_tbaa(slot, true);
+                        let value = self.load_slot(Ty::I64, &address, tag);
+                        self.forwarded_heap_loads.insert(location, value.clone());
+                        value
+                    }
+                } else {
+                    let data = self.heap_entry_map_data(&entry, &owner);
+                    let address = self.gep_words(&data, &selected);
+                    self.load(Ty::I64, &address, Mem::Map)
+                };
                 self.cache_value(self.one_result(node)?, value);
             }
 
@@ -2686,7 +2805,8 @@ impl LlvmLowering<'_> {
                 let index = self.vm_binding_word(VmBindingKind::DenseSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
-                self.store(&tagged, &address, Mem::Heap);
+                let tag = self.slot_tbaa(*slot, true);
+                self.store_slot(&tagged, &address, tag);
                 self.publish_heap_store(Fwd::ShapedMap { entry, slot: *slot }, tagged);
             }
 
@@ -2966,6 +3086,13 @@ impl LlvmLowering<'_> {
             "!5 = !{!\"napalm.str\", !0, i64 0}\n",
             "!6 = !{!\"napalm.binding\", !0, i64 0}\n",
             "!7 = !{!\"napalm.links\", !0, i64 0}\n",
+            // A broad heap access can alias *all* descendants. Kind guards
+            // permit narrower sibling tags for disjoint payload families.
+            "!30 = !{!\"napalm.heap.map\", !4, i64 0}\n",
+            "!31 = !{!\"napalm.heap.instance\", !4, i64 0}\n",
+            "!32 = !{!\"napalm.heap.list\", !4, i64 0}\n",
+            "!33 = !{!\"napalm.heap.cell\", !4, i64 0}\n",
+            "!34 = !{!\"napalm.heap.capture\", !4, i64 0}\n",
             "!11 = !{!1, !1, i64 0}\n",
             "!12 = !{!2, !2, i64 0}\n",
             "!13 = !{!3, !3, i64 0}\n",
@@ -2973,10 +3100,27 @@ impl LlvmLowering<'_> {
             "!15 = !{!5, !5, i64 0}\n",
             "!16 = !{!6, !6, i64 0}\n",
             "!17 = !{!7, !7, i64 0}\n",
+            "!40 = !{!30, !30, i64 0}\n",
+            "!41 = !{!31, !31, i64 0}\n",
+            "!42 = !{!32, !32, i64 0}\n",
+            "!43 = !{!33, !33, i64 0}\n",
+            "!44 = !{!34, !34, i64 0}\n",
             "!20 = !{!\"branch_weights\", i32 1, i32 2000000}\n",
             "!21 = !{!\"branch_weights\", i32 2000000, i32 1}\n",
             "!22 = !{}\n",
         ));
+        // Keep metadata numbering unique even when both payload families
+        // happen to use the same physical offset. Emit in stable ID order.
+        let mut leaves = self.shaped_slot_tbaa.into_iter()
+            .map(|(slot, tag)| (slot, tag, 30u32, "shaped"))
+            .chain(self.instance_slot_tbaa.into_iter()
+                .map(|(slot, tag)| (slot, tag, 31u32, "instance")))
+            .collect::<Vec<_>>();
+        leaves.sort_unstable_by_key(|&(_, tag, _, _)| tag);
+        for (slot, tag, parent, kind) in leaves {
+            let _ = writeln!(out, "!{} = !{{!\"napalm.{kind}.physical_slot.{slot}\", !{parent}, i64 0}}", tag - 1);
+            let _ = writeln!(out, "!{tag} = !{{!{}, !{}, i64 0}}", tag - 1, tag - 1);
+        }
         out
     }
 }
@@ -2984,6 +3128,79 @@ impl LlvmLowering<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shape_aware_forwarding_only_invalidates_overlapping_locations() {
+        let a = V { op: "%a".into(), ty: Ty::Ptr };
+        let b = V { op: "%b".into(), ty: Ty::Ptr };
+
+        let map0 = Fwd::ShapedMap { entry: a.clone(), slot: 0 };
+        let map1 = Fwd::ShapedMap { entry: a.clone(), slot: 1 };
+        let map0_other = Fwd::ShapedMap { entry: b.clone(), slot: 0 };
+        let instance0 = Fwd::Field { entry: a.clone(), slot: 0 };
+        let instance1 = Fwd::Field { entry: b.clone(), slot: 1 };
+        let cell = Fwd::Cell { entry: a.clone() };
+        let list = Fwd::Indexed { entry: a.clone(), index: V::i64(0) };
+
+        // A common physical slot can be reached through different SSA handles;
+        // do not infer object nonaliasing from different SSA names.
+        assert!(map0.may_alias(&map0_other));
+        assert!(instance0.may_alias(&Fwd::Field { entry: b.clone(), slot: 0 }));
+        assert!(cell.may_alias(&Fwd::Cell { entry: b.clone() }));
+        assert!(list.may_alias(&Fwd::Indexed { entry: b, index: V::i64(1) }));
+
+        // Distinct physical offsets and guarded object kinds cannot alias.
+        assert!(!map0.may_alias(&map1));
+        assert!(!instance0.may_alias(&instance1));
+        assert!(!map0.may_alias(&instance0));
+        assert!(!map0.may_alias(&cell));
+        assert!(!map0.may_alias(&list));
+    }
+
+    #[test]
+    fn tbaa_shape_slots_enable_gvn_without_disabling_generic_heap_aliasing() {
+        let host = host_info().expect("LLVM host");
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context = Context::create();
+        let input = r#"
+            define i64 @specific(ptr %a, ptr %b) {
+            entry:
+                %x = load i64, ptr %a, align 8, !tbaa !101
+                store i64 17, ptr %b, align 8, !tbaa !103
+                %y = load i64, ptr %a, align 8, !tbaa !101
+                %r = add i64 %x, %y
+                ret i64 %r
+            }
+            define i64 @generic(ptr %a, ptr %b) {
+            entry:
+                %x = load i64, ptr %a, align 8, !tbaa !101
+                store i64 17, ptr %b, align 8, !tbaa !14
+                %y = load i64, ptr %a, align 8, !tbaa !101
+                %r = add i64 %x, %y
+                ret i64 %r
+            }
+            !0 = !{!"napalm.tbaa"}
+            !4 = !{!"napalm.heap", !0, i64 0}
+            !14 = !{!4, !4, i64 0}
+            !30 = !{!"napalm.heap.map", !4, i64 0}
+            !100 = !{!"napalm.shaped.physical_slot.0", !30, i64 0}
+            !101 = !{!100, !100, i64 0}
+            !102 = !{!"napalm.shaped.physical_slot.1", !30, i64 0}
+            !103 = !{!102, !102, i64 0}
+        "#;
+        let buffer = MemoryBuffer::create_from_memory_range_copy(input.as_bytes(), "alias-analysis-test");
+        let module = context.create_module_from_ir(buffer).expect("LLVM parsed test IR");
+        module.verify().expect("valid LLVM TBAA metadata");
+        let options = PassBuilderOptions::create();
+        module.run_passes("default<O3>", &machine, options).expect("LLVM O3 pipeline");
+        let optimized = module.print_to_string().to_string();
+        let specific = optimized.split(" @specific(").nth(1).expect("specific function")
+            .split('}').next().expect("end of specific function");
+        let generic = optimized.split(" @generic(").nth(1).expect("generic function")
+            .split('}').next().expect("end of generic function");
+        assert_eq!(specific.matches("load i64, ptr %a").count(), 1, "{specific}");
+        assert_eq!(generic.matches("load i64, ptr %a").count(), 2, "{generic}");
+    }
 
     #[test]
     fn remainder_by_one_is_exact_with_signed_zero_and_nonfinite_values() {
