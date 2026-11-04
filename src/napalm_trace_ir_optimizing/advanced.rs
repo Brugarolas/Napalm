@@ -540,12 +540,15 @@ enum Memory {
     Map(TraceValueId, TraceValueId, Vec<u8>, u32, u32),
     MapPic(TraceValueId, TraceValueId, Vec<u8>, Vec<TraceShapeSlot>),
     StringLen(TraceValueId),
+    /// Immutable closure capture array slot.
+    Capture(TraceValueId, u16),
 }
 fn load(kind: &TraceInst, rep: TraceRep) -> Option<Memory> {
     Some(match kind {
         TraceInst::LoadFrameSlot { slot } => Memory::Frame(*slot, rep),
         TraceInst::HeapLoadField { object, slot, .. } => Memory::Field(*object, *slot),
         TraceInst::HeapLoadCell { cell, .. } => Memory::Cell(*cell),
+        TraceInst::ClosureCapture { closure, index, .. } => Memory::Capture(*closure, *index),
         TraceInst::HeapListLen { list, .. } => Memory::ListLen(*list),
         TraceInst::HeapListGet { list, index, .. } => Memory::List(*list, *index),
         TraceInst::HeapMapLen { map, .. } => Memory::MapLen(*map),
@@ -589,6 +592,8 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
     match (store, cached) {
         (Memory::Frame(lhs, _), Memory::Frame(rhs, _)) => lhs == rhs,
         (Memory::Frame(..), _) | (_, Memory::Frame(..)) => false,
+        // Capture arrays are immutable after closure creation.
+        (_, Memory::Capture(..)) => false,
 
         (Memory::Field(_, store_slot), Memory::Field(_, slot)) => {
             // Distinct SSA object values are not a no-alias proof: two values may
@@ -630,7 +635,8 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
         (Memory::ListLen(_), _)
         | (Memory::MapLen(_), _)
         | (Memory::MapPic(..), _)
-        | (Memory::StringLen(_), _) => false,
+        | (Memory::StringLen(_), _)
+        | (Memory::Capture(..), _) => false,
     }
 }
 

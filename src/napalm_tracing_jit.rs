@@ -2533,6 +2533,23 @@ impl<'a> TraceRecorder<'a> {
         // closure direct-call ABI. The method-epoch guard preserves rebinding
         // semantics; closure kind/function guards preserve the dynamic callee.
         if op.opcode == Opcode::Invoke {
+            // First choice: inline the closure body (captures included), which
+            // removes the native -> runtime -> callee frame round trip entirely.
+            let inline_checkpoint = builder.clone();
+            if !runtime.trace_reactive_tracking_active() {
+                match self.inline_closure_call(runtime, program, op, builder) {
+                    Ok(step) => return Ok(step),
+                    Err(
+                        RecordingAbort::UnsupportedCall
+                        | RecordingAbort::UnsupportedOpcode(_)
+                        | RecordingAbort::UnsupportedConstant
+                        | RecordingAbort::RepresentationConflict,
+                    ) => {
+                        *builder = inline_checkpoint;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let closure_checkpoint = builder.clone();
             match self.direct_invoke_closure_call(runtime, program, op, builder) {
                 Ok(step) => return Ok(step),
@@ -6871,6 +6888,9 @@ fn collect_vm_bindings(
                 for &class in classes { add(VmBindingKind::ClassKey, class); }
             }
             GuardMethodEpoch { expected, .. } => add(VmBindingKind::MethodEpoch, *expected),
+            GuardClosure { function_index, .. } => {
+                add(VmBindingKind::PreparedFunctionIndex, *function_index as u64)
+            }
             HeapLoadField { slot, .. } | HeapStoreField { slot, .. } => {
                 add(VmBindingKind::FieldSlot, *slot as u64)
             }
@@ -9874,6 +9894,40 @@ impl CraneliftLoweringState<'_, '_> {
                     value
                 };
                 self.cache_value(one_result(node)?, result);
+            }
+
+            GuardClosure { value, function_index, capture_count, exit } => {
+                // Closure function identity and capture count are immutable and
+                // published in the stable sidecar (len / metadata payload).
+                let (entry, _, metadata) =
+                    self.heap_entry_with_metadata_for_value(*value, TraceHeapKind::Closure, *exit)?;
+                let actual = self.heap_entry_len(entry);
+                let expected = self.vm_binding_word(VmBindingKind::PreparedFunctionIndex, *function_index as u64)?;
+                let wrong_function = self.builder.ins().icmp(IntCC::NotEqual, actual, expected);
+                self.emit_side_exit(*exit, wrong_function)?;
+                let count = self.heap_metadata_payload(metadata);
+                let wrong_count = self.builder.ins().icmp_imm_u(IntCC::NotEqual, count, *capture_count as i64);
+                self.emit_side_exit(*exit, wrong_count)?;
+            }
+
+            ClosureCapture { closure, index, exit } => {
+                let (entry, _, metadata) =
+                    self.heap_entry_with_metadata_for_value(*closure, TraceHeapKind::Closure, *exit)?;
+                let count = self.heap_metadata_payload(metadata);
+                let out_of_range = self.builder.ins().icmp_imm_u(
+                    IntCC::UnsignedLessThanOrEqual,
+                    count,
+                    *index as i64,
+                );
+                self.emit_side_exit(*exit, out_of_range)?;
+                let captures = self.heap_entry_data(entry);
+                let value = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    captures,
+                    (*index as i32) * std::mem::size_of::<RegisterWord>() as i32,
+                );
+                self.cache_value(one_result(node)?, value);
             }
 
             HeapStoreCell { cell, value, exit } => {

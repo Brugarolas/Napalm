@@ -19381,6 +19381,59 @@ return result
     }
 
     #[test]
+    fn trace_inlines_closures_with_captured_cells() {
+        let source = r#"
+class Closures {
+  static run() {
+    var a = 0
+    var b = 1
+    var k = 3
+    var step = Fn.new { |x|
+      a = a + x * k
+      b = b + a
+    }
+    var shared = 0
+    var inc = Fn.new { shared = shared + 1 }
+    var dbl = Fn.new { shared = shared * 2 % 1000003 }
+    var i = 0
+    while (i < 300) {
+      step.call(i)
+      inc.call()
+      dbl.call()
+      i = i + 1
+    }
+    return a + b + shared
+  }
+}
+var result = Closures.run()
+"#;
+        let (mut a, mut b, mut shared) = (0.0f64, 1.0f64, 0.0f64);
+        for i in 0..300 {
+            a += i as f64 * 3.0;
+            b += a;
+            shared += 1.0;
+            shared = (shared * 2.0) % 1000003.0;
+        }
+        let expected = a + b + shared;
+
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
+            if jit_enabled {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.inlined_calls >= 3 && stats.native_entries > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
     fn trace_inlines_invoke_spread_at_observed_arity() {
         let source = r#"
 class Box {

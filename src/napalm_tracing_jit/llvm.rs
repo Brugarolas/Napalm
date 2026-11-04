@@ -2526,6 +2526,31 @@ impl LlvmLowering<'_> {
                 self.cache_value(self.one_result(node)?, result);
             }
 
+            GuardClosure { value, function_index, capture_count, exit } => {
+                let (entry, _, metadata) =
+                    self.heap_entry_with_metadata_for_value(*value, TraceHeapKind::Closure, *exit)?;
+                let actual = self.heap_entry_len(&entry);
+                let expected = self.vm_binding_word(VmBindingKind::PreparedFunctionIndex, *function_index as u64)?;
+                let wrong_function = self.icmp("ne", &actual, &expected);
+                self.emit_side_exit(*exit, &wrong_function)?;
+                let count = self.heap_metadata_payload(&metadata);
+                let wrong_count = self.icmp("ne", &count, &V::i32(*capture_count as i32));
+                self.emit_side_exit(*exit, &wrong_count)?;
+            }
+
+            ClosureCapture { closure, index, exit } => {
+                let (entry, _, metadata) =
+                    self.heap_entry_with_metadata_for_value(*closure, TraceHeapKind::Closure, *exit)?;
+                let count = self.heap_metadata_payload(&metadata);
+                let out_of_range = self.icmp("ule", &count, &V::i32(*index as i32));
+                self.emit_side_exit(*exit, &out_of_range)?;
+                let captures = self.heap_entry_data(&entry);
+                // Capture words are VM Value words: TBAA heap class.
+                let slot = self.gep8(&captures, *index as i64 * 8);
+                let value = self.load(Ty::I64, &slot, Mem::Heap);
+                self.cache_value(self.one_result(node)?, value);
+            }
+
             HeapStoreCell { cell, value, exit } => {
                 let tagged = self.lower_value(*value)?;
                 let tagged = self.word(&tagged);

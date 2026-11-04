@@ -207,6 +207,15 @@ pub enum TraceInst {
     HeapLoadField { object: TraceValueId, slot: u32, exit: SideExitId },
     HeapStoreField { object: TraceValueId, value: TraceValueId, slot: u32, exit: SideExitId },
     HeapLoadCell { cell: TraceValueId, exit: SideExitId },
+    /// Prove a Closure of one immutable prepared function with exactly
+    /// `capture_count` captures (no result). Used by closure inlining; a
+    /// mismatch replays the original call.
+    GuardClosure { value: TraceValueId, function_index: u32, capture_count: u16, exit: SideExitId },
+    /// Read capture `index` of a Closure. The backend validates Closure kind and
+    /// `index < capture count` itself, so the read stays safe if it is hoisted
+    /// above GuardClosure. Capture arrays are immutable; mutable captured
+    /// variables are Cells, accessed through HeapLoadCell/HeapStoreCell.
+    ClosureCapture { closure: TraceValueId, index: u16, exit: SideExitId },
     HeapStoreCell { cell: TraceValueId, value: TraceValueId, exit: SideExitId },
     /// Explicit GC post-barrier. Non-heap values are a native no-op; a heap value
     /// validates the owner handle before invoking the non-allocating barrier.
@@ -279,6 +288,8 @@ impl TraceInst {
             | StoreAbsoluteValue { value, .. }
             | HeapLoadField { object: value, .. }
             | HeapLoadCell { cell: value, .. }
+            | GuardClosure { value, .. }
+            | ClosureCapture { closure: value, .. }
             | HeapListLen { list: value, .. }
             | HeapMapLen { map: value, .. }
             | HeapStringLen { string: value, .. }
@@ -331,6 +342,7 @@ impl TraceInst {
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
+            | GuardClosure { exit, .. } | ClosureCapture { exit, .. }
             | HeapWriteBarrier { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
@@ -349,11 +361,12 @@ impl TraceInst {
             | Self::GuardNotNull { .. } | Self::GuardType { .. } | Self::GuardClass { .. }
             | Self::GuardBounds { .. } | Self::GuardEq { .. } | Self::GuardSwitch { .. }
             | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. }
-            | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. })
+            | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. }
+            | Self::GuardClosure { .. })
     }
 
     pub fn is_heap_read(&self) -> bool {
-        matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. }
+        matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. } | Self::ClosureCapture { .. }
             | Self::HeapListLen { .. } | Self::HeapListGet { .. }
             | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. } | Self::HeapMapGetPic { .. }
             | Self::HeapStringLen { .. } | Self::HeapStringAsciiCodePointAt { .. }
@@ -372,6 +385,7 @@ impl TraceInst {
             | GuardEq { exit, .. } | GuardSwitch { exit, .. }
             | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. } | IsInstanceObserved { exit, .. }
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
+            | GuardClosure { exit, .. } | ClosureCapture { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
