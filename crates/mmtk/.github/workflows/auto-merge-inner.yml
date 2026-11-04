@@ -1,0 +1,135 @@
+name: Merge Binding PR
+
+on:
+  workflow_call:
+    inputs:
+      # The repository from which the binding PR is submitted, such as qinsoon/mmtk-openjdk
+      repo:
+        required: true
+        type: string
+      # The upstream repository where the binding PR is opened, such as mmtk/mmtk-openjdk
+      base_repo:
+        required: true
+        type: string
+      # The checkout ref, with branches qualified under refs/heads/.
+      ref:
+        required: true
+        type: string
+      # The upstream branch where the binding PR is targeting, such as master, dev
+      base_ref:
+        required: true
+        type: string
+      # The core commit hash that the binding should be using.
+      core_commit:
+        required: true
+        type: string
+      # the command line to update lock file once we update Cargo.toml
+      update_lockfile:
+        required: true
+        type: string
+    secrets:
+      CI_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    cache-mode: none
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.prepare.outputs.skip }}
+      branch: ${{ steps.prepare.outputs.branch }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+      artifact_name: ${{ steps.prepare.outputs.artifact_name }}
+    steps:
+      # github.sha belongs to the caller; only trust helpers from core master pushes.
+      - name: Check caller context
+        run: |
+          test "$GITHUB_REPOSITORY" = mmtk/mmtk-core
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/master
+      - name: Checkout workflow helpers
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          persist-credentials: false
+      - name: Resolve binding pull request
+        id: prepare
+        uses: actions/github-script@v7
+        env:
+          BINDING_REPO: ${{ inputs.repo }}
+          BINDING_REF: ${{ inputs.ref }}
+          BASE_REPO: ${{ inputs.base_repo }}
+          BASE_REF: ${{ inputs.base_ref }}
+          CORE_COMMIT: ${{ inputs.core_commit }}
+          UPDATE_LOCKFILE: ${{ inputs.update_lockfile }}
+        with:
+          script: |
+            await require('./workflow/.github/scripts/auto-merge.cjs').prepare({github, context, core});
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false'
+    cache-mode: read
+    permissions:
+      contents: read
+    # No secrets are forwarded to the nested build workflow.
+    uses: ./.github/workflows/auto-merge-build.yml
+    with:
+      repo: ${{ inputs.repo }}
+      head_sha: ${{ needs.prepare.outputs.head_sha }}
+      core_commit: ${{ inputs.core_commit }}
+      update_lockfile: ${{ inputs.update_lockfile }}
+      artifact_name: ${{ needs.prepare.outputs.artifact_name }}
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    cache-mode: none
+    env:
+      BINDING_REPO: ${{ inputs.repo }}
+      BINDING_BRANCH: ${{ needs.prepare.outputs.branch }}
+      BASE_REPO: ${{ inputs.base_repo }}
+      BASE_REF: ${{ inputs.base_ref }}
+      CORE_COMMIT: ${{ inputs.core_commit }}
+      HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+      PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+      ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact_name }}
+    steps:
+      # Never restore the build workspace or execute files supplied by the binding or artifact.
+      - name: Checkout workflow helpers
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          persist-credentials: false
+      - name: Download metadata for validation
+        id: download
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./workflow/.github/scripts/auto-merge.cjs').download({github, context, core});
+      - name: Validate dependency update
+        env:
+          UPDATE_DIRECTORY: ${{ steps.download.outputs.directory }}
+        run: |
+          python3 -I workflow/.github/scripts/validate-binding-update.py "$UPDATE_DIRECTORY"
+
+      - name: Commit update and enable auto-merge
+        uses: actions/github-script@v7
+        env:
+          UPDATE_DIRECTORY: ${{ steps.download.outputs.directory }}
+        with:
+          github-token: ${{ secrets.CI_ACCESS_TOKEN }}
+          script: |
+            await require('./workflow/.github/scripts/auto-merge.cjs').publish({github, core});

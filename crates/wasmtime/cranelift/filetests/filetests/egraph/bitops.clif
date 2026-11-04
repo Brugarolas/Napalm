@@ -1,0 +1,3326 @@
+test optimize
+set opt_level=speed
+target x86_64
+
+function %or_and_y_with_not_y_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = band v0, v1
+    v3 = bnot v1
+    v4 = bor v2, v3
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_constant_with_not_constant_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -4
+    v2 = band v0, v1
+    v3 = iconst.i8 3
+    v4 = bor v2, v3
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_y_with_not_y_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = band v0, v1
+    v3 = bnot v1
+    v4 = bor v3, v2
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_constant_with_not_constant_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -4
+    v2 = band v0, v1
+    v3 = iconst.i8 3
+    v4 = bor v3, v2
+    return v4
+    ; check: v6 = bor v0, v3
+    ; check: return v6
+}
+
+function %or_and_constant_with_any_constant_should_not_apply_rule_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -4
+    v2 = band v0, v1
+    ;; `v3` is not `bnot(v1)` so the rewrite should not apply.
+    v3 = iconst.i8 -5
+    v4 = bor v2, v3
+    return v4
+    ; check: return v4
+}
+
+function %or_and_y_with_not_y_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = band v0, v1
+    v3 = bnot v1
+    v4 = bor v2, v3
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_constant_with_not_constant_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -4
+    v2 = band v0, v1
+    v3 = iconst.i64 3
+    v4 = bor v2, v3
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_y_with_not_y_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = band v0, v1
+    v3 = bnot v1
+    v4 = bor v3, v2
+    return v4
+    ; check: v5 = bor v0, v3
+    ; check: return v5
+}
+
+function %or_and_constant_with_not_constant_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -4
+    v2 = band v0, v1
+    v3 = iconst.i64 3
+    v4 = bor v3, v2
+    return v4
+    ; check: v6 = bor v0, v3
+    ; check: return v6
+}
+
+function %or_and_constant_with_any_constant_should_not_apply_rule_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -4
+    v2 = band v0, v1
+    ;; `v3` is not `bnot(v1)` so the rewrite should not apply.
+    v3 = iconst.i64 -5
+    v4 = bor v2, v3
+    return v4
+    ; check: return v4
+}
+
+function %bnot1(i8) -> i8 {
+block0(v1: i8):
+    v2 = iconst.i8 -1
+    v3 = bxor v1, v2
+    return v3
+}
+
+; check: v4 = bnot v1
+; check: return v4
+
+function %bnot2(i64) -> i64 {
+block0(v1: i64):
+    v2 = iconst.i64 -1
+    v3 = bxor v1, v2
+    return v3
+}
+
+; check: v4 = bnot v1
+; check: return v4
+
+function %bnot3(i64) -> i64 {
+block0(v1: i64):
+    v2 = iconst.i64 -1
+    v3 = bxor v2, v1
+    return v3
+}
+
+; check: v5 = bnot v1
+; check: return v5
+
+function %bxor_x_x_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: v2 = f32const 0.0
+; check: return v2
+
+function %bxor_x_x_f64(f64) -> f64 {
+block0(v0: f64):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: v2 = f64const 0.0
+; check: return v2
+
+function %vector_bxor_x_x_f32x4(f32x4) -> f32x4 {
+block0(v0: f32x4):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v2 = vconst.f32x4 const0
+; check: return v2
+
+function %vector_bxor_x_x_f64x2(f64x2) -> f64x2 {
+block0(v0: f64x2):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v2 = vconst.f64x2 const0
+; check: return v2
+
+function %vector_bxor_x_x_f32x2(f32x2) -> f32x2 {
+block0(v0: f32x2):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: const0 = 0x0000000000000000
+; check: v2 = vconst.f32x2 const0
+; check: return v2
+
+function %bor_all_zero_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = bor v0, v1
+    return v2
+}
+
+; check: return v0
+
+function %bor_all_zero_lhs_f16(f16) -> f16 {
+block0(v0: f16):
+    v1 = f16const 0.0
+    v2 = bor v1, v0
+    return v2
+}
+
+; check: return v0
+
+function %bxor_all_zero_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = f32const 0.0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: return v0
+
+function %bxor_all_zero_f16(f16) -> f16 {
+block0(v0: f16):
+    v1 = f16const 0.0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: return v0
+
+function %bxor_all_zero_lhs_f128(f128) -> f128 {
+block0(v0: f128):
+    v1 = f128const 0.0
+    v2 = bxor v1, v0
+    return v2
+}
+
+; check: return v0
+
+function %bxor_negative_zero_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = f32const -0.0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: v1 = f32const -0.0
+; check: v2 = bxor v0, v1
+; check: return v2
+
+function %bxor_negative_zero_f16(f16) -> f16 {
+block0(v0: f16):
+    v1 = f16const -0.0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: v1 = f16const -0.0
+; check: v2 = bxor v0, v1
+; check: return v2
+
+function %bxor_negative_zero_f128(f128) -> f128 {
+block0(v0: f128):
+    v1 = f128const -0.0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: const0 = 0x80000000000000000000000000000000
+; check: v1 = f128const const0
+; check: v2 = bxor v0, v1
+; check: return v2
+
+function %bxor_all_zero_i32x4(i32x4) -> i32x4 {
+    const0 = 0x00000000000000000000000000000000
+
+block0(v0: i32x4):
+    v1 = vconst.i32x4 const0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: return v0
+
+function %bor_all_zero_lhs_i32x4(i32x4) -> i32x4 {
+    const0 = 0x00000000000000000000000000000000
+
+block0(v0: i32x4):
+    v1 = vconst.i32x4 const0
+    v2 = bor v1, v0
+    return v2
+}
+
+; check: return v0
+
+function %bor_all_zero_i32x2(i32x2) -> i32x2 {
+    const0 = 0x0000000000000000
+
+block0(v0: i32x2):
+    v1 = vconst.i32x2 const0
+    v2 = bor v0, v1
+    return v2
+}
+
+; check: return v0
+
+function %bxor_all_zero_lhs_i32x2(i32x2) -> i32x2 {
+    const0 = 0x0000000000000000
+
+block0(v0: i32x2):
+    v1 = vconst.i32x2 const0
+    v2 = bxor v1, v0
+    return v2
+}
+
+; check: return v0
+
+function %bxor_x_x_f16(f16) -> f16 {
+block0(v0: f16):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: v2 = f16const 0.0
+; check: return v2
+
+function %bxor_x_x_f128(f128) -> f128 {
+block0(v0: f128):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v2 = f128const const0
+; check: return v2
+
+function %bxor_x_x_i32x8(i32x8) -> i32x8 {
+block0(v0: i32x8):
+    v1 = bxor v0, v0
+    return v1
+}
+
+; check: const0 = 0x0000000000000000000000000000000000000000000000000000000000000000
+; check: v2 = vconst.i32x8 const0
+; check: return v2
+
+function %vector_bxor_x_bnot_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = bxor v0, v1
+    return v2
+}
+
+; check: const0 = 0xffffffffffffffffffffffffffffffff
+; check: v5 = vconst.i32x4 const0
+; check: return v5
+
+function %vector_bxor_bnot_x_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = bxor v1, v0
+    return v2
+}
+
+; check: const0 = 0xffffffffffffffffffffffffffffffff
+; check: v5 = vconst.i32x4 const0
+; check: return v5
+
+function %vector_bxor_bnot_x_bnot_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = bxor v1, v1
+    return v2
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v4 = vconst.i32x4 const0
+; check: return v4
+
+function %vector_bor_x_bnot_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = bor v0, v1
+    return v2
+}
+
+; check: const0 = 0xffffffffffffffffffffffffffffffff
+; check: v5 = vconst.i32x4 const0
+; check: return v5
+
+function %vector_bor_bnot_x_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = bor v1, v0
+    return v2
+}
+
+; check: const0 = 0xffffffffffffffffffffffffffffffff
+; check: v5 = vconst.i32x4 const0
+; check: return v5
+
+function %vector_band_x_bnot_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = band v0, v1
+    return v2
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v3 = vconst.i32x4 const0
+; check: return v3
+
+function %vector_band_bnot_x_x(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = bnot v0
+    v2 = band v1, v0
+    return v2
+}
+
+; check: const0 = 0x00000000000000000000000000000000
+; check: v3 = vconst.i32x4 const0
+; check: return v3
+
+function %issue_13229_band_not_f64(f64) {
+block0(v0: f64):
+    v2 = bnot v0
+    v1 = band v0, v2
+    return
+}
+
+; check: return
+
+function %bitops_bmask(i64) -> i64 {
+block0(v0: i64):
+    v1 = bnot v0
+    v2 = iconst.i64 1
+    v3 = iadd.i64 v1, v2
+    v4 = bor.i64 v0, v3
+    v5 = iconst.i64 63
+    v6 = ushr.i64 v4, v5
+    v7 = iconst.i64 1
+    v8 = isub.i64 v6, v7
+    v9 = bnot.i64 v8
+    return v9
+}
+
+; check: v19 = bmask.i64 v0
+; check: return v19
+
+function %bmask_sshr(i64) -> i64 {
+block0(v0: i64):
+    v1 = ineg v0
+    v2 = bor v0, v1
+    v3 = iconst.i64 63
+    v4 = sshr v2, v3
+    return v4
+}
+
+; check: v5 = bmask.i64 v0
+; check: return v5
+
+function %bmask_reverse_sshr(i64) -> i64 {
+block0(v0: i64):
+    v1 = ineg v0
+    v2 = bor v1, v0
+    v3 = iconst.i64 63
+    v4 = sshr v2, v3
+    return v4
+}
+
+; check: v5 = bmask.i64 v0
+; check: return v5
+
+
+function %double_bmask(i16) -> i64 {
+block0(v0: i16):
+    v1 = bmask.i32 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_sextend(i16) -> i64 {
+block0(v0: i16):
+    v1 = sextend.i32 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_uextend(i16) -> i64 {
+block0(v0: i16):
+    v1 = uextend.i32 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_ineg(i16) -> i64 {
+block0(v0: i16):
+    v1 = ineg.i16 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_bswap(i16) -> i64 {
+block0(v0: i16):
+    v1 = bswap.i16 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_bitrev(i16) -> i64 {
+block0(v0: i16):
+    v1 = bitrev.i16 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_popcnt(i16) -> i64 {
+block0(v0: i16):
+    v1 = popcnt.i16 v0
+    v2 = bmask.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %bmask_rotl(i16, i16) -> i64 {
+block0(v0: i16, v1: i16):
+    v2 = rotl.i16 v0, v1
+    v3 = bmask.i64 v2
+    return v3
+}
+
+; check: v4 = bmask.i64 v0
+; check: return v4
+
+function %bmask_rotr(i16, i16) -> i64 {
+block0(v0: i16, v1: i16):
+    v2 = rotr.i16 v0, v1
+    v3 = bmask.i64 v2
+    return v3
+}
+
+; check: v4 = bmask.i64 v0
+; check: return v4
+
+function %bmask_select_non_zero(i16) -> i64 {
+block0(v0: i16):
+    v1 = iconst.i16 123
+    v2 = iconst.i16 0
+    v3 = select v0, v1, v2
+    v4 = bmask.i64 v3
+    return v4
+}
+
+; check: v5 = bmask.i64 v0
+; check: return v5
+
+function %bmask_icmp_ne_zero(i16) -> i64 {
+block0(v0: i16):
+    v1 = iconst.i16 0
+    v2 = icmp ne v0, v1
+    v3 = bmask.i64 v2
+    return v3
+}
+
+; check: v4 = bmask.i64 v0
+; check: return v4
+
+function %icmp_ne_zero_deletes_thruthy_input(i16) -> i8 {
+block0(v0: i16):
+    v1 = popcnt v0
+    v2 = iconst.i16 0
+    v3 = icmp ne v1, v2
+    return v3
+}
+
+; check: v2 = iconst.i16 0
+; check: v4 = icmp ne v0, v2
+; check: return v4
+
+
+function %icmp_ne_zero_deletes_thruthy_input_const_lhs(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0
+    v2 = popcnt v0
+    v3 = icmp ne v1, v2
+    return v3
+}
+
+; check: v1 = iconst.i16 0
+; check: v5 = icmp ne v0, v1
+; check: return v5
+
+
+function %icmp_ne_matches_arms_of_different_types(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i64 0
+    v2 = uextend.i64 v0
+    v3 = icmp ne v1, v2
+    return v3
+}
+
+; check: v5 = iconst.i16 0
+; check: v6 = icmp ne v0, v5
+; check: return v6
+
+
+
+function %sextend_bmask(i16) -> i64 {
+block0(v0: i16):
+    v1 = bmask.i32 v0
+    v2 = sextend.i64 v1
+    return v2
+}
+
+; check: v3 = bmask.i64 v0
+; check: return v3
+
+function %ireduce_bmask(i16) -> i8 {
+block0(v0: i16):
+    v1 = bmask.i32 v0
+    v2 = ireduce.i8 v1
+    return v2
+}
+
+; check: v3 = bmask.i8 v0
+; check: return v3
+
+
+function %double_bswap(i64) -> i64 {
+block0(v0: i64):
+    v1 = bswap.i64 v0
+    v2 = bswap.i64 v1
+    return v2
+}
+
+; check: return v0
+
+
+function %double_bitrev(i64) -> i64 {
+block0(v0: i64):
+    v1 = bitrev.i64 v0
+    v2 = bitrev.i64 v1
+    return v2
+}
+
+; check: return v0
+
+function %test_bxor_band_bxor_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = band v0, v1
+    v3 = bxor v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_band_bxor_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = bxor v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_band_bxor_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = band v0, v1
+    v3 = bxor v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_band_bxor_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = band v0, v1
+    v3 = bxor v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_bor_band_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bor v0, v1
+    v3 = band v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bxor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_bor_band_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = band v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bxor v0, v1
+    ; check: return v5
+}
+
+function %test_bxor_bor_band_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = bor v0, v1
+    v3 = band v0, v1
+    v4 = bxor v2, v3
+    return v4
+    ; check: v5 = bxor v0, v1
+    ; check: return v5
+}
+
+;; (x & y) & x == x & y
+;; (x & y) & y == x & y
+;; x & (x & y) == x & y
+;; y & (x & y) == x & y
+function %test_and_and1(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = band v2, v0
+    return v3
+    ; check: v2 = band v0, v1
+    ; check: return v2
+}
+
+function %test_and_and2(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = band v0, v2
+    return v3
+    ; check: v2 = band v0, v1
+    ; check: return v2
+}
+
+function %test_and_and3(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v1, v0
+    v3 = band v0, v2
+    return v3
+    ; check: v2 = band v1, v0
+    ; check: return v2
+}
+
+function %test_and_and4(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v1, v0
+    v3 = band v2, v0
+    return v3
+    ; check: v2 = band v1, v0
+    ; check: return v2
+}
+
+;; (bor ty (bxor ty (bxor ty x y) z) x) -> (bor ty (bxor ty y z) x)
+function %test_bor_bxor_bxor_x(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v1
+    v4 = bxor v3, v2
+    v5 = bor v4, v0
+    return v5
+}
+
+; function %test_bor_bxor_bxor_x(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = bxor v1, v2
+;     v7 = bor v6, v0
+;     return v7
+; }
+
+;; (eq ty (bxor cty x z) (bxor cty y z)) -> (eq ty x y)
+function %simplify_icmp_eq_bxor_shared_rhs(i32, i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v2
+    v4 = bxor v1, v2
+    v5 = icmp eq v3, v4
+    return v5
+}
+
+; function %simplify_icmp_eq_bxor_shared_rhs(i32, i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = icmp eq v0, v1
+;     return v6
+; }
+
+;; (bor ty y (bnot ty (bor ty x y))) -> (bor ty y (bnot ty x))
+function %test_bor_bnot_bor_absorb(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = bnot v2
+    v4 = bor v1, v3
+    return v4
+}
+
+; function %test_bor_bnot_bor_absorb(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bnot v0
+;     v6 = bor v1, v5
+;     return v6
+; }
+
+;; (band ty y (bnot ty (band ty x y))) -> (band ty y (bnot ty x))
+function %test_band_bnot_band_absorb(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = bnot v2
+    v4 = band v1, v3
+    return v4
+}
+
+; function %test_band_bnot_band_absorb(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bnot v0
+;     v6 = band v1, v5
+;     return v6
+; }
+
+;; (bxor ty (bnot ty x) (bor ty x y)) -> (bor ty x (bnot ty y))
+function %test_bxor_bnot_bor(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = bor v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; function %test_bxor_bnot_bor(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bnot v1
+;     v6 = bor v0, v5
+;     return v6
+; }
+
+;; (bor ty (slt ty x y) (sgt ty x y)) -> (ne ty x y)
+function %test_bor_slt_sgt(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    v3 = icmp sgt v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_slt_sgt(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp ne v0, v1
+;     return v5
+; }
+
+;; (bor ty (ult ty x y) (ugt ty x y)) -> (ne ty x y)
+function %test_bor_ult_ugt(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp ult v0, v1
+    v3 = icmp ugt v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_ult_ugt(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp ne v0, v1
+;     return v5
+; }
+
+;; (bnot ty (band ty (bnot ty x) y)) -> (bor ty x (bnot ty y))
+function %test_bnot_band_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; function %test_bnot_band_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bnot v1
+;     v6 = bor v0, v5
+;     return v6
+; }
+
+;; (bnot ty (bor ty (bnot ty x) y)) -> (band ty x (bnot ty y))
+function %test_bnot_bor_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; function %test_bnot_bor_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bnot v1
+;     v6 = band v0, v5
+;     return v6
+; }
+
+;; (bor ty (ult ty x y) (eq ty x y)) -> (ule ty x y)
+function %test_bor_ult_eq(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp ult v0, v1
+    v3 = icmp eq v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_ult_eq(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp ule v0, v1
+;     return v5
+; }
+
+;; (bor ty (ugt ty y x) (eq ty x y)) -> (ule ty x y)
+function %test_bor_ugt_eq_swap(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp ugt v1, v0
+    v3 = icmp eq v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_ugt_eq_swap(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp ule v0, v1
+;     return v5
+; }
+
+;; (bor ty (slt ty x y) (eq ty x y)) -> (sle ty x y)
+function %test_bor_slt_eq(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    v3 = icmp eq v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_slt_eq(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp sle v0, v1
+;     return v5
+; }
+
+;; (bor ty (sgt ty y x) (eq ty x y)) -> (sle ty x y)
+function %test_bor_sgt_eq_swap(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp sgt v1, v0
+    v3 = icmp eq v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_sgt_eq_swap(i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = icmp sle v0, v1
+;     return v5
+; }
+
+;; (bor ty (bxor ty x z) (bxor ty (bxor ty x z) y)) -> (bor ty (bxor ty x z) y)
+function %test_bor_bxor_bxor_chain(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v1
+    v4 = bxor v3, v2
+    v5 = bor v3, v4
+    return v5
+}
+
+; function %test_bor_bxor_bxor_chain(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = bor v3, v2
+;     return v6
+; }
+
+;; (bor ty x (bxor ty x y)) -> (bor ty x y)
+function %test_bor_bxor_self(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bxor v0, v1
+    v3 = bor v0, v2
+    return v3
+}
+
+; function %test_bor_bxor_self(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v4 = bor v0, v1
+;     return v4
+; }
+
+;; (bnot ty (iadd ty (bnot ty x) y)) -> (isub ty x y)
+function %test_bnot_iadd_bnot_to_isub(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = iadd v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; function %test_bnot_iadd_bnot_to_isub(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = isub v0, v1
+;     return v5
+; }
+
+;; (bnot ty (ineg ty x)) -> (isub ty x (iconst_u ty 1))
+function %test_bnot_ineg_to_isub_one(i32) -> i32 fast {
+block0(v0: i32):
+    v1 = ineg v0
+    v2 = bnot v1
+    return v2
+}
+
+; function %test_bnot_ineg_to_isub_one(i32) -> i32 fast {
+; block0(v0: i32):
+;     v3 = iconst.i32 1
+;     v4 = isub v0, v3
+;     return v4
+; }
+
+;; (bor ty (bxor ty x z) (bor ty y x)) -> (bor ty (bor ty y x) z)
+function %test_bor_bxor_bor(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v2
+    v4 = bor v1, v0
+    v5 = bor v3, v4
+    return v5
+}
+
+; function %test_bor_bxor_bor(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v4 = bor v1, v0
+;     v6 = bor v4, v2
+;     return v6
+; }
+
+;; (bxor ty (bor ty x y) (bxor ty x y)) -> (band ty x y)
+function %test_bxor_bor_bxor(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = bxor v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; function %test_bxor_bor_bxor(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = band v0, v1
+;     return v5
+; }
+
+;; (bor ty (band ty (bxor ty x y) z) x) -> (bor ty (band ty y z) x)
+function %test_bor_band_bxor(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v1
+    v4 = band v3, v2
+    v5 = bor v4, v0
+    return v5
+}
+
+; function %test_bor_band_bxor(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = band v1, v2
+;     v7 = bor v6, v0
+;     return v7
+; }
+
+;; (bor ty (bor ty x y) (bxor ty x z)) -> (bor ty (bor ty x y) z)
+function %test_bor_bor_bxor(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bor v0, v1
+    v4 = bxor v0, v2
+    v5 = bor v3, v4
+    return v5
+}
+
+; function %test_bor_bor_bxor(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v3 = bor v0, v1
+;     v6 = bor v3, v2
+;     return v6
+; }
+
+;; (ne ty (bxor cty x z) (bxor cty y z)) -> (ne ty x y)
+function %simplify_icmp_ne_bxor_shared_rhs(i32, i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bxor v0, v2
+    v4 = bxor v1, v2
+    v5 = icmp ne v3, v4
+    return v5
+}
+
+; function %simplify_icmp_ne_bxor_shared_rhs(i32, i32, i32) -> i8 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = icmp ne v0, v1
+;     return v6
+; }
+
+;; (bor ty (band ty x y) (band ty x (bnot ty y))) -> x
+function %test_bor_band_band_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = bnot v1
+    v4 = band v0, v3
+    v5 = bor v2, v4
+    return v5
+}
+
+; function %test_bor_band_band_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     return v0
+; }
+
+;; (band ty (bor ty x y) (bor ty x (bnot ty y))) -> x
+function %test_band_bor_bor_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = bnot v1
+    v4 = bor v0, v3
+    v5 = band v2, v4
+    return v5
+}
+
+; function %test_band_bor_bor_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     return v0
+; }
+
+;; (bor ty (bxor ty x y) (bnot ty x)) -> (bnot ty (band ty y x))
+function %test_bor_bxor_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bxor v0, v1
+    v3 = bnot v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; function %test_bor_bxor_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = band v1, v0
+;     v6 = bnot v5
+;     return v6
+; }
+
+;; (bxor ty (bxor ty x y) x) -> y
+function %test_bxor_bxor_x(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bxor v0, v1
+    v3 = bxor v2, v0
+    return v3
+}
+
+; function %test_bxor_bxor_x(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     return v1
+; }
+
+;; (bor ty (band ty x (bor ty y z)) y) -> (bor ty (band ty x z) y)
+function %test_bor_band_bor(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bor v1, v2
+    v4 = band v0, v3
+    v5 = bor v4, v1
+    return v5
+}
+
+; function %test_bor_band_bor(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = band v0, v2
+;     v7 = bor v6, v1
+;     return v7
+; }
+
+;; (band ty (bor ty x (band ty y z)) y) -> (band ty (bor ty x z) y)
+function %test_band_bor_band(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = band v1, v2
+    v4 = bor v0, v3
+    v5 = band v4, v1
+    return v5
+}
+
+; function %test_band_bor_band(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = bor v0, v2
+;     v7 = band v6, v1
+;     return v7
+; }
+
+;; (bor ty (bxor ty x (band ty y z)) y) -> (bor ty x y)
+function %test_bor_bxor_band(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = band v1, v2
+    v4 = bxor v0, v3
+    v5 = bor v4, v1
+    return v5
+}
+
+; function %test_bor_bxor_band(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = bor v0, v1
+;     return v6
+; }
+
+;; (iadd ty (bxor ty (band ty x y) y) z) -> (isub ty (iadd ty y z) (band ty x y))
+function %test_iadd_bxor_band_to_isub(i32, i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = band v0, v1
+    v4 = bxor v3, v1
+    v5 = iadd v4, v2
+    return v5
+}
+
+; function %test_iadd_bxor_band_to_isub(i32, i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32, v2: i32):
+;     v6 = iadd v1, v2
+;     v7 = band v0, v1
+;     v8 = isub v6, v7
+;     return v8
+; }
+
+;; (band ty y (bor ty (bnot ty y) x)) -> (band ty y x)
+function %test_band_bor_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v1
+    v3 = bor v2, v0
+    v4 = band v1, v3
+    return v4
+}
+
+; function %test_band_bor_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = band v1, v0
+;     return v5
+; }
+
+;; (bor ty y (band ty (bnot ty y) x)) -> (bor ty y x)
+function %test_bor_band_bnot(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v1
+    v3 = band v2, v0
+    v4 = bor v1, v3
+    return v4
+}
+
+; function %test_bor_band_bnot(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = bor v1, v0
+;     return v5
+; }
+
+;; (~x & y) & x --> 0
+function %band_band_bnot_x_y_x_i32(i32, i32) -> i32 fast {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = band v3, v0
+    return v4
+}
+
+; function %band_band_bnot_x_y_x_i32(i32, i32) -> i32 fast {
+; block0(v0: i32, v1: i32):
+;     v5 = iconst.i32 0
+;     return v5
+; }
+
+function %band_band_x_bnot_y_y_f32(f32, f32) -> f32 fast {
+block0(v0: f32, v1: f32):
+    v2 = bnot v1
+    v3 = band v0, v2
+    v4 = band v3, v1
+    return v4
+}
+
+; function %band_band_x_bnot_y_y_f32(f32, f32) -> f32 fast {
+; block0(v0: f32, v1: f32):
+;     v5 = f32const 0.0
+;     return v5
+; }
+
+function %band_x_band_bnot_x_y_f32x2(f32x2, f32x2) -> f32x2 fast {
+block0(v0: f32x2, v1: f32x2):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = band v0, v3
+    return v4
+}
+
+; function %band_x_band_bnot_x_y_f32x2(f32x2, f32x2) -> f32x2 fast {
+; block0(v0: f32x2, v1: f32x2):
+;     const0 = 0x0000000000000000
+;     v5 = vconst.f32x2 const0
+;     return v5
+; }
+
+function %band_x_band_y_bnot_x_i32x4(i32x4, i32x4) -> i32x4 fast {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = band v1, v2
+    v4 = band v0, v3
+    return v4
+}
+
+; function %band_x_band_y_bnot_x_i32x4(i32x4, i32x4) -> i32x4 fast {
+; block0(v0: i32x4, v1: i32x4):
+;     const0 = 0x00000000000000000000000000000000
+;     v5 = vconst.i32x4 const0
+;     return v5
+; }
+
+;; ~(x | y) & x/y --> 0
+function %band_bnot_bor_x_y_x_i64(i64, i64) -> i64 fast {
+block0(v0: i64, v1: i64):
+    v2 = bor v0, v1
+    v3 = bnot v2
+    v4 = band v3, v0
+    return v4
+}
+
+; function %band_bnot_bor_x_y_x_i64(i64, i64) -> i64 fast {
+; block0(v0: i64, v1: i64):
+;     v5 = iconst.i64 0
+;     return v5
+; }
+
+function %band_bnot_bor_x_y_y_f64(f64, f64) -> f64 fast {
+block0(v0: f64, v1: f64):
+    v2 = bor v0, v1
+    v3 = bnot v2
+    v4 = band v3, v1
+    return v4
+}
+
+; function %band_bnot_bor_x_y_y_f64(f64, f64) -> f64 fast {
+; block0(v0: f64, v1: f64):
+;     v5 = f64const 0.0
+;     return v5
+; }
+
+function %band_x_bnot_bor_x_y_f32x2(f32x2, f32x2) -> f32x2 fast {
+block0(v0: f32x2, v1: f32x2):
+    v2 = bor v0, v1
+    v3 = bnot v2
+    v4 = band v0, v3
+    return v4
+}
+
+; function %band_x_bnot_bor_x_y_f32x2(f32x2, f32x2) -> f32x2 fast {
+; block0(v0: f32x2, v1: f32x2):
+;     const0 = 0x0000000000000000
+;     v5 = vconst.f32x2 const0
+;     return v5
+; }
+
+function %band_x_bnot_bor_y_x_i16x8(i16x8, i16x8) -> i16x8 fast {
+block0(v0: i16x8, v1: i16x8):
+    v2 = bor v1, v0
+    v3 = bnot v2
+    v4 = band v0, v3
+    return v4
+}
+
+; function %band_x_bnot_bor_y_x_i16x8(i16x8, i16x8) -> i16x8 fast {
+; block0(v0: i16x8, v1: i16x8):
+;     const0 = 0x00000000000000000000000000000000
+;     v5 = vconst.i16x8 const0
+;     return v5
+; }
+
+;; ~x ^ ~y --> x ^ y
+function %bxor_bnot_bnot(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bnot.i32 v0
+    v3 = bnot.i32 v1
+    v4 = bxor.i32 v2, v3
+    return v4
+    ; check: v5 = bxor v0, v1
+    ; check: return v5
+}
+
+;; ~x & (x ^ y) --> ~x & y
+function %band_bnot_bxor(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bnot.i32 v0
+    v3 = bxor.i32 v0, v1
+    v4 = band.i32 v2, v3
+    return v4
+    ; check: v2 = bnot v0
+    ; check: v5 = band v2, v1
+    ; check: return v5
+}
+
+;; ~(~x ^ y) --> x ^ y
+function %bnot_bxor_bnot(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bnot.i32 v0
+    v3 = bxor.i32 v2, v1
+    v4 = bnot.i32 v3
+    return v4
+    ; check: v5 = bxor v0, v1
+    ; check: return v5
+}
+
+;; x & (x ^ y) --> x & ~y
+function %band_bxor_to_band_bnot(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bxor.i32 v0, v1
+    v3 = band.i32 v0, v2
+    return v3
+    ; check: v4 = bnot v1
+    ; check: v5 = band v0, v4
+    ; check: return v5
+}
+
+;; x ^ (x & y) --> x & ~y
+function %bxor_band_to_band_bnot(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band.i32 v0, v1
+    v3 = bxor.i32 v0, v2
+    return v3
+    ; check: v4 = bnot v1
+    ; check: v5 = band v0, v4
+    ; check: return v5
+}
+
+;; (x | y) ^ y --> x & ~y
+function %bxor_bor_to_band_bnot(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bor.i32 v0, v1
+    v3 = bxor.i32 v2, v1
+    return v3
+    ; check: v4 = bnot v1
+    ; check: v5 = band v0, v4
+    ; check: return v5
+}
+
+;; popcnt(bswap(x)) -> popcnt(x)
+function %test_popcnt_bswap_i32(i32) -> i32 fast {
+block0(v0: i32):
+    v1 = bswap v0
+    v2 = popcnt v1
+    return v2
+    ; check: v3 = popcnt v0
+    ; check: return v3
+}
+
+;; popcnt(bitrev(x)) -> popcnt(x)
+function %test_popcnt_bitrev_i32(i32) -> i32 fast {
+block0(v0: i32):
+    v1 = bitrev v0
+    v2 = popcnt v1
+    return v2
+    ; check: v3 = popcnt v0
+    ; check: return v3
+}
+
+function %band_x_zero_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = f32const 0.0
+    v2 = band v0, v1
+    return v2
+    ; check: return v1
+}
+
+function %band_zero_x_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = f32const 0.0
+    v2 = band v1, v0
+    return v2
+    ; check: return v1
+}
+
+function %band_x_bnot_x_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = bnot v0
+    v2 = band v0, v1
+    return v2
+    ; check: v3 = f32const 0.0
+    ; check: return v3
+}
+
+function %band_bnot_x_x_f32(f32) -> f32 {
+block0(v0: f32):
+    v1 = bnot v0
+    v2 = band v1, v0
+    return v2
+    ; check: v3 = f32const 0.0
+    ; check: return v3
+}
+
+function %band_bnot_bor_xy_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = bor v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: function %band_bnot_bor_xy_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v2 = bnot v0
+; nextln:     v5 = band v2, v1
+; nextln:     return v5
+; nextln: }
+
+function %band_bnot_bor_yx_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bnot v0
+    v3 = bor v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: function %band_bnot_bor_yx_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v2 = bnot v0
+; nextln:     v5 = band v2, v1
+; nextln:     return v5
+; nextln: }
+
+function %band_bor_bnot_x_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = bnot v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: function %band_bor_bnot_x_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v3 = bnot v0
+; nextln:     v5 = band v3, v1
+; nextln:     return v5
+; nextln: }
+
+function %band_bor_bnot_y_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = bor v0, v1
+    v3 = bnot v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: function %band_bor_bnot_y_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v3 = bnot v1
+; nextln:     v5 = band v3, v0
+; nextln:     return v5
+; nextln: }
+
+function %bnot_xor_constant_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = bnot v0
+    v2 = iconst.i64 85
+    v3 = bxor v1, v2
+    return v3
+}
+
+; check: function %bnot_xor_constant_i64(i64) -> i64 fast {
+; nextln: block0(v0: i64):
+; nextln:     v4 = iconst.i64 -86
+; nextln:     v5 = bxor v0, v4  ; v4 = -86
+; nextln:     return v5
+; nextln: }
+
+function %bnot_xor_constant_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = bnot v0
+    v2 = iconst.i8 85
+    v3 = bxor v1, v2
+    return v3
+}
+
+; check: function %bnot_xor_constant_i8(i8) -> i8 fast {
+; nextln: block0(v0: i8):
+; nextln:     v4 = iconst.i8 -86
+; nextln:     v5 = bxor v0, v4  ; v4 = -86
+; nextln:     return v5
+; nextln: }
+
+function %band_bnot_band_bor_to_xor_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = bnot v2
+    v4 = bor v0, v1
+    v5 = band v3, v4
+    return v5
+}
+
+; check: function %band_bnot_band_bor_to_xor_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v6 = bxor v0, v1
+; nextln:     return v6
+; nextln: }
+
+function %bor_bnot_band_absorb_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = band v0, v1
+    v3 = bnot v2
+    v4 = bor v3, v0
+    return v4
+}
+
+; check: function %bor_bnot_band_absorb_i32(i32, i32) -> i32 fast {
+; nextln: block0(v0: i32, v1: i32):
+; nextln:     v5 = iconst.i32 -1
+; nextln:     return v5  ; v5 = -1
+; nextln: }
+
+
+function %band_bnot_band_bor_to_xor_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = band v0, v1
+    v3 = bnot v2
+    v4 = bor v0, v1
+    v5 = band v3, v4
+    return v5
+}
+
+; check: function %band_bnot_band_bor_to_xor_i32x4(i32x4, i32x4) -> i32x4 fast {
+; nextln: block0(v0: i32x4, v1: i32x4):
+; nextln:     v6 = bxor v0, v1
+; nextln:     return v6
+; nextln: }
+
+function %bor_bnot_band_absorb_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = band v0, v1
+    v3 = bnot v2
+    v4 = bor v3, v0
+    return v4
+}
+
+; check: function %bor_bnot_band_absorb_i32x4(i32x4, i32x4) -> i32x4 fast {
+; nextln:     const0 = 0xffffffffffffffffffffffffffffffff
+; nextln: $(=^$)
+; nextln: block0(v0: i32x4, v1: i32x4):
+; nextln:     v7 = vconst.i32x4 const0
+; nextln:     return v7  ; v7 = const0
+; nextln: }
+
+function %transplant_41059_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v3, v0
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41059_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v3, v0
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41059_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v3, v0
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41066_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bxor v3, v1
+    return v4
+}
+
+; check: v5 = band v1, v0
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41066_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bxor v3, v1
+    return v4
+}
+
+; check: v5 = band v1, v0
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41263_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v0, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41263_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v0, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41264_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v1, v2
+    v4 = bxor v0, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_41264_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v1, v2
+    v4 = bxor v0, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_38578_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38578_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38578_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38579_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38579_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38580_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38580_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38581_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_38581_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39078_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39078_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39078_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39079_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39079_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39080_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39080_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39081_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39081_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_40372_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40372_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40372_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40373_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40373_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40374_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40374_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40375_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40375_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40790_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40790_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40790_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40791_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40791_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40792_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40792_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40793_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40793_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_41171_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41171_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41171_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41172_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41172_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smax v0, v1
+    v3 = smin v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41173_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41173_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41174_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41174_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = smin v0, v1
+    v3 = smax v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41251_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41251_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41251_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41252_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41252_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umax v0, v1
+    v3 = umin v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41253_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41253_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41254_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41254_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = umax v1, v0
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41053_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41053_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41053_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41054_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v0, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41054_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v0, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41060_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v4, v1
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41060_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v4, v1
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41062_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41062_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41026_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41026_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41026_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41027_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v0, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41027_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v0, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_41031_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = band v0, v2
+    v4 = bnot v0
+    v5 = band v4, v1
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41031_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = band v0, v2
+    v4 = bnot v0
+    v5 = band v4, v1
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41032_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = band v0, v2
+    v4 = bnot v0
+    v5 = band v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41032_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = band v0, v2
+    v4 = bnot v0
+    v5 = band v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_37458_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37458_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37458_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37459_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v0, v4
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37459_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v0, v4
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37471_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v4, v1
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37471_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v4, v1
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37472_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v1, v4
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_37472_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = bor v0, v2
+    v4 = bnot v0
+    v5 = bor v1, v4
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_40979_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 13
+    v2 = iadd v0, v1
+    v3 = iconst.i8 -1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v1 = iconst.i8 13
+; check: v2 = iadd v0, v1
+; check: v3 = iconst.i8 -1
+; check: v4 = bxor v2, v3
+; check: return v4
+
+function %transplant_40979_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 13
+    v2 = iadd v0, v1
+    v3 = iconst.i64 -1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v1 = iconst.i64 13
+; check: v2 = iadd v0, v1
+; check: v3 = iconst.i64 -1
+; check: v4 = bxor v2, v3
+; check: return v4
+
+function %transplant_40979_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = iconst.i64 13
+    v2 = sextend.i128 v1
+    v3 = iadd v0, v2
+    v4 = iconst.i64 -1
+    v5 = sextend.i128 v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v1 = iconst.i64 13
+; check: v2 = sextend.i128 v1
+; check: v3 = iadd v0, v2
+; check: v4 = iconst.i64 -1
+; check: v5 = sextend.i128 v4
+; check: v6 = bxor v3, v5
+; check: return v6
+
+function %transplant_40923_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = iconst.i8 13
+    v3 = bor v2, v0
+    v4 = iconst.i8 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v12 = bxor v1, v0
+; check: v10 = iconst.i8 -14
+; check: v13 = band v12, v10
+; check: return v13
+
+function %transplant_40923_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 13
+    v3 = bor v2, v0
+    v4 = iconst.i64 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v12 = bxor v1, v0
+; check: v10 = iconst.i64 -14
+; check: v13 = band v12, v10
+; check: return v13
+
+function %transplant_40923_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = iconst.i64 13
+    v3 = sextend.i128 v2
+    v4 = bor v3, v0
+    v5 = iconst.i64 13
+    v6 = sextend.i128 v5
+    v7 = bor v1, v6
+    v8 = bxor v4, v7
+    return v8
+}
+
+; check: v2 = iconst.i64 13
+; check: v3 = sextend.i128 v2
+; check: v4 = bor v3, v0
+; check: v7 = bor v1, v3
+; check: v8 = bxor v4, v7
+; check: return v8
+
+function %transplant_40933_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = iconst.i8 13
+    v3 = bor v0, v2
+    v4 = iconst.i8 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = iconst.i8 -14
+; check: v9 = band v7, v8
+; check: return v9
+
+function %transplant_40933_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 13
+    v3 = bor v0, v2
+    v4 = iconst.i64 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = iconst.i64 -14
+; check: v9 = band v7, v8
+; check: return v9
+
+function %transplant_40935_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = iconst.i8 13
+    v3 = bor v0, v2
+    v4 = iconst.i8 13
+    v5 = bxor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = iconst.i8 -14
+; check: v8 = band v0, v7
+; check: v9 = bxor v8, v1
+; check: return v9
+
+function %transplant_40935_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 13
+    v3 = bor v0, v2
+    v4 = iconst.i64 13
+    v5 = bxor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = iconst.i64 -14
+; check: v8 = band v0, v7
+; check: v9 = bxor v8, v1
+; check: return v9
+
+function %transplant_40935_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = iconst.i64 13
+    v3 = sextend.i128 v2
+    v4 = bor v0, v3
+    v5 = iconst.i64 13
+    v6 = sextend.i128 v5
+    v7 = bxor v1, v6
+    v8 = bxor v4, v7
+    return v8
+}
+
+; check: v2 = iconst.i64 13
+; check: v3 = sextend.i128 v2
+; check: v4 = bor v0, v3
+; check: v7 = bxor v1, v3
+; check: v8 = bxor v4, v7
+; check: return v8
+
+function %transplant_40950_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = iconst.i8 13
+    v3 = bxor v0, v2
+    v4 = iconst.i8 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = iconst.i8 -14
+; check: v8 = band v1, v7
+; check: v9 = bxor v8, v0
+; check: return v9
+
+function %transplant_40950_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 13
+    v3 = bxor v0, v2
+    v4 = iconst.i64 13
+    v5 = bor v1, v4
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = iconst.i64 -14
+; check: v8 = band v1, v7
+; check: v9 = bxor v8, v0
+; check: return v9
+
+function %transplant_39206_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = smax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smin v0, v5
+; check: return v6
+
+function %transplant_39206_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = smax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smin v0, v5
+; check: return v6
+
+function %transplant_39206_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = smax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smin v0, v5
+; check: return v6
+
+function %transplant_39207_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = smax v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = smin v1, v5
+; check: return v6
+
+function %transplant_39207_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = smax v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = smin v1, v5
+; check: return v6
+
+function %transplant_39214_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = umax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umin v0, v5
+; check: return v6
+
+function %transplant_39214_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = umax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umin v0, v5
+; check: return v6
+
+function %transplant_39214_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = umax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umin v0, v5
+; check: return v6
+
+function %transplant_39215_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = umax v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = umin v1, v5
+; check: return v6
+
+function %transplant_39215_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = umax v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = umin v1, v5
+; check: return v6
+
+function %transplant_39208_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = smin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smax v0, v5
+; check: return v6
+
+function %transplant_39208_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = smin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smax v0, v5
+; check: return v6
+
+function %transplant_39208_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = smin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smax v0, v5
+; check: return v6
+
+function %transplant_39209_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = smin v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = smax v1, v5
+; check: return v6
+
+function %transplant_39209_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = smin v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = smax v1, v5
+; check: return v6
+
+function %transplant_39216_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v0
+    v3 = umin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umax v0, v5
+; check: return v6
+
+function %transplant_39216_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v0
+    v3 = umin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umax v0, v5
+; check: return v6
+
+function %transplant_39216_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v0
+    v3 = umin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umax v0, v5
+; check: return v6
+
+function %transplant_39217_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = bnot v1
+    v3 = umin v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = umax v1, v5
+; check: return v6
+
+function %transplant_39217_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = bnot v1
+    v3 = umin v0, v2
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v0
+; check: v6 = umax v1, v5
+; check: return v6
+
+function %transplant_41059_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bxor v3, v0
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: v6 = bnot v5
+; check: return v6
+
+function %transplant_38578_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_39078_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = band v2, v3
+    return v4
+}
+
+; check: v5 = band v0, v1
+; check: return v5
+
+function %transplant_40372_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_40790_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+
+; check: v5 = bor v0, v1
+; check: return v5
+
+function %transplant_41171_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = smax v0, v1
+    v3 = smin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41251_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = umax v0, v1
+    v3 = umin v0, v1
+    v4 = bxor v2, v3
+    return v4
+}
+
+; check: v5 = bxor v0, v1
+; check: return v5
+
+function %transplant_41053_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: return v7
+
+function %transplant_41026_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = band v2, v1
+    v4 = bnot v1
+    v5 = band v4, v0
+    v6 = bxor v3, v5
+    return v6
+}
+
+; check: v7 = bxor v1, v0
+; check: return v7
+
+function %transplant_37458_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = bor v2, v1
+    v4 = bnot v1
+    v5 = bor v4, v0
+    v6 = band v3, v5
+    return v6
+}
+
+; check: v7 = bxor v0, v1
+; check: v8 = bnot v7
+; check: return v8
+
+function %transplant_39206_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = smax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smin v0, v5
+; check: return v6
+
+function %transplant_39214_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = umax v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umin v0, v5
+; check: return v6
+
+function %transplant_39208_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = smin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = smax v0, v5
+; check: return v6
+
+function %transplant_39216_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = bnot v0
+    v3 = umin v2, v1
+    v4 = bnot v3
+    return v4
+}
+
+; check: v5 = bnot v1
+; check: v6 = umax v0, v5
+; check: return v6

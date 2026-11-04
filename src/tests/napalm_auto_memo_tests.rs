@@ -140,3 +140,97 @@ fn napalm_auto_memo_leaves_static_benchmark_kernels_uncached() {
     }
 }
 
+const SHARED_MEMO_FIB: &str = r#"
+    function fib(n) {
+        if (n < 2) return n;
+        return fib(n - 1) + fib(n - 2);
+    }
+    const result = fib(30);
+"#;
+
+#[test]
+fn napalm_auto_memo_shares_scalar_results_across_vms() {
+    let (program, entry, manifest) = compile_typescript_module(SHARED_MEMO_FIB);
+    let (fib, policy) = auto_memo_policy(&program, 0);
+    assert_eq!(policy, MemoizationKind::Recursive);
+
+    let mut parent = source_vm(&program, &manifest);
+    parent.set_jit_options(None);
+    parent.run_module(entry).unwrap();
+    assert_eq!(source_result(&parent), 832040.0);
+    let seeded = parent.memo_tables[fib].as_ref().unwrap().entries.len();
+    assert!(seeded > 1);
+    // The first launch seeds the domain from the parent's private results and attaches it.
+    let shared = parent.shared_memo_for_workers().expect("memoized program has a shared domain");
+    assert!(Arc::ptr_eq(parent.shared_memo.as_ref().unwrap(), &shared));
+    assert_eq!(shared.len(fib as u32), seeded);
+
+    // A joined VM reuses the published top-level result instead of recursing.
+    let mut worker = source_vm(&program, &manifest);
+    worker.set_jit_options(None);
+    worker.set_shared_memo(Some(shared.clone()));
+    assert!(worker.shared_memo.is_some());
+    worker.run_module(entry).unwrap();
+    assert_eq!(source_result(&worker), 832040.0);
+    let table = worker.memo_tables[fib].as_ref().unwrap();
+    assert_eq!((table.entries.len(), table.hits), (1, 1));
+}
+
+#[test]
+fn napalm_auto_memo_builtin_rebinding_leaves_shared_domain() {
+    let (program, entry, manifest) = compile_typescript_module(SHARED_MEMO_FIB);
+    let fib = auto_memo_policy(&program, 0).0 as u32;
+    let plus = program.metadata.methods.iter().position(|method| {
+        program.metadata.string(method.name) == Some("+")
+            && method.kind == crate::napalm_ir::MethodKind::Method
+            && method.arity == 1
+    }).map(|index| MethodSymbol(index as u32)).expect("Num + method");
+
+    let mut vm = source_vm(&program, &manifest);
+    vm.set_jit_options(None);
+    vm.run_module(entry).unwrap();
+    let shared = vm.shared_memo_for_workers().unwrap();
+    assert!(vm.shared_memo.is_some());
+
+    vm.bind_builtin_primitive(BuiltinClass::Num, plus, PrimitiveId(0));
+    assert!(vm.shared_memo.is_none());
+    // Customized dispatch can neither rejoin nor seed a later workers-only domain.
+    vm.set_shared_memo(Some(shared.clone()));
+    assert!(vm.shared_memo.is_none());
+    let workers_only = vm.shared_memo_for_workers().unwrap();
+    assert!(!Arc::ptr_eq(&shared, &workers_only));
+    assert_eq!(workers_only.len(fib), 0);
+    assert!(vm.shared_memo.is_none());
+}
+
+#[test]
+fn napalm_auto_memo_launch_workers_share_scalar_results() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        function fib(n) {
+            if (n < 2) return n;
+            return fib(n - 1) + fib(n - 2);
+        }
+        concurrent function work(n: Number): Number {
+            return fib(n);
+        }
+        let warm: Number = fib(30);
+        let p1 = launch work(30);
+        let p2 = launch work(31);
+        let r1: Number = await p1;
+        let r2: Number = await p2;
+        let result = warm + r1 + r2;
+    "#);
+    let (fib, policy) = auto_memo_policy(&program, 0);
+    assert_eq!(policy, MemoizationKind::Recursive);
+
+    let mut vm = source_vm(&program, &manifest);
+    vm.set_jit_options(None);
+    let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+        panic!("expected module return after concurrent jobs settle")
+    };
+    assert_eq!(source_result(&vm), 832040.0 * 2.0 + 1346269.0);
+    let shared = vm.shared_memo.as_ref().expect("parent joins its workers' domain");
+    // Parent-seeded fib(0..=30) plus fib(31), published by a worker.
+    assert!(shared.len(fib as u32) > vm.memo_tables[fib].as_ref().unwrap().entries.len());
+}
+

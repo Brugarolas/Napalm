@@ -35,6 +35,10 @@
 //! ```
 
 #![allow(warnings)]
+// Nightly-only branch-weight and cache hints (`std::hint::{likely, unlikely,
+// cold_path, prefetch_read, prefetch_write}`), used by the interpreter hot paths.
+#![feature(likely_unlikely)]
+#![feature(hint_prefetch)]
 
 pub mod napalm_builtin;
 pub mod napalm_collections;
@@ -80,7 +84,10 @@ const EXIT_IO_ERROR: u8 = 3;
 const EXIT_RUNTIME_ERROR: u8 = 4;
 
 fn main() -> ExitCode {
-    ExitCode::from(run())
+    // Never let process exit wait for (or tear down) background LLVM compilers.
+    napalm_tracing_jit::use_fast_process_exit();
+    let code = run(); // drops the VM, flushing all program output
+    ExitCode::from(napalm_tracing_jit::finish_process(code))
 }
 
 fn run() -> u8 {

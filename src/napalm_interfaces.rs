@@ -36,7 +36,18 @@ impl Heap {
         // typed-list contract therefore needs neither another deep traversal nor a
         // duplicate installation plan. This is especially valuable for nested
         // typed object graphs passed repeatedly through typed APIs.
-        if matches!(expected, Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)))
+        if matches!(
+            expected,
+            Type::Interface(_)
+                | Type::Record(_)
+                | Type::List(Some(_))
+                | Type::GenericMap(_, _)
+                | Type::Set(Some(_))
+                | Type::Builtin(
+                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+                    Some(_),
+                )
+        )
             && self.interface_matches(value, expected)
         {
             return Ok(());
@@ -140,6 +151,47 @@ impl Heap {
                 plan.push((value, expected.clone()));
                 true
             }
+            Type::Builtin(builtin, element) => {
+                let object = self.get(value);
+                let state_payload_type = match (builtin, object) {
+                    (BuiltinId::Event, Some(HeapObject::Event { state }))
+                    | (BuiltinId::Emitter, Some(HeapObject::Emitter { state, .. })) => {
+                        unsafe { state.get() }.payload_type.as_ref()
+                    }
+                    (BuiltinId::Channel, Some(HeapObject::Channel { state, .. }))
+                    | (BuiltinId::Receiver, Some(HeapObject::Receiver { state })) => {
+                        unsafe { state.get() }.payload_type.as_ref()
+                    }
+                    (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => None,
+                    _ => return Err(mismatch(path, expected)),
+                };
+
+                if let Some(element) = element {
+                    if let Some(existing) = state_payload_type {
+                        if existing != element.as_ref() {
+                            return Err(RuntimeError::new(format!(
+                                "{TYPE_ERROR}{path} already carries incompatible payload contract {existing:?}"
+                            )));
+                        }
+                    }
+
+                    // Channel/Receiver may already contain buffered values when a
+                    // typed alias is installed. Validate the existing queue before
+                    // publishing the persistent shared-state contract.
+                    if let Some(state) = match object {
+                        Some(HeapObject::Channel { state, .. })
+                        | Some(HeapObject::Receiver { state }) => Some(state),
+                        _ => None,
+                    } {
+                        for (index, item) in unsafe { state.get() }.queue.iter().copied().enumerate() {
+                            self.plan_contract(item, element, &format!("channel item {index}"), plan)?;
+                        }
+                    }
+
+                    plan.push((value, expected.clone()));
+                }
+                true
+            }
             Type::Union(types) => {
                 let checkpoint = plan.len();
                 for ty in types {
@@ -209,7 +261,27 @@ impl Heap {
             });
             let object = self.object(value).expect("validated contract owner");
             let managed = unsafe { managed_object_mut(object) };
-            self.handle_table.stage_contract(handle, ty);
+            self.handle_table.stage_contract(handle, ty.clone());
+
+            // Event/Emitter and Channel/Receiver share their payload contract in
+            // native sidecar state. This makes the contract capability-wide rather
+            // than handle-local: an untyped alias cannot bypass a typed endpoint.
+            if let Type::Builtin(
+                BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+                Some(element),
+            ) = &ty
+            {
+                match &mut managed.object {
+                    HeapObject::Event { state } | HeapObject::Emitter { state, .. } => {
+                        unsafe { state.get_mut() }.payload_type = Some((**element).clone());
+                    }
+                    HeapObject::Channel { state, .. } | HeapObject::Receiver { state } => {
+                        unsafe { state.get_mut() }.payload_type = Some((**element).clone());
+                    }
+                    _ => {}
+                }
+            }
+
             if let HeapObject::Map(map) = &mut managed.object {
                 match typed_shape {
                     Some(Some(typed_shape)) => {

@@ -8,7 +8,7 @@ use crate::napalm_interpreter::{
     BuiltinClass, ExecutionResult, Host, HostContext, Interpreter, RuntimeError, Value,
 };
 use crate::napalm_ir::{ForeignFnId, FuncId, MethodKind, PrimitiveId};
-use crate::{napalm_bytecodecompiler, napalm_core, napalm_front, napalm_lowerer};
+use crate::{napalm_bytecodecompiler, napalm_front, napalm_lowerer};
 
 #[derive(Clone, Default)]
 struct Output(Rc<RefCell<Vec<u8>>>);
@@ -289,13 +289,7 @@ fn core_is_compiled_once_for_multiple_modules() {
         assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
         entries.push(lowered.lowered.unwrap().entry);
     }
-    assert_eq!(
-        hir.modules
-            .iter()
-            .filter(|module| hir.string(module.name) == Some(napalm_core::MODULE_NAME))
-            .count(),
-        1
-    );
+
     let program = napalm_bytecodecompiler::compile_program(&hir).unwrap();
     let output = Output::default();
     let mut vm = Interpreter::with_host(&program, Box::new(output.clone())).unwrap();

@@ -563,7 +563,10 @@ impl Collector {
 
     #[inline]
     pub fn collection_count(&self) -> u64 {
-        self.counters.collections.load(Ordering::Acquire)
+        // This counter is monotonic diagnostic/epoch state. Callers only compare
+        // values; it does not publish object memory, so Acquire ordering buys no
+        // correctness and is measurably more expensive on weakly ordered CPUs.
+        self.counters.collections.load(Ordering::Relaxed)
     }
 
     pub fn statistics(&self) -> Statistics {
@@ -775,11 +778,14 @@ impl Mutator {
         self.gc.requested.load(Ordering::Acquire)
     }
     #[inline]
-    pub fn safepoint(&mut self) {
+    pub fn safepoint(&mut self) -> bool {
         self.check_running();
         if self.collection_requested() {
             self.flush_statistics();
             self.gc.wait(&self.record, false);
+            true
+        } else {
+            false
         }
     }
     /// Waits for a collection. StickyImmix selects nursery or full-heap GC.

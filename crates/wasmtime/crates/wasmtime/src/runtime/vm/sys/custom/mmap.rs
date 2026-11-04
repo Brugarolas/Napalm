@@ -1,0 +1,123 @@
+use super::cvt;
+use crate::prelude::*;
+use crate::runtime::vm::sys::capi;
+use crate::runtime::vm::{HostAlignedByteCount, SendSyncPtr};
+use core::ops::Range;
+use core::ptr::{self, NonNull};
+#[cfg(feature = "std")]
+use std::{fs::File, path::Path};
+
+#[cfg(feature = "std")]
+pub fn open_file_for_mmap(_path: &Path) -> Result<File> {
+    crate::bail!("not supported on this platform");
+}
+
+#[derive(Debug)]
+pub struct Mmap {
+    memory: SendSyncPtr<[u8]>,
+}
+
+impl Mmap {
+    pub fn new_empty() -> Mmap {
+        Mmap {
+            memory: crate::vm::sys::empty_mmap(),
+        }
+    }
+
+    pub fn new(size: HostAlignedByteCount) -> Result<Self> {
+        let mut ptr = ptr::null_mut();
+        cvt(unsafe {
+            capi::wasmtime_mmap_new(
+                size.byte_count(),
+                capi::PROT_READ | capi::PROT_WRITE,
+                &mut ptr,
+            )
+        })?;
+        let memory = ptr::slice_from_raw_parts_mut(ptr.cast(), size.byte_count());
+        let memory = SendSyncPtr::new(NonNull::new(memory).unwrap());
+        Ok(Mmap { memory })
+    }
+
+    pub fn reserve(size: HostAlignedByteCount) -> Result<Self> {
+        let mut ptr = ptr::null_mut();
+        cvt(unsafe { capi::wasmtime_mmap_new(size.byte_count(), 0, &mut ptr) })?;
+        let memory = ptr::slice_from_raw_parts_mut(ptr.cast(), size.byte_count());
+        let memory = SendSyncPtr::new(NonNull::new(memory).unwrap());
+        Ok(Mmap { memory })
+    }
+
+    #[cfg(feature = "std")]
+    pub fn from_file(_file: &File) -> Result<Self> {
+        crate::bail!("not supported on this platform");
+    }
+
+    pub unsafe fn make_accessible(
+        &self,
+        start: HostAlignedByteCount,
+        len: HostAlignedByteCount,
+    ) -> Result<()> {
+        let ptr = self.memory.as_ptr();
+        unsafe {
+            cvt(capi::wasmtime_mprotect(
+                ptr.byte_add(start.byte_count()).cast(),
+                len.byte_count(),
+                capi::PROT_READ | capi::PROT_WRITE,
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn as_send_sync_ptr(&self) -> SendSyncPtr<u8> {
+        self.memory.cast()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.memory.as_ptr().len()
+    }
+
+    unsafe fn change_protections(&self, range: Range<usize>, permissions: u32) -> Result<()> {
+        let base = unsafe { self.memory.as_ptr().byte_add(range.start).cast() };
+        let len = range.end - range.start;
+
+        unsafe { cvt(capi::wasmtime_mprotect(base, len, permissions)) }
+    }
+
+    pub unsafe fn make_executable(
+        &self,
+        range: Range<usize>,
+        enable_branch_protection: bool,
+    ) -> Result<()> {
+        // not mapped into the C API at this time.
+        let _ = enable_branch_protection;
+
+        unsafe { self.change_protections(range, capi::PROT_READ | capi::PROT_EXEC) }
+    }
+
+    pub unsafe fn make_readonly(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, capi::PROT_READ) }
+    }
+
+    pub unsafe fn make_readwrite(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, capi::PROT_READ | capi::PROT_WRITE) }
+    }
+
+    pub unsafe fn make_inaccessible(&self, range: Range<usize>) -> Result<()> {
+        unsafe { self.change_protections(range, 0) }
+    }
+}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        unsafe {
+            let ptr = self.memory.as_ptr().cast();
+            let len = self.memory.as_ptr().len();
+            if len == 0 {
+                return;
+            }
+            cvt(capi::wasmtime_munmap(ptr, len)).unwrap();
+        }
+    }
+}

@@ -83,6 +83,27 @@ Programs with concurrent functions or `launch` are skipped, because isolated wor
 
 On `scripts/trees.napalm` the pass removes all leaf allocations: one shared leaf replaces half of the nodes. Median release time drops from about 18.4 ms to 12.4 ms.
 
+### Static types as optimization facts
+
+Napalm annotations are enforced contracts: parameters, typed bindings, typed fields, typed lists, structural objects and declared results are validated where values enter them. Every WIR `Value::ty` is therefore a guarantee, never a profile. `StaticTypeSpecialization` (`src/static_type_specialization.rs`) is a whole-program finalizer that runs before `AutoMemoization` and turns those guarantees into code:
+
+- **Class-hierarchy devirtualization.** An `Invoke` on a receiver whose static type is `Instance<C>` becomes `CallDirect` when `C` and every class that may extend it resolve the selector to one target. Trivial accessors become `LoadField`/`StoreField` inside the owning class.
+- **Result types.** Declared result contracts (`function f(): T`, checked on every return; `NAPALM-T007` for statically wrong returns) and the join of returned values type every resolved call.
+- **Builtin results.** Stock numeric operators over numbers, `List<T>[i]` (`T | null`: out-of-range reads yield null) and the `length`/`count`/`size` getters each builtin class actually registers.
+- **Validation elimination.** A scalar `BindInterface` whose operand already satisfies the contract is removed, and so is a structural/typed-list binding of a value that comes straight out of a binding of the identical contract (rebinding an installed contract is a runtime no-op).
+- **Allocation-enabling inlining.** A small straight-line direct callee (no control flow, captures, field/module state or deopt metadata) that receives an object allocated by the caller is copied into the caller. The function pipeline then re-runs, so escape analysis can scalar-replace the object. For example, a `{ x, y }` literal passed to `dist(a: Point, b: Point)` disappears with its contract binding and property accesses.
+
+The bytecode compiler publishes the same facts to the native tiers. Each live-register entry carries the static types of its live GPRs (`LiveRegisterEntry::types`, Napalm-visible types only), and `BytecodeFunction::result_type` records the join of all returned values.
+
+### Automatic memoization across `launch` workers
+
+Every VM keeps a private first-level memo table per auto-memoized function. When a VM first launches concurrent work, it creates one program-wide second-level domain (`src/napalm_shared_memo.rs`): a lock-free `papaya` map per memoized function, shared by that VM and all of its workers. An L1 miss consults the shared tier and adopts hits into L1; each new result is published to both tiers, with the first publisher winning.
+
+- Only VM-independent scalar results (null, booleans, numbers and raw `Int32`/`F64` words) are shared. Managed results stay private to the producing heap, so the shared tier needs no GC rooting.
+- The launching VM seeds the domain with its warm L1 results, so workers start warm.
+- Auto-memoized functions are pure over scalar operators and stock builtin dispatch, and workers install the same builtin manifest. A VM that rebinds builtins after installation leaves the domain permanently, and its later launches use a domain only its workers share.
+- The shared tier uses the same entry limits as L1. Unobserved entries are swept at most once per minute, and only when a table is full.
+
 ### Aggressive HIR mode
 
 A throughput-oriented pipeline is available for hot/AOT-style use and benchmarks. It additionally pays for global analyses such as dominator-based CSE and repeats cleanup/SROA to a bounded fixed point.
@@ -296,6 +317,21 @@ their normal tracing entry and loop paths.
 ### Bounded language-call inlining
 
 The recorder can inline bounded Wren calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
+
+Every inlined guard exits to the caller's call instruction and replays it, so no exit may follow a callee effect. Within that rule:
+
+- **Receiver field stores** are buffered and emitted at the inlined `Return`, after every guard. A receiver class guard fixes the field layout first, so the stores' own checks cannot fail. Later loads of a stored slot are forwarded, and any load that could alias the receiver aborts inlining. Reactive VMs keep the baseline store path.
+- **Structural property loads** of parameter objects use the same shaped/PIC native loads as root traces.
+- **A structural binding** of a parameter whose proven type is exactly the bound contract is skipped.
+- A callee already compiled by the whole-function tier may complete inside the recorded call step; the recorder accepts the caller continuation.
+
+### Static type facts in traces
+
+The recorder seeds trace values from the bytecode's static register types. Trace-entry values and loop phis take the types at the anchor. Values reloaded after a runtime boundary take the types at the boundary's resume PC, and statically bound calls also contribute their callee's `result_type`. The builder clears the boundary facts at every boundary, so a stale fact can never cross into a later epoch. These facts remove type, class and not-null guards on values that come from outside the recorded path.
+
+The stock `list.length` and `list[i]` Invokes run natively (`HeapListLen`, `GuardInt32` + `GuardBounds` + `HeapListGet`). A statically typed `List<T>` receiver proves the element type `T` for in-bounds reads. Negative, out-of-range, fractional and range indices replay the original Invoke.
+
+`NAPALM_JIT_DUMP=1` prints each compiled trace's live nodes and loop phis, to audit which guards survive.
 
 ### Trace IR optimizations
 

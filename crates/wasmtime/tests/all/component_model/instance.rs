@@ -1,0 +1,293 @@
+use wasmtime::Result;
+use wasmtime::component::*;
+use wasmtime::{Module, Store, StoreContextMut, Trap};
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn instance_exports() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (import "a" (instance $i))
+            (import "b" (instance $i2 (export "m" (core module))))
+
+            (alias export $i2 "m" (core module $m))
+
+            (component $c
+                (component $c
+                    (export "m" (core module $m))
+                )
+                (instance $c (instantiate $c))
+                (export "i" (instance $c))
+            )
+            (instance $c (instantiate $c))
+            (export "i" (instance $c))
+            (export "r" (instance $i))
+            (export "r2" (instance $i2))
+        )
+    "#;
+    let component = Component::new(&engine, component)?;
+    let mut store = Store::new(&engine, ());
+    let mut linker = Linker::new(&engine);
+    linker.instance("a")?;
+    linker
+        .instance("b")?
+        .module("m", &Module::new(&engine, "(module)")?)?;
+    let instance = linker.instantiate(&mut store, &component)?;
+
+    assert!(
+        instance
+            .get_export(&mut store, None, "not an instance")
+            .is_none()
+    );
+    let i = instance.get_export_index(&mut store, None, "r").unwrap();
+    assert!(instance.get_export(&mut store, Some(&i), "x").is_none());
+    instance.get_export(&mut store, None, "i").unwrap();
+    let i2 = instance.get_export_index(&mut store, None, "r2").unwrap();
+    let m = instance
+        .get_export_index(&mut store, Some(&i2), "m")
+        .unwrap();
+    assert!(instance.get_func(&mut store, &m).is_none());
+    assert!(instance.get_module(&mut store, &m).is_some());
+
+    let i = instance.get_export_index(&mut store, None, "i").unwrap();
+    let i = instance
+        .get_export_index(&mut store, Some(&i), "i")
+        .unwrap();
+    let m = instance
+        .get_export_index(&mut store, Some(&i), "m")
+        .unwrap();
+    instance.get_module(&mut store, &m).unwrap();
+
+    Ok(())
+}
+
+#[test]
+fn export_old_get_new() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (core module $m)
+            (export "a:b/m@1.0.0" (core module $m))
+
+            (instance $i (export "m" (core module $m)))
+            (export "a:b/i@1.0.0" (instance $i))
+        )
+    "#;
+
+    let component = Component::new(&engine, component)?;
+    component.get_export(None, "a:b/m@1.0.1").unwrap();
+    let i = component.get_export_index(None, "a:b/i@1.0.1").unwrap();
+    component.get_export(Some(&i), "m").unwrap();
+
+    let mut store = Store::new(&engine, ());
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate(&mut store, &component)?;
+
+    instance.get_module(&mut store, "a:b/m@1.0.1").unwrap();
+    instance
+        .get_export(&mut store, None, "a:b/m@1.0.1")
+        .unwrap();
+
+    let i = instance
+        .get_export_index(&mut store, None, "a:b/i@1.0.1")
+        .unwrap();
+    instance.get_export(&mut store, Some(&i), "m").unwrap();
+
+    Ok(())
+}
+
+#[test]
+fn export_new_get_old() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (core module $m)
+            (export "a:b/m@1.0.1" (core module $m))
+
+            (instance $i (export "m" (core module $m)))
+            (export "a:b/i@1.0.1" (instance $i))
+        )
+    "#;
+
+    let component = Component::new(&engine, component)?;
+    component.get_export(None, "a:b/m@1.0.0").unwrap();
+    let i = component.get_export_index(None, "a:b/i@1.0.0").unwrap();
+    component.get_export(Some(&i), "m").unwrap();
+
+    let mut store = Store::new(&engine, ());
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate(&mut store, &component)?;
+
+    instance.get_module(&mut store, "a:b/m@1.0.0").unwrap();
+    instance
+        .get_export(&mut store, None, "a:b/m@1.0.0")
+        .unwrap();
+
+    let i = instance
+        .get_export_index(&mut store, None, "a:b/i@1.0.0")
+        .unwrap();
+    instance.get_export(&mut store, Some(&i), "m").unwrap();
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn export_missing_get_max() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (core module $m1)
+            (core module $m2 (import "" "" (func)))
+            (export "a:b/m@1.0.1" (core module $m1))
+            (export "a:b/m@1.0.3" (core module $m2))
+        )
+    "#;
+
+    fn assert_m2(module: &Module) {
+        assert_eq!(module.imports().len(), 1);
+    }
+    fn assert_m1(module: &Module) {
+        assert_eq!(module.imports().len(), 0);
+    }
+
+    let component = Component::new(&engine, component)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    let tests = [
+        ("a:b/m@1.0.0", assert_m2 as fn(&_)), // no exact, should pick max available
+        ("a:b/m@1.0.1", assert_m1),           // exact hit
+        ("a:b/m@1.0.2", assert_m2),           // no exact, should pick max available
+        ("a:b/m@1.0.3", assert_m2),           // exact hit
+        ("a:b/m@1.0.4", assert_m2),           // no exact, should pick max available
+    ];
+
+    for (name, test_fn) in tests {
+        println!("test {name}");
+        let m = component.get_export_index(None, name).unwrap();
+        let m = instance.get_module(&mut store, &m).unwrap();
+        test_fn(&m);
+
+        let m = instance.get_module(&mut store, name).unwrap();
+        test_fn(&m);
+
+        let m = instance.get_export_index(&mut store, None, name).unwrap();
+        let m = instance.get_module(&mut store, &m).unwrap();
+        test_fn(&m);
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn export_type_ascription_hides_exports() -> Result<()> {
+    let engine = super::engine();
+    let component = r#"
+        (component
+            (core module $m
+                (func (export "f") (result i32) i32.const 1)
+                (func (export "g") (result i32) i32.const 2))
+            (core instance $i (instantiate $m))
+            (func $f (result u32) (canon lift (core func $i "f")))
+            (func $g (result u32) (canon lift (core func $i "g")))
+            (instance $inst (export "f" (func $f)) (export "g" (func $g)))
+            (export "hidden" (instance $inst) (instance (export "f" (func (result u32)))))
+        )
+    "#;
+    let component = Component::new(&engine, component)?;
+
+    let ty = component.component_type();
+    let (_, hidden) = ty.exports(&engine).next().unwrap();
+    let types::ComponentItem::ComponentInstance(hidden) = hidden.ty else {
+        panic!("expected an instance export");
+    };
+    let names = hidden.exports(&engine).map(|(n, _)| n).collect::<Vec<_>>();
+    assert_eq!(names, ["f"]);
+
+    let hidden = component.get_export_index(None, "hidden").unwrap();
+    assert!(component.get_export_index(Some(&hidden), "g").is_none());
+
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let hidden = instance
+        .get_export_index(&mut store, None, "hidden")
+        .unwrap();
+    assert!(
+        instance
+            .get_export_index(&mut store, Some(&hidden), "g")
+            .is_none()
+    );
+    let f = instance
+        .get_export_index(&mut store, Some(&hidden), "f")
+        .unwrap();
+    let f = instance.get_typed_func::<(), (u32,)>(&mut store, &f)?;
+    assert_eq!(f.call(&mut store, ())?, (1,));
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn start_function_not_run_in_poisoned_store() -> Result<()> {
+    let engine = super::engine();
+
+    let trapper = Component::new(
+        &engine,
+        r#"
+(component
+  (core module $m (func (export "trap") unreachable))
+  (core instance $m (instantiate $m))
+  (func (export "trap") (canon lift (core func $m "trap")))
+)
+        "#,
+    )?;
+
+    // The start function calls a host import so we can observe whether it
+    // ran.
+    let starter = Component::new(
+        &engine,
+        r#"
+            (component
+              (import "ran" (func $ran))
+              (core func $ran_lower (canon lower (func $ran)))
+              (core module $m
+                (import "host" "ran" (func $ran))
+                (func $start call $ran)
+                (start $start)
+              )
+              (core instance (instantiate $m
+                (with "host" (instance (export "ran" (func $ran_lower))))
+              ))
+            )
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, false);
+    let mut linker = Linker::new(&engine);
+    linker
+        .root()
+        .func_wrap("ran", |mut store: StoreContextMut<'_, bool>, _: ()| {
+            *store.data_mut() = true;
+            Ok(())
+        })?;
+
+    // Poison the store with a trap.
+    let instance = linker.instantiate(&mut store, &trapper)?;
+    let trap = instance.get_typed_func::<(), ()>(&mut store, "trap")?;
+    assert!(trap.call(&mut store, ()).is_err());
+
+    // Instantiating into the poisoned store must fail without running the
+    // start function.
+    let err = linker.instantiate(&mut store, &starter).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<Trap>(),
+        Some(&Trap::CannotEnterComponent),
+        "{err:?}"
+    );
+    assert!(!*store.data(), "start function ran in a poisoned store");
+
+    Ok(())
+}

@@ -27,7 +27,7 @@ enum Kind {
     #[token("'", string)]
     #[token("`", string)]
     String,
-    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
+    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
     Symbol,
     Eof,
 }
@@ -165,6 +165,8 @@ struct Parser<'a> {
     /// the corresponding FunctionBody is assembled. This keeps the existing AST
     /// parameter representation compact while preserving TypeScript annotations.
     parameter_types: HashMap<Span, TypeAnnotation>,
+    /// Direct `this.name` writes in the current constructor (including lexical closures).
+    constructor_properties: Option<Vec<Ident>>,
     synthetic_span: usize,
 }
 
@@ -276,7 +278,19 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                 Box::new(classify_variable_type(arguments[1], span))), span),
             "Set" | "ReadonlySet" if arguments.len() == 1 => TypeAnnotation::new(K::Set(
                 Some(Box::new(classify_variable_type(arguments[0], span)))), span),
-            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet" => TypeAnnotation::new(K::Never, span),
+            "Event" | "Emitter" | "Channel" | "Receiver" if arguments.len() == 1 => {
+                TypeAnnotation::new(
+                    K::BuiltinGeneric(
+                        base.to_owned(),
+                        Some(Box::new(classify_variable_type(arguments[0], span))),
+                    ),
+                    span,
+                )
+            }
+            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet"
+            | "Event" | "Emitter" | "Channel" | "Receiver" => {
+                TypeAnnotation::new(K::Never, span)
+            }
             "Record" => TypeAnnotation::new(K::Map, span),
             "Function" | "Fn" => TypeAnnotation::new(K::Closure, span),
             _ => TypeAnnotation::new(K::Named(base.to_owned()), span),
@@ -441,6 +455,7 @@ impl<'a> Parser<'a> {
             immutable: HashSet::default(),
             parameter_patterns: HashMap::default(),
             parameter_types: HashMap::default(),
+            constructor_properties: None,
             synthetic_span: source.len() + 1,
         }
     }
@@ -841,14 +856,16 @@ impl<'a> Parser<'a> {
             };
             self.type_parameters()?;
             let params = self.params()?;
-            self.annotation()?;
+            // `async` functions declare `Promise<T>` while their body returns `T`;
+            // the annotation therefore never constrains `return` statements.
+            let return_type = self.variable_annotation()?.filter(|_| !async_);
             // TypeScript overload signatures have no runtime body. Keep the final
             // implementation only; the overloads are erased like other types.
             if !self.at("{") {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            let body = self.function_body(params, start)?;
+            let body = self.function_body(params, return_type, start)?;
             let initializer = Expr::new(
                 if concurrent_ {
                     ExprKind::ConcurrentClosure(body)
@@ -1927,7 +1944,12 @@ impl<'a> Parser<'a> {
         Ok(prefix)
     }
 
-    fn function_body(&mut self, params: Vec<Ident>, start: usize) -> Result<FunctionBody> {
+    fn function_body(
+        &mut self,
+        params: Vec<Ident>,
+        return_type: Option<TypeAnnotation>,
+        start: usize,
+    ) -> Result<FunctionBody> {
         self.lines();
         let block = self.block()?;
         let StmtKind::Block(body_statements) = block.kind else {
@@ -1939,6 +1961,7 @@ impl<'a> Parser<'a> {
         Ok(FunctionBody {
             params,
             param_types,
+            return_type,
             kind: FunctionBodyKind::Statements(statements),
             span: self.end(start),
         })
@@ -2641,6 +2664,20 @@ impl<'a> Parser<'a> {
     }
 
     fn assignment_target(&mut self, e: &Expr) -> Result<()> {
+        if let Some(properties) = &mut self.constructor_properties {
+            if let ExprKind::Invoke(invoke) = &e.kind {
+                let mut receiver = invoke.receiver.as_deref();
+                while let Some(Expr { kind: ExprKind::Grouped(inner), .. }) = receiver {
+                    receiver = Some(inner);
+                }
+                if invoke.syntax == InvokeSyntax::Getter
+                    && invoke.args.is_empty()
+                    && receiver.is_some_and(|receiver| matches!(receiver.kind, ExprKind::This))
+                {
+                    properties.push(invoke.name.clone());
+                }
+            }
+        }
         if matches!(&e.kind, ExprKind::Name(_) | ExprKind::Subscript { .. })
             || matches!(&e.kind, ExprKind::Invoke(i) if i.syntax == InvokeSyntax::Getter)
         {
@@ -2738,16 +2775,19 @@ impl<'a> Parser<'a> {
         // Named functions and parenthesized arrow functions may carry a return
         // annotation here. For an unparenthesized arrow the preceding annotation
         // was the parameter annotation itself.
-        if function || parenthesized {
-            self.annotation()?;
-        }
+        let return_type = if function || parenthesized {
+            // Async closures declare `Promise<T>`; their `return` yields `T`.
+            self.variable_annotation()?.filter(|_| !async_)
+        } else {
+            None
+        };
         let body = if function {
-            self.function_body(params, start)?
+            self.function_body(params, return_type, start)?
         } else {
             self.expect("=>")?;
             self.lines();
             if self.at("{") {
-                self.function_body(params, start)?
+                self.function_body(params, return_type, start)?
             } else {
                 let value = self.expr(1)?;
                 let param_types = self.take_parameter_types(&params);
@@ -2757,7 +2797,7 @@ impl<'a> Parser<'a> {
                     statements.push(Stmt { span: value.span, kind: StmtKind::Return(Some(value)) });
                     FunctionBodyKind::Statements(statements)
                 };
-                FunctionBody { params, param_types, kind, span: self.end(start) }
+                FunctionBody { params, param_types, return_type, kind, span: self.end(start) }
             }
         };
         Ok(Expr::new(
@@ -2803,13 +2843,14 @@ impl<'a> Parser<'a> {
         }
         self.lines();
         let body = if self.at("{") {
-            self.function_body(params, start)?
+            self.function_body(params, None, start)?
         } else {
             let value = self.expr(1)?;
             let param_types = self.take_parameter_types(&params);
             FunctionBody {
                 params,
                 param_types,
+                return_type: None,
                 kind: FunctionBodyKind::Expression(Box::new(value)),
                 span: self.end(start),
             }
@@ -3012,11 +3053,17 @@ impl<'a> Parser<'a> {
                     let type_start = self.peek().span.start;
                     self.type_arguments()?;
                     let type_end = self.tokens[self.pos - 1].span.end;
-                    if matches!(collection_name.as_str(), "Map" | "Set") {
+                    if matches!(collection_name.as_str(), "Map" | "Set" | "Emitter" | "Channel") {
                         let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
                         let annotation = classify_variable_type(&spelling, self.end(start));
                         if matches!(annotation.kind, TypeAnnotationKind::Never) {
-                            return self.error("Map expects two type arguments; Set expects one");
+                            return self.error(match collection_name.as_str() {
+                                "Map" => "Map expects two type arguments",
+                                "Set" => "Set expects one type argument",
+                                "Emitter" => "Emitter expects one event type argument",
+                                "Channel" => "Channel expects one message type argument",
+                                _ => "invalid generic constructor",
+                            });
                         }
                         collection_annotation = Some(annotation);
                     }
@@ -3268,6 +3315,7 @@ impl<'a> Parser<'a> {
                 let close = interpolation_end(bytes, i + 2, 1).ok_or(())?;
                 let mut nested = Parser::new(self.source, i + 2, close, self.arena);
                 nested.synthetic_span = self.synthetic_span;
+                nested.constructor_properties = self.constructor_properties.take();
                 nested.lines();
                 let value = nested.expr(0);
                 nested.lines();
@@ -3275,6 +3323,7 @@ impl<'a> Parser<'a> {
                     let _: Result<()> = nested.error("unexpected tokens in template expression");
                 }
                 self.synthetic_span = nested.synthetic_span;
+                self.constructor_properties = nested.constructor_properties;
                 self.immutable.extend(nested.immutable);
                 self.diagnostics.extend(nested.diagnostics);
                 parts.push(StringPart::Expression(value?));
@@ -3378,6 +3427,9 @@ impl<'a> Parser<'a> {
     }
 
     fn class(&mut self, start: usize, is_foreign: bool, default_export: bool) -> Result<Vec<Stmt>> {
+        // A nested class owns its own `this`; its members must not declare fields
+        // on the enclosing constructor's class.
+        let enclosing_constructor_properties = self.constructor_properties.take();
         let name = if default_export && (self.at("{") || self.at("extends")) {
             Spanned::new("<default>".into(), self.peek().span)
         } else {
@@ -3418,6 +3470,7 @@ impl<'a> Parser<'a> {
         let decorator_payload = ast.ident("payload");
         let decorator_parameter = ast.ident("payloadParameter");
         let mut constructor = None;
+        let mut constructor_properties = Vec::new();
         while !self.at("}") && self.peek().kind != Kind::Eof {
             let member_start = self.peek().span.start;
             let decorators = self.decorators()?;
@@ -3510,11 +3563,11 @@ impl<'a> Parser<'a> {
                         ));
                     }
                 };
-                self.annotation()?;
+                let return_type = self.variable_annotation()?;
                 if !self.at("{") {
                     return self.error("operator overloads require an implementation body");
                 }
-                let body = Some(self.function_body(params, member_start)?);
+                let body = Some(self.function_body(params, return_type, member_start)?);
                 methods.push(MethodDecl {
                     signature,
                     is_async: false,
@@ -3530,10 +3583,11 @@ impl<'a> Parser<'a> {
             }
 
             // `computed name() { ... }` creates a lazy cached property. The
-            // implementation body is stored as a zero-argument closure in a hidden
-            // fixed-layout field. The public getter brackets closure execution with
-            // the internal reactive begin/finish hooks so field reads can be
-            // dependency-tracked without changing the ordinary getter ABI.
+            // implementation body is stored as a zero-argument closure in one hidden
+            // fixed-layout field. Native reactive state owns the logical cache/version;
+            // a second hidden field only anchors managed cached values to the instance
+            // for GC and is never read by the getter. The public getter brackets closure
+            // execution with internal begin/finish hooks without changing the ABI.
             //
             // `watch name() { ... }` similarly stores a closure, but the reactive runtime
             // schedules it as a microtask and re-schedules it when any dependency
@@ -3573,10 +3627,14 @@ impl<'a> Parser<'a> {
                         "a watcher requires a function body"
                     });
                 }
-                let body = self.function_body(Vec::new(), member_start)?;
+                // Computed/watch bodies are wrapped by reactive machinery whose
+                // public getter is synthesized separately; keep them unconstrained.
+                let body = self.function_body(Vec::new(), None, member_start)?;
                 if is_computed {
+                    let local_span = Span::empty(self.synthetic_span);
+                    self.synthetic_span += 1;
                     let (callback_field, cache_field, getter, initializer) =
-                        synthesize_computed_property(&member, body);
+                        synthesize_computed_property(&member, body, local_span);
                     fields.push(callback_field);
                     fields.push(cache_field);
                     methods.push(getter);
@@ -3604,7 +3662,7 @@ impl<'a> Parser<'a> {
             if self.at("(") {
                 let (params, parameter_properties) = self.params_with_properties(is_constructor)?;
                 let body_params = params.clone();
-                self.annotation()?;
+                let return_type = self.variable_annotation()?;
                 let signature = match access {
                     Some("get") if params.is_empty() => MethodSignatureAst::Getter { name: member },
                     Some("set") if params.len() == 1 => MethodSignatureAst::Setter {
@@ -3665,7 +3723,17 @@ impl<'a> Parser<'a> {
                     self.boundary()?;
                     None
                 } else {
-                    Some(self.function_body(body_params, member_start)?)
+                    if is_constructor {
+                        self.constructor_properties = Some(Vec::new());
+                    }
+                    // Constructors always yield the new instance; `async` methods
+                    // declare `Promise<T>`. Neither annotation constrains `return`.
+                    let return_type = return_type.filter(|_| !is_constructor && !async_);
+                    let body = self.function_body(body_params, return_type, member_start)?;
+                    if is_constructor {
+                        constructor_properties = self.constructor_properties.take().unwrap();
+                    }
+                    Some(body)
                 };
                 if is_constructor {
                     constructor = Some(methods.len());
@@ -3762,6 +3830,31 @@ impl<'a> Parser<'a> {
             self.separators();
         }
         self.expect("}")?;
+        // Infer public fields only after seeing the complete class, so an explicit
+        // field/accessor wins regardless of whether it precedes the constructor.
+        let mut property_names = methods.iter()
+            .filter(|method| !method.is_static)
+            .filter_map(|method| match &method.signature {
+                MethodSignatureAst::Getter { name } | MethodSignatureAst::Setter { name, .. } => {
+                    Some(name.value.clone())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for property in constructor_properties {
+            if !property_names.insert(property.value.clone()) {
+                continue;
+            }
+            fields.push(ClassFieldDecl {
+                storage: class_storage_ident(&property, false),
+                annotation: None,
+                initializer: None,
+                is_static: false,
+            });
+            let (getter, setter, _) = synthesize_class_property(&property, false, None);
+            methods.push(getter);
+            methods.push(setter);
+        }
         initializers.splice(0..0, method_initializers);
         if !initializers.is_empty() || !parameter_initializers.is_empty() || !watch_initializers.is_empty() {
             if constructor.is_none() {
@@ -3794,6 +3887,7 @@ impl<'a> Parser<'a> {
                     body: Some(FunctionBody {
                         params: Vec::new(),
                         param_types: Vec::new(),
+                        return_type: None,
                         kind: FunctionBodyKind::Statements(statements),
                         span: self.end(start),
                     }),
@@ -3840,6 +3934,7 @@ impl<'a> Parser<'a> {
                 body: Some(FunctionBody {
                     params: Vec::new(),
                     param_types: Vec::new(),
+                    return_type: None,
                     kind: FunctionBodyKind::Statements(static_initializers),
                     span: self.end(start),
                 }),
@@ -3881,6 +3976,7 @@ impl<'a> Parser<'a> {
                 span: self.end(start),
             });
         }
+        self.constructor_properties = enclosing_constructor_properties;
         Ok(out)
     }
 }
@@ -3934,13 +4030,28 @@ fn instance_field_expr(storage: &Ident) -> Expr {
 fn synthesize_computed_property(
     member: &Ident,
     body: FunctionBody,
+    local_span: Span,
 ) -> (ClassFieldDecl, ClassFieldDecl, MethodDecl, Stmt) {
     let callback_storage = hidden_reactive_field(member, "computed");
     let cache_storage = hidden_reactive_field(member, "computed_cache");
+    let callback_local = Spanned::new(
+        format!("<reactive:computed-local:{}>", member.value),
+        local_span,
+    );
     let span = member.span;
     let closure = Expr::new(ExprKind::Closure(body), span);
-    let callback = || instance_field_expr(&callback_storage);
+    let callback_field = || instance_field_expr(&callback_storage);
+    let callback = || Expr::new(ExprKind::Name(callback_local.clone()), span);
     let cache = || instance_field_expr(&cache_storage);
+
+    let callback_decl = Stmt {
+        kind: StmtKind::Variable {
+            name: callback_local.clone(),
+            annotation: None,
+            initializer: Some(callback_field()),
+        },
+        span,
+    };
 
     let begin = reactive_static_call("__beginComputed", vec![callback()], span);
     let evaluate = invoke(callback(), "call", Vec::new(), span);
@@ -3949,7 +4060,11 @@ fn synthesize_computed_property(
         vec![callback(), evaluate],
         span,
     );
-    let cache_update = Expr::new(
+    // Native state owns dirty/version metadata and mirrors the current value here.
+    // The hidden field is both the precise-GC anchor and the getter's cache-hit
+    // return path; runtime brackets suppress this implementation-only read from
+    // the parent reactive dependency graph.
+    let cache_anchor = Expr::new(
         ExprKind::Assign {
             target: Box::new(cache()),
             value: Box::new(finish),
@@ -3964,7 +4079,7 @@ fn synthesize_computed_property(
                 kind: StmtKind::Try {
                     body: Box::new(Stmt {
                         kind: StmtKind::Block(vec![Stmt {
-                            kind: StmtKind::Expression(cache_update),
+                            kind: StmtKind::Expression(cache_anchor),
                             span,
                         }]),
                         span,
@@ -3994,8 +4109,14 @@ fn synthesize_computed_property(
         body: Some(FunctionBody {
             params: Vec::new(),
             param_types: Vec::new(),
+            return_type: None,
             kind: FunctionBodyKind::Statements(vec![
+                callback_decl,
                 guarded_eval,
+                // __beginComputed/__abortComputed arrange for this one hidden
+                // cache-anchor load to bypass dependency tracking. Returning the
+                // field directly removes a second native runtime call from every
+                // computed cache hit.
                 Stmt {
                     kind: StmtKind::Return(Some(cache())),
                     span,
@@ -4008,7 +4129,7 @@ fn synthesize_computed_property(
     let initializer = Stmt {
         kind: StmtKind::Expression(Expr::new(
             ExprKind::Assign {
-                target: Box::new(callback()),
+                target: Box::new(callback_field()),
                 value: Box::new(reactive_static_call("__registerComputed", vec![closure], span)),
             },
             span,
@@ -4095,15 +4216,20 @@ fn synthesize_class_property(
         member.span,
     );
     let param = Spanned::new("<value>".into(), member.span);
+    // The accessors carry no explicit result annotation: the backing field's
+    // declared type already types the LoadField, and return-type inference
+    // propagates it to every statically resolved caller.
     let read = FunctionBody {
         params: Vec::new(),
         param_types: Vec::new(),
+        return_type: None,
         kind: FunctionBodyKind::Expression(Box::new(field.clone())),
         span: member.span,
     };
     let write = FunctionBody {
         params: Vec::new(),
         param_types: Vec::new(),
+        return_type: None,
         kind: FunctionBodyKind::Expression(Box::new(Expr::new(
             ExprKind::Assign {
                 target: Box::new(field.clone()),
@@ -4367,6 +4493,7 @@ impl DecoratorAst<'_> {
             attributes: Vec::new(),
             body: Some(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(statements),
                 span,
@@ -4560,6 +4687,7 @@ impl DecoratorAst<'_> {
         let span = self.span();
         Expr::new(ExprKind::Closure(FunctionBody {
             param_types: vec![None; params.len()],
+            return_type: None,
             params,
             kind: FunctionBodyKind::Statements(statements),
             span,
@@ -4698,6 +4826,7 @@ fn invoke(receiver: Expr, name: &str, args: Vec<Expr>, span: Span) -> Expr {
 fn infix(op: &str) -> Option<(u8, BinaryOp)> {
     use BinaryOp::*;
     Some(match op {
+        "|>" => (2, Pipeline),
         "|" => (5, BitOr),
         "^" => (6, BitXor),
         "&" => (7, BitAnd),
@@ -5395,6 +5524,56 @@ mod napalm_syntax_tests {
     }
 
     #[test]
+    fn parses_thread_first_pipeline_operator() {
+        let module = assert_parses(r#"
+            function double(value) { return value * 2; }
+            function add(value, amount) { return value + amount; }
+
+            const direct = 21 |> double;
+            const called = 20 |> add(2);
+            const chained = 5 |> double |> add(1);
+            const conditional = true ? 10 : 20 |> double;
+        "#);
+
+        let initializer = |index: usize| -> &Expr {
+            let StmtKind::Variable { initializer: Some(initializer), .. } = &module.statements[index].kind else {
+                panic!("expected initialized variable");
+            };
+            initializer
+        };
+
+        assert!(matches!(
+            &initializer(2).kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+        assert!(matches!(
+            &initializer(3).kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+
+        let ExprKind::Binary {
+            left,
+            operator: BinaryOp::Pipeline,
+            right,
+        } = &initializer(4).kind else {
+            panic!("expected outer pipeline");
+        };
+        assert!(matches!(
+            left.kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+        assert!(matches!(right.kind, ExprKind::Invoke(_)));
+
+        let ExprKind::Conditional { else_expr, .. } = &initializer(5).kind else {
+            panic!("pipeline must bind more tightly than the conditional operator");
+        };
+        assert!(matches!(
+            else_expr.kind,
+            ExprKind::Binary { operator: BinaryOp::Pipeline, .. }
+        ));
+    }
+
+    #[test]
     fn parses_sized_array_constructors() {
         let module = assert_parses(r#"
             const genericNew = new Array(4);
@@ -5502,6 +5681,33 @@ mod napalm_syntax_tests {
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed$magnitude2")));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
+    }
+
+    #[test]
+    fn constructor_properties_are_deduplicated_and_nested_classes_keep_their_scope() {
+        let module = assert_parses(r#"
+            class Outer {
+                constructor() {
+                    this.value = 1;
+                    this.value = 2;
+                    class Inner { constructor() { this.inner = 3; } }
+                    this.after = 4;
+                }
+            }
+        "#);
+        let StmtKind::Class(outer) = &module.statements[0].kind else { panic!("expected class") };
+        assert_eq!(outer.fields.iter().map(|field| field.storage.value.as_str()).collect::<Vec<_>>(),
+            ["_value", "_after"]);
+        let constructor = outer.methods.iter().find(|method| method.is_constructor).unwrap();
+        let FunctionBodyKind::Statements(statements) = &constructor.body.as_ref().unwrap().kind else {
+            panic!("expected constructor statements")
+        };
+        let inner = statements.iter().find_map(|statement| match &statement.kind {
+            StmtKind::Class(class) => Some(class),
+            _ => None,
+        }).unwrap();
+        assert_eq!(inner.fields.len(), 1);
+        assert_eq!(inner.fields[0].storage.value, "_inner");
     }
 
     #[test]

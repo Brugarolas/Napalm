@@ -1,0 +1,970 @@
+use crate::field_map::remove_forbidden;
+use crate::p3::bindings::http::types::{ErrorCode, Trailers};
+use crate::p3::helpers::FutureReaderExt;
+use crate::{Error, FieldMap, ForbiddenHeaderFilter, WasiHttpCtxView};
+use bytes::Bytes;
+use core::iter;
+use core::num::NonZeroUsize;
+use core::pin::Pin;
+use core::task::{Context, Poll, ready};
+use http::HeaderMap;
+use http_body::Body as _;
+use http_body_util::combinators::UnsyncBoxBody;
+use std::any::{Any, TypeId};
+use std::mem;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::PollSender;
+use wasmtime::component::{
+    Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer, StreamReader,
+    StreamResult,
+};
+use wasmtime::error::Context as _;
+use wasmtime::{AsContextMut, StoreContextMut};
+
+/// Clamp a requested outgoing body channel capacity into the range that
+/// `tokio::sync::mpsc::channel` accepts (it panics outside of it).
+fn channel_capacity(requested: usize) -> usize {
+    requested.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// The concrete type behind a `wasi:http/types.body` resource.
+pub(crate) enum Body {
+    /// Body constructed by the guest
+    Guest {
+        /// The body stream
+        contents_rx: Option<StreamReader<u8>>,
+        /// Future, on which guest will write result and optional trailers
+        trailers_rx: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        /// Channel, on which transmission result will be written
+        result_tx: oneshot::Sender<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+    },
+    /// Body constructed by the host.
+    Host {
+        /// The [`http_body::Body`]
+        body: UnsyncBoxBody<Bytes, Error>,
+        /// Channel, on which transmission result will be written
+        result_tx: oneshot::Sender<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+    },
+}
+
+async fn guest_body_result<E>(
+    rx: oneshot::Receiver<Box<dyn Future<Output = Result<(), E>> + Send>>,
+) -> wasmtime::Result<Result<(), E>> {
+    match rx.await {
+        Ok(fut) => Ok(Pin::from(fut).await),
+        // oneshot sender dropped, treat as success
+        Err(..) => Ok(Ok(())),
+    }
+}
+
+impl Body {
+    pub(crate) fn new_guest<S>(
+        mut store: S,
+        mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Send + 'static,
+        contents: Option<StreamReader<u8>>,
+        mut trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+    ) -> wasmtime::Result<(Self, FutureReader<Result<(), ErrorCode>>)>
+    where
+        S: AsContextMut,
+    {
+        // Attempt to unwrap this guest-specified body stream as a host-owned
+        // stream. That helps bypass a layer of indirection where possible.
+        let contents = match contents
+            .map(|rx| rx.try_into::<HostBodyStreamProducer>(store.as_context_mut()))
+        {
+            Some(Ok(mut producer)) => {
+                trailers.close(store.as_context_mut())?;
+                let (result_tx, result_rx) = oneshot::channel();
+                let body = Body::Host {
+                    body: mem::take(&mut producer.body),
+                    result_tx,
+                };
+                return Ok((
+                    body,
+                    FutureReader::new_cb(
+                        store.as_context_mut(),
+                        guest_body_result(result_rx),
+                        move |d, res: Result<_, Error>| {
+                            Ok(res.map_err(|e| getter(d).error_to_p3(&e)))
+                        },
+                    )?,
+                ));
+            }
+            Some(Err(rx)) => Some(rx),
+            None => None,
+        };
+        let (result_tx, result_rx) = oneshot::channel();
+        let body = Body::Guest {
+            contents_rx: contents,
+            trailers_rx: trailers,
+            result_tx,
+        };
+        Ok((
+            body,
+            FutureReader::new_cb(
+                store.as_context_mut(),
+                guest_body_result(result_rx),
+                move |d, res: Result<_, Error>| Ok(res.map_err(|e| getter(d).error_to_p3(&e))),
+            )?,
+        ))
+    }
+
+    /// Implementation of `consume-body` shared between requests and responses
+    pub(crate) fn consume<S>(
+        self,
+        mut store: S,
+        fut: FutureReader<Result<(), ErrorCode>>,
+        mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Send + 'static,
+    ) -> wasmtime::Result<(
+        StreamReader<u8>,
+        FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+    )>
+    where
+        S: AsContextMut,
+    {
+        let (contents_rx, trailers_rx) = match self {
+            Body::Guest {
+                contents_rx,
+                trailers_rx,
+                result_tx,
+            } => {
+                let body = match contents_rx {
+                    Some(stream) => stream,
+                    None => StreamReader::new(store.as_context_mut(), iter::empty())?,
+                };
+                fut.pipe_cb(store.as_context_mut(), |_, res| {
+                    _ = result_tx.send(Box::new(async { res.map_err(|e| e.into()) }));
+                    Ok(())
+                })?;
+                (body, trailers_rx)
+            }
+            Body::Host { body, result_tx } => {
+                fut.pipe_cb(store.as_context_mut(), |_, res| {
+                    _ = result_tx.send(Box::new(async { res.map_err(|e| e.into()) }));
+                    Ok(())
+                })?;
+                let (trailers_tx, trailers_rx) = oneshot::channel();
+                (
+                    StreamReader::new(
+                        store.as_context_mut(),
+                        HostBodyStreamProducer {
+                            body,
+                            trailers: Some(trailers_tx),
+                        },
+                    )?,
+                    FutureReader::new_cb(store.as_context_mut(), trailers_rx, move |d, res| {
+                        let mut view = getter(d);
+                        let trailers = match res {
+                            Ok(Some(trailers)) => trailers,
+                            Ok(None) => return Ok(Ok(None)),
+                            Err(e) => return Ok(Err(view.error_to_p3(&e))),
+                        };
+                        let trailers = FieldMap::new_immutable(view.hooks, trailers);
+                        let trailers = view
+                            .table
+                            .push(trailers)
+                            .context("failed to push trailers to table")?;
+                        Ok(Ok(Some(trailers)))
+                    })?,
+                )
+            }
+        };
+
+        Ok((contents_rx, trailers_rx))
+    }
+
+    /// Implementation of `drop` shared between requests and responses
+    pub(crate) fn drop(self, mut store: impl AsContextMut) -> wasmtime::Result<()> {
+        if let Body::Guest {
+            contents_rx,
+            mut trailers_rx,
+            ..
+        } = self
+        {
+            if let Some(mut contents_rx) = contents_rx {
+                contents_rx.close(&mut store)?;
+            }
+            trailers_rx.close(store)?;
+        }
+        Ok(())
+    }
+}
+
+/// [StreamConsumer] implementation for bodies originating in the guest with `Content-Length`
+/// header set.
+struct LimitedGuestBodyConsumer {
+    contents_tx: PollSender<Result<Bytes, ErrorCode>>,
+    error_tx: Option<oneshot::Sender<ErrorCode>>,
+    make_error: fn(Option<u64>) -> ErrorCode,
+    /// Limit of bytes to be sent
+    limit: u64,
+    /// Number of bytes sent
+    sent: u64,
+    max_chunk_size: usize,
+    // `true` when the other side of `contents_tx` was unexpectedly closed
+    closed: bool,
+}
+
+impl LimitedGuestBodyConsumer {
+    /// Sends the error constructed by [Self::make_error] on both error channels.
+    /// Does nothing if an error has already been sent on [Self::error_tx].
+    fn send_error(&mut self, sent: Option<u64>) {
+        if let Some(error_tx) = self.error_tx.take() {
+            _ = error_tx.send((self.make_error)(sent));
+            self.contents_tx.abort_send();
+            if let Some(tx) = self.contents_tx.get_ref() {
+                _ = tx.try_send(Err((self.make_error)(sent)))
+            }
+            self.contents_tx.close();
+        }
+    }
+}
+
+impl Drop for LimitedGuestBodyConsumer {
+    fn drop(&mut self) {
+        if !self.closed && self.limit != self.sent {
+            self.send_error(Some(self.sent))
+        }
+    }
+}
+
+impl<D> StreamConsumer<D> for LimitedGuestBodyConsumer {
+    type Item = u8;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        src: Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        debug_assert!(!self.closed);
+        let mut src = src.as_direct(store);
+        let buf = src.remaining()?;
+        let n = buf.len().min(self.max_chunk_size);
+        let buf = &buf[..n];
+
+        // Perform `content-length` check early and precompute the next value
+        let Ok(sent) = n.try_into() else {
+            self.send_error(None);
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        };
+        let Some(sent) = self.sent.checked_add(sent) else {
+            self.send_error(None);
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        };
+        if sent > self.limit {
+            self.send_error(Some(sent));
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        }
+        match self.contents_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let buf = Bytes::copy_from_slice(buf);
+                match self.contents_tx.send_item(Ok(buf)) {
+                    Ok(()) => {
+                        src.mark_read(n);
+                        // Record new `content-length` only on successful send
+                        self.sent = sent;
+                        Poll::Ready(Ok(StreamResult::Completed))
+                    }
+                    Err(..) => {
+                        self.closed = true;
+                        Poll::Ready(Ok(StreamResult::Dropped))
+                    }
+                }
+            }
+            Poll::Ready(Err(..)) => {
+                self.closed = true;
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// [StreamConsumer] implementation for bodies originating in the guest without `Content-Length`
+/// header set.
+struct UnlimitedGuestBodyConsumer {
+    contents_tx: PollSender<Result<Bytes, ErrorCode>>,
+    max_chunk_size: usize,
+}
+
+impl<D> StreamConsumer<D> for UnlimitedGuestBodyConsumer {
+    type Item = u8;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        src: Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        match self.contents_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let mut src = src.as_direct(store);
+                let buf = src.remaining()?;
+                let n = buf.len().min(self.max_chunk_size);
+                let buf = Bytes::copy_from_slice(&buf[..n]);
+                match self.contents_tx.send_item(Ok(buf)) {
+                    Ok(()) => {
+                        src.mark_read(n);
+                        Poll::Ready(Ok(StreamResult::Completed))
+                    }
+                    Err(..) => Poll::Ready(Ok(StreamResult::Dropped)),
+                }
+            }
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// [http_body::Body] implementation for bodies originating in the guest.
+pub(crate) struct GuestBody {
+    contents_rx: Option<mpsc::Receiver<Result<Bytes, ErrorCode>>>,
+    trailers_rx: Option<oneshot::Receiver<Result<Option<Arc<FieldMap>>, ErrorCode>>>,
+    content_length: Option<u64>,
+}
+
+impl GuestBody {
+    /// Construct a new [GuestBody]
+    pub(crate) fn new<T: 'static>(
+        mut store: impl AsContextMut<Data = T>,
+        contents_rx: Option<StreamReader<u8>>,
+        trailers_rx: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        result_tx: oneshot::Sender<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+        result_fut: impl Future<Output = Result<(), Error>> + Send + 'static,
+        content_length: Option<u64>,
+        make_error: fn(Option<u64>) -> ErrorCode,
+        mut getter: impl FnMut(&mut T) -> WasiHttpCtxView<'_> + Unpin + Send + 'static,
+    ) -> wasmtime::Result<Self> {
+        let max_chunk_size = getter(store.as_context_mut().data_mut())
+            .hooks
+            .p3_outgoing_body_chunk_size()
+            .max(1);
+        let buffer_chunks = getter(store.as_context_mut().data_mut())
+            .hooks
+            .p3_outgoing_body_buffer_chunks()
+            .max(1);
+
+        let (trailers_http_tx, trailers_http_rx) = oneshot::channel();
+        trailers_rx.pipe_cb(&mut store, move |data, res| {
+            let res = match res {
+                Ok(Some(trailers)) => {
+                    let WasiHttpCtxView { table, .. } = getter(data);
+                    let trailers = table
+                        .delete(trailers)
+                        .context("failed to delete trailers")?;
+                    Ok(Some(Arc::from(trailers)))
+                }
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            };
+            _ = trailers_http_tx.send(res);
+            Ok(())
+        })?;
+
+        let contents_rx = if let Some(rx) = contents_rx {
+            // `PollSender` can use every slot, so no extra one is needed, but the
+            // capacity still has to stay inside what `mpsc::channel` accepts.
+            let capacity = channel_capacity(buffer_chunks);
+            let (http_tx, http_rx) = mpsc::channel(capacity);
+            let contents_tx = PollSender::new(http_tx);
+            if let Some(limit) = content_length {
+                let (error_tx, error_rx) = oneshot::channel();
+                _ = result_tx.send(Box::new(async move {
+                    if let Ok(err) = error_rx.await {
+                        return Err(Error::from(err));
+                    };
+                    result_fut.await
+                }));
+                rx.pipe(
+                    store,
+                    LimitedGuestBodyConsumer {
+                        contents_tx,
+                        error_tx: Some(error_tx),
+                        make_error,
+                        limit,
+                        sent: 0,
+                        max_chunk_size,
+                        closed: false,
+                    },
+                )?;
+            } else {
+                _ = result_tx.send(Box::new(result_fut));
+                rx.pipe(
+                    store,
+                    UnlimitedGuestBodyConsumer {
+                        contents_tx,
+                        max_chunk_size,
+                    },
+                )?;
+            };
+            Some(http_rx)
+        } else {
+            _ = result_tx.send(Box::new(result_fut));
+            None
+        };
+        Ok(Self {
+            trailers_rx: Some(trailers_http_rx),
+            contents_rx,
+            content_length,
+        })
+    }
+}
+
+impl http_body::Body for GuestBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(contents_rx) = self.contents_rx.as_mut() {
+            // `contents_rx` has not been closed yet, poll it
+            while let Some(res) = ready!(contents_rx.poll_recv(cx)) {
+                match res {
+                    Ok(buf) => {
+                        if let Some(n) = self.content_length.as_mut() {
+                            // Subtract frame length from `content_length`,
+                            // [LimitedGuestBodyConsumer] already performs the validation, so
+                            // just keep count as optimization for
+                            // `is_end_stream` and `size_hint`
+                            *n = n.saturating_sub(buf.len().try_into().unwrap_or(u64::MAX));
+                        }
+                        return Poll::Ready(Some(Ok(http_body::Frame::data(buf))));
+                    }
+                    Err(err) => {
+                        return Poll::Ready(Some(Err(err.into())));
+                    }
+                }
+            }
+            // Record that `contents_rx` is closed
+            self.contents_rx = None;
+        }
+
+        let Some(trailers_rx) = self.trailers_rx.as_mut() else {
+            // `trailers_rx` has already terminated - this is the end of stream
+            return Poll::Ready(None);
+        };
+
+        let res = ready!(Pin::new(trailers_rx).poll(cx));
+        // Record that `trailers_rx` has terminated
+        self.trailers_rx = None;
+        match res {
+            Ok(Ok(Some(trailers))) => Poll::Ready(Some(Ok(http_body::Frame::trailers(
+                Arc::unwrap_or_clone(trailers).into(),
+            )))),
+            Ok(Ok(None)) => Poll::Ready(None),
+            Ok(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            // The sender was dropped without a result, e.g. because the guest
+            // trapped or the store was dropped. Treat this as an incomplete
+            // body.
+            Err(..) => Poll::Ready(Some(Err(Error::HttpProtocolError))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        if let Some(contents_rx) = self.contents_rx.as_ref() {
+            if !contents_rx.is_empty()
+                || !contents_rx.is_closed()
+                || self.content_length.is_some_and(|n| n > 0)
+            {
+                // `contents_rx` might still produce data frames
+                return false;
+            }
+        }
+        if let Some(trailers_rx) = self.trailers_rx.as_ref() {
+            if !trailers_rx.is_terminated() {
+                // `trailers_rx` has not terminated yet
+                return false;
+            }
+        }
+
+        // no data left
+        return true;
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(n) = self.content_length {
+            http_body::SizeHint::with_exact(n)
+        } else {
+            http_body::SizeHint::default()
+        }
+    }
+}
+
+/// [StreamProducer] implementation for bodies originating in the host.
+pub(crate) struct HostBodyStreamProducer {
+    pub(crate) body: UnsyncBoxBody<Bytes, Error>,
+    trailers: Option<oneshot::Sender<Result<Option<HeaderMap>, Error>>>,
+}
+
+impl Drop for HostBodyStreamProducer {
+    fn drop(&mut self) {
+        self.close(Ok(None))
+    }
+}
+
+impl HostBodyStreamProducer {
+    fn close(&mut self, res: Result<Option<HeaderMap>, Error>) {
+        if let Some(tx) = self.trailers.take() {
+            _ = tx.send(res);
+        }
+    }
+}
+
+impl<D> StreamProducer<D> for HostBodyStreamProducer
+where
+    D: 'static,
+{
+    type Item = u8;
+    type Buffer = Bytes;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'a, D>,
+        mut dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let res = 'result: {
+            let cap = match dst.remaining(&mut store)?.map(NonZeroUsize::new) {
+                Some(Some(cap)) => Some(cap),
+                Some(None) => {
+                    // On 0-length the best we can do is check that underlying stream has not
+                    // reached the end yet
+                    if self.body.is_end_stream() {
+                        break 'result Ok(None);
+                    } else {
+                        // Destination has zero capacity but the body could still have data. Cannot return
+                        // `Completed` (nothing was produced — violates the StreamProducer contract). Fall
+                        // through to poll the body with `cap = None` so it buffers the frame.
+                        None
+                    }
+                }
+                None => None,
+            };
+            loop {
+                match Pin::new(&mut self.body).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        match frame.into_data().map_err(http_body::Frame::into_trailers) {
+                            Ok(mut frame) => {
+                                if frame.len() == 0 {
+                                    // Zero-length data frames are valid per the http_body::Body
+                                    // trait contract and RFC 9113 §6.1 — skip and re-poll
+                                    // directly rather than using `wake_by_ref()` + Pending, which
+                                    // would just re-enter this function via the task queue
+                                    if self.body.is_end_stream() {
+                                        break 'result Ok(None);
+                                    }
+                                    continue;
+                                }
+
+                                if let Some(cap) = cap {
+                                    let n = frame.len();
+                                    let cap = cap.into();
+                                    if n > cap {
+                                        // data frame does not fit in destination, fill it and buffer the rest
+                                        dst.set_buffer(frame.split_off(cap));
+                                        let mut dst = dst.as_direct(store, cap);
+                                        dst.remaining()?.copy_from_slice(&frame);
+                                        dst.mark_written(cap);
+                                    } else {
+                                        // copy the whole frame into the destination
+                                        let mut dst = dst.as_direct(store, n);
+                                        dst.remaining()?[..n].copy_from_slice(&frame);
+                                        dst.mark_written(n);
+                                    }
+                                } else {
+                                    dst.set_buffer(frame);
+                                }
+                                return Poll::Ready(Ok(StreamResult::Completed));
+                            }
+                            Err(Ok(trailers)) => break 'result Ok(Some(trailers)),
+                            Err(Err(..)) => break 'result Err(Error::HttpProtocolError),
+                        }
+                    }
+                    Poll::Ready(Some(Err(err))) => break 'result Err(err),
+                    Poll::Ready(None) => break 'result Ok(None),
+                    Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        };
+        self.close(res);
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+
+    fn try_into(
+        me: Pin<Box<Self>>,
+        buffer: Bytes,
+        ty: TypeId,
+    ) -> Result<Box<dyn Any>, (Pin<Box<Self>>, Bytes)> {
+        if ty == TypeId::of::<Self>() {
+            let mut me = Pin::into_inner(me);
+            if !buffer.is_empty() {
+                // Data buffered by a previous read has already been taken from
+                // `body`, so it must be yielded before the rest of `body`.
+                let body = mem::take(&mut me.body);
+                me.body = UnsyncBoxBody::new(BodyWithPrefix {
+                    prefix: buffer,
+                    body,
+                });
+            }
+            Ok(me)
+        } else {
+            Err((me, buffer))
+        }
+    }
+}
+
+/// A wrapper around [http_body::Body], which yields `prefix` before `body`
+struct BodyWithPrefix<T> {
+    prefix: Bytes,
+    body: T,
+}
+
+impl<T> http_body::Body for BodyWithPrefix<T>
+where
+    T: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = T::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            let prefix = std::mem::take(&mut this.prefix);
+            return Poll::Ready(Some(Ok(http_body::Frame::data(prefix))));
+        }
+        Pin::new(&mut this.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_empty() && self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let n = self.prefix.len() as u64;
+        let hint = self.body.size_hint();
+        let mut res = http_body::SizeHint::new();
+        res.set_lower(hint.lower().saturating_add(n));
+        if let Some(upper) = hint.upper() {
+            res.set_upper(upper + n);
+        }
+        res
+    }
+}
+
+/// A wrapper around [http_body::Body], which allows attaching arbitrary state to it
+pub(crate) struct BodyWithState<T, U> {
+    body: T,
+    _state: U,
+}
+
+impl<T, U> http_body::Body for BodyWithState<T, U>
+where
+    T: http_body::Body + Unpin,
+    U: Unpin,
+{
+    type Data = T::Data;
+    type Error = T::Error;
+
+    #[inline]
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// A wrapper around [http_body::Body], which validates `Content-Length`
+pub(crate) struct BodyWithContentLength<T, E> {
+    body: T,
+    error_tx: Option<oneshot::Sender<E>>,
+    make_error: fn(Option<u64>) -> E,
+    /// Limit of bytes to be sent
+    limit: u64,
+    /// Number of bytes sent
+    sent: u64,
+}
+
+impl<T, E> BodyWithContentLength<T, E> {
+    /// Sends the error constructed by [Self::make_error] on [Self::error_tx].
+    /// Does nothing if an error has already been sent on [Self::error_tx].
+    fn send_error<V>(&mut self, sent: Option<u64>) -> Poll<Option<Result<V, E>>> {
+        if let Some(error_tx) = self.error_tx.take() {
+            _ = error_tx.send((self.make_error)(sent));
+        }
+        Poll::Ready(Some(Err((self.make_error)(sent))))
+    }
+}
+
+impl<T, E> http_body::Body for BodyWithContentLength<T, E>
+where
+    T: http_body::Body<Data = Bytes, Error = E> + Unpin,
+{
+    type Data = T::Data;
+    type Error = T::Error;
+
+    #[inline]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match ready!(Pin::new(&mut self.as_mut().body).poll_frame(cx)) {
+            Some(Ok(frame)) => {
+                let Some(data) = frame.data_ref() else {
+                    return Poll::Ready(Some(Ok(frame)));
+                };
+                let Ok(sent) = data.len().try_into() else {
+                    return self.send_error(None);
+                };
+                let Some(sent) = self.sent.checked_add(sent) else {
+                    return self.send_error(None);
+                };
+                if sent > self.limit {
+                    return self.send_error(Some(sent));
+                }
+                self.sent = sent;
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            None if self.limit != self.sent => {
+                // short write
+                let sent = self.sent;
+                self.send_error(Some(sent))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        // Do not report end of stream before `limit` bytes were sent, otherwise
+        // the consumer might stop polling before a short write is detected in
+        // `poll_frame`.
+        self.sent == self.limit && self.body.is_end_stream()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.limit.saturating_sub(self.sent))
+    }
+}
+
+/// A wrapper around [http_body::Body], which removes forbidden fields from
+/// trailers
+pub(crate) struct BodyWithFilteredTrailers<T> {
+    body: T,
+    is_forbidden: ForbiddenHeaderFilter,
+}
+
+impl<T> http_body::Body for BodyWithFilteredTrailers<T>
+where
+    T: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = T::Data;
+    type Error = T::Error;
+
+    #[inline]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let frame = match ready!(Pin::new(&mut self.as_mut().body).poll_frame(cx)) {
+            Some(Ok(frame)) => frame,
+            other => return Poll::Ready(other),
+        };
+        match frame.into_trailers() {
+            Ok(mut trailers) => {
+                remove_forbidden(&mut trailers, &self.is_forbidden);
+                Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
+            }
+            Err(frame) => Poll::Ready(Some(Ok(frame))),
+        }
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+pub(crate) trait BodyExt {
+    fn with_filtered_trailers(
+        self,
+        is_forbidden: ForbiddenHeaderFilter,
+    ) -> BodyWithFilteredTrailers<Self>
+    where
+        Self: Sized,
+    {
+        BodyWithFilteredTrailers {
+            body: self,
+            is_forbidden,
+        }
+    }
+
+    fn with_state<T>(self, state: T) -> BodyWithState<Self, T>
+    where
+        Self: Sized,
+    {
+        BodyWithState {
+            body: self,
+            _state: state,
+        }
+    }
+
+    fn with_content_length<E>(
+        self,
+        limit: u64,
+        error_tx: oneshot::Sender<E>,
+        make_error: fn(Option<u64>) -> E,
+    ) -> BodyWithContentLength<Self, E>
+    where
+        Self: Sized,
+    {
+        BodyWithContentLength {
+            body: self,
+            error_tx: Some(error_tx),
+            make_error,
+            limit,
+            sent: 0,
+        }
+    }
+}
+
+impl<T> BodyExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::{BodyExt as _, channel_capacity};
+    use crate::Error;
+    use bytes::Bytes;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use http_body::Body as _;
+    use http_body_util::{BodyExt as _, Full};
+    use tokio::sync::oneshot;
+
+    /// A body shorter than its `Content-Length` must not report end of stream
+    /// or a size hint based on its actual length, otherwise a consumer like
+    /// `hyper` frames the message by the wrong length without ever observing
+    /// the short write.
+    #[test]
+    fn content_length_short_body() {
+        let (error_tx, mut error_rx) = oneshot::channel();
+        let body = Full::new(Bytes::from_static(b"hello"))
+            .map_err(|never| match never {})
+            .with_content_length(10, error_tx, Error::HttpResponseBodySize);
+        let mut body = pin!(body);
+        assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(10));
+
+        let mut cx = Context::from_waker(Waker::noop());
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => assert_eq!(frame.into_data().unwrap(), "hello"),
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+        assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(5));
+
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Err(Error::HttpResponseBodySize(Some(5))))) => {}
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+        assert!(matches!(
+            error_rx.try_recv(),
+            Ok(Error::HttpResponseBodySize(Some(5)))
+        ));
+    }
+
+    /// A body longer than its `Content-Length` must fail before any data
+    /// exceeding the limit is produced.
+    #[test]
+    fn content_length_long_body() {
+        let (error_tx, mut error_rx) = oneshot::channel();
+        let body = Full::new(Bytes::from_static(b"helloworld"))
+            .map_err(|never| match never {})
+            .with_content_length(3, error_tx, Error::HttpResponseBodySize);
+        let mut body = pin!(body);
+        assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(3));
+
+        let mut cx = Context::from_waker(Waker::noop());
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Err(Error::HttpResponseBodySize(Some(10))))) => {}
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+        assert!(matches!(
+            error_rx.try_recv(),
+            Ok(Error::HttpResponseBodySize(Some(10)))
+        ));
+    }
+
+    /// A body matching its `Content-Length` is passed through unchanged.
+    #[test]
+    fn content_length_exact_body() {
+        let (error_tx, mut error_rx) = oneshot::channel();
+        let body = Full::new(Bytes::from_static(b"hello"))
+            .map_err(|never| match never {})
+            .with_content_length(5, error_tx, Error::HttpResponseBodySize);
+        let mut body = pin!(body);
+        assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(5));
+
+        let mut cx = Context::from_waker(Waker::noop());
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => assert_eq!(frame.into_data().unwrap(), "hello"),
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(matches!(
+            body.as_mut().poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert!(error_rx.try_recv().is_err());
+    }
+
+    /// `mpsc::channel` panics above `Semaphore::MAX_PERMITS` and at zero, so the
+    /// capacity handed to it must always be clamped - including for the huge
+    /// values an embedder or `-Shttp-outgoing-body-buffer-chunks` can supply.
+    #[test]
+    fn outgoing_body_channel_capacity_is_always_accepted() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        for requested in [0, 1, 1024, max, max + 1, usize::MAX] {
+            let capacity = channel_capacity(requested);
+            assert!(
+                capacity >= 1 && capacity <= max,
+                "capacity {capacity} out of range"
+            );
+            // Not panicking is the point: that is what the clamp buys us.
+            let _ = tokio::sync::mpsc::channel::<u8>(capacity);
+        }
+    }
+}

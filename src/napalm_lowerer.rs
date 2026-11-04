@@ -282,6 +282,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             operator,
             right,
         } => match operator {
+            BinaryOp::Pipeline => None,
             BinaryOp::Less
             | BinaryOp::LessEqual
             | BinaryOp::Greater
@@ -375,6 +376,8 @@ fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Ty
         TypeAnnotationKind::Object(fields) => fields.iter().all(|f| supported_interface_annotation(&f.annotation, known)),
         TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => supported_interface_annotation(t, known),
         TypeAnnotationKind::GenericMap(k, v) => supported_interface_annotation(k, known) && supported_interface_annotation(v, known),
+        TypeAnnotationKind::BuiltinGeneric(_, Some(t)) => supported_interface_annotation(t, known),
+        TypeAnnotationKind::BuiltinGeneric(_, None) => true,
         TypeAnnotationKind::Union(ts) => ts.iter().all(|t| supported_interface_annotation(t, known)),
         _ => true,
     }
@@ -395,6 +398,8 @@ fn supported_alias_annotation(
             supported_alias_annotation(element, known, type_params)
         }
         TypeAnnotationKind::GenericMap(k, v) => supported_alias_annotation(k, known, type_params) && supported_alias_annotation(v, known, type_params),
+        TypeAnnotationKind::BuiltinGeneric(_, Some(element)) => supported_alias_annotation(element, known, type_params),
+        TypeAnnotationKind::BuiltinGeneric(_, None) => true,
         TypeAnnotationKind::Union(types) => types
             .iter()
             .all(|ty| supported_alias_annotation(ty, known, type_params)),
@@ -407,6 +412,8 @@ fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<St
         TypeAnnotationKind::Object(_) => !supported_interface_annotation(annotation, known),
         TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => invalid_structural_annotation(t, known),
         TypeAnnotationKind::GenericMap(k, v) => invalid_structural_annotation(k, known) || invalid_structural_annotation(v, known),
+        TypeAnnotationKind::BuiltinGeneric(_, Some(t)) => invalid_structural_annotation(t, known),
+        TypeAnnotationKind::BuiltinGeneric(_, None) => false,
         TypeAnnotationKind::Union(ts) => ts.iter().any(|t| invalid_structural_annotation(t, known)),
         _ => false,
     }
@@ -435,6 +442,22 @@ fn resolve_type_annotation(
             Box::new(resolve_type_annotation(k, classes, interfaces)),
             Box::new(resolve_type_annotation(v, classes, interfaces))),
         K::Set(element) => Type::Set(element.as_ref().map(|t| Box::new(resolve_type_annotation(t, classes, interfaces)))),
+        K::BuiltinGeneric(name, element) => {
+            let builtin = match name.as_str() {
+                "Event" => Some(BuiltinId::Event),
+                "Emitter" => Some(BuiltinId::Emitter),
+                "Channel" => Some(BuiltinId::Channel),
+                "Receiver" => Some(BuiltinId::Receiver),
+                "Promise" => Some(BuiltinId::Promise),
+                _ => None,
+            };
+            builtin.map_or(Type::Top, |builtin| {
+                Type::Builtin(
+                    builtin,
+                    element.as_ref().map(|t| Box::new(resolve_type_annotation(t, classes, interfaces))),
+                )
+            })
+        }
         K::Object(fields) => Type::Interface(fields.iter().map(|field| ir::InterfaceFieldType {
             name: field.name.value.clone(),
             ty: resolve_type_annotation(&field.annotation, classes, interfaces),
@@ -446,6 +469,11 @@ fn resolve_type_annotation(
         K::Named(name) => match name.rsplit('.').next().unwrap_or(name) {
             "Range" => Type::Range,
             "Fiber" => Type::Fiber,
+            "Event" => Type::Builtin(BuiltinId::Event, None),
+            "Emitter" => Type::Builtin(BuiltinId::Emitter, None),
+            "Channel" => Type::Builtin(BuiltinId::Channel, None),
+            "Receiver" => Type::Builtin(BuiltinId::Receiver, None),
+            "Promise" => Type::Builtin(BuiltinId::Promise, None),
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
             "Set" => Type::Set(None),
@@ -496,6 +524,10 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         // Structural objects and typed Lists carry persistent runtime contracts so
         // aliases through `any` cannot bypass later writes.
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
+        Type::Builtin(
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+            Some(_),
+        ) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
         _ => false,
     }
@@ -508,6 +540,7 @@ fn semantic_source_type(ty: &Type) -> Type {
         Type::Cell(inner) => semantic_source_type(inner),
         Type::Closure(_) => Type::Closure(None),
         Type::List(Some(inner)) => Type::List(Some(Box::new(semantic_source_type(inner)))),
+        Type::Builtin(id, Some(inner)) => Type::Builtin(*id, Some(Box::new(semantic_source_type(inner)))),
         Type::Union(types) => {
             let mut normalized = Vec::new();
             for ty in types {
@@ -533,6 +566,8 @@ fn type_is_unknown(ty: &Type) -> bool {
     match ty {
         Type::Top | Type::RawPtr => true,
         Type::List(None) => true,
+        Type::Builtin(_, None) => true,
+        Type::Builtin(_, Some(inner)) => type_is_unknown(inner),
         Type::Class(classes) | Type::Instance(classes) => classes.is_unknown(),
         Type::Foreign(None) => true,
         Type::Union(types) => types.iter().any(type_is_unknown),
@@ -559,6 +594,7 @@ fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Interface(_) | Type::Record(_), Type::Map | Type::Interface(_) | Type::Record(_)) => true,
             (Type::List(Some(e)), Type::List(Some(a))) => may_satisfy(e, a),
+            (Type::Builtin(expected_id, Some(_)), Type::Builtin(actual_id, None)) if expected_id == actual_id => true,
             (Type::GenericMap(_, _), Type::Map) | (Type::Set(Some(_)), Type::Set(None)) => true,
             (e, Type::Union(ts)) => ts.iter().all(|a| may_satisfy(e, a)),
             (Type::Union(ts), a) => ts.iter().any(|e| may_satisfy(e, a)),
@@ -592,6 +628,8 @@ fn display_source_type(ty: &Type) -> String {
         Type::Fiber => "Fiber".to_owned(),
         Type::Foreign(_) => "foreign".to_owned(),
         Type::Module => "module".to_owned(),
+        Type::Builtin(id, None) => id.name().to_owned(),
+        Type::Builtin(id, Some(inner)) => format!("{}<{}>", id.name(), display_source_type(inner)),
         Type::Cell(inner) => display_source_type(inner),
         Type::Union(types) => types
             .iter()
@@ -617,6 +655,8 @@ fn display_type_annotation(annotation: &TypeAnnotation) -> String {
         K::GenericMap(k, v) => format!("Map<{}, {}>", display_type_annotation(k), display_type_annotation(v)),
         K::Set(None) => "Set".to_owned(),
         K::Set(Some(t)) => format!("Set<{}>", display_type_annotation(t)),
+        K::BuiltinGeneric(name, None) => name.clone(),
+        K::BuiltinGeneric(name, Some(t)) => format!("{name}<{}>", display_type_annotation(t)),
         K::Object(_) => "object interface".to_owned(),
         K::Closure => "Function".to_owned(),
         K::Named(name) | K::Opaque(name) => name.clone(),
@@ -2329,14 +2369,51 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
         param_types.extend((0..node.formal_params.len()).map(|_| Type::Top));
 
+        // A declared result type becomes the function's signature result. The
+        // lowering below validates every return path against it, so the
+        // signature is a sound guarantee rather than a hint. `never`/unparsed
+        // annotations resolve to Bottom and `void`/generics to Top: neither
+        // constrains returns, so both are treated as "no contract".
+        let return_contract = match &node.ast {
+            FunctionAst::Body(body) if !spec.constructor && !spec.is_async => {
+                body.return_type.as_ref().and_then(|annotation| {
+                    if invalid_structural_annotation(annotation, &self.interface_types) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T002",
+                            "unsupported field type in object interface",
+                            annotation.span,
+                        ));
+                        return None;
+                    }
+                    let expected = resolve_type_annotation(
+                        annotation,
+                        &self.top_level_classes,
+                        &self.interface_types,
+                    );
+                    (!matches!(expected, Type::Top | Type::Bottom)).then(|| StaticBindingType {
+                        expected,
+                        origin: annotation.span,
+                        display: display_type_annotation(annotation),
+                    })
+                })
+            }
+            _ => None,
+        };
+        let result_type = return_contract
+            .as_ref()
+            .map_or(Type::Top, |contract| contract.expected.clone());
+
         let mut builder = Builder::new(
             self.program,
             module,
             &spec.name,
             spec.kind,
             param_types,
-            Type::Top,
+            result_type,
         );
+        if let Some(contract) = &return_contract {
+            let _ = builder.intern_structural_layout(&contract.expected);
+        }
         builder.set_async(spec.is_async);
         builder.set_concurrent(spec.is_concurrent);
         if let Some(class) = spec.class {
@@ -2436,6 +2513,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             has_receiver,
             is_concurrent: spec.is_concurrent,
             allows_await: node.is_async || node.is_concurrent || (node_id.0 == 0 && spec.kind == FunctionKind::ModuleBody),
+            return_contract,
         };
         let diagnostics = &mut self.diagnostics;
         let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values);
@@ -2578,6 +2656,9 @@ struct FunctionCompilerContext<'a> {
     has_receiver: bool,
     is_concurrent: bool,
     allows_await: bool,
+    /// Declared result contract (`function f(): T`). Every `return` validates
+    /// against it, which makes `Signature::result` a guarantee callers can use.
+    return_contract: Option<StaticBindingType>,
 }
 
 struct FunctionCompiler<'p, 'a, 'd> {
@@ -2804,6 +2885,38 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.bind_interface(value, &binding_type.expected)
     }
 
+    /// Validate a returned value against the declared result contract.
+    ///
+    /// Statically incompatible explicit returns are compile errors. Dynamic
+    /// values are checked by `BindInterface`, so the function's signature result
+    /// is guaranteed on every normal exit. Implicit fall-through returns (`null`)
+    /// are only checked at runtime: the lowering cannot always prove that the
+    /// end of a body is unreachable, and a false compile error would reject
+    /// valid programs.
+    fn check_return(&mut self, value: ValueId, span: Span, explicit: bool) -> ValueId {
+        let Some(contract) = self.context.return_contract.clone() else {
+            return value;
+        };
+        let actual = self.builder.value_type(value).clone();
+        if explicit && assignment_is_known_incompatible(&contract.expected, &actual) {
+            let actual = display_source_type(&semantic_source_type(&actual));
+            let expected = contract.display.clone();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "NAPALM-T007",
+                    format!("cannot return `{actual}` from a function declared to return `{expected}`"),
+                    span,
+                )
+                .with_primary_label(span, format!("this value has type `{actual}`"))
+                .with_secondary_label(
+                    contract.origin,
+                    format!("the result is declared as `{expected}` here"),
+                ),
+            );
+        }
+        self.bind_interface(value, &contract.expected)
+    }
+
     fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) -> ValueId {
         let Some(binding_type) = self.context.module_binding_types.get(name).cloned() else {
             return value;
@@ -2869,7 +2982,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         if let Some(instance) = self.constructor_this {
                             self.builder.ret(instance);
                         } else {
-                            self.builder.ret(value);
+                            let value = self.check_return(value, expr.span, true);
+                            if !self.current_terminated() {
+                                self.builder.ret(value);
+                            }
                         }
                     }
                 }
@@ -2889,7 +3005,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.builder.ret(instance);
         } else {
             let null = self.builder.const_null();
-            self.builder.ret(null);
+            let span = self.default_return_span();
+            let null = self.check_return(null, span, false);
+            if !self.current_terminated() {
+                self.builder.ret(null);
+            }
+        }
+    }
+
+    fn default_return_span(&self) -> Span {
+        let node = &self.context.analysis.nodes[self.context.node_id.0];
+        match &node.ast {
+            FunctionAst::Body(body) => Span::empty(body.span.end),
+            FunctionAst::Statements(_) => function_node_span(node),
         }
     }
 
@@ -3820,9 +3948,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             return;
         }
+        let explicit = value.is_some();
+        let value_span = value.map_or(span, |expr| expr.span);
         let value = value
             .map(|expr| self.lower_expr(expr))
             .unwrap_or_else(|| self.builder.const_null());
+        // Validate before deferred cleanup runs, so a contract violation is
+        // raised at the `return` and still flows through finally/errdefer.
+        let value = if self.current_terminated() {
+            value
+        } else {
+            self.check_return(value, value_span, explicit)
+        };
         self.emit_exit_actions_from(0);
         if !self.current_terminated() {
             self.builder.ret(value);
@@ -3934,7 +4071,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         expr.span,
                     );
                 }
-                self.builder.emit1(Inst::Await { promise }, Type::Top)
+                let result_type = match semantic_source_type(self.builder.value_type(promise)) {
+                    Type::Builtin(BuiltinId::Promise, Some(inner)) => *inner,
+                    _ => Type::Top,
+                };
+                self.builder.emit1(Inst::Await { promise }, result_type)
             }
             ExprKind::Launch(call) => self.lower_launch(call, expr.span),
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => self.lower_closure(body),
@@ -4590,6 +4731,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_binary(&mut self, left: &Expr, operator: BinaryOp, right: &Expr) -> ValueId {
+        if operator == BinaryOp::Pipeline {
+            return self.lower_pipeline(left, right);
+        }
+
         let left = self.lower_expr(left);
         let right = self.lower_expr(right);
         if operator == BinaryOp::Is {
@@ -4689,6 +4834,253 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             },
             result_type,
         )
+    }
+
+    /// Lower Napalm's thread-first pipeline while preserving source evaluation order.
+    ///
+    ///     value |> f          => f(value)
+    ///     value |> f(a, b)    => f(value, a, b)
+    ///     value |> obj.m(a)   => obj.m(value, a)
+    ///
+    /// The input is always evaluated exactly once and before the pipeline target.
+    /// After this lowering there is no pipeline-specific WIR: ordinary Invoke /
+    /// InvokeSpread nodes let all existing call optimizations apply unchanged.
+    fn lower_pipeline(&mut self, input: &Expr, target: &Expr) -> ValueId {
+        let input = self.lower_expr(input);
+
+        let mut semantic_target = target;
+        while let ExprKind::Grouped(inner) = &semantic_target.kind {
+            semantic_target = inner;
+        }
+
+        match &semantic_target.kind {
+            ExprKind::Invoke(invoke) if invoke.syntax == InvokeSyntax::Method => {
+                self.lower_pipeline_invoke(input, invoke, semantic_target.span)
+            }
+            ExprKind::Super(super_expr) if super_expr.syntax == InvokeSyntax::Method => {
+                self.lower_pipeline_super(input, super_expr, semantic_target.span)
+            }
+            _ => {
+                let callee = self.lower_expr(target);
+                let method = self.builder.intern_method("call", MethodKind::Method, 1);
+                self.builder.invoke_typed(callee, method, vec![input], Type::Top)
+            }
+        }
+    }
+
+    fn lower_pipeline_super(
+        &mut self,
+        input: ValueId,
+        super_expr: &front::SuperExpr,
+        span: Span,
+    ) -> ValueId {
+        let Some(method_context) = self.context.method_context.clone() else {
+            self.error("NAPALM-L025", "'super' used outside a method", span);
+            return self.builder.const_null();
+        };
+
+        let receiver = self.lower_this(span);
+        let name = if let Some(name) = &super_expr.method {
+            name.value.clone()
+        } else if let Some(symbol) = method_context.method_symbol {
+            let Some((name, _)) = self.context_symbol_signature(symbol) else {
+                self.error("NAPALM-L026", "cannot resolve enclosing method signature", span);
+                return self.builder.const_null();
+            };
+            name
+        } else {
+            self.error("NAPALM-L027", "unnamed super call has no enclosing method", span);
+            return self.builder.const_null();
+        };
+
+        if super_expr
+            .args
+            .iter()
+            .any(|argument| matches!(argument.kind, ExprKind::Spread(_)))
+        {
+            let arguments = self.lower_pipeline_argument_list(input, &super_expr.args);
+            for arity in 0..=MAX_NAPALM_ARITY {
+                self.builder
+                    .intern_method(&name, MethodKind::Method, arity as u8);
+            }
+            let method = self.builder.intern_method(&name, MethodKind::Method, 0);
+            return self.builder.emit1(
+                Inst::InvokeSpread {
+                    receiver,
+                    method,
+                    arguments,
+                    home_class: Some(method_context.class),
+                },
+                Type::Top,
+            );
+        }
+
+        let mut args = Vec::with_capacity(super_expr.args.len() + 1);
+        args.push(input);
+        args.extend(self.lower_call_args(&super_expr.args, span));
+        if args.len() > MAX_NAPALM_ARITY {
+            self.error(
+                "NAPALM-L104",
+                format!(
+                    "pipeline super call expands to {} arguments; calls currently support at most {MAX_NAPALM_ARITY}",
+                    args.len()
+                ),
+                span,
+            );
+        }
+
+        let method = self
+            .builder
+            .intern_method(&name, MethodKind::Method, args.len() as u8);
+        self.builder
+            .invoke_super(method_context.class, receiver, method, args)
+    }
+
+    fn lower_pipeline_invoke(
+        &mut self,
+        mut input: ValueId,
+        invoke: &front::InvokeExpr,
+        span: Span,
+    ) -> ValueId {
+        // Evaluate the receiver/callee after the input. A parser-only rewrite to
+        // `f(input, ...)` would reverse this order for side-effectful callees.
+        let receiver = invoke
+            .receiver
+            .as_ref()
+            .map(|expression| self.lower_expr(expression))
+            .unwrap_or_else(|| self.lower_this(span));
+
+        let receiver_type = semantic_source_type(self.builder.value_type(receiver));
+
+        // Preserve the persistent payload contracts of typed native endpoints when
+        // their mutating operation is reached through a pipeline.
+        if invoke.args.is_empty() {
+            if let Type::Builtin(builtin, Some(expected)) = &receiver_type {
+                if matches!(
+                    (*builtin, invoke.name.value.as_str()),
+                    (BuiltinId::Emitter, "emit") | (BuiltinId::Channel, "send")
+                ) {
+                    let actual = self.builder.value_type(input).clone();
+                    if assignment_is_known_incompatible(expected, &actual) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "NAPALM-T006",
+                            format!(
+                                "{}<{}>.{} expects {}, got {}",
+                                builtin.name(),
+                                display_source_type(expected),
+                                invoke.name.value,
+                                display_source_type(expected),
+                                display_source_type(&semantic_source_type(&actual)),
+                            ),
+                            span,
+                        ));
+                    }
+                    input = self.bind_interface(input, expected);
+                }
+            }
+        }
+
+        let result_type = self.pipeline_method_result_type(
+            &receiver_type,
+            invoke.name.value.as_str(),
+            invoke.args.len() + 1,
+        );
+
+        if invoke
+            .args
+            .iter()
+            .any(|argument| matches!(argument.kind, ExprKind::Spread(_)))
+        {
+            let arguments = self.lower_pipeline_argument_list(input, &invoke.args);
+            for arity in 0..=MAX_NAPALM_ARITY {
+                self.builder
+                    .intern_method(&invoke.name.value, MethodKind::Method, arity as u8);
+            }
+            let method = self
+                .builder
+                .intern_method(&invoke.name.value, MethodKind::Method, 0);
+            return self.builder.emit1(
+                Inst::InvokeSpread {
+                    receiver,
+                    method,
+                    arguments,
+                    home_class: None,
+                },
+                result_type,
+            );
+        }
+
+        let mut args = Vec::with_capacity(invoke.args.len() + 1);
+        args.push(input);
+        args.extend(self.lower_call_args(&invoke.args, span));
+
+        if args.len() > MAX_NAPALM_ARITY {
+            self.error(
+                "NAPALM-L104",
+                format!(
+                    "pipeline call expands to {} arguments; calls currently support at most {MAX_NAPALM_ARITY}",
+                    args.len()
+                ),
+                span,
+            );
+        }
+
+        let method = self.builder.intern_method(
+            &invoke.name.value,
+            MethodKind::Method,
+            args.len() as u8,
+        );
+        self.builder.invoke_typed(receiver, method, args, result_type)
+    }
+
+    fn lower_pipeline_argument_list(&mut self, input: ValueId, args: &[Expr]) -> ValueId {
+        let fixed = 1 + args
+            .iter()
+            .filter(|argument| !matches!(argument.kind, ExprKind::Spread(_)))
+            .count();
+        let capacity = self.builder.const_i32(fixed.min(i32::MAX as usize) as i32);
+        let list = self.builder.emit1(
+            Inst::AllocList {
+                capacity: Some(capacity),
+            },
+            Type::List(None),
+        );
+
+        self.builder.emit0(Inst::ListAppend { list, value: input });
+
+        for argument in args {
+            match &argument.kind {
+                ExprKind::Spread(iterable) => {
+                    let iterable = self.lower_expr(iterable);
+                    self.append_iterable_to_list(list, iterable);
+                }
+                _ => {
+                    let value = self.lower_expr(argument);
+                    self.builder.emit0(Inst::ListAppend { list, value });
+                }
+            }
+        }
+
+        list
+    }
+
+    fn pipeline_method_result_type(
+        &self,
+        receiver_type: &Type,
+        name: &str,
+        arity: usize,
+    ) -> Type {
+        let Type::Builtin(builtin, _) = receiver_type else {
+            return Type::Top;
+        };
+
+        match (*builtin, name, arity) {
+            (BuiltinId::Emitter, "emit", 1) => Type::Num,
+            (BuiltinId::Event, "on" | "once", 1) => Type::Num,
+            (BuiltinId::Event, "off", 1) => Type::Bool,
+            (BuiltinId::Channel, "send", 1) => Type::Bool,
+            _ => Type::Top,
+        }
     }
 
     fn lower_logical(&mut self, left: &Expr, operator: LogicalOp, right: &Expr) -> ValueId {
@@ -5497,6 +5889,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 _ => None,
             }
         });
+        let builtin_constructor_type = invoke.receiver.as_deref().and_then(|receiver| {
+            let ExprKind::Name(name) = &receiver.kind else { return None; };
+            if invoke.syntax != InvokeSyntax::Method || invoke.name.value != "new" {
+                return None;
+            }
+            match name.value.as_str() {
+                "Emitter" => Some(Type::Builtin(BuiltinId::Emitter, None)),
+                "Channel" => Some(Type::Builtin(BuiltinId::Channel, None)),
+                _ => None,
+            }
+        });
 
         let receiver = invoke.receiver.as_ref().map(|e| self.lower_expr(e))
             .unwrap_or_else(|| self.lower_this(span));
@@ -5537,7 +5940,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 );
             }
         }
-        if let Some(result_type) = sized_array_type {
+        let receiver_type = semantic_source_type(self.builder.value_type(receiver));
+        if let Some(value) = self.lower_native_endpoint_invoke(
+            receiver,
+            &receiver_type,
+            invoke,
+            kind,
+            span,
+        ) {
+            return value;
+        }
+        if let Some(result_type) = builtin_constructor_type.or(sized_array_type) {
             if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
                 return self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span);
             }
@@ -5553,6 +5966,101 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.builder.invoke_typed(receiver, symbol, Vec::new(), Type::String);
         }
         self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span)
+    }
+
+    fn lower_native_endpoint_invoke(
+        &mut self,
+        receiver: ValueId,
+        receiver_type: &Type,
+        invoke: &front::InvokeExpr,
+        kind: MethodKind,
+        span: Span,
+    ) -> Option<ValueId> {
+        let Type::Builtin(builtin, element) = receiver_type else {
+            return None;
+        };
+
+        let name = invoke.name.value.as_str();
+        let arity = invoke.args.len();
+        let typed_payload = element.as_deref();
+
+        let result_type = match (*builtin, kind, name, arity) {
+            (BuiltinId::Emitter, MethodKind::Getter, "event", 0) => {
+                Type::Builtin(BuiltinId::Event, element.clone())
+            }
+            (BuiltinId::Emitter, MethodKind::Getter, "listenerCount", 0) => Type::Num,
+            (BuiltinId::Emitter, MethodKind::Getter, "closed", 0) => Type::Bool,
+            (BuiltinId::Emitter, MethodKind::Method, "emit", 1) => Type::Num,
+            (BuiltinId::Emitter, MethodKind::Method, "clear", 0) => Type::Num,
+            (BuiltinId::Emitter, MethodKind::Method, "close", 0) => Type::Bool,
+
+            (BuiltinId::Event, MethodKind::Method, "on", 1)
+            | (BuiltinId::Event, MethodKind::Method, "once", 1) => Type::Num,
+            (BuiltinId::Event, MethodKind::Method, "off", 1) => Type::Bool,
+            (BuiltinId::Event, MethodKind::Getter, "listenerCount", 0) => Type::Num,
+            (BuiltinId::Event, MethodKind::Getter, "closed", 0) => Type::Bool,
+
+            (BuiltinId::Channel, MethodKind::Getter, "receiver", 0) => {
+                Type::Builtin(BuiltinId::Receiver, element.clone())
+            }
+            (BuiltinId::Channel, MethodKind::Method, "send", 1) => Type::Bool,
+            (BuiltinId::Channel, MethodKind::Method, "close", 0) => Type::Bool,
+            (BuiltinId::Channel, MethodKind::Getter, "closed", 0) => Type::Bool,
+            (BuiltinId::Channel, MethodKind::Getter, "length", 0)
+            | (BuiltinId::Channel, MethodKind::Getter, "capacity", 0) => Type::Num,
+
+            (BuiltinId::Receiver, MethodKind::Method, "receive", 0) => {
+                let result = match element {
+                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
+                    None => Type::Top,
+                };
+                Type::Builtin(BuiltinId::Promise, Some(Box::new(result)))
+            }
+            (BuiltinId::Receiver, MethodKind::Method, "tryReceive", 0) => {
+                match element {
+                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
+                    None => Type::Top,
+                }
+            }
+            (BuiltinId::Receiver, MethodKind::Method, "close", 0) => Type::Bool,
+            (BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
+            (BuiltinId::Receiver, MethodKind::Getter, "length", 0) => Type::Num,
+
+            _ => return None,
+        };
+
+        if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
+            return None;
+        }
+
+        let mut args = self.lower_call_args(&invoke.args, span);
+        if matches!(
+            (*builtin, kind, name),
+            (BuiltinId::Emitter, MethodKind::Method, "emit")
+                | (BuiltinId::Channel, MethodKind::Method, "send")
+        ) {
+            if let (Some(expected), Some(value)) = (typed_payload, args.first().copied()) {
+                let actual = self.builder.value_type(value).clone();
+                if assignment_is_known_incompatible(expected, &actual) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "NAPALM-T006",
+                        format!(
+                            "{}<{}>.{} expects {}, got {}",
+                            builtin.name(),
+                            display_source_type(expected),
+                            name,
+                            display_source_type(expected),
+                            display_source_type(&semantic_source_type(&actual)),
+                        ),
+                        invoke.args[0].span,
+                    ));
+                }
+                args[0] = self.bind_interface(value, expected);
+            }
+        }
+
+        let symbol = self.builder.intern_method(name, kind, args.len() as u8);
+        Some(self.builder.invoke_typed(receiver, symbol, args, result_type))
     }
 
     fn structural_property_info(
@@ -5931,6 +6439,7 @@ fn display_method_signature(signature: &MethodSignatureAst) -> String {
 
 fn binary_operator_name(operator: BinaryOp) -> &'static str {
     match operator {
+        BinaryOp::Pipeline => "|>",
         BinaryOp::Power => "**",
         BinaryOp::Multiply => "*",
         BinaryOp::Divide => "/",
@@ -6300,7 +6809,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(key, out);
         }
         ExprKind::Binary { left, operator, right } => {
-            if *operator != BinaryOp::Is {
+            if !matches!(*operator, BinaryOp::Is | BinaryOp::Pipeline) {
                 out.insert(MethodKey {
                     name: binary_operator_name(*operator).to_owned(),
                     kind: MethodKind::Method,
@@ -6859,6 +7368,75 @@ fn collect_written_bindings_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lowers_pipeline_to_ordinary_invoke_without_pipeline_ir() {
+        let source = r#"
+            function double(value: number): number {
+                return value * 2;
+            }
+
+            function add(value: number, amount: number): number {
+                return value + amount;
+            }
+
+            const a = 21 |> double;
+            const b = 20 |> add(2);
+            const c = 5 |> double |> add(1);
+        "#;
+
+        let module = parse_typescript(source);
+        let output = lower_new_program("pipeline.napalm", source, "pipeline", &module);
+        assert!(
+            !output.has_errors(),
+            "pipeline lowering diagnostics: {:?}",
+            output.diagnostics
+        );
+
+        let invoke_count = output
+            .program
+            .functions
+            .iter()
+            .flat_map(|function| function.nodes.iter())
+            .filter(|node| matches!(node.kind, Inst::Invoke { .. }))
+            .count();
+        assert!(invoke_count >= 3);
+    }
+
+    #[test]
+    fn pipeline_preserves_thread_first_call_arity() {
+        let source = r#"
+            function add3(a: number, b: number, c: number): number {
+                return a + b + c;
+            }
+
+            const result = 1 |> add3(2, 3);
+        "#;
+
+        let module = parse_typescript(source);
+        let output = lower_new_program("pipeline-arity.napalm", source, "pipeline-arity", &module);
+        assert!(
+            !output.has_errors(),
+            "pipeline lowering diagnostics: {:?}",
+            output.diagnostics
+        );
+
+        let call_arities = output
+            .program
+            .functions
+            .iter()
+            .flat_map(|function| function.nodes.iter())
+            .filter_map(|node| match &node.kind {
+                Inst::Invoke { args, .. } => Some(args.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            call_arities.contains(&3),
+            "expected pipeline to prepend its input, saw arities {call_arities:?}"
+        );
+    }
 
     #[test]
     fn indexed_source_positions_preserve_unicode_crlf_and_eof() {
@@ -7712,7 +8290,7 @@ class Child is Parent {
     }
 
     #[test]
-    fn undeclared_this_property_becomes_fixed_instance_field() {
+    fn undeclared_constructor_property_becomes_public_fixed_instance_field() {
         let source = r#"
             class Counter {
                 constructor() {
@@ -7763,8 +8341,19 @@ class Child is Parent {
             }
         }
 
-        assert!(loads >= 2, "this.value reads should lower to LoadField");
-        assert!(stores >= 2, "this.value writes should lower to StoreField");
+        // Like explicit class fields, constructor properties now expose accessor
+        // methods over one fixed slot. Their bodies own the raw loads/stores;
+        // callers use normal property dispatch, including subclass overrides.
+        assert!(loads >= 1, "the property getter should load its fixed field");
+        assert!(stores >= 1, "the property setter should store its fixed field");
+        for kind in [MethodKind::Getter, MethodKind::Setter] {
+            assert!(output.program.functions.iter().flat_map(|function| &function.nodes).any(|node| {
+                let Inst::BindMethod { method, .. } = &node.kind else { return false };
+                output.program.method(*method).is_some_and(|signature| {
+                    signature.kind == kind && output.program.string(signature.name) == Some("value")
+                })
+            }), "constructor property must bind a public {kind:?}");
+        }
     }
 
     #[test]

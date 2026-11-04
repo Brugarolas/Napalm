@@ -1,15 +1,48 @@
 //! Bounded, replayable leaf inlining. No callee frame is needed on a side exit:
 //! every check resumes at the caller's original call, before any callee effects.
 //! Invoke may guard up to four observed classes sharing the same target. Reads
-//! and scalar computations are replayable; stores, allocations and nested Napalm
-//! calls still require the synchronized fallback.
+//! and scalar computations are replayable. Receiver field stores are buffered
+//! and emitted after every guard (see `flush_inlined_stores`); other stores,
+//! allocations and nested Napalm calls still require the synchronized fallback.
 use super::*;
 use crate::napalm_bytecode::{IncomingSource, function_kind_uses_this};
 
 impl TraceRecorder<'_> {
+    /// Inline `closure.call(args)` (an ordinary Invoke resolving to the stock
+    /// Fn.call) whose closure currently runs `target`. The closure's identity and
+    /// capture count are guarded, its captures become callee registers exactly as
+    /// the frame builder installs them, and captured-cell writes are buffered
+    /// until every guard has passed.
+    pub(super) fn inline_closure_call<R: TraceRuntime>(
+        &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::Invoke || op.c as usize != op.args.len() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let closure_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let target = runtime
+            .trace_invoke_closure_target(op.location.function, op.x, closure_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        let function_index = runtime
+            .trace_prepared_function_index(target)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        self.inline_call_impl(runtime, program, op, builder, Some((target, function_index)))
+    }
+
     pub(super) fn inline_call<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        self.inline_call_impl(runtime, program, op, builder, None)
+    }
+
+    fn inline_call_impl<R: TraceRuntime>(
+        &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        closure: Option<(FuncId, u32)>,
     ) -> Result<ExpectedStep, RecordingAbort> {
         // Reactive dependency tracking is intentionally implemented in the baseline
         // field handlers. Bounded replayable inlining would otherwise turn a
@@ -20,7 +53,9 @@ impl TraceRecorder<'_> {
             return Err(RecordingAbort::UnsupportedCall);
         }
 
-        let (target, class) = if op.opcode == Opcode::Invoke {
+        let (target, class) = if let Some((target, _)) = closure {
+            (target, None)
+        } else if op.opcode == Opcode::Invoke {
             let receiver = runtime.trace_read_slot(FrameSlot::General(Reg(op.b)))
                 .map_err(|_| RecordingAbort::UnsupportedCall)?;
             let (target, class) = runtime.trace_inline_target(op.location.function, op.x, receiver)
@@ -28,13 +63,17 @@ impl TraceRecorder<'_> {
             (target, Some(class))
         } else { (FuncId(op.x), None) };
         let callee = program.function(target).ok_or(RecordingAbort::UnsupportedCall)?;
-        if callee.is_async || callee.capture_count != 0 || !callee.chunk.exception_handlers.is_empty()
+        if callee.is_async || callee.is_concurrent
+            || (closure.is_none() && callee.capture_count != 0)
+            || (closure.is_some() && (function_kind_uses_this(callee.kind)
+                || callee.frame.captures.len() > callee.capture_count as usize))
+            || !callee.chunk.exception_handlers.is_empty()
             || callee.memoization.enabled()
             || callee.frame.return_kind != RegisterKind::Value || target == op.location.function
             || builder.trace().stats.inlined_calls >= 8 {
             return Err(RecordingAbort::UnsupportedCall);
         }
-        let uses_this = function_kind_uses_this(callee.kind);
+        let uses_this = closure.is_none() && function_kind_uses_this(callee.kind);
         let receiver_reg = if class.is_some() { Some(Reg(op.b)) }
             else if uses_this { op.args.first().copied() } else { None };
         let arguments = if class.is_none() && uses_this { op.args.get(1..).ok_or(RecordingAbort::UnsupportedCall)? } else { &op.args };
@@ -57,13 +96,51 @@ impl TraceRecorder<'_> {
             builder.emit1(TraceInst::GuardClass { value: receiver.ok_or(RecordingAbort::UnsupportedCall)?, classes: classes.clone(), exit }, TraceType::Any, TraceRep::Tagged);
         }
         let mut registers = vec![None; 256];
+        if let Some((_, function_index)) = closure {
+            // Fix the inlined body (immutable function identity) and the capture
+            // layout, then install captures like the frame builder does.
+            let closure_value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+            builder.emit0(TraceInst::GuardClosure {
+                value: closure_value,
+                function_index,
+                capture_count: callee.capture_count,
+                exit,
+            });
+            for binding in &callee.frame.captures {
+                if binding.kind != RegisterKind::Value || binding.capture_index >= callee.capture_count {
+                    return Err(RecordingAbort::UnsupportedCall);
+                }
+                registers[binding.destination.0 as usize] = Some(builder.emit1(
+                    TraceInst::ClosureCapture { closure: closure_value, index: binding.capture_index, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                ));
+            }
+        }
+        // Recording-time words of callee registers that alias caller values
+        // (parameters and their copies). Structural property loads need the
+        // observed object to pick its hidden-shape slot.
+        let mut words: Vec<Option<RegisterWord>> = vec![None; 256];
         for binding in &callee.frame.parameters {
             if binding.kind != RegisterKind::Value { return Err(RecordingAbort::UnsupportedCall); }
-            registers[binding.destination.0 as usize] = match binding.source {
+            let destination = binding.destination.0 as usize;
+            registers[destination] = match binding.source {
                 IncomingSource::This => receiver,
                 IncomingSource::Argument(arg) => args.get(arg.0 as usize).copied(),
             };
+            words[destination] = match binding.source {
+                IncomingSource::This => receiver_word,
+                IncomingSource::Argument(arg) => arguments
+                    .get(arg.0 as usize)
+                    .and_then(|reg| runtime.trace_read_slot(FrameSlot::General(*reg)).ok()),
+            };
         }
+        // Receiver field stores are buffered and emitted only at the inlined
+        // Return, after every callee guard: an exit always replays the caller's
+        // call, so no exit may follow an effect. See `flush_inlined_stores`.
+        let mut pending_stores: Vec<(TraceValueId, u32, TraceValueId)> = Vec::new();
+        // Captured-cell writes, buffered for the same reason: (cell, value).
+        let mut pending_cells: Vec<(TraceValueId, TraceValueId)> = Vec::new();
         let mut pc = BytecodePc(0);
         for count in 1..=32 {
             let inst = decode_at(program, TraceLocation::new(target, pc)).map_err(|_| RecordingAbort::UnsupportedCall)?;
@@ -73,9 +150,55 @@ impl TraceRecorder<'_> {
                 if builder.trace().value(v).is_some_and(|v| v.rep == rep) { Ok(v) } else { Err(RecordingAbort::UnsupportedCall) }
             };
             use Opcode::*;
+            // Only copies keep a known recording-time word.
+            let word = match inst.opcode {
+                Move | BindInterface => words[inst.b as usize],
+                _ => None,
+            };
             let value = match inst.opcode {
                 Nop | OsrPoint => { pc = inst.next_pc; continue; }
                 Move => get(inst.b)?,
+                BindInterface if !matches!(
+                    callee.chunk.type_guards.get(inst.x as usize).map(|guard| &guard.expected),
+                    Some(Type::Top | Type::Null | Type::Bool | Type::Num)
+                ) => {
+                    // Structural/heap contracts are persistent and rebinding the
+                    // exact installed contract is a no-op (`bind_contract`). SSA
+                    // values carry an Interface/Record/List<T> type only once that
+                    // contract is installed, so a proven operand needs no binding.
+                    // Anything else would install state: not replayable.
+                    let descriptor = callee.chunk.type_guards.get(inst.x as usize)
+                        .ok_or(RecordingAbort::UnsupportedCall)?;
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    // Pure class checks (`Instance<C>`) depend only on the receiver
+                    // class: a class guard replays them, and a failure replays the
+                    // caller's call before any callee effect.
+                    let observed = words[inst.b as usize];
+                    if builder.proven_type(value) != Some(&descriptor.expected)
+                        && let Some(word) = observed
+                        && runtime.trace_value_satisfies_pure_type(word, &descriptor.expected)
+                        && let Some(class) = runtime.trace_receiver_class(word)
+                    {
+                        let guarded = builder.emit1(
+                            TraceInst::GuardClass { value, classes: vec![class], exit },
+                            TraceType::Any,
+                            TraceRep::Tagged,
+                        );
+                        builder.set_proven_type(guarded, descriptor.expected.clone());
+                        guarded
+                    } else if builder.proven_type(value) == Some(&descriptor.expected) {
+                        value
+                    } else {
+                        if jit_events_enabled() {
+                            eprintln!(
+                                "[napalm-jit] inline {target:?} stops at BindInterface {:?} (operand proven {:?})",
+                                descriptor.expected,
+                                builder.proven_type(value)
+                            );
+                        }
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                }
                 BindInterface => {
                     let descriptor = callee.chunk.type_guards.get(inst.x as usize)
                         .ok_or(RecordingAbort::UnsupportedCall)?;
@@ -98,12 +221,111 @@ impl TraceRecorder<'_> {
                         Some(Constant::Bool(v)) => TraceConstant::Bool(*v),
                         Some(Constant::Num(v)) => TraceConstant::NumBits(v.to_bits()),
                         Some(Constant::Int32(v)) => TraceConstant::Int32(*v),
+                        // Program strings are persistent VM roots: embed the
+                        // stable tagged handle, exactly like a root LoadConst.
+                        Some(Constant::String(id)) => {
+                            let word = runtime
+                                .trace_materialize_constant(TraceConstant::String(*id))
+                                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+                            TraceConstant::StableTagged(word.0)
+                        }
                         _ => return Err(RecordingAbort::UnsupportedCall),
                     };
                     builder.constant(c)
                 }
+                LoadProperty => {
+                    // Structural read of a parameter-derived map. Shape/PIC
+                    // misses exit before any effect and replay the caller's call.
+                    let object = scalar(inst.b, TraceRep::Tagged)?;
+                    let key = scalar(inst.c, TraceRep::Tagged)?;
+                    let object_word = words[inst.b as usize].ok_or(RecordingAbort::UnsupportedCall)?;
+                    let layout = StructuralLayoutId(inst.x);
+                    let slot = PropertySlotId(inst.y as u16);
+                    let access = runtime
+                        .trace_structural_map_access(object_word, layout, slot)
+                        .ok_or(RecordingAbort::UnsupportedCall)?;
+                    let map = self.guard_heap_object(builder, object, TraceHeapObjectKind::Map, exit);
+                    let field_type = program
+                        .metadata
+                        .structural_layout(layout)
+                        .and_then(|layout| layout.property(slot))
+                        .map(|property| property.ty.clone())
+                        .unwrap_or(Type::Top);
+                    let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+                    let current = TraceShapeSlot { shape: access.shape, slot: access.slot as u32 };
+                    let mut entries = vec![current];
+                    for entry in runtime.trace_structural_map_pic(inst.location, layout, slot) {
+                        if entries.len() == 4 { break; }
+                        if !entries.iter().any(|known| known.shape == entry.shape) {
+                            entries.push(entry);
+                        }
+                    }
+                    let kind = if entries.len() > 1 {
+                        TraceInst::HeapMapGetPic { map, key, expected_key: access.key_bytes, entries, exit }
+                    } else {
+                        TraceInst::HeapMapGetShaped {
+                            map, key, expected_key: access.key_bytes,
+                            shape: current.shape, slot: current.slot, exit,
+                        }
+                    };
+                    let result = builder.emit1(kind, trace_ty, trace_rep);
+                    if !matches!(field_type, Type::Top) {
+                        builder.set_proven_type(result, field_type);
+                    }
+                    result
+                }
                 MoveFromArg => *args.get(inst.b as usize).ok_or(RecordingAbort::UnsupportedCall)?,
                 MoveFromSpecial if inst.b == 0 => receiver.ok_or(RecordingAbort::UnsupportedCall)?,
+                LoadField if !pending_stores.is_empty() => {
+                    // Forward a buffered store to the same receiver slot. Any
+                    // other object may alias the receiver, so give up.
+                    let object = scalar(inst.b, TraceRep::Tagged)?;
+                    if Some(object) != receiver {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                    let slot = runtime.trace_field_slot(inst.location, inst.x);
+                    match pending_stores.iter().rev().find(|(_, stored, _)| *stored == slot) {
+                        Some(&(_, _, value)) => value,
+                        None => {
+                            let field_type = receiver_word
+                                .and_then(|word| runtime.trace_field_type(word, slot))
+                                .unwrap_or(Type::Top);
+                            let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
+                            let result = builder.emit1(
+                                TraceInst::HeapLoadField { object, slot, exit },
+                                trace_ty,
+                                trace_rep,
+                            );
+                            if !matches!(&field_type, Type::Top) {
+                                builder.set_proven_type(result, field_type);
+                            }
+                            result
+                        }
+                    }
+                }
+                StoreField => {
+                    // Only the receiver's own fields, outside reactive VMs (field
+                    // writes notify subscribers in the baseline handler).
+                    let object = scalar(inst.a, TraceRep::Tagged)?;
+                    if runtime.trace_reactive_enabled() || Some(object) != receiver {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                    let slot = runtime.trace_field_slot(inst.location, inst.x);
+                    let expected = receiver_word
+                        .and_then(|word| runtime.trace_field_type(word, slot))
+                        .unwrap_or(Type::Top);
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    // The field contract is checked here, before any store.
+                    let value = if matches!(expected, Type::Top) {
+                        value
+                    } else {
+                        self.guard_store_value(builder, value, &expected, op.location.pc)
+                            .ok_or(RecordingAbort::UnsupportedCall)?
+                    };
+                    pending_stores.push((object, slot, value));
+                    pc = inst.next_pc;
+                    continue;
+                }
                 LoadField => {
                     let object = scalar(inst.b, TraceRep::Tagged)?;
                     let slot = runtime.trace_field_slot(inst.location, inst.x);
@@ -127,7 +349,43 @@ impl TraceRecorder<'_> {
                 }
                 LoadCell => {
                     let cell = scalar(inst.b, TraceRep::Tagged)?;
-                    builder.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged)
+                    // The newest buffered write to this exact SSA cell (if any).
+                    let last_own = pending_cells.iter().rposition(|(stored, _)| *stored == cell);
+                    // Any *later* buffered write to a different SSA cell could name
+                    // the same Cell object: prove distinct identity first. Effects
+                    // are still buffered, so a failing guard just replays the call.
+                    let later = last_own.map_or(0, |index| index + 1);
+                    {
+                        let mut proven: Vec<TraceValueId> = Vec::new();
+                        for &(stored, _) in &pending_cells[later..] {
+                            if stored == cell || proven.contains(&stored) {
+                                continue;
+                            }
+                            proven.push(stored);
+                            let same = builder.emit1(
+                                TraceInst::RefEq { lhs: cell, rhs: stored },
+                                TraceType::Bool,
+                                TraceRep::Bool,
+                            );
+                            builder.emit0(TraceInst::GuardSwitch {
+                                tag: same,
+                                observed: crate::napalm_trace_ir::TraceSwitchGuard::Case(0),
+                                exit,
+                            });
+                        }
+                    }
+                    match last_own {
+                        // Forward the buffered write to the same cell.
+                        Some(index) => pending_cells[index].1,
+                        None => builder.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged),
+                    }
+                }
+                StoreCell => {
+                    let cell = scalar(inst.a, TraceRep::Tagged)?;
+                    let value = scalar(inst.b, TraceRep::Tagged)?;
+                    pending_cells.push((cell, value));
+                    pc = inst.next_pc;
+                    continue;
                 }
                 ListLen | MapLen | StringLen => {
                     let object = scalar(inst.b, TraceRep::Tagged)?;
@@ -224,18 +482,87 @@ impl TraceRecorder<'_> {
                 }
                 Return => {
                     let result = scalar(inst.a, TraceRep::Tagged)?;
+                    // Every guard (cell kinds, receiver class) precedes the first
+                    // effect: an exit replays the whole call.
+                    let mut guarded_cells: Vec<(TraceValueId, TraceValueId)> = Vec::new();
+                    for &(cell, _) in &pending_cells {
+                        if !guarded_cells.iter().any(|(known, _)| *known == cell) {
+                            let guarded = self.guard_heap_object(builder, cell, TraceHeapObjectKind::Cell, exit);
+                            guarded_cells.push((cell, guarded));
+                        }
+                    }
+                    if !pending_stores.is_empty() {
+                        self.flush_inlined_stores(
+                            runtime, builder, &pending_stores, receiver, receiver_word,
+                            class.is_some(), exit,
+                        )?;
+                    }
+                    for (position, &(cell, value)) in pending_cells.iter().enumerate() {
+                        // Only the last write to each cell is observable.
+                        if pending_cells[position + 1..].iter().any(|(later, _)| *later == cell) {
+                            continue;
+                        }
+                        let guarded = guarded_cells
+                            .iter()
+                            .find(|(known, _)| *known == cell)
+                            .map(|(_, guarded)| *guarded)
+                            .ok_or(RecordingAbort::UnsupportedCall)?;
+                        builder.emit0(TraceInst::HeapStoreCell { cell: guarded, value, exit });
+                    }
                     self.write_gpr(builder, op.a, result);
                     builder.write_slot(FrameSlot::Return(ReturnReg(0)), result);
                     builder.trace_mut().stats.inlined_calls += 1;
                     builder.trace_mut().stats.devirtualized_calls += class.is_some() as usize;
                     return Ok(ExpectedStep::Inlined { next: TraceLocation::new(op.location.function, op.next_pc), callee: target, steps: count });
                 }
-                _ => return Err(RecordingAbort::UnsupportedCall),
+                _ => {
+                    if jit_events_enabled() {
+                        eprintln!(
+                            "[napalm-jit] inline {target:?} stops at {:?} (pc {})",
+                            inst.opcode, inst.location.pc.0
+                        );
+                    }
+                    return Err(RecordingAbort::UnsupportedCall);
+                }
             };
             registers[inst.a as usize] = Some(value);
+            words[inst.a as usize] = word;
             pc = inst.next_pc;
         }
         Err(RecordingAbort::UnsupportedCall)
+    }
+
+    /// Emit the buffered receiver stores of an inlined callee. Every guard that
+    /// can fail, including the receiver's exact-class guard (which fixes the
+    /// field layout, so the stores' slot checks cannot fail), precedes the first
+    /// store. No runtime boundary occurs inside the inlined region, so the heap
+    /// entry validated here stays valid for the stores that follow.
+    fn flush_inlined_stores<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        stores: &[(TraceValueId, u32, TraceValueId)],
+        receiver: Option<TraceValueId>,
+        receiver_word: Option<RegisterWord>,
+        class_guarded: bool,
+        exit: SideExitId,
+    ) -> Result<(), RecordingAbort> {
+        let receiver = receiver.ok_or(RecordingAbort::UnsupportedCall)?;
+        if !class_guarded {
+            let class = receiver_word
+                .and_then(|word| runtime.trace_receiver_class(word))
+                .ok_or(RecordingAbort::UnsupportedCall)?;
+            builder.emit1(
+                TraceInst::GuardClass { value: receiver, classes: vec![class], exit },
+                TraceType::Any,
+                TraceRep::Tagged,
+            );
+        }
+        let object = self.guard_heap_object(builder, receiver, TraceHeapObjectKind::Instance, exit);
+        for &(_, slot, value) in stores {
+            builder.emit0(TraceInst::HeapStoreField { object, value, slot, exit });
+        }
+        Ok(())
     }
 
     fn inline_numeric_invoke(

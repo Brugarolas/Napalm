@@ -1410,6 +1410,11 @@ pub struct LiveRegisterEntry {
     pub live: LiveRegisterMap,
     /// Live SSA literals, including constants hoisted outside a traced loop.
     pub constants: Vec<(Reg, Constant)>,
+    /// Static WIR types of live GPRs at this boundary. Napalm annotations are
+    /// enforced contracts, so every entry is a guarantee (never a profile): a
+    /// trace anchored here may treat these registers as already type-checked.
+    /// Only Napalm-visible types are listed (no Int32/F64/RawPtr/Cell/Top).
+    pub types: Vec<(Reg, Type)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1571,6 +1576,14 @@ impl BytecodeChunk {
             .map_or(&[], |index| self.live_registers[index].constants.as_slice())
     }
 
+    /// Statically guaranteed types of live registers at an instruction boundary.
+    pub fn types_at(&self, pc: BytecodePc) -> &[(Reg, Type)] {
+        self.live_registers
+            .binary_search_by_key(&pc.0, |entry| entry.pc.0)
+            .ok()
+            .map_or(&[], |index| self.live_registers[index].types.as_slice())
+    }
+
     pub fn deopt_by_id(&self, id: DeoptId) -> Option<&BytecodeDeoptPoint> {
         self.deopts.iter().find(|point| point.id == id)
     }
@@ -1595,6 +1608,11 @@ pub struct BytecodeFunction {
     pub name: StringId,
     /// Number of explicit Napalm parameters; the implicit receiver is not counted.
     pub arity: u8,
+    /// Static type of every value a synchronous call to this function returns
+    /// (join of all WIR `Return` operands; declared result contracts are enforced
+    /// before returning). `Top` when unknown, for async/concurrent functions and
+    /// for functions ending in a tail call.
+    pub result_type: Type,
     /// Number of physical values stored in the closure environment.
     pub capture_count: u16,
     pub frame: FrameLayout,
@@ -2439,6 +2457,7 @@ impl BytecodeVerifier {
     fn verify_type(program: &BytecodeProgram, ty: &Type) -> Result<(), VerificationError> {
         match ty {
             Type::List(Some(element)) | Type::Cell(element) => Self::verify_type(program, element),
+            Type::Builtin(_, Some(element)) => Self::verify_type(program, element),
             Type::Interface(fields) | Type::Record(fields) => {
                 for field in fields {
                     Self::verify_type(program, &field.ty)?;

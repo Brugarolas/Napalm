@@ -1,0 +1,6 @@
+# Local LLVM 23.1 used by inkwell/llvm-sys for the LLVM trace tier.
+# The official Windows installer ships no llvm-config, so this points at the
+# extracted clang+llvm-23.1.4-x86_64-pc-windows-msvc release tarball. build.rs
+# links its LLVM-C.dll (C API) and copies the DLL next to the executables.
+[env]
+LLVM_SYS_231_PREFIX = "C:\\Users\\Andre\\llvm-23.1.4"

@@ -343,6 +343,10 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Module,
         BuiltinClass::Date,
         BuiltinClass::NativeDecorator,
+        BuiltinClass::Event,
+        BuiltinClass::Emitter,
+        BuiltinClass::Channel,
+        BuiltinClass::Receiver,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
@@ -995,6 +999,42 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, instance(BuiltinClass::Promise), "isRejected", MethodKind::Getter, 0, NativeBuiltin::PromiseIsRejected);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isCancelled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsCancelled);
 
+    // Event/Emitter provide one-to-many notifications. Emitter owns the publish
+    // capability; `event` returns a read-only Event view sharing the same native
+    // listener state. Delivery is queued as runtime microtasks to avoid arbitrary
+    // reentrant VM calls from emit().
+    manifest.register_native(program, static_(BuiltinId::Emitter), "new", MethodKind::Method, 0, NativeBuiltin::EmitterNew);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "event", MethodKind::Getter, 0, NativeBuiltin::EmitterEvent);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "emit", MethodKind::Method, 1, NativeBuiltin::EmitterEmit);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EmitterListenerCount);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "clear", MethodKind::Method, 0, NativeBuiltin::EmitterClear);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "close", MethodKind::Method, 0, NativeBuiltin::EmitterClose);
+    manifest.register_native(program, instance(BuiltinClass::Emitter), "closed", MethodKind::Getter, 0, NativeBuiltin::EmitterClosed);
+
+    manifest.register_native(program, instance(BuiltinClass::Event), "on", MethodKind::Method, 1, NativeBuiltin::EventOn);
+    manifest.register_native(program, instance(BuiltinClass::Event), "once", MethodKind::Method, 1, NativeBuiltin::EventOnce);
+    manifest.register_native(program, instance(BuiltinClass::Event), "off", MethodKind::Method, 1, NativeBuiltin::EventOff);
+    manifest.register_native(program, instance(BuiltinClass::Event), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EventListenerCount);
+    manifest.register_native(program, instance(BuiltinClass::Event), "closed", MethodKind::Getter, 0, NativeBuiltin::EventClosed);
+
+    // Channel/Receiver are split FIFO capabilities. Channel.send() never blocks;
+    // a bounded full queue returns false. Receiver.receive() returns a Promise and
+    // is fulfilled immediately when data is already buffered.
+    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 0, NativeBuiltin::ChannelNew);
+    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 1, NativeBuiltin::ChannelNew);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "receiver", MethodKind::Getter, 0, NativeBuiltin::ChannelReceiver);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "send", MethodKind::Method, 1, NativeBuiltin::ChannelSend);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "close", MethodKind::Method, 0, NativeBuiltin::ChannelClose);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "closed", MethodKind::Getter, 0, NativeBuiltin::ChannelClosed);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "length", MethodKind::Getter, 0, NativeBuiltin::ChannelLength);
+    manifest.register_native(program, instance(BuiltinClass::Channel), "capacity", MethodKind::Getter, 0, NativeBuiltin::ChannelCapacity);
+
+    manifest.register_native(program, instance(BuiltinClass::Receiver), "receive", MethodKind::Method, 0, NativeBuiltin::ReceiverReceive);
+    manifest.register_native(program, instance(BuiltinClass::Receiver), "tryReceive", MethodKind::Method, 0, NativeBuiltin::ReceiverTryReceive);
+    manifest.register_native(program, instance(BuiltinClass::Receiver), "close", MethodKind::Method, 0, NativeBuiltin::ReceiverClose);
+    manifest.register_native(program, instance(BuiltinClass::Receiver), "closed", MethodKind::Getter, 0, NativeBuiltin::ReceiverClosed);
+    manifest.register_native(program, instance(BuiltinClass::Receiver), "length", MethodKind::Getter, 0, NativeBuiltin::ReceiverLength);
+
     // Timer is a static-only engine class. All operations return cancellable
     // Promises; trailing Napalm blocks are simply the final closure argument.
     manifest.register_native(program, static_(BuiltinId::Timer), "delay", MethodKind::Method, 1, NativeBuiltin::TimerDelay);
@@ -1014,6 +1054,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, reactive, "__unwatch", MethodKind::Method, 1, NativeBuiltin::ReactiveUnwatch);
     manifest.register_native(program, reactive, "__beginComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveBeginComputed);
     manifest.register_native(program, reactive, "__finishComputed", MethodKind::Method, 2, NativeBuiltin::ReactiveFinishComputed);
+    manifest.register_native(program, reactive, "__readComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveReadComputed);
     manifest.register_native(program, reactive, "__abortComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveAbortComputed);
 
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);
@@ -1423,6 +1464,36 @@ impl Host for BuiltinHost {
                 | (Some(NumIsInfinity), "isInfinity", 0)
                 | (Some(NumIsInteger), "isInteger", 0)
         )
+    }
+
+    fn standard_list_method(
+        &self,
+        primitive: PrimitiveId,
+        name: &str,
+        arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceListMethod> {
+        use crate::napalm_tracing_jit::TraceListMethod;
+        use BuiltinPrimitive::*;
+        match (self.manifest.implementation(primitive), name, arity) {
+            (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
+            (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
+            _ => None,
+        }
+    }
+
+    fn standard_map_method(
+        &self,
+        primitive: PrimitiveId,
+        name: &str,
+        arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> {
+        use crate::napalm_tracing_jit::TraceMapMethod;
+        use BuiltinPrimitive::*;
+        match (self.manifest.implementation(primitive), name, arity) {
+            (Some(MapSubscript), "[]", 1) => Some(TraceMapMethod::Subscript),
+            (Some(MapSubscriptSet), "[]=", 2) => Some(TraceMapMethod::SubscriptSet),
+            _ => None,
+        }
     }
 
     fn call_primitive(

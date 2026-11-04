@@ -11,12 +11,12 @@ Variable types are optional: the compiler checks known incompatible assignments.
 ## Run
 
 ```sh
-cargo run --release -- scripts/complete.nap
-cargo run --release -- scripts/module_import.nap
+cargo run --release -- scripts/complete.napalm
+cargo run --release -- scripts/module_import.napalm
 cargo test napalm -- --test-threads=1
 ```
 
-Use `.nap` for Napalm programs. The module resolver also accepts `.ts` files written in the supported subset. An extensionless import tries the exact path, `.nap`, `.ts`, `index.nap`, and `index.ts`.
+Use `.napalm` for Napalm programs. An extensionless import tries the exact path, `.napalm`, and `index.napalm`.
 
 ```typescript
 import { Answer } from './module_exports';
@@ -54,7 +54,7 @@ System.print(twice(Answer));
 - Semicolons and line-separated statements. Braced function bodies always contain statements; only expression-bodied arrows return implicitly. Napalm does not implement every ECMAScript automatic-semicolon-insertion edge case.
 - HTTP services with `listen "127.0.0.1:3000" { route "GET" ["/"] (req) => ({body: "Hello!"}); }`, async handlers, path parameters, streaming/SSE and simple HTTP clients. See [HTTP services](docs/HTTP.md) and [the server example](scripts/server.napalm).
 
-Examples are in [scripts/complete.nap](scripts/complete.nap), [scripts/module_import.nap](scripts/module_import.nap), [scripts/builtins.nap](scripts/builtins.nap) and [scripts/destructuring_spread.nap](scripts/destructuring_spread.nap).
+Examples are in [scripts/complete.napalm](scripts/complete.napalm), [scripts/module_import.napalm](scripts/module_import.napalm), [scripts/builtins.napalm](scripts/builtins.napalm) and [scripts/destructuring_spread.napalm](scripts/destructuring_spread.napalm).
 
 ## Decorators
 
@@ -196,7 +196,7 @@ For class fields containing functions, use `(object.callback)(...)` to call the 
 
 Package modules use `@lib/...`, standard modules use `@std/...`, with default roots `.napalm/packages` and `.napalm/std`. Configure `NAPALM_LIB_PATH`, `NAPALM_STD_PATH`, and `NAPALM_HOME`; `napalm.toml` or `.git` marks a project root. Package namespace traversal remains rejected.
 
-`NAPALM_NO_JIT`, `NAPALM_JIT_STATS`, and `NAPALM_GC_STATS` control CLI diagnostics. Existing internal `WREN_*` tuning flags remain available for the inherited engine. Benchmark programs are in `scripts/jit.nap`, `scripts/jit_entries.nap` and `scripts/gc.nap`; historical Wren benchmark results are not claims about this syntax revision.
+`NAPALM_NO_JIT`, `NAPALM_JIT_STATS`, and `NAPALM_GC_STATS` control CLI diagnostics. Existing internal `WREN_*` tuning flags remain available for the inherited engine. Benchmark programs are in `scripts/jit.napalm`, `scripts/jit_entries.napalm` and `scripts/gc.napalm`; historical Wren benchmark results are not claims about this syntax revision.
 
 ### JIT benchmarks
 

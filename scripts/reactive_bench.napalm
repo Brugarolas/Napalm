@@ -1,0 +1,635 @@
+// reactive_benchmark.napalm
+//
+// Native reactivity benchmark for Napalm.
+//
+// This benchmark stresses four different reactive workloads:
+//
+//   1. Cached computed reads.
+//   2. Wide invalidation fan-out.
+//   3. Deep computed dependency chains.
+//   4. A multi-level dependency graph with repeated invalidations.
+//
+// The benchmark deliberately avoids arrays, closures and dynamic collections
+// in the hot loops so that the measured cost is dominated by the reactive
+// system itself.
+//
+// There is no explicit warm-up. Initial dependency discovery is therefore
+// included naturally in the benchmark.
+
+const SCALE: Number = 1;
+
+const CACHE_ROUNDS: Number = 2_000_000 * SCALE;
+const FANOUT_ROUNDS: Number = 250_000 * SCALE;
+const CHAIN_ROUNDS: Number = 400_000 * SCALE;
+const GRAPH_ROUNDS: Number = 250_000 * SCALE;
+
+
+class ReactiveBenchmark {
+    constructor() {
+        // Shared state.
+        this.a = 1;
+        this.b = 2;
+        this.c = 3;
+        this.d = 4;
+
+        // Dedicated state for fan-out and chain tests.
+        this.hot = 1;
+        this.chainSeed = 1;
+    }
+
+
+    // ========================================================================
+    // Cached computed values
+    // ========================================================================
+
+    computed cached0() {
+        return this.a + this.b;
+    }
+
+    computed cached1() {
+        return this.b + this.c;
+    }
+
+    computed cached2() {
+        return this.c + this.d;
+    }
+
+    computed cached3() {
+        return this.a + this.d;
+    }
+
+
+    // ========================================================================
+    // Wide fan-out
+    //
+    // All sixteen computed properties depend on the same hot field.
+    //
+    // A write to `hot` should invalidate all of them.
+    // Multiple writes before any read should ideally not recompute anything.
+    // ========================================================================
+
+    computed fan0() {
+        return this.hot + this.a + 1;
+    }
+
+    computed fan1() {
+        return this.hot * 2 + this.a + 2;
+    }
+
+    computed fan2() {
+        return this.hot * 3 + this.a + 3;
+    }
+
+    computed fan3() {
+        return this.hot * 4 + this.a + 4;
+    }
+
+    computed fan4() {
+        return this.hot * 5 + this.b + 5;
+    }
+
+    computed fan5() {
+        return this.hot * 6 + this.b + 6;
+    }
+
+    computed fan6() {
+        return this.hot * 7 + this.b + 7;
+    }
+
+    computed fan7() {
+        return this.hot * 8 + this.b + 8;
+    }
+
+    computed fan8() {
+        return this.hot * 9 + this.c + 9;
+    }
+
+    computed fan9() {
+        return this.hot * 10 + this.c + 10;
+    }
+
+    computed fan10() {
+        return this.hot * 11 + this.c + 11;
+    }
+
+    computed fan11() {
+        return this.hot * 12 + this.c + 12;
+    }
+
+    computed fan12() {
+        return this.hot * 13 + this.d + 13;
+    }
+
+    computed fan13() {
+        return this.hot * 14 + this.d + 14;
+    }
+
+    computed fan14() {
+        return this.hot * 15 + this.d + 15;
+    }
+
+    computed fan15() {
+        return this.hot * 16 + this.d + 16;
+    }
+
+
+    // ========================================================================
+    // Deep dependency chain
+    //
+    // Only chain0 directly depends on mutable state.
+    //
+    // Invalidating chainSeed must eventually invalidate the entire chain:
+    //
+    // chainSeed
+    //    ↓
+    // chain0
+    //    ↓
+    // chain1
+    //    ↓
+    // ...
+    //    ↓
+    // chain15
+    //
+    // Reading chain15 should lazily rebuild the chain.
+    // ========================================================================
+
+    computed chain0() {
+        return this.chainSeed + 1;
+    }
+
+    computed chain1() {
+        return this.chain0 + 2;
+    }
+
+    computed chain2() {
+        return this.chain1 + 3;
+    }
+
+    computed chain3() {
+        return this.chain2 + 4;
+    }
+
+    computed chain4() {
+        return this.chain3 + 5;
+    }
+
+    computed chain5() {
+        return this.chain4 + 6;
+    }
+
+    computed chain6() {
+        return this.chain5 + 7;
+    }
+
+    computed chain7() {
+        return this.chain6 + 8;
+    }
+
+    computed chain8() {
+        return this.chain7 + 9;
+    }
+
+    computed chain9() {
+        return this.chain8 + 10;
+    }
+
+    computed chain10() {
+        return this.chain9 + 11;
+    }
+
+    computed chain11() {
+        return this.chain10 + 12;
+    }
+
+    computed chain12() {
+        return this.chain11 + 13;
+    }
+
+    computed chain13() {
+        return this.chain12 + 14;
+    }
+
+    computed chain14() {
+        return this.chain13 + 15;
+    }
+
+    computed chain15() {
+        return this.chain14 + 16;
+    }
+
+
+    // ========================================================================
+    // Multi-level reactive graph
+    //
+    // Four mutable fields feed sixteen leaf computations.
+    // Those feed eight intermediate computations.
+    // Those feed four upper computations.
+    // Finally, everything converges into graphRoot.
+    //
+    //             a b c d
+    //                │
+    //       ┌────────┼────────┐
+    //       │ 16 leaf nodes   │
+    //       └────────┼────────┘
+    //                │
+    //          8 middle nodes
+    //                │
+    //           4 upper nodes
+    //                │
+    //             graphRoot
+    // ========================================================================
+
+    computed leaf0() {
+        return this.a + this.b + 1;
+    }
+
+    computed leaf1() {
+        return this.a + this.c + 2;
+    }
+
+    computed leaf2() {
+        return this.a + this.d + 3;
+    }
+
+    computed leaf3() {
+        return this.a + this.b + this.c + 4;
+    }
+
+    computed leaf4() {
+        return this.b + this.c + 5;
+    }
+
+    computed leaf5() {
+        return this.b + this.d + 6;
+    }
+
+    computed leaf6() {
+        return this.b + this.a + 7;
+    }
+
+    computed leaf7() {
+        return this.b + this.c + this.d + 8;
+    }
+
+    computed leaf8() {
+        return this.c + this.d + 9;
+    }
+
+    computed leaf9() {
+        return this.c + this.a + 10;
+    }
+
+    computed leaf10() {
+        return this.c + this.b + 11;
+    }
+
+    computed leaf11() {
+        return this.c + this.d + this.a + 12;
+    }
+
+    computed leaf12() {
+        return this.d + this.a + 13;
+    }
+
+    computed leaf13() {
+        return this.d + this.b + 14;
+    }
+
+    computed leaf14() {
+        return this.d + this.c + 15;
+    }
+
+    computed leaf15() {
+        return this.d + this.a + this.b + 16;
+    }
+
+
+    computed middle0() {
+        return this.leaf0 + this.leaf1;
+    }
+
+    computed middle1() {
+        return this.leaf2 + this.leaf3;
+    }
+
+    computed middle2() {
+        return this.leaf4 + this.leaf5;
+    }
+
+    computed middle3() {
+        return this.leaf6 + this.leaf7;
+    }
+
+    computed middle4() {
+        return this.leaf8 + this.leaf9;
+    }
+
+    computed middle5() {
+        return this.leaf10 + this.leaf11;
+    }
+
+    computed middle6() {
+        return this.leaf12 + this.leaf13;
+    }
+
+    computed middle7() {
+        return this.leaf14 + this.leaf15;
+    }
+
+
+    computed upper0() {
+        return this.middle0 + this.middle1;
+    }
+
+    computed upper1() {
+        return this.middle2 + this.middle3;
+    }
+
+    computed upper2() {
+        return this.middle4 + this.middle5;
+    }
+
+    computed upper3() {
+        return this.middle6 + this.middle7;
+    }
+
+
+    computed graphRoot() {
+        return this.upper0
+            + this.upper1
+            + this.upper2
+            + this.upper3;
+    }
+}
+
+
+function printResult(
+    name: String,
+    elapsedMs: Number,
+    checksum: Number
+) {
+    System.print(name);
+
+    System.print("Time (ms):");
+    System.print(elapsedMs);
+
+    System.print("Checksum:");
+    System.print(checksum);
+
+    System.print("");
+}
+
+
+function runBenchmark() {
+    System.print("========================================");
+    System.print("Napalm native reactivity benchmark");
+    System.print("========================================");
+
+    const benchmark = new ReactiveBenchmark();
+
+    let totalChecksum: Number = 0;
+
+    const totalStart = System.clock;
+
+
+    // ========================================================================
+    // 1. Cached computed reads
+    // ========================================================================
+    //
+    // No underlying state changes during this phase.
+    //
+    // After their initial evaluation, every access should become a cache hit.
+    // This measures the minimum overhead of accessing a computed property.
+
+    System.print("");
+    System.print("----------------------------------------");
+    System.print("1. COMPUTED CACHE HITS");
+    System.print("----------------------------------------");
+
+    let cacheChecksum: Number = 0;
+
+    const cacheStart = System.clock;
+
+    for (
+        let i: Number = 0;
+        i < CACHE_ROUNDS;
+        i = i + 1
+    ) {
+        cacheChecksum = cacheChecksum + benchmark.cached0;
+        cacheChecksum = cacheChecksum + benchmark.cached1;
+        cacheChecksum = cacheChecksum + benchmark.cached2;
+        cacheChecksum = cacheChecksum + benchmark.cached3;
+    }
+
+    const cacheEnd = System.clock;
+    const cacheMs = (cacheEnd - cacheStart) * 1000;
+
+    totalChecksum = totalChecksum + cacheChecksum;
+
+    printResult(
+        "Computed cache hits",
+        cacheMs,
+        cacheChecksum
+    );
+
+
+    // ========================================================================
+    // 2. Wide fan-out invalidation
+    // ========================================================================
+    //
+    // Four consecutive writes are intentionally performed before reading any
+    // computed property.
+    //
+    // A lazy reactive system should invalidate dependents without repeatedly
+    // recomputing them after every write.
+    //
+    // Each iteration then reads sixteen computed values that depend on `hot`.
+
+    System.print("----------------------------------------");
+    System.print("2. WIDE INVALIDATION FAN-OUT");
+    System.print("----------------------------------------");
+
+    let fanoutChecksum: Number = 0;
+
+    const fanoutStart = System.clock;
+
+    for (
+        let i: Number = 0;
+        i < FANOUT_ROUNDS;
+        i = i + 1
+    ) {
+        benchmark.hot = benchmark.hot + 1;
+        benchmark.hot = benchmark.hot + 1;
+        benchmark.hot = benchmark.hot + 1;
+        benchmark.hot = benchmark.hot + 1;
+
+        fanoutChecksum = fanoutChecksum + benchmark.fan0;
+        fanoutChecksum = fanoutChecksum + benchmark.fan1;
+        fanoutChecksum = fanoutChecksum + benchmark.fan2;
+        fanoutChecksum = fanoutChecksum + benchmark.fan3;
+
+        fanoutChecksum = fanoutChecksum + benchmark.fan4;
+        fanoutChecksum = fanoutChecksum + benchmark.fan5;
+        fanoutChecksum = fanoutChecksum + benchmark.fan6;
+        fanoutChecksum = fanoutChecksum + benchmark.fan7;
+
+        fanoutChecksum = fanoutChecksum + benchmark.fan8;
+        fanoutChecksum = fanoutChecksum + benchmark.fan9;
+        fanoutChecksum = fanoutChecksum + benchmark.fan10;
+        fanoutChecksum = fanoutChecksum + benchmark.fan11;
+
+        fanoutChecksum = fanoutChecksum + benchmark.fan12;
+        fanoutChecksum = fanoutChecksum + benchmark.fan13;
+        fanoutChecksum = fanoutChecksum + benchmark.fan14;
+        fanoutChecksum = fanoutChecksum + benchmark.fan15;
+    }
+
+    const fanoutEnd = System.clock;
+    const fanoutMs = (fanoutEnd - fanoutStart) * 1000;
+
+    totalChecksum = totalChecksum + fanoutChecksum;
+
+    printResult(
+        "Wide invalidation fan-out",
+        fanoutMs,
+        fanoutChecksum
+    );
+
+
+    // ========================================================================
+    // 3. Deep computed dependency chain
+    // ========================================================================
+    //
+    // Every iteration mutates the root dependency and reads only the final
+    // computed property.
+    //
+    // The reactive engine must invalidate and lazily rebuild a sixteen-node
+    // dependency chain.
+
+    System.print("----------------------------------------");
+    System.print("3. DEEP COMPUTED CHAIN");
+    System.print("----------------------------------------");
+
+    let chainChecksum: Number = 0;
+
+    const chainStart = System.clock;
+
+    for (
+        let i: Number = 0;
+        i < CHAIN_ROUNDS;
+        i = i + 1
+    ) {
+        benchmark.chainSeed = benchmark.chainSeed + 1;
+
+        chainChecksum =
+            chainChecksum + benchmark.chain15;
+    }
+
+    const chainEnd = System.clock;
+    const chainMs = (chainEnd - chainStart) * 1000;
+
+    totalChecksum = totalChecksum + chainChecksum;
+
+    printResult(
+        "Deep computed chain",
+        chainMs,
+        chainChecksum
+    );
+
+
+    // ========================================================================
+    // 4. Multi-level graph invalidation
+    // ========================================================================
+    //
+    // Several source properties change before the root is observed.
+    //
+    // This stresses:
+    //
+    //   - invalidation propagation
+    //   - dependency deduplication
+    //   - nested computed dependencies
+    //   - lazy recomputation
+    //   - cache updates
+    //
+    // The final read forces the complete affected graph to become current.
+
+    System.print("----------------------------------------");
+    System.print("4. MULTI-LEVEL REACTIVE GRAPH");
+    System.print("----------------------------------------");
+
+    let graphChecksum: Number = 0;
+
+    const graphStart = System.clock;
+
+    for (
+        let i: Number = 0;
+        i < GRAPH_ROUNDS;
+        i = i + 1
+    ) {
+        benchmark.a = benchmark.a + 1;
+        benchmark.b = benchmark.b + 2;
+        benchmark.c = benchmark.c + 3;
+        benchmark.d = benchmark.d + 4;
+
+        graphChecksum =
+            graphChecksum + benchmark.graphRoot;
+    }
+
+    const graphEnd = System.clock;
+    const graphMs = (graphEnd - graphStart) * 1000;
+
+    totalChecksum = totalChecksum + graphChecksum;
+
+    printResult(
+        "Multi-level reactive graph",
+        graphMs,
+        graphChecksum
+    );
+
+
+    // ========================================================================
+    // Results
+    // ========================================================================
+
+    const totalEnd = System.clock;
+    const totalMs = (totalEnd - totalStart) * 1000;
+
+    const totalReactiveMs =
+        cacheMs
+        + fanoutMs
+        + chainMs
+        + graphMs;
+
+
+    System.print("========================================");
+    System.print("RESULTS");
+    System.print("========================================");
+
+    System.print("Cache-hit time (ms):");
+    System.print(cacheMs);
+
+    System.print("Fan-out time (ms):");
+    System.print(fanoutMs);
+
+    System.print("Deep-chain time (ms):");
+    System.print(chainMs);
+
+    System.print("Reactive-graph time (ms):");
+    System.print(graphMs);
+
+    System.print("");
+
+    System.print("Measured reactive work (ms):");
+    System.print(totalReactiveMs);
+
+    System.print("Whole benchmark time (ms):");
+    System.print(totalMs);
+
+    System.print("Final checksum:");
+    System.print(totalChecksum);
+
+    System.print("========================================");
+}
+
+
+runBenchmark();

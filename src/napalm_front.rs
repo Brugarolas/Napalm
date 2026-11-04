@@ -382,6 +382,8 @@ enum RawTokenKind {
     AndAnd,
     #[token("||")]
     OrOr,
+    #[token("|>")]
+    Pipeline,
 
     #[token("(")]
     LeftParen,
@@ -483,6 +485,7 @@ pub enum TokenKind {
     ShiftRight,
     AndAnd,
     OrOr,
+    Pipeline,
     LeftParen,
     RightParen,
     LeftBracket,
@@ -562,6 +565,7 @@ impl TokenKind {
             ShiftRight => "`>>`",
             AndAnd => "`&&`",
             OrOr => "`||`",
+            Pipeline => "`|>`",
             LeftParen => "`(`",
             RightParen => "`)`",
             LeftBracket => "`[`",
@@ -745,6 +749,7 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::ShiftRight => T::ShiftRight,
         R::AndAnd => T::AndAnd,
         R::OrOr => T::OrOr,
+        R::Pipeline => T::Pipeline,
         R::LeftParen => T::LeftParen,
         R::RightParen => T::RightParen,
         R::LeftBracket => T::LeftBracket,
@@ -1042,6 +1047,9 @@ pub enum TypeAnnotationKind {
     Map,
     GenericMap(Box<TypeAnnotation>, Box<TypeAnnotation>),
     Set(Option<Box<TypeAnnotation>>),
+    /// Native generic runtime endpoint such as Event<T>, Emitter<T>, Channel<T>
+    /// or Receiver<T>. `None` is the untyped/`any` form.
+    BuiltinGeneric(String, Option<Box<TypeAnnotation>>),
     Object(Vec<InterfaceField>),
     Closure,
     Named(String),
@@ -1251,6 +1259,11 @@ pub struct FunctionBody {
     /// Source-visible parameter annotations, aligned with `params`. Legacy syntax
     /// has no parameter type grammar, so its entries are always `None`.
     pub param_types: Vec<Option<TypeAnnotation>>,
+    /// Source-declared result annotation (`function f(): T`). The lowerer treats
+    /// it as an inviolable contract: every return is checked against it, so
+    /// callers whose target is statically known may rely on the result type.
+    /// Legacy syntax has no return type grammar and always leaves this `None`.
+    pub return_type: Option<TypeAnnotation>,
     pub kind: FunctionBodyKind,
     pub span: Span,
 }
@@ -1658,6 +1671,9 @@ pub enum UnaryOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
+    /// Thread-first pipeline. `value |> f(a)` lowers to `f(value, a)`.
+    /// This operator is syntax-owned and cannot be overloaded by user classes.
+    Pipeline,
     Power,
     Multiply,
     Divide,
@@ -2621,6 +2637,7 @@ impl<'a> Parser<'a> {
             let end = self.previous().span.end;
             return Ok(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(Vec::new()),
                 span: Span::new(start, end),
@@ -2649,6 +2666,7 @@ impl<'a> Parser<'a> {
             )?;
             return Ok(FunctionBody {
                 param_types: vec![None; params.len()],
+                return_type: None,
                 params,
                 kind: FunctionBodyKind::Statements(statements),
                 span: Span::new(start, close.span.end),
@@ -2663,6 +2681,7 @@ impl<'a> Parser<'a> {
         )?;
         Ok(FunctionBody {
             param_types: vec![None; params.len()],
+            return_type: None,
             params,
             kind: FunctionBodyKind::Expression(Box::new(expression)),
             span: Span::new(start, close.span.end),
@@ -3968,6 +3987,7 @@ fn infix_binding(kind: TokenKind) -> Option<(u8, u8, InfixKind)> {
     use TokenKind as T;
 
     let (bp, operation) = match kind {
+        T::Pipeline => (2, Binary(B::Pipeline)),
         T::OrOr => (3, Logical(L::Or)),
         T::AndAnd => (4, Logical(L::And)),
         T::EqualEqual => (5, Binary(B::Equal)),

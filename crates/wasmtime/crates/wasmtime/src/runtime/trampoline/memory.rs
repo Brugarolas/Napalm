@@ -1,0 +1,227 @@
+use crate::MemoryType;
+use crate::prelude::*;
+use crate::runtime::vm::mpk::ProtectionKey;
+use crate::runtime::vm::{
+    CompiledModuleId, InstanceAllocationRequest, InstanceAllocator, Memory, MemoryAllocationIndex,
+    ModuleRuntimeInfo, OnDemandInstanceAllocator, SharedMemory, Table, TableAllocationIndex,
+};
+use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque, StoreResourceLimiter};
+use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
+use wasmtime_environ::{
+    DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, MemoryKind, Module,
+    StaticModuleIndex, VMOffsets,
+};
+
+#[cfg(feature = "component-model")]
+use wasmtime_environ::component::{Component, VMComponentOffsets};
+
+/// Create a "frankenstein" instance with a single memory.
+///
+/// This separate instance is necessary because Wasm objects in Wasmtime must be
+/// attached to instances (versus the store, e.g.) and some objects exist
+/// outside: a host-provided memory import, shared memory.
+pub async fn create_memory(
+    store: &mut StoreOpaque,
+    limiter: Option<&mut StoreResourceLimiter<'_>>,
+    memory_ty: &MemoryType,
+    preallocation: Option<&SharedMemory>,
+) -> Result<InstanceId> {
+    let mut module = Module::new(StaticModuleIndex::from_u32(0));
+
+    // Create a memory, though it will never be used for constructing a memory
+    // with an allocator: instead the memories are either preallocated (i.e.,
+    // shared memory) or allocated manually below.
+    let memory_id = module.memories.push(*memory_ty.wasmtime_memory())?;
+
+    // Since we have only associated a single memory with the "frankenstein"
+    // instance, it will be exported at index 0.
+    debug_assert_eq!(memory_id.as_u32(), 0);
+    let name = module.strings.insert("")?;
+    module
+        .exports
+        .insert(name, EntityIndex::Memory(memory_id))?;
+    let info = ModuleRuntimeInfo::bare(try_new::<Arc<_>>(module)?)?;
+
+    // We create an instance in the on-demand allocator when creating handles
+    // associated with external objects. The configured instance allocator
+    // should only be used when creating module instances as we don't want host
+    // objects to count towards instance limits. Host-created memories must
+    // still use the configured memory creator, though, see
+    // `Config::with_host_memory`.
+    let allocator = SingleMemoryInstance {
+        preallocation,
+        ondemand: OnDemandInstanceAllocator::new(
+            store.engine().config().mem_creator.clone(),
+            0,
+            false,
+        ),
+    };
+    unsafe {
+        store
+            .allocate_instance(
+                limiter,
+                AllocateInstanceKind::Dummy {
+                    allocator: &allocator,
+                },
+                &info,
+                Default::default(),
+            )
+            .await
+    }
+}
+
+struct SingleMemoryInstance<'a> {
+    preallocation: Option<&'a SharedMemory>,
+    ondemand: OnDemandInstanceAllocator,
+}
+
+unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
+    #[cfg(feature = "component-model")]
+    fn validate_component<'a>(
+        &self,
+        _component: &Component,
+        _offsets: &VMComponentOffsets<HostPtr>,
+        _get_module: &'a dyn Fn(StaticModuleIndex) -> &'a Module,
+    ) -> Result<()> {
+        unreachable!("`SingleMemoryInstance` allocator never used with components")
+    }
+
+    fn validate_module(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()> {
+        crate::ensure!(
+            module.memories.len() == 1,
+            "`SingleMemoryInstance` allocator can only be used for modules with a single memory"
+        );
+        self.ondemand.validate_module(module, offsets)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "gc")]
+    fn validate_memory(&self, memory: &wasmtime_environ::Memory) -> Result<()> {
+        self.ondemand.validate_memory(memory)
+    }
+
+    #[cfg(feature = "component-model")]
+    fn increment_component_instance_count(&self) -> Result<()> {
+        self.ondemand.increment_component_instance_count()
+    }
+
+    #[cfg(feature = "component-model")]
+    fn decrement_component_instance_count(&self) {
+        self.ondemand.decrement_component_instance_count();
+    }
+
+    fn increment_core_instance_count(&self) -> Result<()> {
+        self.ondemand.increment_core_instance_count()
+    }
+
+    fn decrement_core_instance_count(&self) {
+        self.ondemand.decrement_core_instance_count();
+    }
+
+    fn allocate_memory<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        request: &'a mut InstanceAllocationRequest<'b, 'c>,
+        ty: &'a wasmtime_environ::Memory,
+        memory_index: Option<DefinedMemoryIndex>,
+        memory_kind: MemoryKind,
+    ) -> Pin<Box<dyn Future<Output = Result<(MemoryAllocationIndex, Memory)>> + Send + 'a>> {
+        if cfg!(debug_assertions) {
+            let module = request.runtime_info.env_module();
+            let offsets = request.runtime_info.offsets();
+            self.validate_module(module, offsets)
+                .expect("should have already validated the module before allocating memory");
+        }
+
+        match self.preallocation {
+            Some(shared_memory) => crate::runtime::box_future(async move {
+                Ok((
+                    MemoryAllocationIndex::default(),
+                    shared_memory.clone().as_memory(),
+                ))
+            }),
+            None => self
+                .ondemand
+                .allocate_memory(request, ty, memory_index, memory_kind),
+        }
+    }
+
+    unsafe fn deallocate_memory(
+        &self,
+        memory_index: Option<DefinedMemoryIndex>,
+        allocation_index: MemoryAllocationIndex,
+        memory: Memory,
+    ) {
+        unsafe {
+            self.ondemand
+                .deallocate_memory(memory_index, allocation_index, memory)
+        }
+    }
+
+    fn allocate_table<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        req: &'a mut InstanceAllocationRequest<'b, 'c>,
+        ty: &'a wasmtime_environ::Table,
+        table_index: DefinedTableIndex,
+    ) -> Pin<Box<dyn Future<Output = Result<(TableAllocationIndex, Table)>> + Send + 'a>> {
+        self.ondemand.allocate_table(req, ty, table_index)
+    }
+
+    unsafe fn deallocate_table(
+        &self,
+        table_index: DefinedTableIndex,
+        allocation_index: TableAllocationIndex,
+        table: Table,
+    ) {
+        unsafe {
+            self.ondemand
+                .deallocate_table(table_index, allocation_index, table)
+        }
+    }
+
+    #[cfg(feature = "async")]
+    fn allocate_fiber_stack(&self) -> Result<wasmtime_fiber::FiberStack> {
+        unreachable!()
+    }
+
+    #[cfg(feature = "async")]
+    unsafe fn deallocate_fiber_stack(&self, _stack: wasmtime_fiber::FiberStack) {
+        unreachable!()
+    }
+
+    fn purge_module(&self, _: CompiledModuleId) {
+        unreachable!()
+    }
+
+    fn next_available_pkey(&self) -> Option<ProtectionKey> {
+        unreachable!()
+    }
+
+    fn restrict_to_pkey(&self, _: ProtectionKey) {
+        unreachable!()
+    }
+
+    fn allow_all_pkeys(&self) {
+        unreachable!()
+    }
+
+    #[cfg(feature = "gc")]
+    fn allocate_gc_heap(
+        &self,
+        _engine: &crate::Engine,
+        _gc_runtime: &dyn crate::vm::GcRuntime,
+        _memory_alloc_index: crate::vm::MemoryAllocationIndex,
+    ) -> Result<(crate::vm::GcHeapAllocationIndex, Box<dyn crate::vm::GcHeap>)> {
+        unreachable!()
+    }
+
+    #[cfg(feature = "gc")]
+    fn deallocate_gc_heap(
+        &self,
+        _allocation_index: crate::vm::GcHeapAllocationIndex,
+        _gc_heap: Box<dyn crate::vm::GcHeap>,
+    ) -> crate::vm::MemoryAllocationIndex {
+        unreachable!()
+    }
+}

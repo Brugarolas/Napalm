@@ -207,6 +207,15 @@ pub enum TraceInst {
     HeapLoadField { object: TraceValueId, slot: u32, exit: SideExitId },
     HeapStoreField { object: TraceValueId, value: TraceValueId, slot: u32, exit: SideExitId },
     HeapLoadCell { cell: TraceValueId, exit: SideExitId },
+    /// Prove a Closure of one immutable prepared function with exactly
+    /// `capture_count` captures (no result). Used by closure inlining; a
+    /// mismatch replays the original call.
+    GuardClosure { value: TraceValueId, function_index: u32, capture_count: u16, exit: SideExitId },
+    /// Read capture `index` of a Closure. The backend validates Closure kind and
+    /// `index < capture count` itself, so the read stays safe if it is hoisted
+    /// above GuardClosure. Capture arrays are immutable; mutable captured
+    /// variables are Cells, accessed through HeapLoadCell/HeapStoreCell.
+    ClosureCapture { closure: TraceValueId, index: u16, exit: SideExitId },
     HeapStoreCell { cell: TraceValueId, value: TraceValueId, exit: SideExitId },
     /// Explicit GC post-barrier. Non-heap values are a native no-op; a heap value
     /// validates the owner handle before invoking the non-allocating barrier.
@@ -279,6 +288,8 @@ impl TraceInst {
             | StoreAbsoluteValue { value, .. }
             | HeapLoadField { object: value, .. }
             | HeapLoadCell { cell: value, .. }
+            | GuardClosure { value, .. }
+            | ClosureCapture { closure: value, .. }
             | HeapListLen { list: value, .. }
             | HeapMapLen { map: value, .. }
             | HeapStringLen { string: value, .. }
@@ -331,6 +342,7 @@ impl TraceInst {
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
+            | GuardClosure { exit, .. } | ClosureCapture { exit, .. }
             | HeapWriteBarrier { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
@@ -349,11 +361,12 @@ impl TraceInst {
             | Self::GuardNotNull { .. } | Self::GuardType { .. } | Self::GuardClass { .. }
             | Self::GuardBounds { .. } | Self::GuardEq { .. } | Self::GuardSwitch { .. }
             | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. }
-            | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. })
+            | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. }
+            | Self::GuardClosure { .. })
     }
 
     pub fn is_heap_read(&self) -> bool {
-        matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. }
+        matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. } | Self::ClosureCapture { .. }
             | Self::HeapListLen { .. } | Self::HeapListGet { .. }
             | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. } | Self::HeapMapGetPic { .. }
             | Self::HeapStringLen { .. } | Self::HeapStringAsciiCodePointAt { .. }
@@ -372,6 +385,7 @@ impl TraceInst {
             | GuardEq { exit, .. } | GuardSwitch { exit, .. }
             | GuardHeapObject { exit, .. } | GuardNoContract { exit, .. } | IsInstanceObserved { exit, .. }
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
+            | GuardClosure { exit, .. } | ClosureCapture { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
@@ -517,6 +531,16 @@ pub struct TraceBuilder {
     /// Recorder-only semantic proofs. They intentionally stay out of TraceValue
     /// so optimizer submodules do not need to know about source-level typing.
     proven_types: HashMap<TraceValueId, Type>,
+    /// Static (WIR) types of registers at the trace anchor. Napalm types are
+    /// enforced contracts, so they are facts about every trace-entry value.
+    entry_types: HashMap<FrameSlot, Type>,
+    /// Static types of registers at the resume PC of the latest runtime
+    /// boundary. Cleared by every boundary and reinstalled by the recorder once
+    /// it knows where the boundary resumes (`set_boundary_types`).
+    boundary_types: HashMap<FrameSlot, Type>,
+    /// Registers reloaded after a boundary whose resume types are not yet known.
+    pending_reloads: Vec<(FrameSlot, TraceValueId)>,
+    boundary_open: bool,
     /// Ordered dirty slots for deterministic snapshots plus O(1) membership for
     /// the recorder's very hot write/reload paths.
     dirty: Vec<FrameSlot>, dirty_set: HashSet<FrameSlot>, memory_epoch: bool,
@@ -525,7 +549,65 @@ impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
-            slots: HashMap::default(), proven_types: HashMap::default(), dirty: vec![], dirty_set: HashSet::default(), memory_epoch: false }
+            slots: HashMap::default(), proven_types: HashMap::default(), entry_types: HashMap::default(),
+            boundary_types: HashMap::default(), pending_reloads: Vec::new(), boundary_open: false,
+            dirty: vec![], dirty_set: HashSet::default(), memory_epoch: false }
+    }
+
+    /// Install the statically guaranteed register types at the trace anchor.
+    /// Must be called before any slot is read.
+    pub fn set_entry_types(&mut self, types: impl IntoIterator<Item = (FrameSlot, Type)>) {
+        self.entry_types = types.into_iter().collect();
+    }
+
+    /// Static type of a slot's trace-entry value, if the anchor proves one.
+    pub fn entry_type(&self, slot: FrameSlot) -> Option<&Type> {
+        self.entry_types.get(&slot)
+    }
+
+    /// Install the statically guaranteed register types at the PC where the
+    /// most recent runtime boundary resumes. Values reloaded since that boundary
+    /// receive their facts now; later reloads in the same epoch use them too.
+    /// A no-op unless a boundary happened since the previous installation, so a
+    /// stale type set can never outlive the epoch it describes.
+    pub fn set_boundary_types(&mut self, types: impl IntoIterator<Item = (FrameSlot, Type)>) {
+        if !self.boundary_open {
+            return;
+        }
+        self.boundary_open = false;
+        self.boundary_types = types.into_iter().collect();
+        for (slot, value) in std::mem::take(&mut self.pending_reloads) {
+            // Only a reload that still is the slot's current value describes the
+            // register at the resume PC.
+            if self.slots.get(&slot) != Some(&value) || self.proven_types.contains_key(&value) {
+                continue;
+            }
+            if let Some(ty) = self.boundary_types.get(&slot) {
+                self.proven_types.insert(value, ty.clone());
+            }
+        }
+    }
+
+    fn begin_boundary(&mut self) {
+        self.boundary_types.clear();
+        self.pending_reloads.clear();
+        self.boundary_open = true;
+    }
+
+    fn type_reloaded_slot(&mut self, slot: FrameSlot, value: TraceValueId) {
+        if self.boundary_open {
+            self.pending_reloads.push((slot, value));
+        } else if let Some(ty) = self.boundary_types.get(&slot) {
+            self.proven_types.entry(value).or_insert_with(|| ty.clone());
+        }
+    }
+
+    fn entry_value(&mut self, slot: FrameSlot, ty: TraceType, rep: TraceRep) -> TraceValueId {
+        let value = self.value(ty, rep, TraceValueOrigin::EntrySlot { frame: TraceFrameId(0), slot });
+        if let Some(ty) = self.entry_types.get(&slot) {
+            self.proven_types.entry(value).or_insert_with(|| ty.clone());
+        }
+        value
     }
     /// Reserve the arenas used by one bounded recording up front. Tracing is hot
     /// enough that repeated Vec/HashMap growth is measurable, while the reservation
@@ -577,9 +659,13 @@ impl TraceBuilder {
         let v = if self.memory_epoch {
             self.emit1(TraceInst::LoadFrameSlot { slot }, ty, rep)
         } else {
-            self.value(ty, rep, TraceValueOrigin::EntrySlot { frame: TraceFrameId(0), slot })
+            self.entry_value(slot, ty, rep)
         };
-        self.slots.insert(slot, v); v
+        self.slots.insert(slot, v);
+        if self.memory_epoch {
+            self.type_reloaded_slot(slot, v);
+        }
+        v
     }
     pub fn write_slot(&mut self, slot: FrameSlot, v: TraceValueId) {
         self.slots.insert(slot, v);
@@ -678,6 +764,7 @@ impl TraceBuilder {
     pub fn runtime_leaf(&mut self, location: TraceLocation, next: BytecodePc) {
         self.commit_preserving_ssa();
         self.emit0(TraceInst::Runtime { location, next, terminal: false, direct_call: None });
+        self.begin_boundary();
     }
 
     /// Emit a synchronized same-frame runtime step which may allocate or collect,
@@ -692,6 +779,7 @@ impl TraceBuilder {
         self.commit_preserving_ssa();
         self.emit0(TraceInst::Runtime { location, next, terminal: false, direct_call: None });
         self.memory_epoch = true;
+        self.begin_boundary();
     }
 
     /// Reload a register written by `runtime_leaf` or `runtime_gc_leaf`.
@@ -709,6 +797,7 @@ impl TraceBuilder {
         if self.dirty_set.insert(slot) {
             self.dirty.push(slot);
         }
+        self.type_reloaded_slot(slot, value);
         value
     }
 
@@ -741,6 +830,7 @@ impl TraceBuilder {
             }),
         });
         self.memory_epoch = true;
+        self.begin_boundary();
 
         // The call writes the destination and the return bank. They are already
         // synchronized by the runtime helper, so discard any pre-call SSA view
@@ -795,6 +885,7 @@ impl TraceBuilder {
             }),
         });
         self.memory_epoch = true;
+        self.begin_boundary();
 
         let destination_slot = FrameSlot::General(destination);
         let return0 = FrameSlot::Return(ReturnReg(0));
@@ -821,6 +912,7 @@ impl TraceBuilder {
         self.emit0(TraceInst::Runtime { location, next, terminal, direct_call: None });
         self.slots.clear();
         self.memory_epoch = true;
+        self.begin_boundary();
     }
 
 
@@ -832,6 +924,7 @@ impl TraceBuilder {
         self.emit0(TraceInst::RuntimeCall { location, next });
         self.slots.clear();
         self.memory_epoch = true;
+        self.begin_boundary();
     }
     pub fn has_runtime_calls(&self) -> bool { self.memory_epoch }
     pub fn ensure_loop_entries(&mut self) {
@@ -848,8 +941,7 @@ impl TraceBuilder {
             if entry_slots.insert(slot) {
                 // A register written without being read still carries its previous
                 // iteration value into exits which precede that write.
-                self.value(TraceType::Any, TraceRep::Tagged,
-                    TraceValueOrigin::EntrySlot { frame: TraceFrameId(0), slot });
+                self.entry_value(slot, TraceType::Any, TraceRep::Tagged);
             }
         }
     }
