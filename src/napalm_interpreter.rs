@@ -17896,12 +17896,15 @@ impl TraceRuntime for Interpreter<'_> {
             VmBindingKind::MethodEpoch
             | VmBindingKind::DenseSlot
             | VmBindingKind::FieldSlot
-            | VmBindingKind::ShapeId => None,
+            | VmBindingKind::ShapeId
+            | VmBindingKind::ProfileCounters => None,
         }
     }
 
     fn trace_resolve_vm_binding(&self, binding: &VmBindingDescriptor) -> Option<u64> {
         match binding {
+            // Patched by TracingJit with the worker's own counter array.
+            VmBindingDescriptor::ProfileCounters => Some(0),
             VmBindingDescriptor::ProgramString(id) => {
                 self.strings.get(id.0 as usize).map(|value| value.word().0)
             }
@@ -17996,6 +17999,13 @@ impl TraceRuntime for Interpreter<'_> {
             _ => return None,
         };
         self.prepared.functions.get(function_index as usize).map(|function| function.id)
+    }
+
+    fn trace_closure_capture_word(&self, closure: RegisterWord, index: u16) -> Option<RegisterWord> {
+        match self.heap.get(Value::from_word(closure))? {
+            HeapObject::Closure { captures, .. } => captures.get(index as usize).copied(),
+            _ => None,
+        }
     }
 
     fn trace_invoke_closure_target(
@@ -18163,10 +18173,14 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_module_slot_address(&self, location: TraceLocation) -> Option<usize> {
-        let prepared = self.current_prepared();
-        if prepared.id != location.function {
-            return None;
-        }
+        // Any prepared function: the inliner also resolves callee bytecode.
+        let current = self.current_prepared();
+        let prepared = if current.id == location.function {
+            current
+        } else {
+            let index = *self.prepared.function_by_id.get(&location.function)?;
+            self.prepared.functions.get(index as usize)?
+        };
         let index = *prepared.word_to_op.get(location.pc.0 as usize)?;
         if index == NO_INDEX {
             return None;
@@ -19429,6 +19443,73 @@ var result = Closures.run()
             if jit_enabled {
                 let stats = vm.jit_stats().unwrap();
                 assert!(stats.inlined_calls >= 3 && stats.native_entries > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_inlines_nested_calls_and_argument_stores() {
+        let source = r#"
+class Box {
+  construct new(v) { _v = v }
+  v { _v }
+  setV(x) { _v = x }
+  addTo(other) { other.setV(other.v + _v) }
+  twice { v * 2 }
+}
+class Nested {
+  static run() {
+    var a = Box.new(2)
+    var b = Box.new(3)
+    var count = 0
+    var inner = Fn.new { |x| count = count + x }
+    var outer = Fn.new { |x|
+      inner.call(x)
+      inner.call(1)
+    }
+    var total = 0
+    var i = 0
+    while (i < 300) {
+      a.addTo(b)
+      outer.call(i)
+      total = total + a.twice
+      i = i + 1
+    }
+    var j = 0
+    while (j < 20) {
+      a.addTo(a)
+      j = j + 1
+    }
+    return total + b.v + count + a.v
+  }
+}
+var result = Nested.run()
+"#;
+        let (mut a, mut b, mut count, mut total) = (2.0f64, 3.0f64, 0.0f64, 0.0f64);
+        for i in 0..300 {
+            b += a;
+            count += i as f64 + 1.0;
+            total += a * 2.0;
+        }
+        for _ in 0..20 {
+            a += a; // aliased receiver and argument
+        }
+        let expected = total + b + count + a;
+
+        let (program, entry, manifest) = compile_napalm_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
+            if jit_enabled {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.inlined_calls >= 6, "{stats:?}");
+                assert_eq!(stats.closure_direct_calls + stats.invoke_direct_calls, 0, "{stats:?}");
             }
         }
     }
