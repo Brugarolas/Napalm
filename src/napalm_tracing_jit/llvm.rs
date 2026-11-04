@@ -149,6 +149,9 @@ fn load_llvm_library() -> Result<(), String> {
     Ok(())
 }
 
+/// Napalm's default process-wide LLVM codegen options (tuned with benchmarks).
+const DEFAULT_LLVM_FLAGS: &[&str] = &[];
+
 fn initialize_llvm() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -168,10 +171,18 @@ fn initialize_llvm() -> Result<(), String> {
         // divisions (measured 5x slower). PipelineTuningOptions alone did not
         // keep `default<O3>` from scheduling it, so use LLVM's own switch.
         let slp = std::env::var_os("NAPALM_LLVM_SLP").is_some();
-        let args = [
+        let mut args = vec![
             std::ffi::CString::new("napalm-llvm").unwrap(),
             std::ffi::CString::new(if slp { "-vectorize-slp=true" } else { "-vectorize-slp=false" }).unwrap(),
         ];
+        // Process-wide LLVM/codegen options (`NAPALM_LLVM_FLAGS="-a -b=1"`) on
+        // top of Napalm's defaults; later flags win.
+        let extra = std::env::var("NAPALM_LLVM_FLAGS").unwrap_or_default();
+        for flag in DEFAULT_LLVM_FLAGS.iter().copied().chain(extra.split_whitespace()) {
+            if let Ok(flag) = std::ffi::CString::new(flag) {
+                args.push(flag);
+            }
+        }
         let argv: Vec<*const std::ffi::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
         let overview = std::ffi::CString::new("Napalm LLVM trace tier").unwrap();
         unsafe {
@@ -254,6 +265,8 @@ pub(super) struct LlvmJob {
     pub(super) exits: Vec<CompiledExitPlan>,
     pub(super) binding_slots: HashMap<VmBindingKey, u32>,
     pub(super) native_budget: u32,
+    /// Profile gathered by the instrumented Cranelift code (PGO), if enabled.
+    pub(super) profile: Option<TraceProfile>,
     pub(super) pipeline: String,
     pub(super) slp_vectorize: bool,
     pub(super) dump: bool,
@@ -495,7 +508,15 @@ fn compile_job(
     engines: &mut Vec<(Module<'static>, ExecutionEngine<'static>)>,
 ) -> Result<LlvmCode, String> {
     let started = std::time::Instant::now();
-    let ir = lower_trace(&job.trace, &job.exits, job.binding_slots.clone(), job.native_budget, &job.symbol, host)?;
+    let ir = lower_trace_profiled(
+        &job.trace,
+        &job.exits,
+        job.binding_slots.clone(),
+        job.native_budget,
+        &job.symbol,
+        host,
+        job.profile.as_ref(),
+    )?;
     if job.dump {
         eprintln!("[napalm-llvm] generated {}:\n{ir}", job.symbol);
     }
@@ -648,8 +669,19 @@ enum Mem {
     Act,
     /// Architectural register banks.
     Reg,
-    /// `TraceHeapEntry` sidecars and the handle chunk table.
+    /// Generic sidecar accesses, including the handle chunk pointer table.
+    /// A generic access may alias every specialized TraceHeapEntry field.
     Sidecar,
+    /// Nonoverlapping fields of the fixed-layout TraceHeapEntry sidecar.
+    /// These may be given distinct TBAA children even for unknown entry bases:
+    /// two entries are disjoint, and members never overlap within one entry.
+    SidecarContract,
+    SidecarAddress,
+    SidecarKind,
+    SidecarReceiverClass,
+    SidecarData,
+    SidecarLen,
+    SidecarPromiseValue,
     /// GC payload words, cells, VM Value slots and profile counters.
     Heap,
     /// A shape-backed Map value (dynamic PIC slot).
@@ -676,6 +708,13 @@ impl Mem {
             Mem::Act => 11,
             Mem::Reg => 12,
             Mem::Sidecar => 13,
+            Mem::SidecarContract => 50,
+            Mem::SidecarAddress => 51,
+            Mem::SidecarKind => 52,
+            Mem::SidecarReceiverClass => 53,
+            Mem::SidecarData => 54,
+            Mem::SidecarLen => 55,
+            Mem::SidecarPromiseValue => 56,
             Mem::Heap => 14,
             Mem::Map => 40,
             Mem::Instance => 41,
@@ -811,7 +850,17 @@ struct LlvmLowering<'p> {
     /// Preserve IEEE arithmetic unless the application explicitly accepts
     /// the different rounding that contracting multiply-add can introduce.
     allow_fp_contract: bool,
+    /// PGO: profile of the instrumented tier, and whether the node being
+    /// lowered runs once per entry (preheader) or once per iteration (body).
+    profile: Option<&'p TraceProfile>,
+    in_preheader: bool,
+    /// Numbered `!prof` metadata (ids from PGO_METADATA_BASE), deduplicated.
+    prof_metadata: Vec<(u32, String)>,
+    prof_weight_ids: HashMap<(u32, u32), u32>,
 }
+
+/// PGO metadata ids live far above TBAA/identity ids.
+const PGO_METADATA_BASE: u32 = 900_000;
 
 /// Lower one already-optimized trace. `vm_binding_slots` must describe the
 /// relocation table the installed trace already uses.
@@ -823,6 +872,23 @@ pub(super) fn lower_trace(
     symbol: &str,
     host: &HostInfo,
 ) -> Result<String, String> {
+    lower_trace_profiled(trace, exit_plans, vm_binding_slots, native_budget, symbol, host, None)
+}
+
+/// `lower_trace` plus PGO: with a profile, every side-exit branch gets its
+/// measured branch weights, the loop latch its real trip count, the function
+/// its entry count, and the module a ProfileSummary.
+pub(super) fn lower_trace_profiled(
+    trace: &Trace,
+    exit_plans: &[CompiledExitPlan],
+    vm_binding_slots: HashMap<VmBindingKey, u32>,
+    native_budget: u32,
+    symbol: &str,
+    host: &HostInfo,
+    profile: Option<&TraceProfile>,
+) -> Result<String, String> {
+    // A profile without executions carries no information.
+    let profile = profile.filter(|profile| profile.entries > 0);
     let mut state = LlvmLowering {
         trace,
         exit_plans,
@@ -870,6 +936,10 @@ pub(super) fn lower_trace(
         native_budget_remaining: None,
         native_budget_initial: native_budget,
         allow_fp_contract: std::env::var("NAPALM_LLVM_ALLOW_FMA").ok().as_deref() == Some("1"),
+        profile,
+        in_preheader: true,
+        prof_metadata: Vec::new(),
+        prof_weight_ids: HashMap::default(),
     };
     state.lower_function(native_budget)?;
     Ok(state.finish_module(symbol, host))
@@ -922,6 +992,34 @@ impl LlvmLowering<'_> {
         let condition = self.cond(condition);
         let prof = weights.map(|md| format!(", !prof !{md}")).unwrap_or_default();
         self.line(&format!("br i1 {}, label %{if_true}, label %{if_false}{prof}", condition.op));
+    }
+
+    /// Numbered `!{"branch_weights", t, f}` from measured counts (scaled into u32).
+    fn weights_md(&mut self, if_true: u64, if_false: u64) -> u32 {
+        let scale = (if_true.max(if_false) >> 31) + 1;
+        let key = ((if_true / scale) as u32, (if_false / scale) as u32);
+        if let Some(&id) = self.prof_weight_ids.get(&key) {
+            return id;
+        }
+        let id = PGO_METADATA_BASE + 1 + self.prof_metadata.len() as u32;
+        self.prof_metadata.push((id, format!("!{{!\"branch_weights\", i32 {}, i32 {}}}", key.0, key.1)));
+        self.prof_weight_ids.insert(key, id);
+        id
+    }
+
+    /// Measured (taken, not taken) counts of side exit `exit`, if profiled. A
+    /// preheader guard runs once per native entry; a body guard once per
+    /// iteration (completed iterations plus the final partial one per entry).
+    fn exit_weights(&self, exit: SideExitId) -> Option<(u64, u64)> {
+        let profile = self.profile?;
+        let taken = profile.exit_hits.get(exit.0 as usize).copied().unwrap_or(0);
+        let executions = if self.in_preheader {
+            profile.entries
+        } else {
+            profile.iterations.saturating_add(profile.entries)
+        }
+        .max(taken);
+        Some((taken, executions.saturating_sub(taken).max(1)))
     }
 
     fn ret(&mut self, code: u32) {
@@ -1780,11 +1878,16 @@ impl LlvmLowering<'_> {
         let plan = plans.get(exit.0 as usize).ok_or_else(|| self.error(format!("unknown side exit {exit:?}")))?;
         let resume = self.new_block();
 
+        // PGO: measured exit frequency; otherwise a statically cold exit.
+        let (exit_true_md, exit_false_md) = match self.exit_weights(exit) {
+            Some((taken, continued)) => (self.weights_md(taken, continued), self.weights_md(continued, taken)),
+            None => (MD_COLD_TRUE, MD_HOT_TRUE),
+        };
         let branch = |state: &mut Self, stop: &str, resume: &str| {
             if exit_when_true {
-                state.cond_br(condition, stop, resume, Some(MD_COLD_TRUE));
+                state.cond_br(condition, stop, resume, Some(exit_true_md));
             } else {
-                state.cond_br(condition, resume, stop, Some(MD_HOT_TRUE));
+                state.cond_br(condition, resume, stop, Some(exit_false_md));
             }
         };
 
@@ -1919,7 +2022,7 @@ impl LlvmLowering<'_> {
                 return value.clone();
             }
         }
-        let value = self.load_at(Ty::I32, entry, offset_of!(TraceHeapEntry, kind) as i64, Mem::Sidecar);
+        let value = self.load_at(Ty::I32, entry, offset_of!(TraceHeapEntry, kind) as i64, Mem::SidecarKind);
         if cacheable {
             self.heap_metadata.insert(entry.clone(), value.clone());
         }
@@ -1930,7 +2033,7 @@ impl LlvmLowering<'_> {
         if let Some(value) = self.heap_data.get(entry) {
             return value.clone();
         }
-        let value = self.load_at(Ty::Ptr, entry, offset_of!(TraceHeapEntry, data) as i64, Mem::Sidecar);
+        let value = self.load_at(Ty::Ptr, entry, offset_of!(TraceHeapEntry, data) as i64, Mem::SidecarData);
         self.heap_data.insert(entry.clone(), value.clone());
         value
     }
@@ -1946,7 +2049,7 @@ impl LlvmLowering<'_> {
         if let Some(value) = self.heap_len.get(entry) {
             return value.clone();
         }
-        let value = self.load_at(Ty::I64, entry, offset_of!(TraceHeapEntry, len) as i64, Mem::Sidecar);
+        let value = self.load_at(Ty::I64, entry, offset_of!(TraceHeapEntry, len) as i64, Mem::SidecarLen);
         self.heap_len.insert(entry.clone(), value.clone());
         value
     }
@@ -1955,7 +2058,7 @@ impl LlvmLowering<'_> {
         if let Some(value) = self.heap_receiver_class.get(entry) {
             return value.clone();
         }
-        let value = self.load_at(Ty::I64, entry, offset_of!(TraceHeapEntry, receiver_class) as i64, Mem::Sidecar);
+        let value = self.load_at(Ty::I64, entry, offset_of!(TraceHeapEntry, receiver_class) as i64, Mem::SidecarReceiverClass);
         self.heap_receiver_class.insert(entry.clone(), value.clone());
         value
     }
@@ -1982,7 +2085,7 @@ impl LlvmLowering<'_> {
         let chunk = self.load(Ty::Ptr, &chunk_slot, Mem::Sidecar);
         let entry_offset = self.bin("mul", &entry_index, &V::i64(std::mem::size_of::<TraceHeapEntry>() as i64));
         let entry = self.gep8_dyn(&chunk, &entry_offset);
-        let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::Sidecar);
+        let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::SidecarAddress);
         let dead = self.def(Ty::I1, &format!("icmp eq ptr {}, null", address.op));
         self.emit_side_exit(exit, &dead)?;
         Ok((entry, address))
@@ -2015,7 +2118,7 @@ impl LlvmLowering<'_> {
             let address = if let Some(address) = self.heap_addresses.get(canonical.0 as usize).and_then(Clone::clone) {
                 address
             } else {
-                let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::Sidecar);
+                let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::SidecarAddress);
                 let dead = self.def(Ty::I1, &format!("icmp eq ptr {}, null", address.op));
                 self.emit_side_exit(exit, &dead)?;
                 address
@@ -2057,7 +2160,7 @@ impl LlvmLowering<'_> {
     }
 
     fn guard_uncontracted_store(&mut self, entry: &V, exit: SideExitId) -> Result<(), String> {
-        let contract = self.load_at(Ty::I32, entry, offset_of!(TraceHeapEntry, has_contract) as i64, Mem::Sidecar);
+        let contract = self.load_at(Ty::I32, entry, offset_of!(TraceHeapEntry, has_contract) as i64, Mem::SidecarContract);
         let invalid = self.icmp("ne", &contract, &V::i32(0));
         self.emit_side_exit(exit, &invalid)
     }
@@ -2409,7 +2512,7 @@ impl LlvmLowering<'_> {
                 self.begin(&heap_block);
                 // Branch-local proof: never published into the path-insensitive caches.
                 let (entry, _) = self.live_heap_entry_from_heap_tagged(&tagged, *exit)?;
-                let actual = self.load_at(Ty::I64, &entry, offset_of!(TraceHeapEntry, receiver_class) as i64, Mem::Sidecar);
+                let actual = self.load_at(Ty::I64, &entry, offset_of!(TraceHeapEntry, receiver_class) as i64, Mem::SidecarReceiverClass);
                 let matches = self.class_matches(&actual, instance_classes)?;
                 let known = self.class_matches(&actual, known_classes)?;
                 let kind = self.bin("lshr", &actual, &V::i64(56));
@@ -3175,7 +3278,7 @@ impl LlvmLowering<'_> {
                 let state = self.heap_metadata_payload(&metadata);
                 let not_fulfilled = self.icmp("ne", &state, &V::i32(TRACE_PROMISE_FULFILLED as i32));
                 self.emit_side_exit(*exit, &not_fulfilled)?;
-                let value = self.load_at(Ty::I64, &entry, offset_of!(TraceHeapEntry, promise_value) as i64, Mem::Sidecar);
+                let value = self.load_at(Ty::I64, &entry, offset_of!(TraceHeapEntry, promise_value) as i64, Mem::SidecarPromiseValue);
                 self.cache_value(self.one_result(node)?, value);
             }
 
@@ -3270,6 +3373,7 @@ impl LlvmLowering<'_> {
 
         self.br("loop");
         self.begin("loop");
+        self.in_preheader = false;
 
         if trace.nodes.iter().any(|node| {
             matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. })
@@ -3312,11 +3416,20 @@ impl LlvmLowering<'_> {
                     self.line(&format!("store i64 {}, ptr {slot}, align 8", next_budget.op));
                     let exhausted = self.icmp("eq", &next_budget, &V::i64(0));
                     let stop = self.new_block();
-                    self.cond_br(&exhausted, &stop, "loop", Some(MD_COLD_TRUE));
-                    self.begin(&stop);
                     let exit = trace
                         .native_budget_exit
                         .ok_or_else(|| self.error("native loop budget enabled without watchdog side exit"))?;
+                    // PGO: the latch weights encode the measured trip count, which
+                    // drives LLVM's estimated_trip_count (unrolling, vectorizing).
+                    let latch_md = match self.profile {
+                        Some(profile) => {
+                            let exhausted_hits = profile.exit_hits.get(exit.0 as usize).copied().unwrap_or(0);
+                            self.weights_md(exhausted_hits, profile.iterations.max(1))
+                        }
+                        None => MD_COLD_TRUE,
+                    };
+                    self.cond_br(&exhausted, &stop, "loop", Some(latch_md));
+                    self.begin(&stop);
                     self.native_budget_remaining = Some(next_budget);
                     self.emit_unconditional_side_exit(exit)?;
                 } else {
@@ -3372,9 +3485,11 @@ impl LlvmLowering<'_> {
             "declare i32 @napalm_jit_decode_code_point(ptr, i64, i64) #2\n",
             "\n",
         ));
+        // PGO function entry count (BFI scales every block count from it).
+        let entry_prof = if self.profile.is_some() { format!(" !prof !{PGO_METADATA_BASE}") } else { String::new() };
         let _ = writeln!(
             out,
-            "define i32 @{symbol}(ptr noundef nonnull align 16 dereferenceable({}) %act, ptr noundef nonnull align 4 %links) #0 {{",
+            "define i32 @{symbol}(ptr noundef nonnull align 16 dereferenceable({}) %act, ptr noundef nonnull align 4 %links) #0{entry_prof} {{",
             std::mem::size_of::<TraceActivation>()
         );
         out.push_str("entry:\n");
@@ -3397,6 +3512,15 @@ impl LlvmLowering<'_> {
             "!1 = !{!\"napalm.act\", !0, i64 0}\n",
             "!2 = !{!\"napalm.reg\", !0, i64 0}\n",
             "!3 = !{!\"napalm.sidecar\", !0, i64 0}\n",
+            // Physical fields of a TraceHeapEntry cannot overlap each other.
+            // A bare sidecar access retains the common parent and can alias all.
+            "!60 = !{!\"napalm.sidecar.has_contract\", !3, i64 0}\n",
+            "!61 = !{!\"napalm.sidecar.address\", !3, i64 0}\n",
+            "!62 = !{!\"napalm.sidecar.kind\", !3, i64 0}\n",
+            "!63 = !{!\"napalm.sidecar.receiver_class\", !3, i64 0}\n",
+            "!64 = !{!\"napalm.sidecar.data\", !3, i64 0}\n",
+            "!65 = !{!\"napalm.sidecar.len\", !3, i64 0}\n",
+            "!66 = !{!\"napalm.sidecar.promise_value\", !3, i64 0}\n",
             "!4 = !{!\"napalm.heap\", !0, i64 0}\n",
             "!5 = !{!\"napalm.str\", !0, i64 0}\n",
             "!6 = !{!\"napalm.binding\", !0, i64 0}\n",
@@ -3420,6 +3544,13 @@ impl LlvmLowering<'_> {
             "!42 = !{!32, !32, i64 0}\n",
             "!43 = !{!33, !33, i64 0}\n",
             "!44 = !{!34, !34, i64 0}\n",
+            "!50 = !{!60, !60, i64 0}\n",
+            "!51 = !{!61, !61, i64 0}\n",
+            "!52 = !{!62, !62, i64 0}\n",
+            "!53 = !{!63, !63, i64 0}\n",
+            "!54 = !{!64, !64, i64 0}\n",
+            "!55 = !{!65, !65, i64 0}\n",
+            "!56 = !{!66, !66, i64 0}\n",
             "!20 = !{!\"branch_weights\", i32 1, i32 2000000}\n",
             "!21 = !{!\"branch_weights\", i32 2000000, i32 1}\n",
             "!22 = !{}\n",
@@ -3445,7 +3576,52 @@ impl LlvmLowering<'_> {
             let members = scopes.iter().map(|id| format!("!{id}")).collect::<Vec<_>>().join(", ");
             let _ = writeln!(out, "!{id} = !{{{members}}}");
         }
+        if let Some(profile) = self.profile {
+            Self::write_profile_metadata(&mut out, profile, &self.prof_metadata);
+        }
         out
+    }
+
+    /// Function entry count, measured branch weights and an InstrProf-style
+    /// ProfileSummary, so ProfileSummaryInfo can classify hot loop bodies and
+    /// cold exits (block placement, PGSO, unrolling and vectorizer costs).
+    fn write_profile_metadata(out: &mut String, profile: &TraceProfile, weights: &[(u32, String)]) {
+        let entries = profile.entries.max(1);
+        let body = profile.iterations.saturating_add(profile.entries).max(1);
+        let total_exits: u64 = profile.exit_hits.iter().sum();
+        let max_count = body.max(entries);
+        let total = body.saturating_add(entries).saturating_add(total_exits);
+        let num_counts = 2 + profile.exit_hits.len() as u64;
+        // Hot: the loop body and anything within 1% of it. Cold: (nearly) never run.
+        let hot_min = (max_count / 100).max(1);
+        let cold_min = (max_count / 100_000).max(1);
+        let base = PGO_METADATA_BASE;
+        let _ = writeln!(out, "!{base} = !{{!\"function_entry_count\", i64 {entries}}}");
+        for (id, text) in weights {
+            let _ = writeln!(out, "!{id} = {text}");
+        }
+        let s = base + 500_000;
+        let _ = writeln!(out, "!llvm.module.flags = !{{!{s}}}");
+        let _ = writeln!(out, "!{s} = !{{i32 1, !\"ProfileSummary\", !{}}}", s + 1);
+        let _ = writeln!(
+            out,
+            "!{} = !{{!{}, !{}, !{}, !{}, !{}, !{}, !{}, !{}, !{}, !{}}}",
+            s + 1, s + 2, s + 3, s + 4, s + 5, s + 6, s + 7, s + 8, s + 9, s + 10, s + 11
+        );
+        let _ = writeln!(out, "!{} = !{{!\"ProfileFormat\", !\"InstrProf\"}}", s + 2);
+        let _ = writeln!(out, "!{} = !{{!\"TotalCount\", i64 {total}}}", s + 3);
+        let _ = writeln!(out, "!{} = !{{!\"MaxCount\", i64 {max_count}}}", s + 4);
+        let _ = writeln!(out, "!{} = !{{!\"MaxInternalCount\", i64 {max_count}}}", s + 5);
+        let _ = writeln!(out, "!{} = !{{!\"MaxFunctionCount\", i64 {entries}}}", s + 6);
+        let _ = writeln!(out, "!{} = !{{!\"NumCounts\", i64 {num_counts}}}", s + 7);
+        let _ = writeln!(out, "!{} = !{{!\"NumFunctions\", i64 1}}", s + 8);
+        let _ = writeln!(out, "!{} = !{{!\"IsPartialProfile\", i64 0}}", s + 9);
+        let _ = writeln!(out, "!{} = !{{!\"PartialProfileRatio\", double 0.000000e+00}}", s + 10);
+        let _ = writeln!(out, "!{} = !{{!\"DetailedSummary\", !{}}}", s + 11, s + 12);
+        let _ = writeln!(out, "!{} = !{{!{}, !{}, !{}}}", s + 12, s + 13, s + 14, s + 15);
+        let _ = writeln!(out, "!{} = !{{i32 10000, i64 {max_count}, i32 1}}", s + 13);
+        let _ = writeln!(out, "!{} = !{{i32 990000, i64 {hot_min}, i32 2}}", s + 14);
+        let _ = writeln!(out, "!{} = !{{i32 999999, i64 {cold_min}, i32 {num_counts}}}", s + 15);
     }
 }
 
@@ -3552,6 +3728,93 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_tbaa_fields_match_disjoint_physical_storage() {
+        use std::mem::{offset_of, size_of};
+
+        let fields = [
+            ("has_contract", offset_of!(TraceHeapEntry, has_contract), size_of::<AtomicU32>()),
+            ("address", offset_of!(TraceHeapEntry, address), size_of::<AtomicUsize>()),
+            ("kind", offset_of!(TraceHeapEntry, kind), size_of::<AtomicU32>()),
+            ("receiver_class", offset_of!(TraceHeapEntry, receiver_class), size_of::<AtomicU64>()),
+            ("data", offset_of!(TraceHeapEntry, data), size_of::<AtomicUsize>()),
+            ("len", offset_of!(TraceHeapEntry, len), size_of::<AtomicUsize>()),
+            ("promise_value", offset_of!(TraceHeapEntry, promise_value), size_of::<AtomicU64>()),
+        ];
+        for (i, &(name, start, bytes)) in fields.iter().enumerate() {
+            assert!(start + bytes <= size_of::<TraceHeapEntry>(), "{name}");
+            for &(other, other_start, other_bytes) in &fields[..i] {
+                assert!(
+                    start + bytes <= other_start || other_start + other_bytes <= start,
+                    "sidecar field overlap: {name} and {other}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_tags_are_emitted_for_real_heap_guards() {
+        let trace = identity_test_trace(false);
+        let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
+            .collect::<Vec<_>>();
+        let host = host_info().expect("LLVM host");
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "sidecar_guard", host)
+            .expect("LLVM lowering");
+        assert!(ir.contains("!tbaa !51"), "missing sidecar address tag");
+        assert!(ir.contains("!tbaa !52"), "missing sidecar kind tag");
+        assert!(ir.contains("!tbaa !54"), "missing sidecar data tag");
+        assert!(ir.contains("!tbaa !13"), "missing generic chunk table access");
+        let ctx = Context::create();
+        let module = ctx.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "sidecar_guard"),
+        ).expect("valid LLVM IR");
+        module.verify().expect("valid sidecar TBAA and heap guards");
+    }
+
+    #[test]
+    fn sidecar_field_tbaa_eliminates_only_proven_disjoint_loads() {
+        let host = host_info().expect("LLVM host");
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context = Context::create();
+        let input = r#"
+            define i64 @sidecar_fields(ptr %a, ptr %b) {
+            entry:
+                %x = load i64, ptr %a, align 8, !tbaa !55
+                store i64 17, ptr %b, align 8, !tbaa !54
+                %y = load i64, ptr %a, align 8, !tbaa !55
+                %r = add i64 %x, %y
+                ret i64 %r
+            }
+            define i64 @sidecar_broad(ptr %a, ptr %b) {
+            entry:
+                %x = load i64, ptr %a, align 8, !tbaa !55
+                store i64 17, ptr %b, align 8, !tbaa !13
+                %y = load i64, ptr %a, align 8, !tbaa !55
+                %r = add i64 %x, %y
+                ret i64 %r
+            }
+            !0 = !{!"napalm.tbaa"}
+            !3 = !{!"napalm.sidecar", !0, i64 0}
+            !13 = !{!3, !3, i64 0}
+            !64 = !{!"napalm.sidecar.data", !3, i64 0}
+            !54 = !{!64, !64, i64 0}
+            !65 = !{!"napalm.sidecar.len", !3, i64 0}
+            !55 = !{!65, !65, i64 0}
+        "#;
+        let buffer = MemoryBuffer::create_from_memory_range_copy(input.as_bytes(), "sidecar-proof-test");
+        let module = context.create_module_from_ir(buffer).expect("LLVM parsed sidecar proof");
+        module.verify().expect("valid sidecar metadata");
+        let options = PassBuilderOptions::create();
+        module.run_passes("default<O3>", &machine, options).expect("LLVM O3 pipeline");
+        let optimized = module.print_to_string().to_string();
+        let specific = optimized.split(" @sidecar_fields(").nth(1).expect("field function")
+            .split('}').next().expect("function body");
+        let broad = optimized.split(" @sidecar_broad(").nth(1).expect("broad function")
+            .split('}').next().expect("function body");
+        assert_eq!(specific.matches("load i64, ptr %a").count(), 1, "{specific}");
+        assert_eq!(broad.matches("load i64, ptr %a").count(), 2, "{broad}");
+    }
+
+    #[test]
     fn tbaa_shape_slots_enable_gvn_without_disabling_generic_heap_aliasing() {
         let host = host_info().expect("LLVM host");
         let machine = create_host_target_machine(host).expect("target machine");
@@ -3637,6 +3900,48 @@ mod tests {
         for not_a_power in [0.0, -0.0, 3.0, -6.0, f64::INFINITY, f64::NAN, f64::from_bits(1)] {
             assert!(LlvmLowering::exact_power_of_two_reciprocal(not_a_power).is_none());
         }
+    }
+
+    #[test]
+    fn pgo_profile_becomes_llvm_metadata_and_compiles() {
+        let trace = identity_test_trace(true);
+        let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
+            .collect::<Vec<_>>();
+        let profile = TraceProfile {
+            entries: 1_000,
+            iterations: 250_000,
+            exit_hits: (0..plans.len()).map(|exit| if exit == 0 { 990 } else { 0 }).collect(),
+        };
+        let host = host_info().expect("LLVM host");
+        let symbol = "pgo_trace";
+        let ir = lower_trace_profiled(&trace, &plans, HashMap::default(), 0, symbol, host, Some(&profile))
+            .expect("profiled lowering");
+        assert!(ir.contains("!\"function_entry_count\", i64 1000"), "{ir}");
+        assert!(ir.contains("!\"ProfileSummary\""), "{ir}");
+        assert!(ir.contains("branch_weights\", i32 990"), "measured exit weight missing: {ir}");
+
+        // LLVM must accept the profile through the default trace pipeline.
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context: &'static Context = Box::leak(Box::new(Context::create()));
+        let mut engines = Vec::new();
+        let code = compile_ir(
+            context,
+            &machine,
+            symbol,
+            &ir,
+            crate::napalm_tracing_jit::NAPALM_TRACE_PIPELINE,
+            false,
+            false,
+            &mut engines,
+            std::time::Instant::now(),
+        )
+        .expect("profiled trace compiles");
+        assert_ne!(code.address, 0);
+        std::mem::forget(engines); // the leaked test context outlives them
+
+        // Without a profile, nothing PGO-specific is emitted.
+        let plain = lower_trace(&trace, &plans, HashMap::default(), 0, symbol, host).unwrap();
+        assert!(!plain.contains("function_entry_count") && !plain.contains("ProfileSummary"));
     }
 
     #[test]
