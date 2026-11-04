@@ -27,8 +27,9 @@
 //!
 //! Proven-memory optimization is deliberately split across tiers. LLVM can see
 //! bounded index facts, immutable closure captures, preheader-safe shape guards,
-//! and nonescaping stack slots. The full runtime call and GC post-barrier remain
-//! memory-clobbering until their complete GC implementation has been audited.
+//! and nonescaping stack slots. Full runtime calls remain memory-clobbering;
+//! the GC post-barrier can be marked disjoint from proven VM/JIT-owned buffers
+//! while retaining conservative effects on managed heap and collector metadata.
 //! WIR's partial escape analysis owns managed-object scalar replacement; Trace IR
 //! has no managed allocation opcode to scalar-replace at this tier.
 
@@ -768,6 +769,30 @@ const MD_COLD_TRUE: u32 = 20;
 const MD_HOT_TRUE: u32 = 21;
 const MD_EMPTY: u32 = 22;
 
+/// These storage classes cannot be accessed by the StickyImmix probable-write
+/// callback. They are interpreter/JIT-owned buffers, not GC headers or MMTk
+/// metadata. The scope is attached to READS only, so the required ordering
+/// between a write barrier and its subsequent managed-store is unchanged.
+///
+/// The callback may still write the owner's GC header/log bits, the mutator,
+/// MMTk's remembered set and other collector-internal memory. It must remain
+/// a normal memory-clobbering call for every other access.
+const MD_GC_BARRIER_DISJOINT: u32 = 72;
+
+fn gc_barrier_disjoint_read(tag: u32) -> bool {
+    matches!(
+        tag,
+        // TraceActivation and architectural registers are not touched by the
+        // non-safepointing post-barrier callback.
+        11 | 12
+            // Handle sidecar/chunk table and its individual physical fields.
+            | 13 | 50 | 51 | 52 | 53 | 54 | 55 | 56
+            // Native profile counters, VM value vectors, immutable bytes,
+            // closure capture vectors, relocation bindings and trace links.
+            | 18 | 19 | 15 | 16 | 17 | 44
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Fwd {
     Field { entry: V, slot: u32 },
@@ -1295,9 +1320,19 @@ impl LlvmLowering<'_> {
     fn load_aligned_tagged(&mut self, ty: Ty, ptr: &V, tag: u32, align: u32, invariant: bool) -> V {
         let ptr = self.as_ptr(ptr);
         let invariant = if invariant { format!(", !invariant.load !{MD_EMPTY}") } else { String::new() };
+        // A probable-write barrier cannot mutate JIT sidecars, frame banks or
+        // non-GC runtime buffers. A scoped read can therefore be forwarded
+        // across that call even when pointer-based AA alone is inconclusive.
+        // Never tag managed payload loads or *stores*: the collector barrier
+        // must remain ordered before the reference store it protects.
+        let barrier_scope = if gc_barrier_disjoint_read(tag) {
+            format!(", !alias.scope !{MD_GC_BARRIER_DISJOINT}")
+        } else {
+            String::new()
+        };
         self.def(
             ty,
-            &format!("load {}, ptr {}, align {align}, !tbaa !{tag}{invariant}", ty.ir(), ptr.op),
+            &format!("load {}, ptr {}, align {align}, !tbaa !{tag}{invariant}{barrier_scope}", ty.ir(), ptr.op),
         )
     }
 
@@ -2470,7 +2505,16 @@ impl LlvmLowering<'_> {
         let callee = self.heap_barrier_callee();
         let runtime = self.runtime_context();
         let owner = self.as_ptr(owner);
-        self.line(&format!("call void {}(ptr {}, ptr {}) #3", callee.op, runtime.op, owner.op));
+        // StickyImmix probable_write() only inspects/modifies GC metadata
+        // associated with `owner`, the interpreter's mutator and MMTk's log.
+        // It does not touch the interpreter/JIT buffers tagged by scope 72.
+        // Keep the ordinary memory effects (#3) on this *indirect* call:
+        // `memory(none)` or an argmem-only contract would be unsound, and
+        // noalias on managed payload stores could move them before the barrier.
+        self.line(&format!(
+            "call void {}(ptr {}, ptr {}) #3, !noalias !{MD_GC_BARRIER_DISJOINT}",
+            callee.op, runtime.op, owner.op
+        ));
     }
 
     fn emit_heap_write_barrier(&mut self, owner: &V, value_id: TraceValueId, tagged: &V) -> Result<(), String> {
@@ -3766,6 +3810,13 @@ impl LlvmLowering<'_> {
             "!20 = !{!\"branch_weights\", i32 1, i32 2000000}\n",
             "!21 = !{!\"branch_weights\", i32 2000000, i32 1}\n",
             "!22 = !{}\n",
+            // One function-local alias domain for buffers that the VM's
+            // StickyImmix probable-write callback provably never accesses.
+            // All loads belonging to it carry alias.scope; only the callback
+            // carries the complementary noalias metadata.
+            "!70 = distinct !{!70, !\"napalm.gc_barrier.disjoint\"}\n",
+            "!71 = distinct !{!71, !70, !\"napalm.gc_barrier.non_gc_buffer\"}\n",
+            "!72 = !{!71}\n",
         ));
         // Keep metadata numbering unique even when both payload families
         // happen to use the same physical offset. Emit in stable ID order.
@@ -4405,5 +4456,84 @@ mod tests {
         let result = unsafe { function(std::ptr::null_mut(), links.as_ptr()) };
         assert_eq!(result, 42);
         std::mem::forget(engines); // the leaked test context outlives them
+    }
+
+    #[test]
+    fn gc_barrier_scopes_preserve_heap_store_order_and_aliasing() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor {
+            kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)),
+        };
+        let mut builder = TraceBuilder::new(TraceId(121212), anchor);
+        let cell = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let replacement = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Any, TraceRep::Tagged);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        builder.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged);
+        builder.emit0(TraceInst::HeapStoreCell { cell, value: replacement, exit });
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        let trace = builder.finish().expect("valid heap-barrier trace");
+        let plans = trace.exits.iter().map(|exit| {
+            CompiledExitPlan::from_exit(&trace, exit).expect("valid side exit")
+        }).collect::<Vec<_>>();
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+            "gc_barrier_scoped", host_info().expect("LLVM host"))
+            .expect("LLVM lowering");
+
+        assert!(ir.contains("!72 = !{!71}"), "{ir}");
+        assert!(ir.contains("#3, !noalias !72"), "barrier lost full memory effects: {ir}");
+        assert!(ir.contains("!tbaa !54, !alias.scope !72"), "sidecar data read has no proof: {ir}");
+        assert!(ir.contains("!tbaa !43"), "managed cell store missing: {ir}");
+        assert!(!ir.contains("!tbaa !43, !alias.scope !72"),
+            "managed write incorrectly marked disjoint: {ir}");
+        assert!(ir.contains("attributes #3 = { nounwind }"),
+            "barrier wrongly given restrictive memory effects: {ir}");
+        let ctx = Context::create();
+        let module = ctx.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
+            ir.as_bytes(), "gc_barrier_scoped"))
+            .expect("parsed trace IR");
+        module.verify().expect("verified trace IR");
+    }
+
+    #[test]
+    fn gc_barrier_metadata_enables_gvn_only_for_proven_non_gc_buffers() {
+        let host = host_info().expect("LLVM host");
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context = Context::create();
+        let input = r#"
+            declare void @barrier(ptr, ptr) nounwind
+            define i64 @non_gc(ptr %sidecar, ptr %runtime, ptr %owner) {
+            entry:
+                %before = load i64, ptr %sidecar, !alias.scope !72
+                call void @barrier(ptr %runtime, ptr %owner), !noalias !72
+                %after = load i64, ptr %sidecar, !alias.scope !72
+                %result = add i64 %before, %after
+                ret i64 %result
+            }
+            define i64 @managed(ptr %heap, ptr %runtime, ptr %owner) {
+            entry:
+                %before = load i64, ptr %heap
+                call void @barrier(ptr %runtime, ptr %owner), !noalias !72
+                %after = load i64, ptr %heap
+                %result = add i64 %before, %after
+                ret i64 %result
+            }
+            !70 = distinct !{!70, !"napalm.gc_barrier.disjoint"}
+            !71 = distinct !{!71, !70, !"napalm.gc_barrier.non_gc_buffer"}
+            !72 = !{!71}
+        "#;
+        let module = context.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(input.as_bytes(), "gc-proof-test"))
+            .expect("parse GC proof test IR");
+        module.verify().expect("verify GC proof test IR");
+        module.run_passes("default<O3>", &machine, PassBuilderOptions::create())
+            .expect("LLVM O3");
+        let ir = module.print_to_string().to_string();
+        let non_gc = ir.split(" @non_gc(").nth(1).expect("non-GC function")
+            .split('}').next().expect("non-GC body");
+        let managed = ir.split(" @managed(").nth(1).expect("managed function")
+            .split('}').next().expect("managed body");
+        assert_eq!(non_gc.matches("load i64").count(), 1, "{non_gc}");
+        assert_eq!(managed.matches("load i64").count(), 2, "{managed}");
     }
 }
