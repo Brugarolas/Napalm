@@ -47,6 +47,7 @@ use crate::napalm_bytecode::{
     TypeGuardId, GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
 use crate::napalm_collections::HashMap;
+use crate::napalm_bytecode_optimizer::{optimization_passes, find_superinstruction_sites};
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
     Function, FunctionKind, Inst, InstId, MethodSymbol, Program, ResumeId, SiteId, SnapshotSlot,
@@ -77,6 +78,10 @@ pub struct CompileOptions {
     pub verify_ir: bool,
     /// Verify the complete bytecode program after all cross-function fixups.
     pub verify_bytecode: bool,
+    /// Run the semantics-preserving post-lowering bytecode optimizer.
+    pub optimize_bytecode: bool,
+    /// Verify the bytecode after every optimization pass in all build modes.
+    pub verify_each_bytecode_pass: bool,
     /// Remove pure SSA nodes whose results cannot affect observable execution.
     pub eliminate_dead_code: bool,
     /// Bias physical allocation toward eliminating HIR moves and edge copies.
@@ -101,6 +106,8 @@ impl Default for CompileOptions {
         Self {
             verify_ir: true,
             verify_bytecode: true,
+            optimize_bytecode: true,
+            verify_each_bytecode_pass: cfg!(debug_assertions),
             eliminate_dead_code: true,
             coalesce_registers: true,
             profile_guided_layout: true,
@@ -133,6 +140,12 @@ pub struct CompileStats {
     pub functions: Vec<FunctionCompileStats>,
     pub total_bytecode_words: usize,
     pub max_general_registers: u16,
+    /// Total words before the post-lowering optimizer runs.
+    pub bytecode_words_before_optimization: usize,
+    pub bytecode_words_removed: usize,
+    pub bytecode_passes_changed: usize,
+    /// Potential interpreter superinstruction sites, not emitted opcodes.
+    pub superinstruction_candidates_detected: usize,
 }
 
 pub struct CompilationOutput {
@@ -4027,6 +4040,26 @@ fn compile_program_impl(
     finalize_deopts(hir, &mut bytecode, &infos, options)?;
     bytecode.rebuild_indexes().map_err(CompileError::Metadata)?;
 
+    stats.bytecode_words_before_optimization = stats.total_bytecode_words;
+    if options.optimize_bytecode {
+        let report = optimization_passes()
+            .verify_after_each_pass(options.verify_each_bytecode_pass)
+            .optimize_program(&mut bytecode)
+            .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?;
+        stats.bytecode_words_removed = report.words_removed;
+        stats.bytecode_passes_changed = report.passes_changed;
+        stats.total_bytecode_words = report.output_words;
+        for entry in &mut stats.functions {
+            if let Some(f) = bytecode.function(entry.function) {
+                entry.bytecode_words = f.chunk.code.len();
+                entry.safepoints = f.chunk.safepoints.len();
+            }
+        }
+    }
+
+    stats.superinstruction_candidates_detected = find_superinstruction_sites(&bytecode)
+        .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?.len();
+
     if options.verify_bytecode {
         BytecodeVerifier::verify_program(&bytecode)
             .map_err(|error| CompileError::BytecodeVerification(error.to_string()))?;
@@ -4126,7 +4159,12 @@ mod tests {
             builder.finish();
         }
 
-        let output = BytecodeCompiler::default()
+        // Inspect raw lowering separately: the post-bytecode optimizer is
+        // allowed to replace IAdd with a precomputed LoadI8.
+        let output = BytecodeCompiler::new(CompileOptions {
+            optimize_bytecode: false,
+            ..CompileOptions::default()
+        })
             .compile_with_stats(&hir)
             .expect("HIR must compile");
         BytecodeVerifier::verify_program(&output.program).expect("bytecode must verify");
@@ -4143,6 +4181,45 @@ mod tests {
         let convert = instructions.iter().find(|op| op.opcode == Opcode::Int32ToNum).unwrap();
         assert!(chunk.constants_at(convert.pc).is_empty(),
             "a register reused for an arithmetic result must not retain its previous literal");
+    }
+
+    #[test]
+    fn post_bytecode_optimizer_folds_arithmetic_and_remaps_metadata() {
+        let mut hir = Program::new();
+        let module = hir.add_module("main", 0);
+        {
+            let mut builder = Builder::new(
+                &mut hir,
+                module,
+                "main",
+                FunctionKind::ModuleBody,
+                Vec::new(),
+                Type::Num,
+            );
+            let one = builder.const_i32(1);
+            let two = builder.const_i32(2);
+            let sum = builder.emit1(
+                Inst::IntBin { op: IntBinOp::Add, left: one, right: two },
+                Type::Int32,
+            );
+            let result = builder.emit1(Inst::Int32ToNum { value: sum }, Type::Num);
+            builder.ret(result);
+            builder.finish();
+        }
+        let raw = BytecodeCompiler::new(CompileOptions {
+            optimize_bytecode: false,
+            ..CompileOptions::default()
+        }).compile(&hir).expect("raw bytecode compilation");
+        let optimized = BytecodeCompiler::default()
+            .compile_with_stats(&hir).expect("optimized bytecode compilation");
+        BytecodeVerifier::verify_program(&optimized.program).expect("optimized bytecode verifies");
+        assert!(optimized.program.functions[0].chunk.code.len() <= raw.functions[0].chunk.code.len());
+        assert_eq!(optimized.stats.total_bytecode_words,optimized.program.functions[0].chunk.code.len());
+        let instructions = Decoder::new(&optimized.program.functions[0].chunk.code)
+            .collect::<Result<Vec<_>,_>>().expect("valid decoder stream");
+        assert!(instructions.iter().any(|inst|
+            inst.opcode == Opcode::LoadI8 && inst.first.b() as i8 == 3));
+        assert!(!instructions.iter().any(|inst|inst.opcode == Opcode::IAdd));
     }
 
     #[test]
