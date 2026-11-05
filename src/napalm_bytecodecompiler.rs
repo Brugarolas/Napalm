@@ -1270,6 +1270,7 @@ fn type_may_reference(ty: &Type) -> bool {
         | Type::Foreign(_)
         | Type::Module
         | Type::Builtin(_, _)
+        | Type::GenericInstance { .. }
         | Type::Cell(_) => true,
         Type::Union(types) => types.iter().any(type_may_reference),
         Type::Bottom
@@ -3789,6 +3790,7 @@ fn lower_runtime_metadata(hir: &Program) -> Result<RuntimeMetadata, CompileError
     metadata.classes = hir.classes.clone();
     metadata.foreign_functions = hir.foreign_functions.clone();
     metadata.structural_layouts = hir.structural_layouts.clone();
+    metadata.contract_names = hir.contract_names.clone();
     metadata
         .rebuild_indexes()
         .map_err(CompileError::Metadata)?;

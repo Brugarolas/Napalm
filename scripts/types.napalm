@@ -1,23 +1,39 @@
 // Optional static typing: annotations are checked before execution, and values
 // coming from untyped code are verified by compiled guards at typed boundaries.
 
+// Interfaces and object types describe data only: declaring a method in them is
+// a compile error. Behaviour belongs to classes.
 interface Shape {
     name: string;
-    area(): number;
+    sides: number;
+}
+
+interface Colored {
+    color?: string;
 }
 
 type Pair<A, B> = { first: A; second: B };
 
-class Rect implements Shape {
-    name: string;
+// `implements` adds the contract fields to the class. Required fields (no `?`
+// and not nullable) must be initialized by the constructor; optional ones
+// start as null.
+class Rect implements Shape, Colored {
     width: number;
     height: number;
     constructor(width: number, height: number) {
         this.name = "rect";
+        this.sides = 4;
         this.width = width;
         this.height = height;
     }
     function area(): number { return this.width * this.height; }
+}
+
+class Square extends Rect {
+    constructor(size: number) {
+        super(size, size);
+        this.name = "square";
+    }
 }
 
 class Box<T> {
@@ -31,12 +47,8 @@ class Box<T> {
     }
 }
 
-function totalArea(shapes: Shape[]): number {
-    var total = 0;
-    for (var i = 0; i < shapes.length; i = i + 1) {
-        total = total + shapes[i].area();
-    }
-    return total;
+function describe(shape: Shape): string {
+    return shape.name + "/" + shape.sides;
 }
 
 function first<T>(items: T[]): T { return items[0]; }
@@ -46,12 +58,19 @@ function label(name: string, suffix?: string): string {
     return name + suffix;
 }
 
-var square: Shape = { name: "square", area: function() { return 9; } };
-var triangle: Shape = { name: "triangle", area: function() { return 6; } };
-System.print(totalArea([triangle, square]));   // expect 15
-// Runtime interface contracts currently check object (Map) values only, so a
-// class instance is used directly rather than through `Shape`.
-System.print(new Rect(2, 3).area());            // expect 6
+var triangle: Shape = { name: "triangle", sides: 3 };
+System.print(describe(triangle));               // expect triangle/3
+
+var square = new Square(3);
+System.print(square.area());                    // expect 9
+System.print(square.color);                     // expect null
+System.print(square.keys());                    // expect [width, height, name, sides, color]
+
+// `instanceof` accepts classes, ancestors and implemented interfaces/types;
+// `implements` checks contracts and `inherits` checks strict class ancestry.
+System.print([square instanceof Square, square instanceof Rect, square instanceof Shape]);
+System.print([square implements Colored, square inherits Rect, Rect inherits Rect]);
+System.print([triangle instanceof Shape, triangle implements Shape, triangle instanceof Rect]);
 
 var box = new Box<string>("a");
 System.print(box.swap("b"));
@@ -66,7 +85,7 @@ System.print([p.first, p.second, label("plain")]);
 // stop execution:
 //
 //   var count: number = fromUntyped();      // "not a number" is not a number
-//   System.print(describe(brokenShape()));  // missing required field `area`
+//   System.print(describe({ name: "x" }));  // missing required field `sides`
 function fromUntyped() { return "not a number"; }
 
 var raw = fromUntyped() as string;

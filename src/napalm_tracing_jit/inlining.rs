@@ -566,6 +566,11 @@ impl TraceRecorder<'_> {
                         return Err(RecordingAbort::UnsupportedCall);
                     }
                     let slot = runtime.trace_field_slot(inst.location, inst.x);
+                    // Generic-parameter fields are checked against per-instance
+                    // arguments by the baseline handler; keep the call.
+                    if object_word.is_some_and(|word| runtime.trace_field_is_generic(word, slot)) {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
                     let expected = object_word
                         .and_then(|word| runtime.trace_field_type(word, slot))
                         .unwrap_or(Type::Top);

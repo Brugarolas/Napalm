@@ -2390,6 +2390,15 @@ impl LlvmLowering<'_> {
         self.emit_side_exit(exit, &invalid)
     }
 
+    /// The List's contracts are all `List<Num>` (TRACE_LIST_ELEMENTS_NUMBER).
+    fn guard_numeric_list_store(&mut self, entry: &V, exit: SideExitId) -> Result<(), String> {
+        let metadata = self.heap_entry_metadata(entry, false);
+        let payload = self.heap_metadata_payload(&metadata);
+        let expected = crate::napalm_tracing_jit::TRACE_LIST_ELEMENTS_NUMBER as i32;
+        let invalid = self.icmp("ne", &payload, &V::i32(expected));
+        self.emit_side_exit(exit, &invalid)
+    }
+
     fn guard_map_shape_once(&mut self, map: TraceValueId, metadata: &V, expected: u32, exit: SideExitId) -> Result<(), String> {
         let key = (self.trace.canonical_value(map), expected);
         if self.map_shape_proofs.contains(&key) {
@@ -3379,11 +3388,15 @@ impl LlvmLowering<'_> {
                 self.guard_uncontracted_store(&entry, *exit)?;
             }
 
-            HeapListSet { list, index, value, exit } => {
+            HeapListSet { list, index, value, exit, numeric } => {
                 let tagged = self.lower_value(*value)?;
                 let tagged = self.word(&tagged);
                 let (entry, owner) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                self.guard_uncontracted_store(&entry, *exit)?;
+                if *numeric {
+                    self.guard_numeric_list_store(&entry, *exit)?;
+                } else {
+                    self.guard_uncontracted_store(&entry, *exit)?;
+                }
                 let index = self.validated_list_index(*list, *index, &entry, *exit)?;
                 let data = self.heap_entry_data(&entry);
                 let address = self.gep_bounded_words(&data, &index);

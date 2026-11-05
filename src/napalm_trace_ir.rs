@@ -224,7 +224,10 @@ pub enum TraceInst {
     HeapListGet { list: TraceValueId, index: TraceValueId, exit: SideExitId },
     /// Keep the contract check explicit so dead-store elimination cannot erase a failing write.
     GuardNoContract { value: TraceValueId, kind: TraceHeapObjectKind, exit: SideExitId },
-    HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId },
+    /// `numeric`: the list must publish `TRACE_LIST_ELEMENTS_NUMBER` (every
+    /// contract is `List<Num>`) and `value` is already proven a Number; when
+    /// false the list must carry no contract at all.
+    HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId, numeric: bool },
     HeapMapLen { map: TraceValueId, exit: SideExitId },
     /// Direct access to the dense value array of a shape-backed Map. Dynamic
     /// keys are guarded by exact UTF-8 content, never by recyclable heap handle.

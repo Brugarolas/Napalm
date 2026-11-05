@@ -23,7 +23,7 @@ player.scores.add(20);
 original.position.x = 'invalid'; // Fatal type error before writing the value.
 ```
 
-Declarations are module scoped and can refer to later interface declarations. `extends` supports multiple parents; duplicate fields and conflicting inherited definitions are rejected. Interfaces describe object literals/Maps, not class instances. Extra fields are allowed and remain unconstrained unless another attached interface constrains them.
+Declarations are module scoped and can refer to later interface declarations. `extends` supports multiple parents; duplicate fields and conflicting inherited definitions are rejected. Interfaces describe data: method signatures are a compile error. Besides object literals/Maps, an instance of a class that declares `implements` (directly or through an ancestor) satisfies the interface; see `DOCUMENTATION.md` §14.7. Extra fields are allowed and remain unconstrained unless another attached interface constrains them.
 
 Supported field types include `number`, `string`, `boolean`, `null`, `any`, `never`, function values, arrays (`T[]`, `Array<T>`), named interfaces, inline object schemas, and unions. For example, `child: { value: number; }` and `entries: Position[]` protect nested values too. Function fields check that the value is callable; parameter and return signatures are not checked. Literal annotations retain the existing widening rules (`'a'` denotes `string`, for example).
 
@@ -33,7 +33,7 @@ Dot assignments, bracket assignments, compound updates, Map removal/clear, List 
 
 Spread/rest create independent outer Maps. Their nested references remain shared and retain any existing contracts. `any` permits changing a binding's value, but never removes a contract from an object it references. Map builtin getters (`count`, `size`, `isEmpty`, `keys`, `toString`) retain their precedence over dot property reads; use brackets for fields with those names. Generic `Map<K, V>` and `Set<T>` also install persistent content contracts; see [collections](COLLECTIONS.md).
 
-Generic and recursive interfaces, index signatures, interface merging, type aliases as contract definitions, interface imports, class `implements` checks, and parameter/return contracts are not implemented. Unsupported or unresolved field types in declared interfaces are diagnosed rather than silently weakened. Interface names used as variable annotations must be declared in the same module. Type-only imports and other previously erased annotation forms are still syntax-only.
+Generic and recursive interfaces, index signatures, interface merging, type aliases as contract definitions, interface imports, and parameter/return contracts are not implemented. Unsupported or unresolved field types in declared interfaces are diagnosed rather than silently weakened. Interface names used as variable annotations must be declared in the same module. Type-only imports and other previously erased annotation forms are still syntax-only.
 
 ## Compiler and JIT
 

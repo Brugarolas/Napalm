@@ -268,6 +268,12 @@ pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
 pub const TRACE_HEAP_DATA_RELATIVE_BIT: usize = 1;
 pub const TRACE_HEAP_DATA_RELATIVE_MASK: usize = TRACE_HEAP_DATA_RELATIVE_BIT;
 
+/// Element-contract summary packed into a List's TraceHeapEntry::kind metadata
+/// bits: every contract on the list is `List<Num>`, so storing any Number is
+/// valid and native code may write without a runtime contract check. Lists
+/// without contracts (or with other element types) publish 0.
+pub const TRACE_LIST_ELEMENTS_NUMBER: u32 = 1;
+
 /// Promise state is packed into the high metadata bits of TraceHeapEntry::kind.
 pub const TRACE_PROMISE_PENDING: u32 = 1;
 pub const TRACE_PROMISE_FULFILLED: u32 = 2;
@@ -585,6 +591,10 @@ pub enum TraceListMethod {
     /// `list[i]` for an Int32 index in `0..len`; every other index (negative,
     /// out of range, fractional, Range, nested) replays the original Invoke.
     Subscript,
+    /// `list[i] = value` for an Int32 index in `0..len` on a List with no
+    /// contract or a numbers-only (`number[]`) contract with a Number value.
+    /// Growth, other indices and other contracts replay the original Invoke.
+    SubscriptSet,
 }
 
 /// Stock Map subscript methods whose existing-key fast path a trace replays
@@ -714,6 +724,11 @@ pub trait TraceRuntime {
     /// Guaranteed source type of one fixed instance slot for the observed object.
     fn trace_field_type(&self, _object: RegisterWord, _slot: u32) -> Option<Type> { None }
 
+    /// Whether writes to this slot must be checked against per-instance
+    /// generic arguments (a field typed with a class type parameter). Such
+    /// stores stay runtime calls instead of native fast paths.
+    fn trace_field_is_generic(&self, _object: RegisterWord, _slot: u32) -> bool { false }
+
     /// Stable address of the module-global slot referenced by this bytecode.
     /// Module variable arrays are fixed-size for the lifetime of an interpreter.
     fn trace_module_slot_address(&self, _location: TraceLocation) -> Option<usize> { None }
@@ -808,6 +823,10 @@ pub trait TraceRuntime {
     /// Observe a Map/key pair without mutating VM state. Returning Some allows
     /// the recorder to specialize this site to shape+slot native code.
     fn trace_has_contract(&self, _value: RegisterWord) -> bool { false }
+
+    /// Whether every contract on this List is `List<Num>` (`number[]`), i.e. it
+    /// publishes `TRACE_LIST_ELEMENTS_NUMBER` and accepts any Number natively.
+    fn trace_list_numeric(&self, _value: RegisterWord) -> bool { false }
 
     fn trace_shaped_map_access(
         &self,
@@ -2113,6 +2132,7 @@ impl<'a> TraceRecorder<'a> {
         let arity = match method {
             TraceListMethod::Length => 0,
             TraceListMethod::Subscript => 1,
+            TraceListMethod::SubscriptSet => 2,
         };
         if op.c as usize != arity || op.args.len() != arity {
             return Ok(false);
@@ -2124,7 +2144,25 @@ impl<'a> TraceRecorder<'a> {
         let Some(length) = runtime.trace_list_len(receiver_word) else {
             return Ok(false);
         };
-        if method == TraceListMethod::Subscript {
+        // Stores need a contract-free List or a `number[]` receiving a Number.
+        let numeric_store = if method == TraceListMethod::SubscriptSet {
+            if !runtime.trace_has_contract(receiver_word) {
+                false
+            } else if runtime.trace_list_numeric(receiver_word) {
+                let value_word = runtime
+                    .trace_read_slot(FrameSlot::General(op.args[1]))
+                    .map_err(|_| RecordingAbort::UnsupportedCall)?;
+                if word_num(value_word).is_none() {
+                    return Ok(false);
+                }
+                true
+            } else {
+                return Ok(false);
+            }
+        } else {
+            false
+        };
+        if matches!(method, TraceListMethod::Subscript | TraceListMethod::SubscriptSet) {
             let index_word = runtime
                 .trace_read_slot(FrameSlot::General(op.args[0]))
                 .map_err(|_| RecordingAbort::UnsupportedCall)?;
@@ -2178,6 +2216,33 @@ impl<'a> TraceRecorder<'a> {
                     builder.set_proven_type(element, element_type);
                 }
                 element
+            }
+            TraceListMethod::SubscriptSet => {
+                let index = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let index = builder.emit1(
+                    TraceInst::GuardInt32 { value: index, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit0(TraceInst::GuardBounds { index, length, exit });
+                let value = self.read_gpr(builder, op.args[1].0, TraceType::Any, TraceRep::Tagged)?;
+                let value = if numeric_store {
+                    // Guards replay the Invoke, which reports any violation.
+                    let Some(value) = self.guard_store_value(builder, value, &Type::Num, op.location.pc) else {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    };
+                    value
+                } else {
+                    value
+                };
+                builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: numeric_store });
+                // `list[i] = value` evaluates to the stored value.
+                value
             }
         };
         self.write_gpr(builder, op.a, result);
@@ -4538,6 +4603,9 @@ impl<'a> TraceRecorder<'a> {
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
                 let slot = runtime.trace_field_slot(op.location, op.x);
+                if runtime.trace_field_is_generic(object_word, slot) {
+                    return self.runtime_leaf(op, builder, &[]);
+                }
                 let expected = runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top);
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
@@ -4607,7 +4675,22 @@ impl<'a> TraceRecorder<'a> {
                 let owner = runtime.trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
                 if runtime.trace_has_contract(owner) {
-                    return self.runtime_gc_leaf(op, builder, &[]);
+                    // `number[]`: the only possible contract violation is a
+                    // non-Number value, which a cheap guard rules out. Any other
+                    // element contract keeps the checked runtime path.
+                    if !runtime.trace_list_numeric(owner) {
+                        return self.runtime_gc_leaf(op, builder, &[]);
+                    }
+                    let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                    let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
+                    let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                    let Some(value) = self.guard_store_value(builder, value, &Type::Num, op.location.pc) else {
+                        return self.runtime_gc_leaf(op, builder, &[]);
+                    };
+                    let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                    let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                    builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: true });
+                    return Ok(ExpectedStep::Exact(next));
                 }
                 let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
@@ -4615,7 +4698,7 @@ impl<'a> TraceRecorder<'a> {
                 let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
                 let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
                 builder.emit0(TraceInst::GuardNoContract { value: list, kind: TraceHeapObjectKind::List, exit });
-                builder.emit0(TraceInst::HeapListSet { list, index, value, exit });
+                builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: false });
                 Ok(ExpectedStep::Exact(next))
             }
 
@@ -8657,6 +8740,18 @@ impl CraneliftLoweringState<'_, '_> {
         self.emit_side_exit(exit, invalid)
     }
 
+    /// The List's contracts are all `List<Num>` (see TRACE_LIST_ELEMENTS_NUMBER).
+    /// Read uncached: installing a contract republishes the metadata.
+    fn guard_numeric_list_store(&mut self, entry: Value, exit: SideExitId) -> Result<(), TracingJitError> {
+        let metadata = self.heap_entry_metadata(entry, false);
+        let payload = self.heap_metadata_payload(metadata);
+        let invalid = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, payload, TRACE_LIST_ELEMENTS_NUMBER as i64);
+        self.emit_side_exit(exit, invalid)
+    }
+
     fn guard_map_shape_metadata(
         &mut self,
         metadata: Value,
@@ -10186,11 +10281,15 @@ impl CraneliftLoweringState<'_, '_> {
                 self.guard_uncontracted_store(entry, *exit)?;
             }
 
-            HeapListSet { list, index, value, exit } => {
+            HeapListSet { list, index, value, exit, numeric } => {
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
                     self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                self.guard_uncontracted_store(entry, *exit)?;
+                if *numeric {
+                    self.guard_numeric_list_store(entry, *exit)?;
+                } else {
+                    self.guard_uncontracted_store(entry, *exit)?;
+                }
                 let index = self.validated_list_index(*list, *index, entry, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let address = self.heap_element_address(data, index);

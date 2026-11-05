@@ -289,6 +289,8 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             | BinaryOp::GreaterEqual
             | BinaryOp::In
             | BinaryOp::Is
+            | BinaryOp::Inherits
+            | BinaryOp::Implements
             | BinaryOp::Equal
             | BinaryOp::NotEqual => direct(K::Bool),
             BinaryOp::InclusiveRange | BinaryOp::ExclusiveRange => {
@@ -359,6 +361,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         ExprKind::DestructureCheck { source, .. }
         | ExprKind::Await(source) => infer_surface_type_annotation(source),
         ExprKind::Launch(_) => None,
+        ExprKind::TypeOf(_) => direct(K::String),
         ExprKind::Invoke(invoke)
             if invoke.name.value == "toString" && invoke.args.is_empty() => direct(K::String),
         ExprKind::Name(_)
@@ -374,9 +377,19 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
     }
 }
 
+/// Lookup key of a named contract: generic instantiations are registered by
+/// their whitespace-free spelling (Pair<number,string>).
+fn contract_key(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.contains(char::is_whitespace) {
+        std::borrow::Cow::Owned(crate::napalm_front_main::compact_type_spelling(name))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
 fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
     match &a.kind {
-        TypeAnnotationKind::Named(n) => known.contains_key(n),
+        TypeAnnotationKind::Named(n) => known.contains_key(&*contract_key(n)),
         TypeAnnotationKind::Opaque(_) => false,
         TypeAnnotationKind::Object(fields) => fields.iter().all(|f| supported_interface_annotation(&f.annotation, known)),
         TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => supported_interface_annotation(t, known),
@@ -394,7 +407,7 @@ fn supported_alias_annotation(
     type_params: &HashSet<String>,
 ) -> bool {
     match &annotation.kind {
-        TypeAnnotationKind::Named(name) => type_params.contains(name) || known.contains_key(name),
+        TypeAnnotationKind::Named(name) => type_params.contains(name) || known.contains_key(&*contract_key(name)),
         TypeAnnotationKind::Opaque(_) => false,
         TypeAnnotationKind::Object(fields) => fields
             .iter()
@@ -424,10 +437,43 @@ fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<St
     }
 }
 
+/// Whether a field annotation refers to one of the class's type parameters.
+fn annotation_mentions_type_params(annotation: &TypeAnnotation, params: &[Ident]) -> bool {
+    use TypeAnnotationKind as K;
+    if params.is_empty() {
+        return false;
+    }
+    match &annotation.kind {
+        K::Named(text) | K::Opaque(text) => text
+            .split(|ch: char| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+            .any(|word| params.iter().any(|param| param.value == word)),
+        K::List(Some(inner)) | K::Set(Some(inner)) | K::BuiltinGeneric(_, Some(inner)) => {
+            annotation_mentions_type_params(inner, params)
+        }
+        K::GenericMap(key, value) => {
+            annotation_mentions_type_params(key, params) || annotation_mentions_type_params(value, params)
+        }
+        K::Union(parts) => parts.iter().any(|part| annotation_mentions_type_params(part, params)),
+        K::Object(fields) => fields.iter().any(|field| annotation_mentions_type_params(&field.annotation, params)),
+        _ => false,
+    }
+}
+
+/// Resolve a source annotation. `env` maps class type parameters to their
+/// concrete arguments when instantiating a generic class (`T` -> number).
 fn resolve_type_annotation(
     annotation: &TypeAnnotation,
     classes: &HashMap<String, ClassId>,
     interfaces: &HashMap<String, Type>,
+) -> Type {
+    resolve_type_annotation_with(annotation, classes, interfaces, &HashMap::default())
+}
+
+fn resolve_type_annotation_with(
+    annotation: &TypeAnnotation,
+    classes: &HashMap<String, ClassId>,
+    interfaces: &HashMap<String, Type>,
+    env: &HashMap<String, Type>,
 ) -> Type {
     use TypeAnnotationKind as K;
 
@@ -440,13 +486,13 @@ fn resolve_type_annotation(
         K::String => Type::String,
         K::List(None) => Type::List(None),
         K::List(Some(element)) => {
-            Type::List(Some(Box::new(resolve_type_annotation(element, classes, interfaces))))
+            Type::List(Some(Box::new(resolve_type_annotation_with(element, classes, interfaces, env))))
         }
         K::Map => Type::Map,
         K::GenericMap(k, v) => Type::GenericMap(
-            Box::new(resolve_type_annotation(k, classes, interfaces)),
-            Box::new(resolve_type_annotation(v, classes, interfaces))),
-        K::Set(element) => Type::Set(element.as_ref().map(|t| Box::new(resolve_type_annotation(t, classes, interfaces)))),
+            Box::new(resolve_type_annotation_with(k, classes, interfaces, env)),
+            Box::new(resolve_type_annotation_with(v, classes, interfaces, env))),
+        K::Set(element) => Type::Set(element.as_ref().map(|t| Box::new(resolve_type_annotation_with(t, classes, interfaces, env)))),
         K::BuiltinGeneric(name, element) => {
             let builtin = match name.as_str() {
                 "Event" => Some(BuiltinId::Event),
@@ -459,19 +505,20 @@ fn resolve_type_annotation(
             builtin.map_or(Type::Top, |builtin| {
                 Type::Builtin(
                     builtin,
-                    element.as_ref().map(|t| Box::new(resolve_type_annotation(t, classes, interfaces))),
+                    element.as_ref().map(|t| Box::new(resolve_type_annotation_with(t, classes, interfaces, env))),
                 )
             })
         }
         K::Object(fields) => Type::Interface(fields.iter().map(|field| ir::InterfaceFieldType {
             name: field.name.value.clone(),
-            ty: resolve_type_annotation(&field.annotation, classes, interfaces),
+            ty: resolve_type_annotation_with(&field.annotation, classes, interfaces, env),
             optional: field.optional,
             readonly: field.readonly,
         }).collect()),
         K::Closure => Type::Closure(None),
-        K::Named(name) if interfaces.contains_key(name) => interfaces[name].clone(),
-        K::Named(name) => match name.rsplit('.').next().unwrap_or(name) {
+        K::Named(name) if env.contains_key(name) => env[name].clone(),
+        K::Named(name) if interfaces.contains_key(&*contract_key(name)) => interfaces[&*contract_key(name)].clone(),
+        K::Named(name) => match name.split('<').next().unwrap_or(name).rsplit('.').next().unwrap_or(name) {
             "Range" => Type::Range,
             "Fiber" => Type::Fiber,
             "Event" => Type::Builtin(BuiltinId::Event, None),
@@ -493,7 +540,7 @@ fn resolve_type_annotation(
         K::Union(types) => {
             let mut resolved = Vec::new();
             for annotation in types {
-                let ty = resolve_type_annotation(annotation, classes, interfaces);
+                let ty = resolve_type_annotation_with(annotation, classes, interfaces, env);
                 if matches!(ty, Type::Top) {
                     return Type::Top;
                 }
@@ -529,6 +576,7 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         // Structural objects and typed Lists carry persistent runtime contracts so
         // aliases through `any` cannot bypass later writes.
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
+        Type::GenericInstance { .. } => true,
         Type::Builtin(
             BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
             Some(_),
@@ -598,6 +646,12 @@ fn assignment_is_known_incompatible(expected: &Type, actual: &Type) -> bool {
     fn may_satisfy(expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Interface(_) | Type::Record(_), Type::Map | Type::Interface(_) | Type::Record(_)) => true,
+            // A class may implement the contract; checked when bound.
+            (Type::Interface(_) | Type::Record(_), Type::Instance(_)) => true,
+            // Generic arguments are checked on the instance when bound.
+            (Type::GenericInstance { class, .. }, Type::Instance(classes)) => {
+                classes.is_unknown() || classes.contains(*class)
+            }
             (Type::List(Some(e)), Type::List(Some(a))) => may_satisfy(e, a),
             (Type::Builtin(expected_id, Some(_)), Type::Builtin(actual_id, None)) if expected_id == actual_id => true,
             (Type::GenericMap(_, _), Type::Map) | (Type::Set(Some(_)), Type::Set(None)) => true,
@@ -635,6 +689,10 @@ fn display_source_type(ty: &Type) -> String {
         Type::Module => "module".to_owned(),
         Type::Builtin(id, None) => id.name().to_owned(),
         Type::Builtin(id, Some(inner)) => format!("{}<{}>", id.name(), display_source_type(inner)),
+        Type::GenericInstance { args, .. } => format!(
+            "instance<{}>",
+            args.iter().map(display_source_type).collect::<Vec<_>>().join(", ")
+        ),
         Type::Cell(inner) => display_source_type(inner),
         Type::Union(types) => types
             .iter()
@@ -1181,7 +1239,7 @@ impl<'ast> Analyzer<'ast> {
                     }
                 }
             }
-            ExprKind::Await(value) | ExprKind::Launch(value) => self.visit_expr(value),
+            ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => self.visit_expr(value),
             ExprKind::Closure(body) => self.visit_closure(body, false, false),
             ExprKind::AsyncClosure(body) => self.visit_closure(body, true, false),
             ExprKind::ConcurrentClosure(body) => self.visit_closure(body, false, true),
@@ -1457,6 +1515,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         self.plan_classes(module_id);
         self.plan_interfaces();
+        self.plan_generic_class_uses();
+        self.plan_class_contracts();
         self.plan_module_binding_types();
         self.collect_and_intern_symbols();
         self.preintern_strings();
@@ -1669,6 +1729,97 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     ));
                 }
                 break;
+            }
+        }
+
+        // Let the runtime name these contracts (`typeof` reports
+        // "Object implementation of Name"). Sorted for deterministic output.
+        let mut named: Vec<(&String, &Type)> = self.interface_types.iter().collect();
+        named.sort_by(|left, right| left.0.cmp(right.0));
+        let named: Vec<(String, Type)> = named.into_iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
+        for (name, ty) in named {
+            let id = self.program.intern_string(&name);
+            if !self.program.contract_names.iter().any(|(existing, existing_ty)| *existing == id && *existing_ty == ty) {
+                self.program.contract_names.push((id, ty));
+            }
+        }
+    }
+
+    /// Contracts of concrete generic class uses (`Holder<number>`): the fields
+    /// whose declared type mentions a type parameter, with the arguments
+    /// substituted. Registered by spelling next to interfaces, so both
+    /// `new Holder<number>(...)` and `h: Holder<number>` bind them.
+    fn plan_generic_class_uses(&mut self) {
+        let mut classes = Vec::new();
+        collect_class_declarations(&self.ast.statements, &mut classes);
+        for generic_use in &self.ast.generic_class_uses {
+            let Some((class, _)) = classes
+                .iter()
+                .find(|(class, top)| *top && class.name.value == generic_use.class)
+                .or_else(|| classes.iter().find(|(class, _)| class.name.value == generic_use.class))
+            else {
+                continue;
+            };
+            let Some(plan) = self.class_plans.get(&class.name.span) else { continue };
+            let class_id = plan.id;
+            let args: Vec<Type> = generic_use
+                .args
+                .iter()
+                .map(|arg| resolve_type_annotation(arg, &self.top_level_classes, &self.interface_types))
+                .collect();
+            let env: HashMap<String, Type> = class
+                .type_params
+                .iter()
+                .zip(&args)
+                .map(|(param, arg)| (param.value.clone(), arg.clone()))
+                .collect();
+            let fields = class
+                .fields
+                .iter()
+                .filter(|field| !field.is_static)
+                .filter_map(|field| {
+                    let annotation = field.annotation.as_ref()?;
+                    if !annotation_mentions_type_params(annotation, &class.type_params) {
+                        return None;
+                    }
+                    Some(ir::InterfaceFieldType {
+                        name: field.storage.value.strip_prefix('_').unwrap_or(&field.storage.value).to_owned(),
+                        ty: resolve_type_annotation_with(annotation, &self.top_level_classes, &self.interface_types, &env),
+                        optional: false,
+                        readonly: false,
+                    })
+                })
+                .collect();
+            self.interface_types.insert(
+                generic_use.name.value.clone(),
+                Type::GenericInstance { class: class_id, args, fields },
+            );
+        }
+    }
+
+    /// Record the structural contracts each class declares with `implements`.
+    /// Runs after `plan_interfaces` so contract names are resolved; the
+    /// runtime propagates them to subclasses when linking class layouts.
+    fn plan_class_contracts(&mut self) {
+        let mut classes = Vec::new();
+        collect_class_declarations(&self.ast.statements, &mut classes);
+        for (class, _) in classes {
+            if class.implements.is_empty() {
+                continue;
+            }
+            let Some(plan) = self.class_plans.get(&class.name.span) else {
+                continue;
+            };
+            let id = plan.id;
+            let contracts: Vec<Type> = class
+                .implements
+                .iter()
+                .filter_map(|name| self.interface_types.get(&name.value))
+                .filter(|ty| matches!(ty, Type::Interface(_) | Type::Record(_)))
+                .cloned()
+                .collect();
+            if let Some(info) = self.program.classes.iter_mut().find(|info| info.id == id) {
+                info.implements = contracts;
             }
         }
     }
@@ -2040,6 +2191,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             let public = name.strip_prefix('_').unwrap_or(name);
             field_names[slot.0 as usize] = self.program.intern_string(public);
         }
+        // Fields typed with a class type parameter (`item: T`) are checked per
+        // instance against its generic arguments.
+        let mut generic_fields = vec![false; fields.len()];
+        for field in class.fields.iter().filter(|field| !field.is_static) {
+            let mentions = field
+                .annotation
+                .as_ref()
+                .is_some_and(|annotation| annotation_mentions_type_params(annotation, &class.type_params));
+            if let (true, Some(slot)) = (mentions, fields.get(&field.storage.value)) {
+                generic_fields[slot.0 as usize] = true;
+            }
+        }
 
         let id = self.class_plans[&key].id;
         if let Some(info) = self.program.classes.iter_mut().find(|info| info.id == id) {
@@ -2051,6 +2214,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     field_types.get(name).cloned().unwrap_or(Type::Top);
             }
             info.own_instance_field_names = field_names;
+            info.own_generic_fields = generic_fields;
             info.static_field_count = static_fields.len() as u16;
             info.static_field_types = vec![Type::Top; static_fields.len()];
             for (name, slot) in &static_fields {
@@ -2108,6 +2272,23 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         });
         keys.insert(MethodKey {
             name: "__spreadInto".to_owned(),
+            kind: MethodKind::Method,
+            arity: 1,
+        });
+        // `inherits`, `implements` and `instanceof Contract` lower to hidden
+        // System natives.
+        keys.insert(MethodKey {
+            name: "__inherits".to_owned(),
+            kind: MethodKind::Method,
+            arity: 2,
+        });
+        keys.insert(MethodKey {
+            name: "__implements".to_owned(),
+            kind: MethodKind::Method,
+            arity: 3,
+        });
+        keys.insert(MethodKey {
+            name: "__typeof".to_owned(),
             kind: MethodKind::Method,
             arity: 1,
         });
@@ -3032,9 +3213,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // scalar types it validates the tagged value and returns the same value
         // with a refined WIR type. This is intentionally not a speculative guard.
         let layout = self.builder.intern_structural_layout(expected);
+        // A generic-instance contract (`Holder<number>`) lives on the object;
+        // the SSA value stays an ordinary instance so field fast paths apply.
+        let result_type = match expected {
+            Type::GenericInstance { class, .. } => Type::Instance(ClassSet::singleton(*class)),
+            _ => expected.clone(),
+        };
         self.builder.emit1(
             Inst::BindInterface { value, expected: expected.clone(), layout },
-            expected.clone(),
+            result_type,
         )
     }
 
@@ -4236,13 +4423,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         expr.span,
                     );
                 }
-                let result_type = match semantic_source_type(self.builder.value_type(promise)) {
+                // `Promise<T>` describes what the promise should settle with; the
+                // settled value is validated before code relies on it being a T.
+                let settled_type = match semantic_source_type(self.builder.value_type(promise)) {
                     Type::Builtin(BuiltinId::Promise, Some(inner)) => *inner,
                     _ => Type::Top,
                 };
-                self.builder.emit1(Inst::Await { promise }, result_type)
+                let settled = self.builder.emit1(Inst::Await { promise }, Type::Top);
+                self.bind_interface(settled, &settled_type)
             }
             ExprKind::Launch(call) => self.lower_launch(call, expr.span),
+            ExprKind::TypeOf(operand) => self.lower_typeof(operand),
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => self.lower_closure(body),
         }
     }
@@ -4903,9 +5094,36 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if operator == BinaryOp::Pipeline {
             return self.lower_pipeline(left, right);
         }
+        if operator == BinaryOp::Implements {
+            let value = self.lower_expr(left);
+            let Some(layout) = self.contract_layout_operand(right) else {
+                self.error(
+                    "NAPALM-L047",
+                    "`implements` expects an interface or object type name on its right-hand side",
+                    right.span,
+                );
+                return self.builder.const_bool(false);
+            };
+            return self.lower_contract_check(value, layout, true);
+        }
+        if operator == BinaryOp::Is {
+            if let Some(layout) = self.contract_layout_operand(right) {
+                let value = self.lower_expr(left);
+                return self.lower_contract_check(value, layout, false);
+            }
+        }
 
         let left = self.lower_expr(left);
         let right = self.lower_expr(right);
+        if operator == BinaryOp::Inherits {
+            let system = self.load_system_builtin();
+            let method = self.context.symbols.expect("__inherits", MethodKind::Method, 2);
+            let site = self.builder.fresh_site();
+            return self.builder.emit1(
+                Inst::Invoke { site, receiver: system, method, args: vec![left, right] },
+                Type::Bool,
+            );
+        }
         if operator == BinaryOp::Is {
             return self
                 .builder
@@ -5002,6 +5220,68 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 args: vec![right],
             },
             result_type,
+        )
+    }
+
+    /// Structural layout of a bare interface/type name used as an operand of
+    /// `implements`/`instanceof`. Names bound to a value (classes, variables)
+    /// never qualify, so `x instanceof SomeClass` keeps its class semantics.
+    fn contract_layout_operand(&mut self, operand: &Expr) -> Option<ir::StructuralLayoutId> {
+        let ExprKind::Name(name) = &operand.kind else {
+            return None;
+        };
+        if self.context.analysis.use_map.contains_key(&name.span)
+            || self.context.module_layout.get(&name.value).is_some()
+        {
+            return None;
+        }
+        let contract = self.context.interface_types.get(&name.value)?.clone();
+        self.builder
+            .structural_layout_id(&contract)
+            .or_else(|| self.builder.intern_structural_layout(&contract))
+    }
+
+    /// `typeof operand`. A bare interface/type name is not a value, so it is
+    /// answered at compile time; everything else asks the runtime.
+    fn lower_typeof(&mut self, operand: &Expr) -> ValueId {
+        if let ExprKind::Name(name) = &operand.kind {
+            let is_value = self.context.analysis.use_map.contains_key(&name.span)
+                || self.context.module_layout.get(&name.value).is_some();
+            if !is_value {
+                if let Some(contract) = self.context.interface_types.get(&name.value) {
+                    let kind = if matches!(contract, Type::Interface(_)) { "Interface" } else { "Type" };
+                    return self.builder.const_string(kind);
+                }
+            }
+        }
+        let value = self.lower_expr(operand);
+        let system = self.load_system_builtin();
+        let method = self.context.symbols.expect("__typeof", MethodKind::Method, 1);
+        let site = self.builder.fresh_site();
+        self.builder.emit1(
+            Inst::Invoke { site, receiver: system, method, args: vec![value] },
+            Type::String,
+        )
+    }
+
+    fn load_system_builtin(&mut self) -> ValueId {
+        let slot = self
+            .context
+            .module_layout
+            .get(BuiltinId::System.binding_name())
+            .expect("System builtin is always reserved in the module layout");
+        self.builder.emit1(Inst::LoadModuleVar { module: self.context.module, slot }, Type::Top)
+    }
+
+    fn lower_contract_check(&mut self, value: ValueId, layout: ir::StructuralLayoutId, class_objects: bool) -> ValueId {
+        let system = self.load_system_builtin();
+        let layout = self.builder.const_num(layout.0 as f64);
+        let class_objects = self.builder.const_bool(class_objects);
+        let method = self.context.symbols.expect("__implements", MethodKind::Method, 3);
+        let site = self.builder.fresh_site();
+        self.builder.emit1(
+            Inst::Invoke { site, receiver: system, method, args: vec![value, layout, class_objects] },
+            Type::Bool,
         )
     }
 
@@ -6628,6 +6908,8 @@ fn binary_operator_name(operator: BinaryOp) -> &'static str {
         BinaryOp::GreaterEqual => ">=",
         BinaryOp::In => "__has",
         BinaryOp::Is => "is",
+        BinaryOp::Inherits => "__inherits",
+        BinaryOp::Implements => "__implements",
         BinaryOp::Equal => "==",
         BinaryOp::NotEqual => "!=",
     }
@@ -6856,7 +7138,7 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_fields_expr(value, instance, statics),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_fields_in_body(body, instance, statics),
         ExprKind::Super(super_expr) => {
             for arg in &super_expr.args {
@@ -6978,7 +7260,10 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(key, out);
         }
         ExprKind::Binary { left, operator, right } => {
-            if !matches!(*operator, BinaryOp::Is | BinaryOp::Pipeline) {
+            if !matches!(
+                *operator,
+                BinaryOp::Is | BinaryOp::Pipeline | BinaryOp::Inherits | BinaryOp::Implements
+            ) {
                 out.insert(MethodKey {
                     name: binary_operator_name(*operator).to_owned(),
                     kind: MethodKind::Method,
@@ -7140,7 +7425,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(then_expr, out);
             collect_method_keys_expr(else_expr, out)
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) => collect_method_keys_expr(value, out),
+        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_method_keys_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_method_keys_body(body, out),
         ExprKind::Name(name) => {
             out.insert(MethodKey {
@@ -7317,7 +7602,7 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) => collect_strings_expr(value, out),
+        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_strings_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => match &body.kind {
             FunctionBodyKind::Expression(expr) => collect_strings_expr(expr, out),
             FunctionBodyKind::Statements(statements) => collect_strings_in_statements(statements, out),
@@ -7515,7 +7800,7 @@ fn collect_written_bindings_expr(
         }
         // Do not descend into closures: their writes happen when the closure is
         // invoked, and captured mutable bindings are cells already.
-        ExprKind::Await(value) | ExprKind::Launch(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::Closure(_)
         | ExprKind::AsyncClosure(_)
         | ExprKind::ConcurrentClosure(_)

@@ -168,6 +168,48 @@ struct Parser<'a> {
     /// Direct `this.name` writes in the current constructor (including lexical closures).
     constructor_properties: Option<Vec<Ident>>,
     synthetic_span: usize,
+    /// Module-level interfaces and type aliases, pre-scanned before parsing
+    /// statements so a class may implement a contract declared after it.
+    contracts: HashMap<String, ContractInfo>,
+    /// Facts about classes parsed so far, used to validate contract fields of
+    /// subclasses whose superclass is declared earlier in the same module.
+    class_summaries: HashMap<String, ClassSummary>,
+    /// Generic classes declared in this module (`class Holder<T>`): parameter names.
+    generic_classes: HashMap<String, Vec<String>>,
+    /// Concrete `Holder<number>` uses, collected after parsing.
+    generic_class_uses: Vec<GenericClassUse>,
+}
+
+const IMPLEMENTS_METHOD_ERROR: &str =
+    "interfaces and types cannot declare methods; declare a class to provide methods";
+
+#[derive(Clone)]
+struct ContractInfo {
+    type_params: Vec<String>,
+    parents: Vec<Ident>,
+    body: ContractBody,
+}
+
+#[derive(Clone)]
+enum ContractBody {
+    Fields(Vec<InterfaceField>),
+    /// Non-object alias body (`type Id = string | null`, `type P2 = P`).
+    Alias(TypeAnnotation),
+}
+
+#[derive(Clone, Default)]
+struct ClassSummary {
+    /// Public instance properties (fields and accessors), including inherited ones.
+    properties: HashSet<String>,
+    /// Ordinary instance methods, including inherited ones.
+    methods: HashSet<String>,
+    /// Instance properties backed by a storage field, including inherited ones.
+    data_properties: HashSet<String>,
+    /// Properties guaranteed to be assigned while constructing an instance.
+    initialized: HashSet<String>,
+    /// Required contract fields an abstract class leaves to its subclasses,
+    /// as `(field, contract)` pairs.
+    pending: Vec<(String, String)>,
 }
 
 fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
@@ -278,7 +320,7 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                 Box::new(classify_variable_type(arguments[1], span))), span),
             "Set" | "ReadonlySet" if arguments.len() == 1 => TypeAnnotation::new(K::Set(
                 Some(Box::new(classify_variable_type(arguments[0], span)))), span),
-            "Event" | "Emitter" | "Channel" | "Receiver" if arguments.len() == 1 => {
+            "Event" | "Emitter" | "Channel" | "Receiver" | "Promise" if arguments.len() == 1 => {
                 TypeAnnotation::new(
                     K::BuiltinGeneric(
                         base.to_owned(),
@@ -288,12 +330,14 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                 )
             }
             "Map" | "ReadonlyMap" | "Set" | "ReadonlySet"
-            | "Event" | "Emitter" | "Channel" | "Receiver" => {
+            | "Event" | "Emitter" | "Channel" | "Receiver" | "Promise" => {
                 TypeAnnotation::new(K::Never, span)
             }
             "Record" => TypeAnnotation::new(K::Map, span),
             "Function" | "Fn" => TypeAnnotation::new(K::Closure, span),
-            _ => TypeAnnotation::new(K::Named(base.to_owned()), span),
+            // Keep the type arguments: generic interfaces/types are registered by
+            // their full spelling and generic classes are instantiated per use.
+            _ => TypeAnnotation::new(K::Named(source.to_owned()), span),
         };
     }
 
@@ -390,10 +434,13 @@ fn encloses_complete_type(source: &str, open: char, close: char) -> bool {
 pub fn parse(_name: &str, source: &str) -> ParseOutput {
     let arena = Bump::new();
     let mut p = Parser::new(source, 0, source.len(), &arena);
+    p.prescan_contracts();
     let statements = p.statements(None);
+    p.instantiate_generic_contracts();
     let module = ModuleAst {
         interfaces: p.interfaces,
         type_aliases: p.type_aliases,
+        generic_class_uses: std::mem::take(&mut p.generic_class_uses),
         statements,
         span: Span::new(0, source.len()),
         exports: Some(p.exports),
@@ -457,8 +504,269 @@ impl<'a> Parser<'a> {
             parameter_types: HashMap::default(),
             constructor_properties: None,
             synthetic_span: source.len() + 1,
+            contracts: HashMap::default(),
+            class_summaries: HashMap::default(),
+            generic_classes: HashMap::default(),
+            generic_class_uses: Vec::new(),
         }
     }
+
+    /// Record every module-level interface and type alias without emitting
+    /// AST or diagnostics; the ordinary statement pass reports any errors.
+    fn prescan_contracts(&mut self) {
+        let saved_pos = self.pos;
+        let saved_diagnostics = self.diagnostics.len();
+        let split_checkpoint = self.token_splits.len();
+        let mut depth = 0usize;
+        let mut index = 0usize;
+        while index < self.tokens.len() {
+            let token = self.tokens[index];
+            if token.kind == Kind::Eof {
+                break;
+            }
+            let text = &self.source[token.span.as_range()];
+            if token.kind == Kind::Symbol {
+                match text {
+                    "{" | "(" | "[" => depth += 1,
+                    "}" | ")" | "]" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            let keyword = token.kind == Kind::Word && matches!(text, "interface" | "type");
+            let statement_start = index == 0 || {
+                let previous = self.tokens[index - 1];
+                let previous_text = &self.source[previous.span.as_range()];
+                previous.kind == Kind::Line || matches!(previous_text, ";" | "}" | "export")
+            };
+            let named = self.tokens.get(index + 1).is_some_and(|next| next.kind == Kind::Word);
+            if depth != 0 || !keyword || !statement_start || !named {
+                index += 1;
+                continue;
+            }
+            self.pos = index + 1;
+            let parsed = if text == "interface" {
+                self.interface_decl().map(|(decl, type_params)| {
+                    (decl.name.value.clone(), ContractInfo {
+                        type_params: type_params.into_iter().map(|param| param.value).collect(),
+                        parents: decl.parents,
+                        body: ContractBody::Fields(decl.fields),
+                    })
+                })
+            } else if matches!(self.tokens.get(index + 2).map(|t| &self.source[t.span.as_range()]), Some("=" | "<")) {
+                self.type_alias_decl().map(|decl| {
+                    let body = match decl.annotation.kind {
+                        TypeAnnotationKind::Object(fields) => ContractBody::Fields(fields),
+                        _ => ContractBody::Alias(decl.annotation),
+                    };
+                    (decl.name.value.clone(), ContractInfo {
+                        type_params: decl.type_params.into_iter().map(|param| param.value).collect(),
+                        parents: Vec::new(),
+                        body,
+                    })
+                })
+            } else {
+                Err(())
+            };
+            match parsed {
+                Ok((name, info)) => {
+                    self.contracts.entry(name).or_insert(info);
+                    index = self.pos;
+                }
+                Err(()) => index += 1,
+            }
+        }
+        self.restore_token_splits(split_checkpoint);
+        self.diagnostics.truncate(saved_diagnostics);
+        self.pos = saved_pos;
+    }
+    /// Generic interfaces and type aliases (`interface Box<T>`, `type Pair<A, B>`).
+    ///
+    /// Every concrete use such as `Box<number>` becomes an ordinary declaration
+    /// named by its compact spelling (`Box<number>`) whose fields have the type
+    /// arguments substituted, so the lowerer resolves and enforces it like any
+    /// other contract. The bare generic name keeps working unconstrained: its
+    /// parameters are `any`. Identifiers in type arguments that are neither
+    /// known types nor contracts/classes (e.g. `Box<T>` inside another generic
+    /// declaration or a generic function) are type parameters and become `any`.
+    fn instantiate_generic_contracts(&mut self) {
+        let generic: HashMap<String, ContractInfo> = self
+            .contracts
+            .iter()
+            .filter(|(_, info)| !info.type_params.is_empty())
+            .map(|(name, info)| (name.clone(), info.clone()))
+            .collect();
+        let generic_classes = self.generic_classes.clone();
+        if generic.is_empty() && generic_classes.is_empty() {
+            return;
+        }
+        let mut known_names: HashSet<String> = self.contracts.keys().cloned().collect();
+        for window in self.tokens.windows(2) {
+            if window[0].kind == Kind::Word && &self.source[window[0].span.as_range()] == "class"
+                && window[1].kind == Kind::Word
+            {
+                known_names.insert(self.source[window[1].span.as_range()].to_owned());
+            }
+        }
+
+        // Original (unsubstituted) bodies, captured before rewriting the raw declarations.
+        let interface_templates: HashMap<String, (Vec<Ident>, Vec<InterfaceField>)> = self
+            .interfaces
+            .iter()
+            .filter(|decl| generic.contains_key(&decl.name.value))
+            .map(|decl| (decl.name.value.clone(), (decl.parents.clone(), decl.fields.clone())))
+            .collect();
+        let alias_templates: HashMap<String, TypeAnnotation> = self
+            .type_aliases
+            .iter()
+            .filter(|decl| generic.contains_key(&decl.name.value))
+            .map(|decl| (decl.name.value.clone(), decl.annotation.clone()))
+            .collect();
+
+        // Concrete uses anywhere in the module.
+        let mut work: Vec<(String, Span)> = Vec::new();
+        for index in 0..self.tokens.len().saturating_sub(1) {
+            let token = self.tokens[index];
+            let text = &self.source[token.span.as_range()];
+            if token.kind != Kind::Word || !(generic.contains_key(text) || generic_classes.contains_key(text)) {
+                continue;
+            }
+            let declaring = index > 0 && matches!(
+                &self.source[self.tokens[index - 1].span.as_range()],
+                "interface" | "type" | "class"
+            );
+            if declaring || !self.source[self.tokens[index + 1].span.as_range()].starts_with('<') {
+                continue;
+            }
+            if let Some(end) = matching_angle(self.source, self.tokens[index + 1].span.start) {
+                work.push((self.source[token.span.start..=end].to_owned(), token.span));
+            }
+        }
+
+        let mut done = HashSet::<String>::default();
+        while let Some((spelling, span)) = work.pop() {
+            let Some(open) = spelling.find('<') else { continue };
+            let base = spelling[..open].trim().to_owned();
+            let params = match (generic.get(&base), generic_classes.get(&base)) {
+                (Some(info), _) => &info.type_params,
+                (None, Some(params)) => params,
+                (None, None) => continue,
+            };
+            let inner = &spelling[open + 1..spelling.len().saturating_sub(1)];
+            let args: Vec<String> = split_type_top_level(inner, ',')
+                .into_iter()
+                .map(|arg| erase_unknown_type_parameters(arg.trim(), &known_names))
+                .collect();
+            if args.len() != params.len() {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-P001",
+                    format!("`{base}` expects {} type argument(s)", params.len()),
+                    span,
+                ));
+                continue;
+            }
+            let name = compact_type_spelling(&format!("{base}<{}>", args.join(",")));
+            if !done.insert(name.clone()) {
+                continue;
+            }
+            for arg in &args {
+                queue_generic_uses(arg, span, &mut work);
+            }
+            if generic_classes.contains_key(&base) && !generic.contains_key(&base) {
+                // Generic class: the lowerer derives the per-instance contract.
+                self.generic_class_uses.push(GenericClassUse {
+                    name: Spanned::new(name, span),
+                    class: base,
+                    args: args.iter().map(|arg| classify_variable_type(arg, span)).collect(),
+                });
+                continue;
+            }
+            let Some(info) = generic.get(&base) else { continue };
+            if let Some((parents, fields)) = interface_templates.get(&base) {
+                let fields: Vec<InterfaceField> = fields
+                    .iter()
+                    .map(|field| InterfaceField {
+                        annotation: self.substitute_type_parameters(&field.annotation, &info.type_params, &args, &mut work),
+                        ..field.clone()
+                    })
+                    .collect();
+                if !self.interfaces.iter().any(|decl| decl.name.value == name) {
+                    self.interfaces.push(InterfaceDecl { name: Spanned::new(name, span), parents: parents.clone(), fields });
+                }
+            } else if let Some(annotation) = alias_templates.get(&base) {
+                let annotation = self.substitute_type_parameters(annotation, &info.type_params, &args, &mut work);
+                if !self.type_aliases.iter().any(|decl| decl.name.value == name) {
+                    self.type_aliases.push(TypeAliasDecl { name: Spanned::new(name, span), type_params: Vec::new(), annotation });
+                }
+            }
+        }
+
+        // The bare generic declaration is the unconstrained form: parameters are `any`.
+        let mut ignored = Vec::new();
+        for index in 0..self.interfaces.len() {
+            let Some(info) = generic.get(&self.interfaces[index].name.value) else { continue };
+            let any = vec!["any".to_owned(); info.type_params.len()];
+            let fields: Vec<InterfaceField> = self.interfaces[index]
+                .fields
+                .clone()
+                .into_iter()
+                .map(|field| InterfaceField {
+                    annotation: self.substitute_type_parameters(&field.annotation, &info.type_params, &any, &mut ignored),
+                    ..field
+                })
+                .collect();
+            self.interfaces[index].fields = fields;
+        }
+        for index in 0..self.type_aliases.len() {
+            let Some(info) = generic.get(&self.type_aliases[index].name.value) else { continue };
+            let any = vec!["any".to_owned(); info.type_params.len()];
+            let annotation = self.type_aliases[index].annotation.clone();
+            self.type_aliases[index].annotation =
+                self.substitute_type_parameters(&annotation, &info.type_params, &any, &mut ignored);
+        }
+    }
+
+    /// Replace whole-word type parameters in an annotation's source spelling and
+    /// re-classify it. Generic uses produced by the substitution are queued.
+    fn substitute_type_parameters(
+        &self,
+        annotation: &TypeAnnotation,
+        params: &[String],
+        args: &[String],
+        work: &mut Vec<(String, Span)>,
+    ) -> TypeAnnotation {
+        let Some(text) = self.source.get(annotation.span.as_range()) else {
+            return annotation.clone();
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut word = String::new();
+        let flush = |word: &mut String, out: &mut String| {
+            match params.iter().position(|param| param == word) {
+                Some(index) if args[index].contains('|') => {
+                    out.push('(');
+                    out.push_str(&args[index]);
+                    out.push(')');
+                }
+                Some(index) => out.push_str(&args[index]),
+                None => out.push_str(word),
+            }
+            word.clear();
+        };
+        for ch in text.chars() {
+            if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+                word.push(ch);
+            } else {
+                flush(&mut word, &mut out);
+                out.push(ch);
+            }
+        }
+        flush(&mut word, &mut out);
+        // Queue nested generic uses (`next: Box<T>` becomes `Box<number>`).
+        queue_generic_uses(&out, annotation.span, work);
+        classify_variable_type(&out, annotation.span)
+    }
+
     fn peek(&self) -> Tok {
         self.tokens[self.pos]
     }
@@ -591,25 +899,14 @@ impl<'a> Parser<'a> {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            let name = self.ident()?;
-            let type_params = self.type_parameter_names()?;
-            self.expect("=")?;
-            self.lines();
-            let type_start = self.peek().span.start;
-            self.ty()?;
-            let type_end = self
-                .tokens
-                .get(self.pos.saturating_sub(1))
-                .map_or(type_start, |token| token.span.end);
-            let span = Span::new(type_start, type_end);
-            let annotation = classify_variable_type(&self.source[span.as_range()], span);
+            let decl = self.type_alias_decl()?;
             self.boundary()?;
-            if self.interfaces.iter().any(|i| i.name.value == name.value)
-                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            if self.interfaces.iter().any(|i| i.name.value == decl.name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == decl.name.value)
             {
                 return self.error("duplicate interface/type declaration");
             }
-            self.type_aliases.push(TypeAliasDecl { name, type_params, annotation });
+            self.type_aliases.push(decl);
             return Ok(Vec::new());
         }
 
@@ -692,47 +989,25 @@ impl<'a> Parser<'a> {
             if !module {
                 return self.error("type aliases must be declared at module scope");
             }
-            let name = self.ident()?;
-            let type_params = self.type_parameter_names()?;
-            self.expect("=")?;
-            self.lines();
-            let type_start = self.peek().span.start;
-            self.ty()?;
-            let type_end = self
-                .tokens
-                .get(self.pos.saturating_sub(1))
-                .map_or(type_start, |token| token.span.end);
-            let span = Span::new(type_start, type_end);
-            let annotation = classify_variable_type(&self.source[span.as_range()], span);
+            let decl = self.type_alias_decl()?;
             self.boundary()?;
-            if self.interfaces.iter().any(|i| i.name.value == name.value)
-                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            if self.interfaces.iter().any(|i| i.name.value == decl.name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == decl.name.value)
             {
                 return self.error("duplicate interface/type declaration");
             }
-            self.type_aliases.push(TypeAliasDecl { name, type_params, annotation });
+            self.type_aliases.push(decl);
             return Ok(Vec::new());
         }
         if self.eat("interface") {
             if !module { return self.error("interfaces must be declared at module scope"); }
-            let name = self.ident()?;
-            self.type_parameters()?;
-            let mut parents = Vec::new();
-            if self.eat("extends") {
-                loop {
-                    parents.push(self.ident()?);
-                    if !self.eat(",") {
-                        break;
-                    }
-                }
-            }
-            let fields = self.interface_fields()?;
-            if self.interfaces.iter().any(|i| i.name.value == name.value)
-                || self.type_aliases.iter().any(|alias| alias.name.value == name.value)
+            let (decl, _) = self.interface_decl()?;
+            if self.interfaces.iter().any(|i| i.name.value == decl.name.value)
+                || self.type_aliases.iter().any(|alias| alias.name.value == decl.name.value)
             {
                 return self.error("duplicate interface/type declaration");
             }
-            self.interfaces.push(InterfaceDecl { name, parents, fields });
+            self.interfaces.push(decl);
             return Ok(Vec::new());
         }
 
@@ -888,7 +1163,7 @@ impl<'a> Parser<'a> {
             let abstract_class = self.eat("abstract");
             let foreign = self.eat("foreign");
             if self.eat("class") {
-                self.class(start, foreign, default_export)?
+                self.class(start, foreign, abstract_class, default_export)?
             } else if foreign {
                 return self.error("expected `class` after `foreign`");
             } else if abstract_class {
@@ -2133,6 +2408,128 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+    /// `Name<T> = Type` after the `type` keyword (without the statement boundary).
+    fn type_alias_decl(&mut self) -> Result<TypeAliasDecl> {
+        let name = self.ident()?;
+        let type_params = self.type_parameter_names()?;
+        self.expect("=")?;
+        self.lines();
+        let type_start = self.peek().span.start;
+        self.ty()?;
+        let type_end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map_or(type_start, |token| token.span.end);
+        let span = Span::new(type_start, type_end);
+        let annotation = classify_variable_type(&self.source[span.as_range()], span);
+        Ok(TypeAliasDecl { name, type_params, annotation })
+    }
+
+    /// `Name<T> extends A, B { fields }` after the `interface` keyword.
+    fn interface_decl(&mut self) -> Result<(InterfaceDecl, Vec<Ident>)> {
+        let name = self.ident()?;
+        let type_params = self.type_parameter_names()?;
+        let mut parents = Vec::new();
+        if self.eat("extends") {
+            loop {
+                parents.push(self.ident()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+        }
+        let fields = self.interface_fields()?;
+        Ok((InterfaceDecl { name, parents, fields }, type_params))
+    }
+
+    /// Flattened fields of every contract listed after `implements`, as
+    /// `(field, depends_on_generic_parameter, contract_name)`. Reports unknown
+    /// or non-object contracts and conflicting field declarations.
+    fn implemented_contract_fields(&mut self, implements: &[Ident]) -> Vec<(InterfaceField, bool, String)> {
+        let mut out: Vec<(InterfaceField, bool, String)> = Vec::new();
+        for contract in implements {
+            let mut collected = Vec::new();
+            if let Err(message) = self.collect_contract_fields(&contract.value, 0, &mut collected) {
+                self.diagnostics.push(Diagnostic::error("NAPALM-P001", message, contract.span));
+                continue;
+            }
+            for (field, generic) in collected {
+                match out.iter_mut().find(|(existing, ..)| existing.name.value == field.name.value) {
+                    Some((existing, existing_generic, existing_contract)) => {
+                        if !generic && !*existing_generic && !same_annotation(&existing.annotation, &field.annotation) {
+                            self.diagnostics.push(Diagnostic::error(
+                                "NAPALM-P001",
+                                format!(
+                                    "field `{}` has conflicting types in `{existing_contract}` and `{}`",
+                                    field.name.value, contract.value
+                                ),
+                                contract.span,
+                            ));
+                        }
+                        existing.optional &= field.optional;
+                    }
+                    None => out.push((field, generic, contract.value.clone())),
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_contract_fields(
+        &self,
+        name: &str,
+        depth: usize,
+        out: &mut Vec<(InterfaceField, bool)>,
+    ) -> std::result::Result<(), String> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(format!("interface or type `{name}` is recursive"));
+        }
+        let Some(contract) = self.contracts.get(name) else {
+            return Err(format!(
+                "unknown interface or type `{name}`; a class can only implement interfaces and object types declared in the same module"
+            ));
+        };
+        for parent in &contract.parents {
+            self.collect_contract_fields(&parent.value, depth + 1, out)?;
+        }
+        let not_object = || format!("`{name}` is not an object type; a class can only implement interfaces and object types");
+        let fields = match &contract.body {
+            ContractBody::Fields(fields) => fields,
+            ContractBody::Alias(TypeAnnotation { kind: TypeAnnotationKind::Named(target), .. }) => {
+                let base = target.split('<').next().unwrap_or(target).trim();
+                if contract.type_params.iter().any(|param| param == base) || !self.contracts.contains_key(base) {
+                    return Err(not_object());
+                }
+                return self.collect_contract_fields(base, depth + 1, out);
+            }
+            ContractBody::Alias(_) => return Err(not_object()),
+        };
+        for field in fields {
+            let generic = annotation_mentions(&field.annotation, &contract.type_params);
+            match out.iter_mut().find(|(existing, _)| existing.name.value == field.name.value) {
+                Some(existing) => *existing = (field.clone(), generic),
+                None => out.push((field.clone(), generic)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `null` is a valid value of the annotation (`T | null`, `any`,
+    /// or an alias of such a type).
+    fn annotation_allows_null(&self, annotation: &TypeAnnotation, depth: usize) -> bool {
+        match &annotation.kind {
+            TypeAnnotationKind::Null | TypeAnnotationKind::Any => true,
+            TypeAnnotationKind::Union(parts) => parts.iter().any(|part| self.annotation_allows_null(part, depth)),
+            TypeAnnotationKind::Named(name) if depth < MAX_PARSE_DEPTH => match self.contracts.get(name) {
+                Some(ContractInfo { body: ContractBody::Alias(alias), .. }) => {
+                    self.annotation_allows_null(alias, depth + 1)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn interface_fields(&mut self) -> Result<Vec<InterfaceField>> {
         self.lines();
         self.expect("{")?;
@@ -2142,12 +2539,17 @@ impl<'a> Parser<'a> {
             let readonly = self.eat("readonly");
             let field_name = self.ident()?;
             let optional = self.eat("?");
-            let method = self.at("(");
-            if method { self.params()?; }
-            let Some(mut annotation) = self.variable_annotation()? else {
+            // Contracts describe data only. Function-typed fields
+            // (`onDone: () => void`) remain ordinary data properties.
+            if self.at("(") || self.at("<") {
+                self.reject_contract_method();
+                if !self.eat(",") { self.boundary()?; }
+                self.separators();
+                continue;
+            }
+            let Some(annotation) = self.variable_annotation()? else {
                 return self.error("interface fields require a type");
             };
-            if method { annotation.kind = TypeAnnotationKind::Closure; }
             if fields.iter().any(|f: &InterfaceField| f.name.value == field_name.value) {
                 return self.error("duplicate interface field");
             }
@@ -2167,8 +2569,13 @@ impl<'a> Parser<'a> {
             self.eat("readonly");
             self.ident()?;
             self.eat("?");
-            if self.at("(") {
-                self.params()?;
+            if self.at("(") || self.at("<") {
+                self.reject_contract_method();
+                if !self.eat(",") {
+                    self.boundary()?;
+                }
+                self.separators();
+                continue;
             }
             self.expect(":")?;
             self.ty()?;
@@ -2179,6 +2586,30 @@ impl<'a> Parser<'a> {
         }
         self.expect("}")?;
         Ok(())
+    }
+
+    /// Report a method signature inside an interface/object type and skip it,
+    /// so the rest of the contract still parses without cascading errors.
+    fn reject_contract_method(&mut self) {
+        self.diagnostics.push(Diagnostic::error("NAPALM-P001", IMPLEMENTS_METHOD_ERROR, self.peek().span));
+        let mut depth = 0usize;
+        loop {
+            let kind = self.peek().kind;
+            if kind == Kind::Eof {
+                break;
+            }
+            match self.text() {
+                "(" | "[" | "{" | "<" => depth += 1,
+                ")" | "]" | ">" => depth = depth.saturating_sub(1),
+                ">>" => depth = depth.saturating_sub(2),
+                ">>>" => depth = depth.saturating_sub(3),
+                "}" | "," | ";" if depth == 0 => break,
+                "}" => depth -= 1,
+                _ if depth == 0 && kind == Kind::Line => break,
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     fn expr(&mut self, min: u8) -> Result<Expr> {
@@ -2961,7 +3392,11 @@ impl<'a> Parser<'a> {
             };
             return Ok(invoke(receiver, "__delete", vec![key], span));
         }
-        if matches!(self.text(), "typeof" | "void" | "...") {
+        if self.eat("typeof") {
+            let value = self.expr(16)?;
+            return Ok(Expr::new(ExprKind::TypeOf(Box::new(value)), self.end(start)));
+        }
+        if matches!(self.text(), "void" | "...") {
             return self.error(format!(
                 "`{}` is recognized TypeScript syntax but is not lowered yet",
                 self.text()
@@ -3072,6 +3507,14 @@ impl<'a> Parser<'a> {
                             });
                         }
                         collection_annotation = Some(annotation);
+                    } else if matches!(receiver.kind, ExprKind::Name(_)) {
+                        // `new Holder<number>(...)`: bind the new instance to the
+                        // generic class instantiation (registered by spelling).
+                        let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
+                        collection_annotation = Some(TypeAnnotation::new(
+                            TypeAnnotationKind::Named(compact_type_spelling(&spelling)),
+                            self.end(start),
+                        ));
                     }
                 }
             }
@@ -3322,6 +3765,8 @@ impl<'a> Parser<'a> {
                 let mut nested = Parser::new(self.source, i + 2, close, self.arena);
                 nested.synthetic_span = self.synthetic_span;
                 nested.constructor_properties = self.constructor_properties.take();
+                nested.contracts = std::mem::take(&mut self.contracts);
+                nested.class_summaries = std::mem::take(&mut self.class_summaries);
                 nested.lines();
                 let value = nested.expr(0);
                 nested.lines();
@@ -3330,6 +3775,8 @@ impl<'a> Parser<'a> {
                 }
                 self.synthetic_span = nested.synthetic_span;
                 self.constructor_properties = nested.constructor_properties;
+                self.contracts = nested.contracts;
+                self.class_summaries = nested.class_summaries;
                 self.immutable.extend(nested.immutable);
                 self.diagnostics.extend(nested.diagnostics);
                 parts.push(StringPart::Expression(value?));
@@ -3432,7 +3879,13 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn class(&mut self, start: usize, is_foreign: bool, default_export: bool) -> Result<Vec<Stmt>> {
+    fn class(
+        &mut self,
+        start: usize,
+        is_foreign: bool,
+        is_abstract: bool,
+        default_export: bool,
+    ) -> Result<Vec<Stmt>> {
         // A nested class owns its own `this`; its members must not declare fields
         // on the enclosing constructor's class.
         let enclosing_constructor_properties = self.constructor_properties.take();
@@ -3441,15 +3894,30 @@ impl<'a> Parser<'a> {
         } else {
             self.ident()?
         };
-        self.type_parameters()?;
+        let type_params = self.type_parameter_names()?;
+        if !type_params.is_empty() {
+            self.generic_classes.insert(
+                name.value.clone(),
+                type_params.iter().map(|param| param.value.clone()).collect(),
+            );
+        }
         let superclass = if self.eat("extends") {
             Some(self.heritage_expr()?)
         } else {
             None
         };
+        let mut implements = Vec::new();
         if self.eat("implements") {
             loop {
-                self.ty()?;
+                self.lines();
+                let contract = self.ident()?;
+                if self.at(".") {
+                    return self.error("a class can only implement interfaces and types declared in the same module");
+                }
+                if self.at("<") {
+                    self.type_arguments()?;
+                }
+                implements.push(contract);
                 if !self.eat(",") {
                     break;
                 }
@@ -3477,6 +3945,10 @@ impl<'a> Parser<'a> {
         let decorator_parameter = ast.ident("payloadParameter");
         let mut constructor = None;
         let mut constructor_properties = Vec::new();
+        // Instance properties with a field initializer / parameter property, and
+        // plain declared fields that still need a constructor assignment.
+        let mut initialized_properties = HashSet::<String>::default();
+        let mut uninitialized_fields = HashSet::<String>::default();
         while !self.at("}") && self.peek().kind != Kind::Eof {
             let member_start = self.peek().span.start;
             let decorators = self.decorators()?;
@@ -3663,7 +4135,7 @@ impl<'a> Parser<'a> {
             };
             let member = self.ident()?;
             let is_constructor = member.value == "constructor";
-            let _optional_or_definite = self.eat("?") || self.eat("!");
+            let definite = !self.eat("?") && self.eat("!");
             self.type_parameters()?;
             if self.at("(") {
                 let (params, parameter_properties) = self.params_with_properties(is_constructor)?;
@@ -3709,6 +4181,7 @@ impl<'a> Parser<'a> {
                 }
                 if is_constructor {
                     for (property, annotation) in &parameter_properties {
+                        initialized_properties.insert(property.value.clone());
                         let value = Expr::new(ExprKind::Name(property.clone()), property.span);
                         let (getter, setter, assignment) =
                             synthesize_class_property(property, false, Some(value));
@@ -3793,6 +4266,13 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let mut extra = None;
+                if !is_static {
+                    if initializer.is_some() || decorated || definite {
+                        initialized_properties.insert(member.value.clone());
+                    } else {
+                        uninitialized_fields.insert(member.value.clone());
+                    }
+                }
                 let initializer = if decorated {
                     let mut ast = DecoratorAst { next_span: &mut self.synthetic_span, anchor: member.span };
                     let (value, callbacks) = ast.decorate_field(&member, is_static, initializer, decorators,
@@ -3847,7 +4327,110 @@ impl<'a> Parser<'a> {
                 _ => None,
             })
             .collect::<HashSet<_>>();
+        let method_names = methods.iter()
+            .filter(|method| !method.is_static && !method.is_constructor)
+            .filter_map(|method| match &method.signature {
+                MethodSignatureAst::Method { name, .. } => Some(name.value.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        // `None` when the superclass is not a class declared earlier in this
+        // module; its members are then unknown and contract checks stay lenient.
+        let super_summary = match superclass.as_ref().map(|expr| &expr.kind) {
+            None => Some(ClassSummary::default()),
+            Some(ExprKind::Name(parent)) => self.class_summaries.get(&parent.value).cloned(),
+            Some(_) => None,
+        };
+        let contract_fields = self.implemented_contract_fields(&implements);
+        let mut conflicting = HashSet::<String>::default();
+        // Contract fields become ordinary class properties (fixed storage plus
+        // accessors) unless the class or a known ancestor already declares them.
+        for (field, generic, contract) in &contract_fields {
+            let field_name = &field.name.value;
+            let inherited = super_summary.as_ref().is_some_and(|summary| summary.properties.contains(field_name));
+            if property_names.contains(field_name) || inherited {
+                continue;
+            }
+            if method_names.contains(field_name)
+                || super_summary.as_ref().is_some_and(|summary| summary.methods.contains(field_name))
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-P001",
+                    format!("method `{field_name}` of class `{}` conflicts with field `{field_name}` of `{contract}`", name.value),
+                    name.span,
+                ));
+                conflicting.insert(field_name.clone());
+                continue;
+            }
+            let annotation = if *generic {
+                None
+            } else if field.optional && !self.annotation_allows_null(&field.annotation, 0) {
+                let span = field.annotation.span;
+                Some(TypeAnnotation::new(
+                    TypeAnnotationKind::Union(vec![
+                        field.annotation.clone(),
+                        TypeAnnotation::new(TypeAnnotationKind::Null, span),
+                    ]),
+                    span,
+                ))
+            } else {
+                Some(field.annotation.clone())
+            };
+            // Synthesized members need spans unique to this class: spans are
+            // binding identities, and several classes may implement one contract.
+            let member = Spanned::new(field_name.clone(), Span::empty(self.synthetic_span));
+            self.synthetic_span += 1;
+            fields.push(ClassFieldDecl {
+                storage: class_storage_ident(&member, false),
+                annotation,
+                initializer: None,
+                is_static: false,
+            });
+            let (getter, setter, _) = synthesize_class_property(&member, false, None);
+            methods.push(getter);
+            methods.push(setter);
+            property_names.insert(field_name.clone());
+            uninitialized_fields.insert(field_name.clone());
+        }
+        // Required contract fields (neither `?` nor nullable) must be assigned
+        // by a field initializer, a parameter property or the constructor.
+        let mut initialized = super_summary.as_ref().map(|summary| summary.initialized.clone()).unwrap_or_default();
+        initialized.extend(initialized_properties);
+        initialized.extend(constructor_properties.iter().map(|property| property.value.clone()));
+        initialized.extend(property_names.iter().filter(|property| !uninitialized_fields.contains(*property)).cloned());
+        let mut pending = Vec::<(String, String)>::new();
+        let inherited_pending = super_summary.as_ref().map(|summary| summary.pending.clone()).unwrap_or_default();
+        let required = contract_fields
+            .iter()
+            .filter(|(field, ..)| {
+                !field.optional
+                    && !conflicting.contains(&field.name.value)
+                    && !self.annotation_allows_null(&field.annotation, 0)
+            })
+            .map(|(field, _, contract)| (field.name.value.clone(), contract.clone()));
+        for (field, contract) in inherited_pending.into_iter().chain(required.collect::<Vec<_>>()) {
+            if !initialized.contains(&field) && !pending.iter().any(|(pending, _)| pending == &field) {
+                pending.push((field, contract));
+            }
+        }
+        if super_summary.is_some() && !is_abstract {
+            for (field, contract) in pending.drain(..) {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-P001",
+                    format!(
+                        "class `{}` must initialize required field `{field}` of `{contract}` in its constructor",
+                        name.value
+                    ),
+                    name.span,
+                ));
+            }
+        }
         for property in constructor_properties {
+            // Reassigning a data property of a known ancestor must reach the
+            // inherited storage; a second backing field would shadow it.
+            if super_summary.as_ref().is_some_and(|summary| summary.data_properties.contains(&property.value)) {
+                continue;
+            }
             if !property_names.insert(property.value.clone()) {
                 continue;
             }
@@ -3860,6 +4443,24 @@ impl<'a> Parser<'a> {
             let (getter, setter, _) = synthesize_class_property(&property, false, None);
             methods.push(getter);
             methods.push(setter);
+        }
+        let mut summary = super_summary.clone().unwrap_or_default();
+        summary.properties.extend(property_names);
+        summary.methods.extend(method_names);
+        summary.data_properties.extend(
+            fields
+                .iter()
+                .filter(|field| !field.is_static)
+                .filter_map(|field| field.storage.value.strip_prefix('_'))
+                .map(str::to_owned),
+        );
+        summary.initialized = initialized;
+        summary.pending = pending;
+        if super_summary.is_some() {
+            self.class_summaries.insert(name.value.clone(), summary);
+        } else {
+            // Unknown ancestry: subclasses must not be validated against it.
+            self.class_summaries.remove(&name.value);
         }
         initializers.splice(0..0, method_initializers);
         let has_initializers =
@@ -3969,6 +4570,8 @@ impl<'a> Parser<'a> {
             superclass,
             is_foreign,
             attributes: Vec::new(),
+            implements,
+            type_params,
             fields,
             methods,
         };
@@ -4206,6 +4809,138 @@ fn synthesize_watcher(
     )
 }
 
+/// Queue every `Name<...>` spelling inside a type's text; non-generic names
+/// are ignored by the instantiation loop.
+fn queue_generic_uses(text: &str, span: Span, work: &mut Vec<(String, Span)>) {
+    let mut cursor = 0;
+    while let Some(found) = text[cursor..].find('<') {
+        let open = cursor + found;
+        let start = text[..open]
+            .rfind(|ch: char| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+            .map_or(0, |index| index + 1);
+        if start < open {
+            if let Some(end) = matching_angle(text, open) {
+                work.push((text[start..=end].to_owned(), span));
+            }
+        }
+        cursor = open + 1;
+    }
+}
+
+/// Index of the `>` closing the `<` at `open` (`=>` arrows do not close).
+fn matching_angle(source: &str, open: usize) -> Option<usize> {
+    const MAX_TYPE_ARGUMENTS_BYTES: usize = 1024;
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    for index in open..bytes.len().min(open + MAX_TYPE_ARGUMENTS_BYTES) {
+        match bytes[index] {
+            b'<' => depth += 1,
+            b'>' if index > 0 && bytes[index - 1] == b'=' => {}
+            b'>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Canonical name of a generic contract instantiation: no whitespace, so
+/// `Pair<number, string>` and `Pair<number,string>` are the same contract.
+pub(crate) fn compact_type_spelling(spelling: &str) -> String {
+    spelling.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+/// Capitalized identifiers in a type argument that are not known types,
+/// contracts or classes are type parameters of an enclosing generic
+/// declaration/function; they are erased to `any`.
+fn erase_unknown_type_parameters(argument: &str, known: &HashSet<String>) -> String {
+    const BUILTIN: &[&str] = &[
+        "Number", "String", "Boolean", "Array", "List", "Map", "Set", "Promise", "Event",
+        "Emitter", "Channel", "Receiver", "Date", "Function", "Fn", "Object", "Range", "Fiber",
+        "Record", "Proxy",
+    ];
+    let mut out = String::with_capacity(argument.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let parameter = word.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+            && !BUILTIN.contains(&word.as_str())
+            && !known.contains(word.as_str());
+        out.push_str(if parameter { "any" } else { word });
+        word.clear();
+    };
+    for ch in argument.chars() {
+        if ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Whether a contract field annotation refers to one of the contract's own
+/// generic parameters (erased to `any` on the implementing class).
+fn annotation_mentions(annotation: &TypeAnnotation, names: &[String]) -> bool {
+    use TypeAnnotationKind as K;
+
+    if names.is_empty() {
+        return false;
+    }
+    match &annotation.kind {
+        K::Named(text) | K::Opaque(text) => text
+            .split(|ch: char| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+            .any(|word| names.iter().any(|name| name == word)),
+        K::List(Some(inner)) | K::Set(Some(inner)) | K::BuiltinGeneric(_, Some(inner)) => {
+            annotation_mentions(inner, names)
+        }
+        K::GenericMap(key, value) => annotation_mentions(key, names) || annotation_mentions(value, names),
+        K::Union(parts) => parts.iter().any(|part| annotation_mentions(part, names)),
+        K::Object(fields) => fields.iter().any(|field| annotation_mentions(&field.annotation, names)),
+        _ => false,
+    }
+}
+
+/// Structural annotation equality that ignores source spans.
+fn same_annotation(left: &TypeAnnotation, right: &TypeAnnotation) -> bool {
+    use TypeAnnotationKind as K;
+
+    fn same_optional(left: &Option<Box<TypeAnnotation>>, right: &Option<Box<TypeAnnotation>>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => same_annotation(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    match (&left.kind, &right.kind) {
+        (K::List(left), K::List(right)) | (K::Set(left), K::Set(right)) => same_optional(left, right),
+        (K::BuiltinGeneric(left_name, left), K::BuiltinGeneric(right_name, right)) => {
+            left_name == right_name && same_optional(left, right)
+        }
+        (K::GenericMap(left_key, left_value), K::GenericMap(right_key, right_value)) => {
+            same_annotation(left_key, right_key) && same_annotation(left_value, right_value)
+        }
+        (K::Union(left), K::Union(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(left, right)| same_annotation(left, right))
+        }
+        (K::Object(left), K::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.name.value == right.name.value
+                        && left.optional == right.optional
+                        && left.readonly == right.readonly
+                        && same_annotation(&left.annotation, &right.annotation)
+                })
+        }
+        (left, right) => left == right,
+    }
+}
+
 /// Convert a TypeScript-style class property into the existing Napalm-compatible
 /// AST representation: fixed storage plus ordinary getter/setter methods. This
 /// keeps all field layout, GC and JIT machinery unchanged while the surface
@@ -4396,6 +5131,7 @@ fn rewrite_enum_member_references(
         | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
         | ExprKind::Await(operand)
+        | ExprKind::TypeOf(operand)
         | ExprKind::Launch(operand)
         | ExprKind::DestructureCheck { source: operand, .. }
         | ExprKind::Spread(operand) => {
@@ -4861,6 +5597,8 @@ fn infix(op: &str) -> Option<(u8, BinaryOp)> {
         ">=" => (9, GreaterEqual),
         "in" => (9, In),
         "instanceof" => (9, Is),
+        "inherits" => (9, Inherits),
+        "implements" => (9, Implements),
         "<<" => (10, ShiftLeft),
         ">>" => (10, ShiftRight),
         "+" => (11, Add),
@@ -5112,6 +5850,7 @@ fn validate_bindings(
                 | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
                 | ExprKind::Await(operand)
+                | ExprKind::TypeOf(operand)
                 | ExprKind::Launch(operand)
                 | ExprKind::DestructureCheck { source: operand, .. }
                 | ExprKind::Spread(operand) => self.expr(operand),
@@ -5225,7 +5964,6 @@ mod napalm_syntax_tests {
         let module = assert_parses(r#"
             interface Shape {
                 name: string;
-                area(): number;
             }
 
             class Rect implements Shape {
@@ -5264,9 +6002,18 @@ mod napalm_syntax_tests {
             type Pair<A, B> = { first: A; second: B };
             var pair: Pair<number, string> = { first: 1, second: "x" };
         "#);
-        assert_eq!(module.type_aliases.len(), 1);
+        // The generic declaration (unconstrained: parameters are `any`) plus one
+        // concrete instantiation per distinct use, named by its compact spelling.
+        assert_eq!(module.type_aliases.len(), 2);
         let alias = &module.type_aliases[0];
         assert_eq!(alias.type_params.iter().map(|p| p.value.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+        let instance = &module.type_aliases[1];
+        assert_eq!(instance.name.value, "Pair<number,string>");
+        let TypeAnnotationKind::Object(fields) = &instance.annotation.kind else {
+            panic!("instantiated alias should be an object type: {:?}", instance.annotation);
+        };
+        assert_eq!(fields[0].annotation.kind, TypeAnnotationKind::Num);
+        assert_eq!(fields[1].annotation.kind, TypeAnnotationKind::String);
     }
 
     #[test]
@@ -5279,7 +6026,7 @@ mod napalm_syntax_tests {
             export type { ExternalType as PublicExternal };
 
             interface Runnable<T> {
-                run(value: T): T;
+                value: T;
             }
 
             declare function ambient<T>(value: T): T;
@@ -5472,7 +6219,6 @@ mod napalm_syntax_tests {
     fn recognizes_runtime_typescript_features_that_still_need_lowering() {
         for source in [
             "let x = value >>> shift;",
-            "let x = typeof value;",
         ] {
             let parsed = parse("future-syntax.np", source);
             assert!(parsed.has_errors(), "feature unexpectedly lowered: {source}");

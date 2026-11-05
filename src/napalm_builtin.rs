@@ -1161,6 +1161,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, system, "os", MethodKind::Method, 0, NativeBuiltin::SystemOs);
     manifest.register_native(program, system, "arch", MethodKind::Method, 0, NativeBuiltin::SystemArch);
     manifest.register_native(program, system, "gc", MethodKind::Method, 0, NativeBuiltin::SystemGc);
+    manifest.register_native(program, system, "__implements", MethodKind::Method, 3, NativeBuiltin::SystemImplements);
+    manifest.register_native(program, system, "__inherits", MethodKind::Method, 2, NativeBuiltin::SystemInherits);
+    manifest.register_native(program, system, "__typeof", MethodKind::Method, 1, NativeBuiltin::SystemTypeOf);
 
     // Date follows the JavaScript model: one heap object stores one TimeClip'd
     // millisecond value. Constructor/static overloads are represented by distinct
@@ -1494,6 +1497,7 @@ impl Host for BuiltinHost {
         match (self.manifest.implementation(primitive), name, arity) {
             (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
             (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
+            (Some(ListSubscriptSet), "[]=", 2) => Some(TraceListMethod::SubscriptSet),
             _ => None,
         }
     }
@@ -2832,7 +2836,7 @@ fn execute_primitive(
             )
         }
 
-        MapNew => Ok(context.allocate_map()),
+        MapNew => Ok(context.allocate_map_instance()),
         SetNew => Ok(context.allocate_set()),
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),
         MapContainsKey => Ok(Value::from_bool(context.map_contains_key(this, argument(args,0)?)?)),

@@ -148,6 +148,15 @@ pub enum Type {
     /// source-level payload contract for Event/Emitter/Channel/Receiver and the
     /// compiler-internal resolved value type for Promise-returning native APIs.
     Builtin(BuiltinId, Option<Box<Type>>),
+    /// Instance of a generic class with concrete type arguments
+    /// (`Holder<number>`). It is a persistent per-instance contract: `fields`
+    /// are the class fields whose declared type mentions a type parameter, with
+    /// the arguments substituted. SSA values keep `Instance` as their type.
+    GenericInstance {
+        class: ClassId,
+        args: Vec<Type>,
+        fields: Vec<InterfaceFieldType>,
+    },
 
     // Internal location/reference type used for captured mutable variables.
     Cell(Box<Type>),
@@ -250,6 +259,9 @@ impl Type {
                             .all(|class| expected.contains(*class)))
             }
             (Num, Int32 | F64) => true,
+            (Instance(expected), GenericInstance { class, .. }) => {
+                expected.is_unknown() || expected.contains(*class)
+            }
             (Map, Interface(_) | Record(_) | GenericMap(_, _)) => true,
             (Set(None), Set(_)) => true,
             (Set(Some(e)), Set(Some(a))) => e == a,
@@ -410,6 +422,7 @@ impl fmt::Debug for Type {
             Module => write!(f, "Module"),
             Builtin(id, None) => write!(f, "{}", id.name()),
             Builtin(id, Some(ty)) => write!(f, "{}<{ty:?}>", id.name()),
+            GenericInstance { class, args, .. } => write!(f, "Instance<{class:?}, {args:?}>"),
             Cell(ty) => write!(f, "Cell<{ty:?}>") ,
             Int32 => write!(f, "i32"),
             F64 => write!(f, "f64"),
@@ -684,6 +697,9 @@ pub struct ClassInfo {
     /// Interfaces and object types this class declares with `implements`.
     /// Subclasses implement everything their ancestors implement.
     pub implements: Vec<Type>,
+    /// Per own slot: the declared field type mentions a class type parameter,
+    /// so writes are checked against each instance's generic arguments.
+    pub own_generic_fields: Vec<bool>,
     /// Static storage slots owned by this class. Static fields are not folded
     /// into the inherited instance layout.
     pub static_field_count: u16,
@@ -2304,6 +2320,9 @@ pub struct Program {
     pub foreign_functions: Vec<ForeignFunctionInfo>,
     pub structural_layouts: Vec<StructuralLayoutInfo>,
     structural_layout_index: HashMap<Type, StructuralLayoutId>,
+    /// Source names of declared interfaces and type aliases with their
+    /// resolved contract, so the runtime can name contracts (`typeof`).
+    pub contract_names: Vec<(StringId, Type)>,
 
     strings: Vec<CompactString>,
     string_index: HashMap<CompactString, StringId>,
@@ -2520,6 +2539,7 @@ impl Program {
             own_instance_field_types: vec![Type::Top; own_instance_field_count as usize],
             own_instance_field_names: Vec::new(),
             implements: Vec::new(),
+            own_generic_fields: Vec::new(),
             static_field_count,
             static_field_types: vec![Type::Top; static_field_count as usize],
             is_foreign,

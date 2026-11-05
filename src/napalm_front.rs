@@ -984,8 +984,19 @@ pub struct ModuleAst {
     pub type_aliases: Vec<TypeAliasDecl>,
     /// None for legacy fixtures; Napalm exports are explicit (local, public).
     pub exports: Option<Vec<(Ident, Ident)>>,
+    /// Concrete uses of generic classes (`Holder<number>`) found in this module.
+    pub generic_class_uses: Vec<GenericClassUse>,
     pub statements: Vec<Stmt>,
     pub span: Span,
+}
+
+/// A concrete instantiation of a generic class: `name` is the whitespace-free
+/// spelling (`Holder<number>`) used as the contract name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenericClassUse {
+    pub name: Ident,
+    pub class: String,
+    pub args: Vec<TypeAnnotation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1139,6 +1150,10 @@ pub struct ClassDecl {
     pub superclass: Option<Expr>,
     pub is_foreign: bool,
     pub attributes: Vec<Attribute>,
+    /// Interface and object type alias names listed after `implements`.
+    pub implements: Vec<Ident>,
+    /// Generic type parameters (`class Holder<T>`).
+    pub type_params: Vec<Ident>,
     /// Source-declared fixed-layout fields retained for runtime type invariants.
     pub fields: Vec<ClassFieldDecl>,
     pub methods: Vec<MethodDecl>,
@@ -1396,6 +1411,9 @@ pub enum ExprKind {
     },
     /// NapalmJIT extension: suspend the current async execution until a Promise settles.
     Await(Box<Expr>),
+    /// `typeof value`: a String naming the runtime kind of the value (or
+    /// "Interface"/"Type" for a bare contract name).
+    TypeOf(Box<Expr>),
     /// Executes a concurrent function on the parallel worker pool and returns a Promise.
     Launch(Box<Expr>),
     Closure(FunctionBody),
@@ -1520,6 +1538,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             | ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
             | ExprKind::Await(inner)
+            | ExprKind::TypeOf(inner)
             | ExprKind::Launch(inner)
             | ExprKind::DestructureCheck { source: inner, .. }
             | ExprKind::Spread(inner) => visit_expr(inner, out),
@@ -1700,6 +1719,12 @@ pub enum BinaryOp {
     GreaterEqual,
     In,
     Is,
+    /// `value inherits Class`: true when `Class` is a strict ancestor of the
+    /// value's class (or of the class object itself).
+    Inherits,
+    /// `value implements Contract`: true when the value (or its class) fulfils
+    /// an interface or object type alias.
+    Implements,
     Equal,
     NotEqual,
 }
@@ -1813,6 +1838,7 @@ impl<'a> Parser<'a> {
             interfaces: Vec::new(),
             type_aliases: Vec::new(),
             exports: None,
+            generic_class_uses: Vec::new(),
             statements,
             span: Span::new(start, self.peek().span.end),
         }
@@ -1996,6 +2022,8 @@ impl<'a> Parser<'a> {
                 superclass,
                 is_foreign,
                 attributes,
+                implements: Vec::new(),
+                type_params: Vec::new(),
                 fields: Vec::new(),
                 methods,
             }),
