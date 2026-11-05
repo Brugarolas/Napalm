@@ -99,6 +99,46 @@ const REGION_SPECIAL_VALUES_SOURCE: &str = r#"
     var result = Test.run()
 "#;
 
+/// Guards fail inside region members while deferred frame writes are pending:
+/// `w` changes from small integers to fractions, to numbers outside int32 and
+/// finally to NaN, and `step` from integer to fraction, so the region
+/// exits (and is re-entered or abandoned) from many members. The interpreter
+/// must resume with the exact frame.
+#[cfg(feature = "llvm-jit")]
+const REGION_DEFERRED_EXITS_SOURCE: &str = r#"
+    class Test {
+        static run() {
+            var total = 0
+            var w = 1
+            var step = 1
+            var text = 0
+            var y = 0
+            while (y < 160) {
+                if (y == 60) { w = 0.25 }
+                if (y == 90) { w = 5000000000 }
+                if (y == 110) { step = 0.5 }
+                if (y == 130) { w = 0 / 0 }
+                var x = 0
+                while (x < 70) {
+                    var i = 0
+                    while (i < 4) {
+                        i = i + step
+                    }
+                    if (w != w) {
+                        text = text + 1
+                    } else {
+                        total = total + w * i + x
+                    }
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            return total * 10 + text
+        }
+    }
+    var result = Test.run()
+"#;
+
 #[cfg(feature = "llvm-jit")]
 fn run_region_test(options: Option<TracingJitOptions>) -> (f64, Option<crate::napalm_tracing_jit::TracingJitStats>) {
     run_region_source(REGION_TEST_SOURCE, options)
@@ -154,6 +194,29 @@ fn llvm_region_unboxed_links_preserve_special_numbers() {
         assert_eq!(result.to_bits(), expected.to_bits(), "regions={regions} {result} != {expected} {stats:?}");
         if regions {
             assert!(stats.llvm_regions_installed >= 1, "{stats:?}");
+        }
+    }
+}
+
+#[cfg(feature = "llvm-jit")]
+#[test]
+fn llvm_region_deferred_frame_writes_survive_exits_from_any_member() {
+    let (expected, _) = run_region_source(REGION_DEFERRED_EXITS_SOURCE, None);
+    for budget in [3, 1 << 16] {
+        for regions in [false, true] {
+            let (result, stats) = run_region_source(REGION_DEFERRED_EXITS_SOURCE, Some(TracingJitOptions {
+                llvm_hot_threshold: 1,
+                llvm_background_compile: false,
+                llvm_trace_regions: regions,
+                native_loop_iteration_budget: budget,
+                ..Default::default()
+            }));
+            let stats = stats.unwrap();
+            assert_eq!(result.to_bits(), expected.to_bits(), "regions={regions} budget={budget} {result} != {expected} {stats:?}");
+            if regions {
+                assert!(stats.llvm_regions_installed >= 1, "{stats:?}");
+            }
+            assert!(stats.side_exits > 0, "{stats:?}");
         }
     }
 }

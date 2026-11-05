@@ -1128,6 +1128,9 @@ impl LlvmLowering<'_> {
     }
 
     fn ret(&mut self, code: u32) {
+        // With deferred frame slots every return goes through the region's
+        // single `region_exit` block, which flushes them to the frame.
+        let region_exit = self.region.as_ref().and_then(|region| region.record_return(&self.current, code));
         // The manager attributes a result to `next_trace`. Inside a region the
         // function may return from any member, so name it (a link names its
         // child itself).
@@ -1145,7 +1148,10 @@ impl LlvmLowering<'_> {
                 "  call void @llvm.lifetime.end.p0(i64 {size}, ptr {slot})\n"
             ));
         }
-        self.line(&format!("ret i32 {code}"));
+        match region_exit {
+            Some(label) => self.br(label),
+            None => self.line(&format!("ret i32 {code}")),
+        }
     }
 
     fn error(&self, message: impl Into<String>) -> String {
@@ -1834,8 +1840,17 @@ impl LlvmLowering<'_> {
     }
 
     fn load_frame_slot(&mut self, slot: FrameSlot, rep: TraceRep) -> V {
-        let ptr = self.bank_slot(slot);
-        let raw = self.load(Ty::I64, &ptr, Mem::Reg);
+        // A deferred region slot's architectural value is its alloca.
+        let raw = match self.region.as_ref().and_then(|region| region.deferred_slot(slot)) {
+            Some(alloca) => {
+                let alloca = alloca.to_owned();
+                self.def(Ty::I64, &format!("load i64, ptr {alloca}, align 8"))
+            }
+            None => {
+                let ptr = self.bank_slot(slot);
+                self.load(Ty::I64, &ptr, Mem::Reg)
+            }
+        };
         match rep {
             TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => raw,
             TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => self.trunc(&raw, Ty::I32),
@@ -1844,9 +1859,26 @@ impl LlvmLowering<'_> {
     }
 
     fn store_frame_word(&mut self, slot: FrameSlot, word: &V) {
-        let ptr = self.bank_slot(slot);
         let word = self.word(word);
+        if let Some(alloca) = self.region.as_ref().and_then(|region| region.deferred_slot(slot)) {
+            let alloca = alloca.to_owned();
+            self.line(&format!("store i64 {}, ptr {alloca}, align 8", word.op));
+            return;
+        }
+        let ptr = self.bank_slot(slot);
         self.store(&word, &ptr, Mem::Reg);
+    }
+
+    /// Write every deferred region slot back to the frame, in the region's
+    /// single `region_exit` block that every `ret` branches to: whatever
+    /// returns control to code outside this function sees the exact frame.
+    fn flush_deferred_frame(&mut self) {
+        let Some(deferred) = self.region.as_ref().map(|region| region.deferred_slots()) else { return; };
+        for (slot, alloca) in deferred.iter() {
+            let word = self.def(Ty::I64, &format!("load i64, ptr {alloca}, align 8"));
+            let ptr = self.bank_slot(*slot);
+            self.store(&word, &ptr, Mem::Reg);
+        }
     }
 
     fn normalize_to_word(&mut self, value: &V, rep: TraceRep) -> V {

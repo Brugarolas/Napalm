@@ -41,7 +41,8 @@
 //! runtime/GC epoch.
 
 use super::*;
-use std::rc::Rc;
+use std::cell::RefCell;
+use rclite::Rc;
 
 /// One member of a region job: data cloned by the manager.
 pub(in crate::napalm_tracing_jit) struct RegionMemberJob {
@@ -67,6 +68,68 @@ pub(super) struct RegionMember {
     tier_up: V,
     /// Typed entry slots of every member, by trace id (see `TypedEntry`).
     typed_entries: Rc<HashMap<TraceId, Vec<TypedEntry>>>,
+    /// Deferred frame slots (see `deferred_frame_slots`): slot -> alloca.
+    deferred: Rc<Vec<(FrameSlot, String)>>,
+    /// With deferred slots, every return branches to one `region_exit` block
+    /// that flushes them once: `(predecessor block, result code)`.
+    returns: Rc<RefCell<Vec<(String, u32)>>>,
+}
+
+/// Frame slots whose architectural value lives in an entry-block alloca for
+/// the whole region invocation instead of in the frame: every General slot
+/// written by an internal link. All reads and writes of such a slot go to the
+/// alloca (entry reads, LoadFrameSlot, link writes, exit writes, commits) and
+/// every `ret` flushes all of them to the frame, so the frame is exact again
+/// whenever anything outside this function can observe it. In between,
+/// nothing else can: deferral requires that no member crosses a runtime/GC
+/// boundary (no helper reads or writes the frame, no collector scans it), and
+/// General slots are words of the fiber's register stack, disjoint from the
+/// other banks. A link therefore stores nothing to memory on the hot path.
+/// `NAPALM_LLVM_REGION_DEFER=0` disables this (A/B measurements).
+fn deferred_frame_slots(members: &[RegionMemberJob]) -> Vec<(FrameSlot, String)> {
+    if std::env::var("NAPALM_LLVM_REGION_DEFER").ok().as_deref() == Some("0")
+        || members.iter().any(|member| trace_has_heap_epoch_boundary(&member.trace))
+    {
+        return Vec::new();
+    }
+    let ids: HashSet<TraceId> = members.iter().map(|member| member.trace.id).collect();
+    let mut slots: Vec<(FrameSlot, String)> = Vec::new();
+    for member in members {
+        for plan in &member.exits {
+            let internal = plan.native_linkable && matches!(plan.target, ExitTarget::Trace(child) if ids.contains(&child));
+            if !internal {
+                continue;
+            }
+            for write in &plan.writes {
+                if let FrameSlot::General(reg) = write.slot {
+                    if !slots.iter().any(|(slot, _)| *slot == write.slot) {
+                        slots.push((write.slot, format!("%frame_r{}", reg.0)));
+                    }
+                }
+            }
+        }
+    }
+    slots
+}
+
+impl RegionMember {
+    pub(super) fn deferred_slots(&self) -> Rc<Vec<(FrameSlot, String)>> {
+        self.deferred.clone()
+    }
+
+    /// Record a return from `block` with `code`; the caller branches to
+    /// `region_exit`. None when nothing is deferred (plain `ret`).
+    pub(super) fn record_return(&self, block: &str, code: u32) -> Option<&'static str> {
+        if self.deferred.is_empty() {
+            return None;
+        }
+        self.returns.borrow_mut().push((block.to_owned(), code));
+        Some("region_exit")
+    }
+
+    pub(super) fn deferred_slot(&self, slot: FrameSlot) -> Option<&str> {
+        self.deferred.iter().find(|(deferred, _)| *deferred == slot).map(|(_, name)| name.as_str())
+    }
 }
 
 /// An entry slot that a member reads through a type guard (`GuardedEntry` or a
@@ -283,6 +346,8 @@ pub(super) fn lower_region(
     }
     let invariant_loads = members.iter().all(|member| !trace_has_heap_epoch_boundary(&member.trace));
     let typed_entries: Rc<HashMap<TraceId, Vec<TypedEntry>>> = Rc::new(region_typed_entries(members));
+    let deferred = Rc::new(deferred_frame_slots(members));
+    let returns: Rc<RefCell<Vec<(String, u32)>>> = Rc::default();
 
     let mut previous: Option<LlvmLowering> = None;
     // Entry-block pointers shared by all members.
@@ -321,6 +386,25 @@ pub(super) fn lower_region(
                         let _ = writeln!(state.entry, "  {} = alloca {}, align {}", typed.value, ty.ir(), ty.align());
                     }
                 }
+                // Deferred frame slots start as the frame's current words.
+                // No runtime boundary in the region: the bank is invariant.
+                if !deferred.is_empty() {
+                    let general = state.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, general));
+                    for (slot, name) in deferred.iter() {
+                        let FrameSlot::General(reg) = slot else { continue; };
+                        let offset = reg.0 as usize * std::mem::size_of::<RegisterWord>();
+                        let ptr = state.def_entry(
+                            Ty::Ptr,
+                            &format!("getelementptr inbounds i8, ptr {}, i64 {offset}", general.op),
+                        );
+                        let word = state.def_entry(
+                            Ty::I64,
+                            &format!("load i64, ptr {}, align 8, !tbaa !{}", ptr.op, Mem::Reg.tag()),
+                        );
+                        let _ = writeln!(state.entry, "  {name} = alloca i64, align 8");
+                        let _ = writeln!(state.entry, "  store i64 {}, ptr {name}, align 8", word.op);
+                    }
+                }
                 values
             }
         };
@@ -340,6 +424,8 @@ pub(super) fn lower_region(
             bindings,
             tier_up,
             typed_entries: typed_entries.clone(),
+            deferred: deferred.clone(),
+            returns: returns.clone(),
         });
         if index == 0 {
             state.emit_head_prologue("m0_start")?;
@@ -349,6 +435,20 @@ pub(super) fn lower_region(
     }
 
     let mut state = previous.ok_or_else(|| "empty trace-tree region".to_owned())?;
+    // The single return of a region with deferred frame slots: flush them
+    // once, then return the code of whichever exit branched here.
+    let returns = returns.borrow().clone();
+    if !returns.is_empty() {
+        state.begin("region_exit");
+        let incoming = returns
+            .iter()
+            .map(|(block, code)| format!("[ {code}, %{block} ]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let code = state.def(Ty::I32, &format!("phi i32 {incoming}"));
+        state.flush_deferred_frame();
+        state.line(&format!("ret i32 {}", code.op));
+    }
     // The module is described by its head: entry count and profile summary.
     state.trace = &head.trace;
     state.profile = head.profile.as_ref().filter(|profile| profile.entries > 0);
