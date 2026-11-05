@@ -1484,9 +1484,11 @@ arguments.
 Always use `this.member` in methods. `function method(...) {...}` is also
 accepted inside a class; `fn` is not.
 
-Instances are not open Maps. Do not assume that `object.extra = value` adds an
-arbitrary field or that all instances have `keys()`, `values()`, `entries()`,
-or `size`. Declare the fields that make up their API.
+Instances are not open Maps: `object.extra = value` cannot add an arbitrary
+field. Declare the fields that make up their API. Instances provide `keys()`,
+`values()`, `entries()` and `size` for their stored fields, including inherited
+fields, in field-slot order. Computed getters and static fields are excluded.
+User-defined members can override these defaults.
 
 ### 14.2 Inheritance and super
 
@@ -2517,11 +2519,16 @@ Negative indices in `text[index]` count from the end.
 | `isEmpty` | Whether it is empty. |
 | `[index]` | One-scalar string, or null out of range. |
 | `+ value` | Concatenation through textual conversion. |
-| `contains(text)` | Searches for a substring. |
+| `contains(text)`, `includes(text)` | Searches for a literal substring; both names are aliases. |
 | `startsWith(text, position?)` | Prefix from the specified position. |
 | `endsWith(text, endPosition?)` | Suffix up to the specified endpoint. |
 | `indexOf(text, start?)` | First index or `-1`. |
 | `lastIndexOf(text, position?)` | Last index no later than the position. |
+| `padStart(targetLength, padding?)`, `padEnd(targetLength, padding?)` | Pads to a scalar length; default padding is a space. |
+| `split(separator?, limit?)` | List of substrings separated by literal text, optionally limited in length. |
+| `repeat(count)` | Repeats the string a non-negative integer number of times. |
+| `replace(search, replacement)` | Replaces the first literal match. |
+| `replaceAll(search, replacement)` | Replaces every non-overlapping literal match. |
 | `slice(start, end?)` | Segment with an exclusive end; negatives are relative to the end. |
 | `substring(start, end?)` | Clamps negatives to zero and swaps reversed endpoints. |
 | `trim()`, `trimStart()`, `trimEnd()` | Removes Unicode whitespace at the corresponding ends. |
@@ -2544,9 +2551,33 @@ as in JS. `slice`/`substring` operations clamp their endpoints according to
 their rules; `indexOf` returns `-1` if no match is found.
 Uppercase conversion can change the length.
 
-`includes`, `concat`, `split`, `replace`, `replaceAll`, `padStart`, `padEnd`,
-`repeat`, regular expressions, and regular-expression methods are not
-provided, even if some appear in a historical example.
+`padStart`/`padEnd` repeat and truncate the padding at scalar boundaries to
+reach the target length. A target no larger than the current length (including
+a negative target), or empty padding, leaves the text unchanged.
+
+`split()` returns a one-element List containing the original string.
+`split('')` returns individual Unicode scalar values; splitting an empty string
+this way returns an empty List. Other separators preserve empty parts at either
+end and between adjacent separators. The optional limit is a non-negative
+integer: zero returns an empty List, and any excess parts are discarded.
+
+Replacement strings are literal: `$&`, `$1` and other `$` patterns have no
+special meaning. An empty search inserts the replacement at the start for
+`replace`, or at every scalar boundary (including both ends) for `replaceAll`.
+Replacements are not searched again. Text arguments must be strings; lengths,
+counts and limits must be finite integers. Invalid arguments and unrepresentable
+result sizes produce catchable runtime errors.
+
+```napalm
+System.print('7'.padStart(3, '0'));       // 007
+System.print('a,b,c'.split(',', 2));      // [a, b]
+System.print('é😀'.split(''));            // [é, 😀]
+System.print('ha'.repeat(3));             // hahaha
+System.print('aba'.replace('a', 'x'));    // xba
+System.print('aba'.replaceAll('a', 'x')); // xbx
+```
+
+`concat`, regular expressions, and regular-expression methods are not provided.
 
 ## 25. Numbers and Randomness
 

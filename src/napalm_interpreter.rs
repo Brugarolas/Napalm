@@ -7164,6 +7164,7 @@ pub struct Interpreter<'p> {
     strings: Vec<Value>,
     builtin_values: Vec<Value>,
     builtin_static_methods: Vec<Vec<Option<CallTarget>>>,
+    instance_protocol: Vec<(MethodSymbol, NativeBuiltin)>,
     /// Hidden core helper for the runtime-only `anything + String` coercion arm.
     string_right_add: Option<u32>,
     /// Constants pre-resolved to physical register words once at VM startup.
@@ -7658,6 +7659,21 @@ impl<'p> Interpreter<'p> {
             })
         });
         let (external_wake_tx, external_wake_rx) = mpsc::channel();
+        let instance_protocol = program.metadata.methods.iter().enumerate()
+            .filter_map(|(index, signature)| {
+                use crate::napalm_ir::MethodKind;
+                if signature.arity != 0 {
+                    return None;
+                }
+                let native = match (program.metadata.string(signature.name)?, signature.kind) {
+                    ("keys", MethodKind::Method) => NativeBuiltin::InstanceKeys,
+                    ("values", MethodKind::Method) => NativeBuiltin::InstanceValues,
+                    ("entries", MethodKind::Method) => NativeBuiltin::InstanceEntries,
+                    ("size", MethodKind::Getter) => NativeBuiltin::InstanceSize,
+                    _ => return None,
+                };
+                Some((MethodSymbol(index as u32), native))
+            }).collect();
         Ok(Self {
             jit: Some(jit),
             shared_jit_profile,
@@ -7675,6 +7691,7 @@ impl<'p> Interpreter<'p> {
             strings,
             builtin_values,
             builtin_static_methods: vec![vec![None; program.metadata.methods.len()]; BuiltinId::COUNT],
+            instance_protocol,
             string_right_add: None,
             resolved_constants,
             fibers: vec![Some(main)],
@@ -14249,6 +14266,18 @@ impl Interpreter<'_> {
         }
     }
 
+    fn instance_properties(&self, value: Value) -> Result<Vec<(Value, Value)>, RuntimeError> {
+        let (class_slot, fields) = match self.heap.get(value) {
+            Some(HeapObject::Instance { class_slot, fields }) => (*class_slot, fields),
+            Some(HeapObject::Foreign { .. }) => return Ok(Vec::new()),
+            _ => return Err(RuntimeError::new("receiver is not a class instance")),
+        };
+        let class = &self.classes[class_slot as usize];
+        Ok(class.instance_field_names.iter().zip(fields.iter())
+            .map(|(name, value)| (self.strings[name.0 as usize], *value))
+            .collect())
+    }
+
     fn default_to_string_text(&mut self, value: Value) -> String {
         let named_class = match self.heap.get(value) {
             Some(HeapObject::ClassObject { class_slot }) => Some((true, *class_slot)),
@@ -20259,6 +20288,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_static_type_tests.rs");
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
+    include!("tests/napalm_string_tests.rs");
     include!("tests/napalm_llvm_region_tests.rs");
 
     #[test]
