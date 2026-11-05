@@ -15,13 +15,13 @@ use crate::napalm_ir_optimizer::{
     repair_effect_chain, FunctionOptimization, Optimize, ProgramOptimization,
 };
 
-#[path = "typed_object_specialization.rs"]
+#[path = "napalm_ir/typed_object_specialization.rs"]
 mod typed_object_specialization;
 pub use typed_object_specialization::TypedObjectSpecialization;
-#[path = "shared_constant_literals.rs"]
+#[path = "napalm_ir/shared_constant_literals.rs"]
 mod shared_constant_literals;
 pub use shared_constant_literals::SharedConstantLiterals;
-#[path = "static_type_specialization.rs"]
+#[path = "napalm_ir/static_type_specialization.rs"]
 mod static_type_specialization;
 pub use static_type_specialization::StaticTypeSpecialization;
 
