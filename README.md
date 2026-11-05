@@ -19,7 +19,9 @@ Variable types are optional: the compiler checks known incompatible assignments.
   <a href="https://github.com/Brugarolas/Napalm/issues"><img src="https://img.shields.io/github/issues/Brugarolas/Napalm?style=flat-square" alt="Issues"></a>
 </p>
 
-![Alt](https://repobeats.axiom.co/api/embed/44379307ec6623c00131593148f800c0122f9562.svg "Repobeats analytics image")
+<p align="center">
+  <img src="[https://img.shields.io/badge/license-MIT-blue?style=flat-square](https://repobeats.axiom.co/api/embed/44379307ec6623c00131593148f800c0122f9562.svg)" alt="Repobeats analytics image">
+</p>
 
 ## Run
 
