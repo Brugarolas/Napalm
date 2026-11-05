@@ -1,6 +1,6 @@
 
 <p align="center">
-  [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/brugarolas)
+  <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
 </p>
 
 # Napalm
