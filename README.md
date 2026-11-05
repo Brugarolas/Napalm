@@ -8,6 +8,14 @@ For the complete, current language reference and runnable examples, see [DOCUMEN
 
 Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
 
+## Stats
+
+<p align="center">
+  <a href="https://github.com/Brugarolas/Napalm/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
+  <a href="https://github.com/Brugarolas/Napalm/stargazers"><img src="https://img.shields.io/github/stars/AsterrZep/Astra?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/Brugarolas/Napalm/issues"><img src="https://img.shields.io/github/issues/AsterrZep/Astra?style=flat-square" alt="Issues"></a>
+</p>
+
 ## Run
 
 ```sh
