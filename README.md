@@ -12,8 +12,8 @@ Variable types are optional: the compiler checks known incompatible assignments.
 
 <p align="center">
   <a href="https://github.com/Brugarolas/Napalm/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <a href="https://github.com/Brugarolas/Napalm/stargazers"><img src="https://img.shields.io/github/stars/AsterrZep/Astra?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/Brugarolas/Napalm/issues"><img src="https://img.shields.io/github/issues/AsterrZep/Astra?style=flat-square" alt="Issues"></a>
+  <a href="https://github.com/Brugarolas/Napalm/stargazers"><img src="https://img.shields.io/github/stars/Brugarolas/Napalm?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/Brugarolas/Napalm/issues"><img src="https://img.shields.io/github/issues/Brugarolas/Napalm?style=flat-square" alt="Issues"></a>
 </p>
 
 ## Run
