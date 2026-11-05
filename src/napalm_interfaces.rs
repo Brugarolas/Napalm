@@ -24,6 +24,40 @@ impl Heap {
             .is_some_and(|handle| self.handle_table.contract_contains(handle, expected))
     }
 
+    /// Non-installing structural check behind `implements`/`instanceof` on
+    /// plain objects: does the value currently satisfy `expected`?
+    pub(super) fn structurally_matches(&self, value: Value, expected: &Type) -> bool {
+        let mut plan = Vec::new();
+        self.plan_contract(value, expected, "value", &mut plan).is_ok()
+    }
+
+    /// Whether instances of `class_slot` fulfil an interface/object type: the
+    /// contracts declared with `implements` by the class or an ancestor must
+    /// together provide every wanted field with a compatible type. Their fields
+    /// are class fields typed by the contract, so the class layout keeps them
+    /// valid without installing a per-object contract.
+    pub(super) fn class_implements_contract(&self, class_slot: u32, contract: &Type) -> bool {
+        let Some(declared) = self.class_implements.get(class_slot as usize) else {
+            return false;
+        };
+        if declared.contains(contract) {
+            return true;
+        }
+        let (Type::Interface(wanted) | Type::Record(wanted)) = contract else {
+            return false;
+        };
+        wanted.iter().all(|want| {
+            declared.iter().any(|have| match have {
+                Type::Interface(fields) | Type::Record(fields) => fields.iter().any(|field| {
+                    field.name == want.name
+                        && want.ty.accepts(&field.ty)
+                        && (want.optional || !field.optional)
+                }),
+                _ => false,
+            })
+        })
+    }
+
     fn plan_contract(
         &self,
         value: Value,
@@ -40,6 +74,7 @@ impl Heap {
             expected,
             Type::Interface(_)
                 | Type::Record(_)
+                | Type::GenericInstance { .. }
                 | Type::List(Some(_))
                 | Type::GenericMap(_, _)
                 | Type::Set(Some(_))
@@ -100,9 +135,34 @@ impl Heap {
                 }
                 true
             }
-            Type::Interface(fields) | Type::Record(fields) => {
-                let Some(HeapObject::Map(map)) = self.get(value) else {
+            Type::GenericInstance { class, fields, .. } => {
+                let Some(HeapObject::Instance { class_slot, fields: values }) = self.get(value) else {
                     return Err(mismatch(path, expected));
+                };
+                if self.contract_class_ids.get(*class_slot as usize) != Some(class) {
+                    return Err(mismatch(path, expected));
+                }
+                let names = self.class_field_names.get(*class_slot as usize);
+                for field in fields {
+                    let Some(slot) = names.and_then(|names| names.iter().position(|name| *name == field.name)) else {
+                        continue;
+                    };
+                    let item = values.get(slot).copied().unwrap_or(Value::NULL);
+                    self.plan_contract(item, &field.ty, &format!("{path}.{}", field.name), plan)?;
+                }
+                plan.push((value, expected.clone()));
+                true
+            }
+            Type::Interface(fields) | Type::Record(fields) => {
+                let map = match self.get(value) {
+                    Some(HeapObject::Map(map)) => map,
+                    Some(HeapObject::Instance { class_slot, .. })
+                    | Some(HeapObject::Foreign { class_slot, .. })
+                        if self.class_implements_contract(*class_slot, expected) =>
+                    {
+                        return Ok(());
+                    }
+                    _ => return Err(mismatch(path, expected)),
                 };
                 for field in fields {
                     let key = MapKey::String(MapStringKey::new(Arc::from(field.name.as_bytes())));
@@ -162,7 +222,10 @@ impl Heap {
                     | (BuiltinId::Receiver, Some(HeapObject::Receiver { state })) => {
                         unsafe { state.get() }.payload_type.as_ref()
                     }
-                    (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => None,
+                    // Never install a contract on a Promise: its handle entry reuses
+                    // the contract-pointer word for the settled payload. `await`
+                    // validates the settled value against `Promise<T>` instead.
+                    (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => return Ok(()),
                     _ => return Err(mismatch(path, expected)),
                 };
 
@@ -241,6 +304,11 @@ impl Heap {
             };
             let (handle, shape, already_installed) = {
                 let managed = unsafe { managed_object(object) };
+                // The Promise handle entry reuses the contract-pointer word for
+                // its settled payload, so a contract would corrupt it.
+                if matches!(managed.object, HeapObject::Promise { .. }) {
+                    continue;
+                }
                 let installed = self.handle_table.contract_contains(managed.handle, &ty);
                 let shape = match &managed.object {
                     HeapObject::Map(map) => map.shaped().map(|(shape, _)| shape),

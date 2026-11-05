@@ -321,8 +321,10 @@ mod tests {
         run(&mut trace, AlgebraicSimplification);
         let TraceInst::IntBinary { op: IntBinOp::Add, lhs, rhs } = kind_of(&trace, added) else { panic!() };
         assert_eq!((lhs, constant(&trace, rhs)), (x, Some(TraceConstant::Int32(-2))));
-        let TraceInst::IntBinary { op: IntBinOp::Mul, lhs, rhs } = kind_of(&trace, multiplied) else { panic!() };
-        assert_eq!((lhs, constant(&trace, rhs)), (x, Some(TraceConstant::Int32(i32::MAX.wrapping_mul(i32::MAX)))));
+        // MAX * (x * MAX) reassociates to x * (MAX * MAX), and MAX * MAX wraps
+        // to exactly 1, so the multiplication folds away completely.
+        assert_eq!(i32::MAX.wrapping_mul(i32::MAX), 1);
+        assert_eq!(trace.canonical_value(multiplied), x);
     }
 
     #[test]
@@ -347,15 +349,18 @@ mod tests {
     fn float_division_uses_only_exact_reciprocals() {
         let mut b = builder(TraceKind::Side);
         let x = f64_input(&mut b, 0);
-        let rewritten: Vec<_> = [4.0, 0.5, -2.0, 1.0].into_iter().map(|d| { let d = num(&mut b, d); fb(&mut b, F64BinOp::Div, x, d) }).collect();
+        let rewritten: Vec<_> = [4.0, -2.0, 1.0].into_iter().map(|d| { let d = num(&mut b, d); fb(&mut b, F64BinOp::Div, x, d) }).collect();
+        let doubled = { let half = num(&mut b, 0.5); fb(&mut b, F64BinOp::Div, x, half) };
         let kept: Vec<_> = [3.0, 0.0, f64::INFINITY, f64::NAN, f64::MIN_POSITIVE / 4.0, 2f64.powi(1023)]
             .into_iter().map(|d| { let d = num(&mut b, d); fb(&mut b, F64BinOp::Div, x, d) }).collect();
         let mut trace = finish(b);
         run(&mut trace, AlgebraicSimplification);
-        for (v, r) in rewritten.into_iter().zip([0.25, 2.0, -0.5, 1.0]) {
+        for (v, r) in rewritten.into_iter().zip([0.25, -0.5, 1.0]) {
             let TraceInst::F64Binary { op: F64BinOp::Mul, rhs, .. } = kind_of(&trace, v) else { panic!() };
             assert_eq!(constant(&trace, rhs).and_then(float), Some(r));
         }
+        // x / 0.5 -> x * 2.0 -> x + x in the next round.
+        assert!(matches!(kind_of(&trace, doubled), TraceInst::F64Binary { op: F64BinOp::Add, lhs, rhs } if lhs == x && rhs == x));
         for v in kept { assert!(matches!(kind_of(&trace, v), TraceInst::F64Binary { op: F64BinOp::Div, .. })); }
     }
 

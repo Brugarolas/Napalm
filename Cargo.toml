@@ -50,7 +50,10 @@ llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM
 # rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the
 # LLVM-C.dll C-API instead and copies it next to the executables.
 [target.'cfg(windows)'.dependencies]
-inkwell = { version = "0.11.0", features = ["llvm23-1-no-llvm-linking"], optional = true }
+# Napalm uses initialize_native(), which is independent of Inkwell's target-*
+# features. Its default target-all bindings reference backends absent from the
+# Windows LLVM-C.dll and cause unresolved symbols in unoptimized debug builds.
+inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-no-llvm-linking"], optional = true }
 [target.'cfg(not(windows))'.dependencies]
 inkwell = { version = "0.11.0", features = ["llvm23-1-prefer-dynamic"], optional = true }
 

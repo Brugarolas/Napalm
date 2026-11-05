@@ -848,10 +848,27 @@ impl FunctionOptimization for DominatorCSE {
             }
         }
 
+        // The exceptional edge leaves a protected block from the middle (at any
+        // throwing instruction), not from its end. A handler dominated by one of
+        // its own protected blocks therefore must not reuse values that block
+        // defines: they may not have been computed when the throw happened.
+        let exceptional_edges: HashSet<(usize, usize)> = function
+            .exception_regions
+            .iter()
+            .flat_map(|region| {
+                let handler = region.handler.0 as usize;
+                region
+                    .protected_blocks
+                    .iter()
+                    .map(move |protected| (protected.0 as usize, handler))
+            })
+            .collect();
+
         fn visit(
             function: &mut Function,
             block: usize,
             children: &[SmallVec<[usize; 2]>],
+            exceptional_edges: &HashSet<(usize, usize)>,
             values: &mut HashMap<PureKey, ValueId>,
             arena: &Bump,
             changed: &mut bool,
@@ -872,20 +889,38 @@ impl FunctionOptimization for DominatorCSE {
                         *changed = true;
                     }
                 } else {
-                    inserted.push(key.clone());
+                    inserted.push((key.clone(), result));
                     values.insert(key, result);
                 }
             }
             for &child in &children[block] {
-                visit(function, child, children, values, arena, changed);
+                if exceptional_edges.contains(&(block, child)) {
+                    for (key, _) in &inserted {
+                        values.remove(key);
+                    }
+                    visit(function, child, children, exceptional_edges, values, arena, changed);
+                    for (key, result) in &inserted {
+                        values.insert(key.clone(), *result);
+                    }
+                } else {
+                    visit(function, child, children, exceptional_edges, values, arena, changed);
+                }
             }
-            for key in inserted {
+            for (key, _) in inserted {
                 values.remove(&key);
             }
         }
 
         let mut changed = false;
-        visit(function, entry, &children, &mut HashMap::default(), &arena, &mut changed);
+        visit(
+            function,
+            entry,
+            &children,
+            &exceptional_edges,
+            &mut HashMap::default(),
+            &arena,
+            &mut changed,
+        );
         changed
     }
 }
@@ -910,6 +945,7 @@ impl FunctionOptimization for ConstantFold {
         for _ in 0..2 {
             let live = live_instruction_ids(function);
             let mut changed = false;
+            let mut effect_shape_changed = false;
 
             for id in live {
                 let Some(replacement) = fold_instruction(function, id) else {
@@ -922,13 +958,17 @@ impl FunctionOptimization for ConstantFold {
                     replacement.result_count(),
                     "constant folding must preserve SSA result arity"
                 );
-                debug_assert_eq!(
-                    node.kind.effect_behavior(),
-                    replacement.effect_behavior(),
-                    "constant folding must not change effect-SSA shape"
-                );
+                effect_shape_changed |= node.kind.effect_behavior() != replacement.effect_behavior();
                 node.kind = replacement;
                 changed = true;
+            }
+
+            // Folding a proven read (such as a closed record's MapLen) into a
+            // constant removes its effect token. Reconnect consumers and edges.
+            if effect_shape_changed {
+                for block_ix in 0..function.blocks.len() {
+                    repair_effect_chain(function, block_ix);
+                }
             }
 
             if !changed {
@@ -1610,7 +1650,7 @@ impl FunctionOptimization for FastLocalSimplify {
                 if let Some(replacement) = fold_instruction(function, id) {
                     let node = &mut function.nodes[id.0 as usize];
                     debug_assert_eq!(node.results.len(), replacement.result_count());
-                    debug_assert_eq!(node.kind.effect_behavior(), replacement.effect_behavior());
+                    effect_shape_changed |= node.kind.effect_behavior() != replacement.effect_behavior();
                     node.kind = replacement;
                     changed = true;
                 }
@@ -2962,19 +3002,34 @@ mod typed_object_tests {
             Type::Int32,
         );
         let map = builder.param(0);
+        let x = builder.const_string("x");
+        let payload = builder.const_string("payload");
+        builder.emit1(Inst::MapGet { map, key: x }, Type::Num);
+        let first_len = builder.emit1(Inst::MapLen { map }, Type::Int32);
+        // Exercise both a following effectful read and a CFG edge after a
+        // folded read: neither may retain the removed effect token.
+        builder.emit1(Inst::MapGet { map, key: payload }, Type::Top);
         let len = builder.emit1(Inst::MapLen { map }, Type::Int32);
-        builder.ret(len);
+        let next = builder.new_block(&[Type::Int32]);
+        builder.jump(next, vec![len]);
+        builder.position_at(next);
+        let result = builder.block_param(next, 0);
+        builder.ret(result);
         let function_id = builder.finish();
-        let function = &mut program.functions[function_id.0 as usize];
 
-        assert!(FastLocalSimplify.optimize_function(function));
-        let ValueDef::InstResult(inst, _) = function.value(len).unwrap().def else {
-            panic!("MapLen result must stay instruction-backed");
-        };
-        assert!(matches!(
-            function.node(inst).map(|node| &node.kind),
-            Some(Inst::Const(Constant::Int32(2)))
-        ));
+        for pass in [&mut ConstantFold as &mut dyn FunctionOptimization, &mut FastLocalSimplify] {
+            let mut function = program.functions[function_id.0 as usize].clone();
+            crate::napalm_ir::verify_function(&function).unwrap();
+            assert!(pass.optimize_function(&mut function));
+            for value in [first_len, len] {
+                // Local CSE may reuse the first constant through a Move.
+                assert!(matches!(
+                    resolve_constant(&function, value, 0),
+                    Some(Constant::Int32(2))
+                ));
+            }
+            crate::napalm_ir::verify_function(&function).unwrap();
+        }
     }
 
     #[test]
@@ -2999,16 +3054,18 @@ mod typed_object_tests {
         let len = builder.emit1(Inst::MapLen { map }, Type::Int32);
         builder.ret(len);
         let function_id = builder.finish();
-        let function = &mut program.functions[function_id.0 as usize];
-
-        FastLocalSimplify.optimize_function(function);
-        let ValueDef::InstResult(inst, _) = function.value(len).unwrap().def else {
-            panic!("MapLen result must stay instruction-backed");
-        };
-        assert!(matches!(
-            function.node(inst).map(|node| &node.kind),
-            Some(Inst::MapLen { .. })
-        ));
+        for pass in [&mut ConstantFold as &mut dyn FunctionOptimization, &mut FastLocalSimplify] {
+            let mut function = program.functions[function_id.0 as usize].clone();
+            pass.optimize_function(&mut function);
+            let ValueDef::InstResult(inst, _) = function.value(len).unwrap().def else {
+                panic!("MapLen result must stay instruction-backed");
+            };
+            assert!(matches!(
+                function.node(inst).map(|node| &node.kind),
+                Some(Inst::MapLen { .. })
+            ));
+            crate::napalm_ir::verify_function(&function).unwrap();
+        }
     }
 
     #[test]

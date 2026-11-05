@@ -1627,6 +1627,8 @@ pub struct RuntimeMetadata {
     pub classes: Vec<ClassInfo>,
     pub foreign_functions: Vec<ForeignFunctionInfo>,
     pub structural_layouts: Vec<StructuralLayoutInfo>,
+    /// Declared interface/type alias names with their contracts (`typeof`).
+    pub contract_names: Vec<(StringId, Type)>,
 
     module_index: HashMap<ModuleId, usize>,
     class_index: HashMap<ClassId, usize>,

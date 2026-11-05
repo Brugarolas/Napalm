@@ -212,6 +212,12 @@ enum BuiltinPrimitive {
     StringEndsWith,
     StringIndexOf,
     StringLastIndexOf,
+    StringPadStart,
+    StringPadEnd,
+    StringSplit,
+    StringRepeat,
+    StringReplace,
+    StringReplaceAll,
     StringSlice,
     StringSubstring,
     StringTrim,
@@ -410,6 +416,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("!=", MethodKind::Method, 1, BuiltinPrimitive::StringNe),
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::StringSubscript),
         ("contains", MethodKind::Method, 1, BuiltinPrimitive::StringContains),
+        ("includes", MethodKind::Method, 1, BuiltinPrimitive::StringContains),
         ("startsWith", MethodKind::Method, 1, BuiltinPrimitive::StringStartsWith),
         ("startsWith", MethodKind::Method, 2, BuiltinPrimitive::StringStartsWith),
         ("endsWith", MethodKind::Method, 1, BuiltinPrimitive::StringEndsWith),
@@ -418,6 +425,16 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("indexOf", MethodKind::Method, 2, BuiltinPrimitive::StringIndexOf),
         ("lastIndexOf", MethodKind::Method, 1, BuiltinPrimitive::StringLastIndexOf),
         ("lastIndexOf", MethodKind::Method, 2, BuiltinPrimitive::StringLastIndexOf),
+        ("padStart", MethodKind::Method, 1, BuiltinPrimitive::StringPadStart),
+        ("padStart", MethodKind::Method, 2, BuiltinPrimitive::StringPadStart),
+        ("padEnd", MethodKind::Method, 1, BuiltinPrimitive::StringPadEnd),
+        ("padEnd", MethodKind::Method, 2, BuiltinPrimitive::StringPadEnd),
+        ("split", MethodKind::Method, 0, BuiltinPrimitive::StringSplit),
+        ("split", MethodKind::Method, 1, BuiltinPrimitive::StringSplit),
+        ("split", MethodKind::Method, 2, BuiltinPrimitive::StringSplit),
+        ("repeat", MethodKind::Method, 1, BuiltinPrimitive::StringRepeat),
+        ("replace", MethodKind::Method, 2, BuiltinPrimitive::StringReplace),
+        ("replaceAll", MethodKind::Method, 2, BuiltinPrimitive::StringReplaceAll),
         ("slice", MethodKind::Method, 1, BuiltinPrimitive::StringSlice),
         ("slice", MethodKind::Method, 2, BuiltinPrimitive::StringSlice),
         ("substring", MethodKind::Method, 1, BuiltinPrimitive::StringSubstring),
@@ -1144,6 +1161,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, system, "os", MethodKind::Method, 0, NativeBuiltin::SystemOs);
     manifest.register_native(program, system, "arch", MethodKind::Method, 0, NativeBuiltin::SystemArch);
     manifest.register_native(program, system, "gc", MethodKind::Method, 0, NativeBuiltin::SystemGc);
+    manifest.register_native(program, system, "__implements", MethodKind::Method, 3, NativeBuiltin::SystemImplements);
+    manifest.register_native(program, system, "__inherits", MethodKind::Method, 2, NativeBuiltin::SystemInherits);
+    manifest.register_native(program, system, "__typeof", MethodKind::Method, 1, NativeBuiltin::SystemTypeOf);
 
     // Date follows the JavaScript model: one heap object stores one TimeClip'd
     // millisecond value. Constructor/static overloads are represented by distinct
@@ -1477,6 +1497,7 @@ impl Host for BuiltinHost {
         match (self.manifest.implementation(primitive), name, arity) {
             (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
             (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
+            (Some(ListSubscriptSet), "[]=", 2) => Some(TraceListMethod::SubscriptSet),
             _ => None,
         }
     }
@@ -2145,15 +2166,22 @@ fn string_last_index_of_chars(haystack: &str, needle: &str, position: usize) -> 
     if needle.is_empty() {
         return Some(position);
     }
-    let mut found = None;
-    for (byte, _) in haystack.match_indices(needle) {
-        let index = haystack[..byte].chars().count();
-        if index > position {
-            break;
-        }
-        found = Some(index);
+    // Limit the match's end, not the searched prefix's start. Forward
+    // match_indices skips overlaps ("aaa".lastIndexOf("aa") must be 1).
+    let start_byte = string_char_to_byte(haystack, position);
+    let mut end = start_byte.saturating_add(needle.len()).min(haystack.len());
+    while !haystack.is_char_boundary(end) {
+        end -= 1;
     }
-    found
+    haystack[..end].rfind(needle).map(|byte| haystack[..byte].chars().count())
+}
+
+fn string_buffer(byte_len: Option<usize>) -> Result<String, RuntimeError> {
+    let byte_len = byte_len.ok_or_else(|| RuntimeError::new("resulting String is too large"))?;
+    let mut output = String::new();
+    output.try_reserve_exact(byte_len)
+        .map_err(|_| RuntimeError::new("resulting String is too large"))?;
+    Ok(output)
 }
 
 /// Resolve the containing List or Map, leaving the final subscript for the
@@ -2462,6 +2490,111 @@ fn execute_primitive(
                 string_last_index_of_chars(haystack, needle, position).map_or(-1.0, |index| index as f64)
             ))
         }
+        StringPadStart | StringPadEnd => {
+            let target = integer(argument(args, 0)?, "target length")?.max(0) as usize;
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let padding = if args.len() > 2 {
+                context.string_utf8(argument(args, 1)?)
+                    .ok_or_else(|| RuntimeError::new("padding must be a valid UTF-8 String"))?
+            } else {
+                " "
+            };
+            let needed = target.saturating_sub(string_char_len(text));
+            if needed == 0 || padding.is_empty() {
+                return Ok(this);
+            }
+            let padding_len = string_char_len(padding);
+            let copies = needed / padding_len;
+            let tail = &padding[..string_char_to_byte(padding, needed % padding_len)];
+            let mut output = string_buffer(padding.len().checked_mul(copies)
+                .and_then(|bytes| bytes.checked_add(tail.len()))
+                .and_then(|bytes| bytes.checked_add(text.len())))?;
+            if matches!(op, StringPadEnd) {
+                output.push_str(text);
+            }
+            for _ in 0..copies {
+                output.push_str(padding);
+            }
+            output.push_str(tail);
+            if matches!(op, StringPadStart) {
+                output.push_str(text);
+            }
+            Ok(context.allocate_string(output))
+        }
+        StringRepeat => {
+            let count = integer(argument(args, 0)?, "repeat count")?;
+            if count < 0 {
+                return Err(RuntimeError::new("repeat count must be non-negative"));
+            }
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let mut output = string_buffer(text.len().checked_mul(count as usize))?;
+            if !text.is_empty() {
+                for _ in 0..count {
+                    output.push_str(text);
+                }
+            }
+            Ok(context.allocate_string(output))
+        }
+        StringSplit => {
+            let limit = if args.len() > 2 {
+                let limit = integer(argument(args, 1)?, "split limit")?;
+                if limit < 0 {
+                    return Err(RuntimeError::new("split limit must be non-negative"));
+                }
+                limit as usize
+            } else {
+                usize::MAX
+            };
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let parts: Vec<String> = if args.len() == 1 {
+                vec![text.to_owned()]
+            } else {
+                let separator = context.string_utf8(argument(args, 0)?)
+                    .ok_or_else(|| RuntimeError::new("separator must be a valid UTF-8 String"))?;
+                if separator.is_empty() {
+                    text.chars().take(limit).map(|ch| ch.to_string()).collect()
+                } else {
+                    text.split(separator).take(limit).map(str::to_owned).collect()
+                }
+            };
+            // Own the text before managed allocations and keep each new String
+            // rooted until the returned List owns all the parts.
+            let mut roots = Vec::with_capacity(parts.len());
+            let mut values = Vec::with_capacity(parts.len());
+            for part in parts {
+                let value = context.allocate_string(part);
+                roots.push(context.root(value));
+                values.push(value);
+            }
+            Ok(context.allocate_list(values))
+        }
+        StringReplace | StringReplaceAll => {
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let search = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("search must be a valid UTF-8 String"))?;
+            let replacement = context.string_utf8(argument(args, 1)?)
+                .ok_or_else(|| RuntimeError::new("replacement must be a valid UTF-8 String"))?;
+            let limit = if matches!(op, StringReplace) { 1 } else { usize::MAX };
+            let count = text.match_indices(search).take(limit).count();
+            if count == 0 {
+                return Ok(this);
+            }
+            let retained = text.len() - count * search.len();
+            let mut output = string_buffer(replacement.len().checked_mul(count)
+                .and_then(|bytes| bytes.checked_add(retained)))?;
+            let mut end = 0;
+            for (start, matched) in text.match_indices(search).take(limit) {
+                output.push_str(&text[end..start]);
+                output.push_str(replacement);
+                end = start + matched.len();
+            }
+            output.push_str(&text[end..]);
+            Ok(context.allocate_string(output))
+        }
         StringSlice => {
             let output = {
                 let text = context.string_utf8(this)
@@ -2703,7 +2836,7 @@ fn execute_primitive(
             )
         }
 
-        MapNew => Ok(context.allocate_map()),
+        MapNew => Ok(context.allocate_map_instance()),
         SetNew => Ok(context.allocate_set()),
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),
         MapContainsKey => Ok(Value::from_bool(context.map_contains_key(this, argument(args,0)?)?)),

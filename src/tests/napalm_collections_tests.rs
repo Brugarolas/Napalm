@@ -1,4 +1,19 @@
 #[test]
+fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
+    run_napalm(r#"
+        class Base { name = 'base'; }
+        class Child extends Base { value = 42; }
+        class Empty {}
+        class Custom extends Child { keys() { return ['custom']; } }
+        const item = new Child();
+        const entries = item.entries();
+        System.gc();
+        const result = [item.keys(), item.values(), entries, item.size,
+            new Empty().keys(), new Empty().size, new Custom().keys()];
+    "#, "[[name, value], [base, 42], [[name, base], [value, 42]], 2, [], 0, [custom]]");
+}
+
+#[test]
 fn napalm_collections_map_set_api() {
     run_napalm(r#"
         const m = new Map();

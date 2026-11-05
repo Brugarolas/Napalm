@@ -2,7 +2,7 @@ function work(fail) {
     var value = 1;
     defer System.print(["last cleanup", value]);
     errdefer System.print("Error detected");
-    errdefer (error) System.print(["failure cleanup", error]);
+    errdefer |error| System.print(["failure cleanup", error]);
     defer {
         System.print(["first cleanup", value]);
         value = value + 1;

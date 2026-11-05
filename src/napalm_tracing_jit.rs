@@ -268,6 +268,12 @@ pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
 pub const TRACE_HEAP_DATA_RELATIVE_BIT: usize = 1;
 pub const TRACE_HEAP_DATA_RELATIVE_MASK: usize = TRACE_HEAP_DATA_RELATIVE_BIT;
 
+/// Element-contract summary packed into a List's TraceHeapEntry::kind metadata
+/// bits: every contract on the list is `List<Num>`, so storing any Number is
+/// valid and native code may write without a runtime contract check. Lists
+/// without contracts (or with other element types) publish 0.
+pub const TRACE_LIST_ELEMENTS_NUMBER: u32 = 1;
+
 /// Promise state is packed into the high metadata bits of TraceHeapEntry::kind.
 pub const TRACE_PROMISE_PENDING: u32 = 1;
 pub const TRACE_PROMISE_FULFILLED: u32 = 2;
@@ -585,6 +591,10 @@ pub enum TraceListMethod {
     /// `list[i]` for an Int32 index in `0..len`; every other index (negative,
     /// out of range, fractional, Range, nested) replays the original Invoke.
     Subscript,
+    /// `list[i] = value` for an Int32 index in `0..len` on a List with no
+    /// contract or a numbers-only (`number[]`) contract with a Number value.
+    /// Growth, other indices and other contracts replay the original Invoke.
+    SubscriptSet,
 }
 
 /// Stock Map subscript methods whose existing-key fast path a trace replays
@@ -682,6 +692,11 @@ pub trait TraceRuntime {
     /// function index before reusing this recording-time observation.
     fn trace_closure_target(&self, _closure: RegisterWord) -> Option<FuncId> { None }
 
+    /// Observe capture `index` of a closure while recording. Generated code must
+    /// still read (and guard) the capture itself; this only lets the inliner
+    /// resolve nested calls on captured closures/objects.
+    fn trace_closure_capture_word(&self, _closure: RegisterWord, _index: u16) -> Option<RegisterWord> { None }
+
     /// Resolve an ordinary Invoke site to closure-call semantics only when the
     /// observed receiver is a Closure and the descriptor currently resolves to
     /// the VM's standard Fn.call builtin. Generated code must additionally guard
@@ -708,6 +723,11 @@ pub trait TraceRuntime {
 
     /// Guaranteed source type of one fixed instance slot for the observed object.
     fn trace_field_type(&self, _object: RegisterWord, _slot: u32) -> Option<Type> { None }
+
+    /// Whether writes to this slot must be checked against per-instance
+    /// generic arguments (a field typed with a class type parameter). Such
+    /// stores stay runtime calls instead of native fast paths.
+    fn trace_field_is_generic(&self, _object: RegisterWord, _slot: u32) -> bool { false }
 
     /// Stable address of the module-global slot referenced by this bytecode.
     /// Module variable arrays are fixed-size for the lifetime of an interpreter.
@@ -803,6 +823,10 @@ pub trait TraceRuntime {
     /// Observe a Map/key pair without mutating VM state. Returning Some allows
     /// the recorder to specialize this site to shape+slot native code.
     fn trace_has_contract(&self, _value: RegisterWord) -> bool { false }
+
+    /// Whether every contract on this List is `List<Num>` (`number[]`), i.e. it
+    /// publishes `TRACE_LIST_ELEMENTS_NUMBER` and accepts any Number natively.
+    fn trace_list_numeric(&self, _value: RegisterWord) -> bool { false }
 
     fn trace_shaped_map_access(
         &self,
@@ -966,9 +990,47 @@ pub struct TracingJitOptions {
     /// trace loops it tends to pack independent loop-carried chains into one
     /// vector op, coupling a cheap induction to a long latency chain.
     pub llvm_slp_vectorize: bool,
+    /// Feed the instrumented Cranelift tier's profile (entry counts, loop trip
+    /// counts, per-exit frequencies) to LLVM as PGO metadata (`NAPALM_LLVM_PGO=0`
+    /// disables it).
+    pub llvm_pgo: bool,
+    /// Compile a hot trace together with every trace it reaches through
+    /// stitched native links (its trace-tree region) as one LLVM function, so
+    /// links become direct branches (`NAPALM_LLVM_REGIONS=0` disables it).
+    pub llvm_trace_regions: bool,
     /// Print the generated and the optimized LLVM IR.
     pub llvm_dump_ir: bool,
 }
+
+/// LLVM pass pipeline tuned for traces. A trace is one call-free function whose
+/// body is already optimized Trace IR, so the module/CGSCC half of `default<O3>`
+/// (inliner, IPO, global passes) is pure compile time. This function pipeline
+/// keeps every O3 function and loop transform that matters for traces and adds
+/// trace-specific extras: aggressive LICM with speculation (loads from the
+/// dereferenceable activation and invariant VM bindings), non-trivial loop
+/// unswitching, loop distribution and runtime unrolling, plus a second
+/// GVN/InstCombine/SimplifyCFG round after vectorization. Measured: equal or
+/// better code than `default<O3>` at ~13% less compile time.
+///
+/// Textual `instcombine` verifies that it reached a fixpoint and otherwise
+/// calls `report_fatal_error`, aborting the whole process (seen on a trace-tree
+/// region). LLVM's own `default<On>` pipelines never verify; neither do we.
+pub const NAPALM_TRACE_PIPELINE: &str = concat!(
+    "function(",
+    "sroa<modify-cfg>,early-cse<memssa>,instcombine<no-verify-fixpoint>,simplifycfg,",
+    "correlated-propagation,jump-threading,instcombine<no-verify-fixpoint>,reassociate,",
+    "loop-simplify,lcssa,",
+    "loop-mssa(loop-rotate<header-duplication>,licm<allowspeculation>,simple-loop-unswitch<nontrivial>),",
+    "indvars,loop-deletion,loop-unroll-full,sroa,gvn,sccp,bdce,instcombine<no-verify-fixpoint>,",
+    "jump-threading,correlated-propagation,adce,memcpyopt,dse,",
+    "loop-mssa(licm<allowspeculation>),",
+    "simplifycfg<hoist-common-insts;sink-common-insts;speculate-blocks>,instcombine<no-verify-fixpoint>,",
+    "loop-simplify,lcssa,loop-rotate,loop-distribute,loop-vectorize,loop-load-elim,",
+    "instcombine<no-verify-fixpoint>,simplifycfg,loop-unroll<O3;runtime>,instcombine<no-verify-fixpoint>,",
+    "loop-mssa(licm<allowspeculation>),alignment-from-assumptions,loop-sink,",
+    "instsimplify,div-rem-pairs,simplifycfg",
+    ")"
+);
 
 impl TracingJitOptions {
     /// Env overrides for the LLVM tier: `NAPALM_NO_LLVM`, `NAPALM_LLVM_THRESHOLD=<n>`,
@@ -1012,8 +1074,10 @@ impl Default for TracingJitOptions {
             llvm_hot_threshold: Self::default_llvm_hot_threshold(),
             llvm_background_compile: std::env::var_os("NAPALM_LLVM_SYNC").is_none(),
             llvm_pass_pipeline: std::env::var("NAPALM_LLVM_PASSES")
-                .unwrap_or_else(|_| "default<O3>".to_owned()),
+                .unwrap_or_else(|_| NAPALM_TRACE_PIPELINE.to_owned()),
             llvm_slp_vectorize: std::env::var_os("NAPALM_LLVM_SLP").is_some(),
+            llvm_pgo: std::env::var("NAPALM_LLVM_PGO").ok().as_deref() != Some("0"),
+            llvm_trace_regions: std::env::var("NAPALM_LLVM_REGIONS").ok().as_deref() != Some("0"),
             llvm_dump_ir: std::env::var_os("NAPALM_LLVM_DUMP").is_some(),
         }
     }
@@ -1087,6 +1151,10 @@ pub struct TracingJitStats {
     pub llvm_traces_requested: u64,
     /// LLVM entries installed over their Cranelift code.
     pub llvm_traces_installed: u64,
+    /// Of those, trace-tree regions (one function for several linked traces).
+    pub llvm_regions_installed: u64,
+    /// Traces compiled into installed regions, heads included.
+    pub llvm_region_members: u64,
     /// LLVM lowering/compilation failures (the Cranelift code stays in use).
     pub llvm_failures: u64,
     /// Total LLVM optimization + code generation time.
@@ -2017,7 +2085,12 @@ impl<'a> TraceRecorder<'a> {
             exit,
         });
         let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
-        let key = builder.constant(TraceConstant::String(signature.name));
+        // Interned strings are stable heap words; a raw String constant cannot
+        // be lowered by the native backends.
+        let key_word = runtime
+            .trace_materialize_constant(TraceConstant::String(signature.name))
+            .map_err(|_| RecordingAbort::UnsupportedConstant)?;
+        let key = builder.constant(TraceConstant::StableTagged(key_word.0));
         let field_type = access.read_type.clone().unwrap_or(Type::Top);
         let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
         let result = builder.emit1(
@@ -2059,6 +2132,7 @@ impl<'a> TraceRecorder<'a> {
         let arity = match method {
             TraceListMethod::Length => 0,
             TraceListMethod::Subscript => 1,
+            TraceListMethod::SubscriptSet => 2,
         };
         if op.c as usize != arity || op.args.len() != arity {
             return Ok(false);
@@ -2070,7 +2144,25 @@ impl<'a> TraceRecorder<'a> {
         let Some(length) = runtime.trace_list_len(receiver_word) else {
             return Ok(false);
         };
-        if method == TraceListMethod::Subscript {
+        // Stores need a contract-free List or a `number[]` receiving a Number.
+        let numeric_store = if method == TraceListMethod::SubscriptSet {
+            if !runtime.trace_has_contract(receiver_word) {
+                false
+            } else if runtime.trace_list_numeric(receiver_word) {
+                let value_word = runtime
+                    .trace_read_slot(FrameSlot::General(op.args[1]))
+                    .map_err(|_| RecordingAbort::UnsupportedCall)?;
+                if word_num(value_word).is_none() {
+                    return Ok(false);
+                }
+                true
+            } else {
+                return Ok(false);
+            }
+        } else {
+            false
+        };
+        if matches!(method, TraceListMethod::Subscript | TraceListMethod::SubscriptSet) {
             let index_word = runtime
                 .trace_read_slot(FrameSlot::General(op.args[0]))
                 .map_err(|_| RecordingAbort::UnsupportedCall)?;
@@ -2124,6 +2216,33 @@ impl<'a> TraceRecorder<'a> {
                     builder.set_proven_type(element, element_type);
                 }
                 element
+            }
+            TraceListMethod::SubscriptSet => {
+                let index = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let index = builder.emit1(
+                    TraceInst::GuardInt32 { value: index, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit0(TraceInst::GuardBounds { index, length, exit });
+                let value = self.read_gpr(builder, op.args[1].0, TraceType::Any, TraceRep::Tagged)?;
+                let value = if numeric_store {
+                    // Guards replay the Invoke, which reports any violation.
+                    let Some(value) = self.guard_store_value(builder, value, &Type::Num, op.location.pc) else {
+                        return Err(RecordingAbort::UnsupportedCall);
+                    };
+                    value
+                } else {
+                    value
+                };
+                builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: numeric_store });
+                // `list[i] = value` evaluates to the stored value.
+                value
             }
         };
         self.write_gpr(builder, op.a, result);
@@ -2540,11 +2659,17 @@ impl<'a> TraceRecorder<'a> {
                 match self.inline_closure_call(runtime, program, op, builder) {
                     Ok(step) => return Ok(step),
                     Err(
-                        RecordingAbort::UnsupportedCall
+                        reason @ (RecordingAbort::UnsupportedCall
                         | RecordingAbort::UnsupportedOpcode(_)
                         | RecordingAbort::UnsupportedConstant
-                        | RecordingAbort::RepresentationConflict,
+                        | RecordingAbort::RepresentationConflict),
                     ) => {
+                        if jit_events_enabled() {
+                            eprintln!(
+                                "[napalm-jit] closure inline at {:?}:{} rejected: {reason}",
+                                op.location.function, op.location.pc.0
+                            );
+                        }
                         *builder = inline_checkpoint;
                     }
                     Err(error) => return Err(error),
@@ -4478,6 +4603,9 @@ impl<'a> TraceRecorder<'a> {
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
                 let slot = runtime.trace_field_slot(op.location, op.x);
+                if runtime.trace_field_is_generic(object_word, slot) {
+                    return self.runtime_leaf(op, builder, &[]);
+                }
                 let expected = runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top);
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
@@ -4547,7 +4675,22 @@ impl<'a> TraceRecorder<'a> {
                 let owner = runtime.trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
                 if runtime.trace_has_contract(owner) {
-                    return self.runtime_gc_leaf(op, builder, &[]);
+                    // `number[]`: the only possible contract violation is a
+                    // non-Number value, which a cheap guard rules out. Any other
+                    // element contract keeps the checked runtime path.
+                    if !runtime.trace_list_numeric(owner) {
+                        return self.runtime_gc_leaf(op, builder, &[]);
+                    }
+                    let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                    let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
+                    let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                    let Some(value) = self.guard_store_value(builder, value, &Type::Num, op.location.pc) else {
+                        return self.runtime_gc_leaf(op, builder, &[]);
+                    };
+                    let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                    let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                    builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: true });
+                    return Ok(ExpectedStep::Exact(next));
                 }
                 let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
@@ -4555,7 +4698,7 @@ impl<'a> TraceRecorder<'a> {
                 let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
                 let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
                 builder.emit0(TraceInst::GuardNoContract { value: list, kind: TraceHeapObjectKind::List, exit });
-                builder.emit0(TraceInst::HeapListSet { list, index, value, exit });
+                builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: false });
                 Ok(ExpectedStep::Exact(next))
             }
 
@@ -5575,7 +5718,7 @@ impl<'a> TraceRecorder<'a> {
             let Some(final_value) = builder.slot_value(slot) else {
                 continue;
             };
-            let mut final_value = builder.trace().canonical_value(final_value);
+            let final_value = builder.trace().canonical_value(final_value);
             let initial_canonical = builder.trace().canonical_value(initial);
             if final_value == initial_canonical {
                 continue;
@@ -5866,12 +6009,19 @@ impl<'a> TraceRecorder<'a> {
                 {
                     return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
                 }
-                for _ in 0..if completed { 0 } else { callee_steps } {
-                    if !step.running || runtime.trace_current_location().function != callee {
+                // Run the inlined call tree until it returns to the caller's
+                // continuation. Nested frames may be entered and left; a nested
+                // callee owned by the whole-function tier completes in a single
+                // step, so `callee_steps` is an upper bound, not an exact count.
+                // (Inlined targets never include the caller's own function.)
+                let mut budget = if completed { 0 } else { callee_steps };
+                while !(step.running && step.after == next && runtime.trace_current_location() == next) {
+                    if budget == 0 || !step.running {
                         return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
                     }
                     step = runtime.trace_execute_unfused_step()
                         .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+                    budget -= 1;
                 }
                 if !step.running || step.after != next {
                     return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
@@ -6248,6 +6398,9 @@ pub enum VmBindingKind {
     DenseSlot,
     FieldSlot,
     PreparedFunctionIndex,
+    /// Address of this trace's worker-local profile counters (see
+    /// `CompiledTrace::profile`). Always the last binding slot.
+    ProfileCounters,
 }
 
 /// Cross-worker meaning of one VM-local relocation slot. Unlike `VmBindingKey`,
@@ -6265,6 +6418,8 @@ pub enum VmBindingDescriptor {
     DenseSlot(u32),
     FieldSlot(u32),
     PreparedFunction(FuncId),
+    /// Worker-local profile counter array, allocated by each instantiation.
+    ProfileCounters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -6315,6 +6470,55 @@ struct CompiledTrace {
     /// loop iterations reported by side exits. Drives the LLVM tier.
     tier_visits: u64,
     llvm: LlvmTierState,
+    /// LLVM code (single or region) has been installed for this trace once, so
+    /// a failed recompilation leaves working LLVM code behind.
+    llvm_has_code: bool,
+    /// A region headed by this trace failed to compile: compile it alone, and
+    /// never pull it into another region.
+    llvm_region_failed: bool,
+    /// Worker-local profile written by the instrumented (Cranelift) code:
+    /// `[entries, completed native iterations, exit 0 hits, exit 1 hits, ...]`.
+    /// Exit hits include natively linked exits that never reach the manager.
+    /// The LLVM tier turns it into PGO metadata. The boxed array never moves;
+    /// its address lives in the trace's VM-binding table.
+    profile: Box<[AtomicU64]>,
+}
+
+const PROFILE_ENTRIES: usize = 0;
+const PROFILE_ITERATIONS: usize = 1;
+const PROFILE_EXIT_BASE: usize = 2;
+
+/// Allocate a trace's profile counters and patch their address into its
+/// worker-local VM-binding table (`VmBindingKind::ProfileCounters` slot).
+fn install_profile_counters(
+    vm_bindings: &mut [u64],
+    keys: &[VmBindingKey],
+    exit_count: usize,
+) -> Box<[AtomicU64]> {
+    let profile: Box<[AtomicU64]> = (0..PROFILE_EXIT_BASE + exit_count).map(|_| AtomicU64::new(0)).collect();
+    if let Some(slot) = keys.iter().position(|key| key.kind == VmBindingKind::ProfileCounters) {
+        vm_bindings[slot] = profile.as_ptr() as u64;
+    }
+    profile
+}
+
+/// Snapshot of one trace profile, as consumed by the LLVM tier.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TraceProfile {
+    pub(crate) entries: u64,
+    pub(crate) iterations: u64,
+    pub(crate) exit_hits: Vec<u64>,
+}
+
+impl CompiledTrace {
+    fn profile_snapshot(&self) -> TraceProfile {
+        let read = |index: usize| self.profile.get(index).map_or(0, |counter| counter.load(Ordering::Relaxed));
+        TraceProfile {
+            entries: read(PROFILE_ENTRIES),
+            iterations: read(PROFILE_ITERATIONS),
+            exit_hits: (0..self.exits.len()).map(|exit| read(PROFILE_EXIT_BASE + exit)).collect(),
+        }
+    }
 }
 
 /// LLVM tier state of one installed trace.
@@ -6560,6 +6764,15 @@ impl CraneliftBackend {
                 offset_of!(TraceActivation, vm_bindings) as i32,
             );
 
+            // An LLVM trace-tree region follows its internal links itself and
+            // spends the same link budget, so the budget lives in the
+            // activation across the call.
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                remaining,
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
             // Pass the per-trace link table in SSA instead of storing it into
             // TraceActivation only for the callee to reload it on a side exit.
             let call = builder.ins().call_indirect(
@@ -6568,6 +6781,12 @@ impl CraneliftBackend {
                 &[activation, current_links],
             );
             let result = builder.inst_results(call)[0];
+            let remaining = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
             let linked = builder.ins().icmp_imm(
                 IntCC::Equal,
                 result,
@@ -6908,6 +7127,9 @@ fn collect_vm_bindings(
             _ => {}
         }
     }
+    // Last slot: placeholder for the worker-local profile counter address,
+    // patched by `install_profile_counters` once the counters exist.
+    add(VmBindingKind::ProfileCounters, 0);
 
     drop(add);
     (words.into_boxed_slice(), keys.into_boxed_slice(), slots)
@@ -6955,7 +7177,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
     fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
         let dispatcher = backend.dispatcher;
-        let (vm_bindings, vm_binding_keys, vm_binding_slots) = collect_vm_bindings(self.trace);
+        let (mut vm_bindings, vm_binding_keys, vm_binding_slots) = collect_vm_bindings(self.trace);
+        let profile = install_profile_counters(&mut vm_bindings, &vm_binding_keys, self.exit_plans.len());
         let CraneliftBackend { module, context, function_context, scalar_helpers, .. } = backend;
         let arena = bumpalo::Bump::new();
         context.clear();
@@ -7051,6 +7274,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
             };
 
             state.preload_invocation_invariants();
+            // Instrumented tier: count native entries for the LLVM tier's PGO.
+            let one = state.builder.ins().iconst(types::I64, 1);
+            state.profile_add(PROFILE_ENTRIES, one);
 
             // Entry loads/constants are invariant unless represented by a LoopPhi.
             // Walk by index so lowering does not require a temporary Vec<TraceValueId>.
@@ -7320,6 +7546,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
             debug_text: disassembly.or(clif_text),
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
+            llvm_has_code: false,
+            llvm_region_failed: false,
+            profile,
         })
     }
 }
@@ -7468,6 +7697,31 @@ impl CraneliftLoweringState<'_, '_> {
         );
         self.heap_chunks_base = Some(value);
         value
+    }
+
+    /// `profile[index] += amount` (i64) in this trace's worker-local counters.
+    /// The counter address is a preloaded VM binding, so this is valid in any
+    /// block. Plain (non-atomic) updates: the counters belong to one worker.
+    fn profile_add(&mut self, index: usize, amount: Value) {
+        if !self
+            .vm_binding_slots
+            .contains_key(&VmBindingKey::new(VmBindingKind::ProfileCounters, 0))
+        {
+            return;
+        }
+        let Ok(base) = self.vm_binding_word(VmBindingKind::ProfileCounters, 0) else { return; };
+        let offset = (index * std::mem::size_of::<u64>()) as i32;
+        let current = self.builder.ins().load(types::I64, Self::trusted_mem(), base, offset);
+        let next = self.builder.ins().iadd(current, amount);
+        self.builder.ins().store(Self::trusted_mem(), next, base, offset);
+    }
+
+    /// Count one taken exit plus the native iterations completed before it.
+    fn profile_exit(&mut self, exit: SideExitId, completed: Value) {
+        let completed = self.builder.ins().uextend(types::I64, completed);
+        self.profile_add(PROFILE_ITERATIONS, completed);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        self.profile_add(PROFILE_EXIT_BASE + exit.0 as usize, one);
     }
 
     /// Define every per-invocation cached value in the entry block. These caches
@@ -8120,6 +8374,7 @@ impl CraneliftLoweringState<'_, '_> {
             self.activation,
             offset_of!(TraceActivation, native_iterations) as i32,
         );
+        self.profile_exit(plan.id, completed);
 
         for write in &plan.writes {
             let word = match write.source {
@@ -8180,6 +8435,7 @@ impl CraneliftLoweringState<'_, '_> {
             self.activation,
             offset_of!(TraceActivation, native_iterations) as i32,
         );
+        self.profile_exit(plan.id, completed);
 
         // Dynamic snapshot values are already available in native SSA. Commit
         // them directly to the architectural register banks on the cold exit path
@@ -8481,6 +8737,18 @@ impl CraneliftLoweringState<'_, '_> {
         let contract = self.builder.ins().load(types::I32, Self::trusted_mem(), entry,
             offset_of!(TraceHeapEntry, has_contract) as i32);
         let invalid = self.builder.ins().icmp_imm(IntCC::NotEqual, contract, 0);
+        self.emit_side_exit(exit, invalid)
+    }
+
+    /// The List's contracts are all `List<Num>` (see TRACE_LIST_ELEMENTS_NUMBER).
+    /// Read uncached: installing a contract republishes the metadata.
+    fn guard_numeric_list_store(&mut self, entry: Value, exit: SideExitId) -> Result<(), TracingJitError> {
+        let metadata = self.heap_entry_metadata(entry, false);
+        let payload = self.heap_metadata_payload(metadata);
+        let invalid = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, payload, TRACE_LIST_ELEMENTS_NUMBER as i64);
         self.emit_side_exit(exit, invalid)
     }
 
@@ -10013,11 +10281,15 @@ impl CraneliftLoweringState<'_, '_> {
                 self.guard_uncontracted_store(entry, *exit)?;
             }
 
-            HeapListSet { list, index, value, exit } => {
+            HeapListSet { list, index, value, exit, numeric } => {
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
                     self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                self.guard_uncontracted_store(entry, *exit)?;
+                if *numeric {
+                    self.guard_numeric_list_store(entry, *exit)?;
+                } else {
+                    self.guard_uncontracted_store(entry, *exit)?;
+                }
                 let index = self.validated_list_index(*list, *index, entry, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let address = self.heap_element_address(data, index);
@@ -10845,6 +11117,12 @@ pub struct TracingJit {
     /// The service could not start (no usable LLVM); stop trying.
     llvm_unavailable: bool,
     llvm_next_ticket: u64,
+    /// Members of the last region requested for each head trace.
+    llvm_regions: HashMap<TraceId, Vec<TraceId>>,
+    /// `(child, head)`: `child` was stitched to a member of `head`'s region
+    /// after that region was compiled; once `child` is hot the region is
+    /// recompiled with it.
+    llvm_region_watch: Vec<(TraceId, TraceId)>,
 }
 
 impl Default for TracingJit {
@@ -10863,6 +11141,14 @@ fn jit_events_enabled() -> bool {
 fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
     use crate::napalm_trace_ir::TraceInst;
     eprintln!("[napalm-jit] trace {:?} anchor {:?}", trace.id, trace.anchor);
+    for value in &trace.values {
+        if matches!(
+            value.origin,
+            TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::GuardedEntry { .. } | TraceValueOrigin::Alias(_)
+        ) {
+            eprintln!("  value {:?} {:?} {:?} {:?}", value.id, value.origin, value.ty, value.rep);
+        }
+    }
     for phi in &trace.loop_phis {
         let ty = trace.value(phi.value).map(|value| (value.ty, value.rep));
         eprintln!("  phi {:?} {:?}", phi, ty);
@@ -10882,6 +11168,20 @@ fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
                 .map(|&value| (value, trace.value(value).map(|value| (value.ty, value.rep))))
                 .collect();
             eprintln!("  {label} #{id} {:?} -> {:?}", node.kind, results);
+        }
+    }
+    eprintln!("  terminator {:?}", trace.terminator);
+    if let crate::napalm_trace_ir::TraceTerminator::Exit(exit) = trace.terminator {
+        if let Some(exit) = trace.exits.get(exit.0 as usize) {
+            for frame in &exit.frames {
+                for write in &frame.writes {
+                    let rep = match write.value {
+                        SnapshotValue::Value(value) => trace.value(trace.canonical_value(value)).map(|value| value.rep),
+                        SnapshotValue::Constant(_) => None,
+                    };
+                    eprintln!("  exit write {:?} <- {:?} (source rep {:?}, target {:?})", write.slot, write.value, rep, write.target_rep);
+                }
+            }
         }
     }
 }
@@ -10934,6 +11234,8 @@ impl TracingJit {
             llvm_service: None,
             llvm_unavailable: false,
             llvm_next_ticket: 1,
+            llvm_regions: HashMap::default(),
+            llvm_region_watch: Vec::new(),
         }
     }
 
@@ -11055,16 +11357,26 @@ impl TracingJit {
     // -------------------------------------------------------------------------
 
     /// Account native visits of `id`. Once a trace reaches `llvm_hot_threshold`,
-    /// its whole trace tree (root plus stitched side traces, which execute as one
-    /// unit through native links) is queued for LLVM recompilation.
+    /// it is queued for LLVM recompilation together with every trace it reaches
+    /// through stitched native links (its trace-tree region, which executes as
+    /// one unit), as a single LLVM function. Without regions the whole tree is
+    /// queued trace by trace.
     fn note_native_visits(&mut self, id: TraceId, visits: u64) {
         let threshold = self.options.llvm_hot_threshold;
         if threshold == 0 || self.llvm_unavailable {
             return;
         }
+        if !self.llvm_region_watch.is_empty() {
+            self.poll_llvm_region_watch();
+        }
+        let regions = self.options.llvm_trace_regions;
         let Some(compiled) = self.compiled_mut(id) else { return; };
         compiled.tier_visits = compiled.tier_visits.saturating_add(visits);
         if compiled.llvm != LlvmTierState::Cold || compiled.tier_visits < threshold as u64 {
+            return;
+        }
+        if regions {
+            self.request_llvm(id);
             return;
         }
         let root = compiled.root_trace;
@@ -11087,6 +11399,72 @@ impl TracingJit {
         }
     }
 
+    /// The trace-tree region headed by `head`: `head` first, then, breadth
+    /// first, every trace reachable through exits that are already stitched
+    /// natively. Bounded in members and Trace IR nodes (compile time).
+    fn llvm_region_members(&self, head: TraceId) -> Vec<TraceId> {
+        const MAX_REGION_MEMBERS: usize = 16;
+        const MAX_REGION_NODES: usize = 8192;
+        let Some(compiled) = self.compiled(head) else { return vec![head]; };
+        let mut members = vec![head];
+        let mut nodes = compiled.trace.nodes.len();
+        let mut cursor = 0;
+        while cursor < members.len() {
+            let Some(compiled) = self.compiled(members[cursor]) else { break; };
+            cursor += 1;
+            for (index, plan) in compiled.exits.iter().enumerate() {
+                let ExitTarget::Trace(child) = plan.target else { continue; };
+                if !plan.native_linkable
+                    || compiled.native_links.get(index) != Some(&child.0)
+                    || members.contains(&child)
+                    || members.len() >= MAX_REGION_MEMBERS
+                {
+                    continue;
+                }
+                let Some(candidate) = self.compiled(child) else { continue; };
+                if candidate.llvm == LlvmTierState::Failed
+                    || candidate.llvm_region_failed
+                    || nodes + candidate.trace.nodes.len() > MAX_REGION_NODES
+                {
+                    continue;
+                }
+                nodes += candidate.trace.nodes.len();
+                members.push(child);
+            }
+        }
+        members
+    }
+
+    /// Recompile a region once a trace stitched to it after its compilation
+    /// is hot too (e.g. the side traces of a nested loop that appear late).
+    fn poll_llvm_region_watch(&mut self) {
+        let threshold = self.options.llvm_hot_threshold as u64;
+        let watch = std::mem::take(&mut self.llvm_region_watch);
+        let mut keep = Vec::with_capacity(watch.len());
+        let mut heads = Vec::new();
+        for (child, head) in watch {
+            let (Some(child_trace), Some(head_trace)) = (self.compiled(child), self.compiled(head)) else {
+                continue;
+            };
+            let included = self.llvm_regions.get(&head).is_some_and(|members| members.contains(&child));
+            if included || head_trace.llvm_region_failed || head_trace.llvm == LlvmTierState::Failed {
+                continue;
+            }
+            let entries = child_trace.profile.get(PROFILE_ENTRIES).map_or(0, |counter| counter.load(Ordering::Relaxed));
+            let hot = child_trace.llvm == LlvmTierState::Installed
+                || child_trace.tier_visits.saturating_add(entries) >= threshold;
+            if !hot || matches!(head_trace.llvm, LlvmTierState::Queued { .. }) {
+                keep.push((child, head));
+            } else if !heads.contains(&head) {
+                heads.push(head);
+            }
+        }
+        self.llvm_region_watch = keep;
+        for head in heads {
+            self.request_llvm(head);
+        }
+    }
+
     #[cfg(not(feature = "llvm-jit"))]
     fn request_llvm(&mut self, _id: TraceId) {}
 
@@ -11099,17 +11477,7 @@ impl TracingJit {
         options: &TracingJitOptions,
         ticket: u64,
     ) -> Result<llvm::LlvmJob, String> {
-        // LLVM code must address the relocation table already installed for this
-        // trace, slot for slot.
-        let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
-        if keys.len() != compiled.vm_binding_keys.len()
-            || keys
-                .iter()
-                .zip(compiled.vm_binding_keys.iter())
-                .any(|(lowered, installed)| lowered.kind != installed.kind)
-        {
-            return Err("VM-binding layout differs from the installed trace".to_owned());
-        }
+        let slots = Self::llvm_binding_slots(compiled)?;
         // Only data is cloned here; lowering, optimization and code generation
         // all run on the compiler workers.
         Ok(llvm::LlvmJob {
@@ -11120,9 +11488,40 @@ impl TracingJit {
             exits: compiled.exits.clone(),
             binding_slots: slots,
             native_budget: options.native_loop_iteration_budget,
+            profile: options.llvm_pgo.then(|| compiled.profile_snapshot()),
             pipeline: options.llvm_pass_pipeline.clone(),
             slp_vectorize: options.llvm_slp_vectorize,
             dump: options.llvm_dump_ir,
+            region: Vec::new(),
+        })
+    }
+
+    /// LLVM code must address the relocation table already installed for the
+    /// trace, slot for slot.
+    #[cfg(feature = "llvm-jit")]
+    fn llvm_binding_slots(compiled: &CompiledTrace) -> Result<HashMap<VmBindingKey, u32>, String> {
+        let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
+        if keys.len() != compiled.vm_binding_keys.len()
+            || keys
+                .iter()
+                .zip(compiled.vm_binding_keys.iter())
+                .any(|(lowered, installed)| lowered.kind != installed.kind)
+        {
+            return Err(format!("VM-binding layout of {:?} differs from the installed trace", compiled.trace.id));
+        }
+        Ok(slots)
+    }
+
+    #[cfg(feature = "llvm-jit")]
+    fn prepare_llvm_region_member(
+        compiled: &CompiledTrace,
+        options: &TracingJitOptions,
+    ) -> Result<llvm::region::RegionMemberJob, String> {
+        Ok(llvm::region::RegionMemberJob {
+            trace: compiled.trace.clone(),
+            exits: compiled.exits.clone(),
+            binding_slots: Self::llvm_binding_slots(compiled)?,
+            profile: options.llvm_pgo.then(|| compiled.profile_snapshot()),
         })
     }
 
@@ -11142,7 +11541,27 @@ impl TracingJit {
         let ticket = self.llvm_next_ticket;
         self.llvm_next_ticket = self.llvm_next_ticket.wrapping_add(1);
         let Some(compiled) = self.compiled(id) else { return; };
-        let job = Self::prepare_llvm_job(compiled, &self.options, ticket);
+        let members = if self.options.llvm_trace_regions && !compiled.llvm_region_failed {
+            self.llvm_region_members(id)
+        } else {
+            vec![id]
+        };
+        let mut job = Self::prepare_llvm_job(compiled, &self.options, ticket);
+        if members.len() > 1 {
+            job = job.and_then(|mut job| {
+                job.symbol = format!("napalm_region_{}_{}", id.0, ticket);
+                job.region = members
+                    .iter()
+                    .map(|&member| {
+                        let compiled = self
+                            .compiled(member)
+                            .ok_or_else(|| format!("region member {member:?} disappeared"))?;
+                        Self::prepare_llvm_region_member(compiled, &self.options)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(job)
+            });
+        }
         let job = job.and_then(|job| self.llvm_service.as_mut().unwrap().submit(job));
         let Some(compiled) = self.compiled_mut(id) else { return; };
         match job {
@@ -11150,14 +11569,25 @@ impl TracingJit {
                 compiled.llvm = LlvmTierState::Queued { ticket };
                 self.stats.llvm_traces_requested = self.stats.llvm_traces_requested.saturating_add(1);
                 if jit_events_enabled() {
-                    eprintln!("[napalm-jit] LLVM tier requested for {id:?}");
+                    if members.len() > 1 {
+                        eprintln!("[napalm-jit] LLVM region requested for {id:?}: {members:?}");
+                    } else {
+                        eprintln!("[napalm-jit] LLVM tier requested for {id:?}");
+                    }
+                }
+                // Single traces are recorded too: a side trace stitched to
+                // them later regrows them into a region.
+                if self.options.llvm_trace_regions && !self.compiled(id).is_some_and(|c| c.llvm_region_failed) {
+                    self.llvm_regions.insert(id, members);
                 }
                 if !self.options.llvm_background_compile {
                     self.wait_llvm(id, ticket);
                 }
             }
             Err(error) => {
-                compiled.llvm = LlvmTierState::Failed;
+                // A recompilation that cannot even be prepared keeps the code
+                // that is already installed.
+                compiled.llvm = if compiled.llvm_has_code { LlvmTierState::Installed } else { LlvmTierState::Failed };
                 self.record_llvm_failure(id, error);
             }
         }
@@ -11217,6 +11647,7 @@ impl TracingJit {
                 compiled.entry = unsafe { std::mem::transmute::<usize, NativeTraceFn>(code.address) };
                 compiled.code_ptr = code.address as *const u8;
                 compiled.llvm = LlvmTierState::Installed;
+                compiled.llvm_has_code = true;
                 if let Some(text) = code.optimized_ir {
                     compiled.debug_text = Some(text);
                 }
@@ -11225,11 +11656,30 @@ impl TracingJit {
                 }
                 self.stats.llvm_traces_installed = self.stats.llvm_traces_installed.saturating_add(1);
                 self.stats.llvm_compile_micros = self.stats.llvm_compile_micros.saturating_add(code.micros);
+                if done.region {
+                    let members = self.llvm_regions.get(&done.trace).map_or(0, Vec::len) as u64;
+                    self.stats.llvm_regions_installed = self.stats.llvm_regions_installed.saturating_add(1);
+                    self.stats.llvm_region_members = self.stats.llvm_region_members.saturating_add(members);
+                }
                 if jit_events_enabled() {
                     eprintln!(
-                        "[napalm-jit] LLVM tier installed for {:?} ({} us)",
-                        done.trace, code.micros
+                        "[napalm-jit] LLVM {} installed for {:?} ({} us)",
+                        if done.region { "region" } else { "tier" },
+                        done.trace,
+                        code.micros
                     );
+                }
+            }
+            Err(error) if done.region && !done.unavailable => {
+                // Never retry this region; compile the head alone unless it
+                // already runs LLVM code (a failed regrowth).
+                compiled.llvm_region_failed = true;
+                let had_code = compiled.llvm_has_code;
+                compiled.llvm = if had_code { LlvmTierState::Installed } else { LlvmTierState::Cold };
+                self.llvm_regions.remove(&done.trace);
+                self.record_llvm_failure(done.trace, error);
+                if !had_code {
+                    self.request_llvm(done.trace);
                 }
             }
             Err(error) => {
@@ -11276,6 +11726,7 @@ impl TracingJit {
                 // Shape IDs are allocated independently by each isolated heap.
                 // Sharing them requires a semantic shape schema, not a numeric ID.
                 VmBindingKind::ShapeId => return None,
+                VmBindingKind::ProfileCounters => VmBindingDescriptor::ProfileCounters,
                 VmBindingKind::MethodEpoch => VmBindingDescriptor::MethodEpoch(key.raw),
                 VmBindingKind::DenseSlot => VmBindingDescriptor::DenseSlot(key.raw as u32),
                 VmBindingKind::FieldSlot => VmBindingDescriptor::FieldSlot(key.raw as u32),
@@ -11307,6 +11758,8 @@ impl TracingJit {
                 }
                 VmBindingDescriptor::DenseSlot(slot) => *slot as u64,
                 VmBindingDescriptor::FieldSlot(slot) => *slot as u64,
+                // Patched with this worker's own counters by instantiate_shared_code.
+                VmBindingDescriptor::ProfileCounters => 0,
                 _ => runtime.trace_resolve_vm_binding(binding)?,
             };
             words.push(word);
@@ -11325,7 +11778,8 @@ impl TracingJit {
         if matches!(code.trace.anchor.kind, TraceKind::Side) {
             return None;
         }
-        let vm_bindings = self.rebind_shared_bindings(runtime, &code)?;
+        let mut vm_bindings = self.rebind_shared_bindings(runtime, &code)?;
+        let profile = install_profile_counters(&mut vm_bindings, &code.binding_keys, code.exits.len());
         let mut stable_tagged = HashMap::<u64, u64>::default();
         for (key, word) in code.binding_keys.iter().zip(vm_bindings.iter()) {
             if key.kind == VmBindingKind::StableTagged {
@@ -11390,6 +11844,9 @@ impl TracingJit {
             debug_text,
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
+            llvm_has_code: false,
+            llvm_region_failed: false,
+            profile,
         })
     }
 
@@ -12174,6 +12631,9 @@ impl TracingJit {
             .trace_pre_eliminated
             .saturating_add(trace.stats.pre_eliminated as u64);
 
+        if std::env::var_os("NAPALM_JIT_DUMP").is_some() {
+            dump_trace(&trace);
+        }
         let mut compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -12513,6 +12973,19 @@ impl TracingJit {
         if let Some(side_exit) = parent_trace.trace.exits.get_mut(exit_index) {
             side_exit.target = ExitTarget::Trace(child);
             side_exit.linked_trace = Some(child);
+        }
+
+        // A compiled region containing `parent` now reaches `child` only through
+        // the dispatcher; regrow it once `child` proves hot.
+        if native_linkable && self.options.llvm_trace_regions {
+            for (head, members) in &self.llvm_regions {
+                if members.contains(&parent)
+                    && !members.contains(&child)
+                    && !self.llvm_region_watch.contains(&(child, *head))
+                {
+                    self.llvm_region_watch.push((child, *head));
+                }
+            }
         }
 
         Ok(())
@@ -12999,8 +13472,15 @@ mod tests {
     fn trace_activation_stays_small() {
         // Side exits commit dynamic values directly to architectural register
         // banks. Reintroducing a large per-entry scratch buffer here would make
-        // short/nested loops pathologically expensive again.
-        assert!(std::mem::size_of::<TraceActivation>() <= 128);
+        // short/nested loops pathologically expensive again. The only intended
+        // array is the direct-call argument scratch; everything else is a small
+        // fixed header (bank pointers, dispatcher/link state, exit result).
+        let direct_call_scratch = std::mem::size_of::<[RegisterWord; MAX_NAPALM_ARITY]>();
+        assert!(
+            std::mem::size_of::<TraceActivation>() <= direct_call_scratch + 192,
+            "TraceActivation grew to {} bytes",
+            std::mem::size_of::<TraceActivation>()
+        );
     }
 
     #[test]

@@ -24,11 +24,22 @@
 //! guards and constant floating-point remainders are specialized in the lowering.
 //! Floating-point reassociation is never enabled implicitly: the runtime requires
 //! correct NaN, infinity and signed-zero behavior. FMA contraction is opt-in.
+//!
+//! Proven-memory optimization is deliberately split across tiers. LLVM can see
+//! bounded index facts, immutable closure captures, preheader-safe shape guards,
+//! and nonescaping stack slots. Full runtime calls remain memory-clobbering;
+//! the GC post-barrier can be marked disjoint from proven VM/JIT-owned buffers
+//! while retaining conservative effects on managed heap and collector metadata.
+//! WIR's partial escape analysis owns managed-object scalar replacement; Trace IR
+//! has no managed allocation opcode to scalar-replace at this tier.
 
 use super::*;
 use std::fmt::Write as _;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
+
+/// Trace-tree regions (several linked traces in one LLVM function).
+pub(super) mod region;
 
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
@@ -270,6 +281,10 @@ pub(super) struct LlvmJob {
     pub(super) pipeline: String,
     pub(super) slp_vectorize: bool,
     pub(super) dump: bool,
+    /// Trace-tree region: when non-empty, `region[0]` is this job's trace (the
+    /// single entry) and the others are reachable through native links. All of
+    /// them become one LLVM function whose internal links are direct branches.
+    pub(super) region: Vec<region::RegionMemberJob>,
 }
 
 pub(super) struct LlvmDone {
@@ -277,6 +292,8 @@ pub(super) struct LlvmDone {
     pub(super) ticket: u64,
     /// LLVM itself could not be loaded or initialized; stop requesting the tier.
     pub(super) unavailable: bool,
+    /// The job was a trace-tree region (several traces in one function).
+    pub(super) region: bool,
     pub(super) result: Result<LlvmCode, String>,
 }
 
@@ -469,7 +486,13 @@ fn llvm_worker_main(
             };
             pending.fetch_sub(1, Ordering::AcqRel);
             if done
-                .send(LlvmDone { trace: job.trace_id, ticket: job.ticket, unavailable, result })
+                .send(LlvmDone {
+                    trace: job.trace_id,
+                    ticket: job.ticket,
+                    unavailable,
+                    region: job.region.len() > 1,
+                    result,
+                })
                 .is_err()
             {
                 break;
@@ -497,7 +520,7 @@ fn effective_optimization_pipeline(requested: &str) -> String {
     // SROA/CFG folding opportunities before vectorization and loop transforms.
     // After O3, finish with a second scalar cleanup to remove instructions
     // made redundant by loop and CFG transformations.
-    "function(sroa,early-cse,instcombine,simplifycfg),default<O3>,function(aggressive-instcombine,gvn,dse,instcombine,simplifycfg)".to_owned()
+    "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg),default<O3>,function(aggressive-instcombine,gvn,dse,instcombine<no-verify-fixpoint>,simplifycfg)".to_owned()
 }
 
 fn compile_job(
@@ -508,15 +531,19 @@ fn compile_job(
     engines: &mut Vec<(Module<'static>, ExecutionEngine<'static>)>,
 ) -> Result<LlvmCode, String> {
     let started = std::time::Instant::now();
-    let ir = lower_trace_profiled(
-        &job.trace,
-        &job.exits,
-        job.binding_slots.clone(),
-        job.native_budget,
-        &job.symbol,
-        host,
-        job.profile.as_ref(),
-    )?;
+    let ir = if job.region.len() > 1 {
+        region::lower_region(&job.region, job.native_budget, &job.symbol, host)?
+    } else {
+        lower_trace_profiled(
+            &job.trace,
+            &job.exits,
+            job.binding_slots.clone(),
+            job.native_budget,
+            &job.symbol,
+            host,
+            job.profile.as_ref(),
+        )?
+    };
     if job.dump {
         eprintln!("[napalm-llvm] generated {}:\n{ir}", job.symbol);
     }
@@ -658,8 +685,9 @@ impl V {
 
 /// Memory classes for Napalm's GC-managed, kind-discriminated payloads.
 ///
-/// Broad Heap accesses (absolute VM values and profile counters) conservatively
-/// alias every payload class. Kind-specific children are safe only after a heap
+/// Broad Heap accesses conservatively alias every GC payload class. The
+/// VM's module/static registers and profile counters live in separate Rust
+/// vectors, and the binding resolver validates their physical addresses. Kind-specific children are safe only after a heap
 /// kind guard: a live object cannot simultaneously be a Map, List, Cell, etc.
 /// Physical map/instance slots receive narrower children under their respective
 /// kind (never under a specific shape ID, since shapes may transition).
@@ -682,8 +710,15 @@ enum Mem {
     SidecarData,
     SidecarLen,
     SidecarPromiseValue,
-    /// GC payload words, cells, VM Value slots and profile counters.
+    /// Generic GC payload word; aliases every kind-specific GC payload.
     Heap,
+    /// Module variable and class static-field Value slots; both are separate
+    /// Vec allocations owned by the interpreter, never GC payload storage.
+    VmValue,
+    /// Interpreter profile counters live in their own Vec<Vec<u64>> and the
+    /// relocation table validates these addresses separately from VM Values.
+    /// Their stores cannot clobber GC payload, static fields or modules.
+    Profile,
     /// A shape-backed Map value (dynamic PIC slot).
     Map,
     /// A fixed-slot instance field (generic form).
@@ -716,6 +751,8 @@ impl Mem {
             Mem::SidecarLen => 55,
             Mem::SidecarPromiseValue => 56,
             Mem::Heap => 14,
+            Mem::VmValue => 19,
+            Mem::Profile => 18,
             Mem::Map => 40,
             Mem::Instance => 41,
             Mem::List => 42,
@@ -731,6 +768,30 @@ impl Mem {
 const MD_COLD_TRUE: u32 = 20;
 const MD_HOT_TRUE: u32 = 21;
 const MD_EMPTY: u32 = 22;
+
+/// These storage classes cannot be accessed by the StickyImmix probable-write
+/// callback. They are interpreter/JIT-owned buffers, not GC headers or MMTk
+/// metadata. The scope is attached to READS only, so the required ordering
+/// between a write barrier and its subsequent managed-store is unchanged.
+///
+/// The callback may still write the owner's GC header/log bits, the mutator,
+/// MMTk's remembered set and other collector-internal memory. It must remain
+/// a normal memory-clobbering call for every other access.
+const MD_GC_BARRIER_DISJOINT: u32 = 72;
+
+fn gc_barrier_disjoint_read(tag: u32) -> bool {
+    matches!(
+        tag,
+        // TraceActivation and architectural registers are not touched by the
+        // non-safepointing post-barrier callback.
+        11 | 12
+            // Handle sidecar/chunk table and its individual physical fields.
+            | 13 | 50 | 51 | 52 | 53 | 54 | 55 | 56
+            // Native profile counters, VM value vectors, immutable bytes,
+            // closure capture vectors, relocation bindings and trace links.
+            | 18 | 19 | 15 | 16 | 17 | 44
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Fwd {
@@ -847,6 +908,12 @@ struct LlvmLowering<'p> {
     method_epoch_value: Option<V>,
     native_budget_remaining: Option<V>,
     native_budget_initial: u32,
+    /// An epoch-free trace has no runtime/GC synchronization. Only such traces
+    /// may hoist shape guards or use epoch-local immutable load evidence.
+    epoch_free_trace: bool,
+    /// LLVM's loop-carried scratch allocations do not escape the generated
+    /// function. Lifetime markers complement O3's mem2reg/SROA promotion.
+    nonescaping_stack_slots: Vec<(String, usize)>,
     /// Preserve IEEE arithmetic unless the application explicitly accepts
     /// the different rounding that contracting multiply-add can introduce.
     allow_fp_contract: bool,
@@ -857,10 +924,30 @@ struct LlvmLowering<'p> {
     /// Numbered `!prof` metadata (ids from PGO_METADATA_BASE), deduplicated.
     prof_metadata: Vec<(u32, String)>,
     prof_weight_ids: HashMap<(u32, u32), u32>,
+    /// `!invariant.load` is a whole-function fact. In a trace-tree region it is
+    /// allowed only if *no* member crosses a runtime/GC epoch boundary.
+    invariant_loads: bool,
+    /// Trace-tree region membership (None: an ordinary single-trace function).
+    region: Option<region::RegionMember>,
+    /// First block after `entry` (the region's head start block).
+    entry_branch_target: String,
 }
 
 /// PGO metadata ids live far above TBAA/identity ids.
 const PGO_METADATA_BASE: u32 = 900_000;
+
+/// Only a full runtime transition/read barrier can move heap objects, recycle
+/// handles, change map shapes or replace frame/register banks. The native
+/// specialized store operations update existing payload slots and never change
+/// shape, capacity or sidecar identity. GC post-barriers are intentionally NOT
+/// classified as memory(none) calls: the collector's metadata writes are not
+/// modeled here.
+fn trace_has_heap_epoch_boundary(trace: &Trace) -> bool {
+    trace.nodes.iter().any(|node| matches!(
+        node.kind,
+        TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }
+    ))
+}
 
 /// Lower one already-optimized trace. `vm_binding_slots` must describe the
 /// relocation table the installed trace already uses.
@@ -889,7 +976,21 @@ pub(super) fn lower_trace_profiled(
 ) -> Result<String, String> {
     // A profile without executions carries no information.
     let profile = profile.filter(|profile| profile.entries > 0);
-    let mut state = LlvmLowering {
+    let mut state = LlvmLowering::new(trace, exit_plans, vm_binding_slots, native_budget, profile);
+    state.lower_function(native_budget)?;
+    Ok(state.finish_module(symbol, host))
+}
+
+impl<'p> LlvmLowering<'p> {
+    fn new(
+        trace: &'p Trace,
+        exit_plans: &'p [CompiledExitPlan],
+        vm_binding_slots: HashMap<VmBindingKey, u32>,
+        native_budget: u32,
+        profile: Option<&'p TraceProfile>,
+    ) -> Self {
+        let epoch_free_trace = !trace_has_heap_epoch_boundary(trace);
+        LlvmLowering {
         trace,
         exit_plans,
         entry: String::with_capacity(1024),
@@ -935,14 +1036,18 @@ pub(super) fn lower_trace_profiled(
         method_epoch_value: None,
         native_budget_remaining: None,
         native_budget_initial: native_budget,
+        epoch_free_trace,
+        nonescaping_stack_slots: Vec::new(),
         allow_fp_contract: std::env::var("NAPALM_LLVM_ALLOW_FMA").ok().as_deref() == Some("1"),
         profile,
         in_preheader: true,
         prof_metadata: Vec::new(),
         prof_weight_ids: HashMap::default(),
-    };
-    state.lower_function(native_budget)?;
-    Ok(state.finish_module(symbol, host))
+        invariant_loads: epoch_free_trace,
+        region: None,
+        entry_branch_target: "start".to_owned(),
+        }
+    }
 }
 
 impl LlvmLowering<'_> {
@@ -1023,7 +1128,30 @@ impl LlvmLowering<'_> {
     }
 
     fn ret(&mut self, code: u32) {
-        self.line(&format!("ret i32 {code}"));
+        // With deferred frame slots every return goes through the region's
+        // single `region_exit` block, which flushes them to the frame.
+        let region_exit = self.region.as_ref().and_then(|region| region.record_return(&self.current, code));
+        // The manager attributes a result to `next_trace`. Inside a region the
+        // function may return from any member, so name it (a link names its
+        // child itself).
+        if code != TRACE_RESULT_LINK {
+            if let Some(member) = self.region.as_ref().map(|region| region.trace) {
+                let activation = Self::activation();
+                self.store_at(&V::i32(member.0 as i32), &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
+            }
+        }
+        // No stack-slot address ever leaves this function. Each slot is used
+        // only by the local loop-phi/budget loads and stores, so its lifetime
+        // ends at every native return (including deoptimization side exits).
+        for (slot, size) in &self.nonescaping_stack_slots {
+            self.body.push_str(&format!(
+                "  call void @llvm.lifetime.end.p0(i64 {size}, ptr {slot})\n"
+            ));
+        }
+        match region_exit {
+            Some(label) => self.br(label),
+            None => self.line(&format!("ret i32 {code}")),
+        }
     }
 
     fn error(&self, message: impl Into<String>) -> String {
@@ -1175,17 +1303,52 @@ impl LlvmLowering<'_> {
         self.def(Ty::Ptr, &format!("getelementptr i64, ptr {}, i64 {}", base.op, index.op))
     }
 
+    /// Use inbounds only when a dominating native guard proved 0 <= index <
+    /// sidecar length. Never use it for shape-selected relocations or unchecked
+    /// addresses: incorrect inbounds would create poison, not a runtime error.
+    fn gep_bounded_words(&mut self, base: &V, index: &V) -> V {
+        let base = self.as_ptr(base);
+        let index = self.word(index);
+        self.def(Ty::Ptr, &format!(
+            "getelementptr inbounds i64, ptr {}, i64 {}", base.op, index.op
+        ))
+    }
+
+    /// Add a fact only *after* the branch to the side exit. These conditions
+    /// are true along every path reaching the assume, including repeated loop
+    /// iterations. llvm.assume may improve ValueTracking, SCEV and range-based
+    /// simplification without changing the language's overflow semantics.
+    fn assume(&mut self, condition: &V) {
+        let condition = self.cond(condition);
+        self.line(&format!("call void @llvm.assume(i1 {})", condition.op));
+    }
+
     fn load_aligned_tagged(&mut self, ty: Ty, ptr: &V, tag: u32, align: u32, invariant: bool) -> V {
         let ptr = self.as_ptr(ptr);
         let invariant = if invariant { format!(", !invariant.load !{MD_EMPTY}") } else { String::new() };
+        // A probable-write barrier cannot mutate JIT sidecars, frame banks or
+        // non-GC runtime buffers. A scoped read can therefore be forwarded
+        // across that call even when pointer-based AA alone is inconclusive.
+        // Never tag managed payload loads or *stores*: the collector barrier
+        // must remain ordered before the reference store it protects.
+        let barrier_scope = if gc_barrier_disjoint_read(tag) {
+            format!(", !alias.scope !{MD_GC_BARRIER_DISJOINT}")
+        } else {
+            String::new()
+        };
         self.def(
             ty,
-            &format!("load {}, ptr {}, align {align}, !tbaa !{tag}{invariant}", ty.ir(), ptr.op),
+            &format!("load {}, ptr {}, align {align}, !tbaa !{tag}{invariant}{barrier_scope}", ty.ir(), ptr.op),
         )
     }
 
     fn load_aligned(&mut self, ty: Ty, ptr: &V, mem: Mem, align: u32) -> V {
-        self.load_aligned_tagged(ty, ptr, mem.tag(), align, mem == Mem::Binding)
+        // Binding slots belong to the lifetime-stable relocation table. UTF-8
+        // bytes are immutable while their string allocation is live; however,
+        // a runtime/GC boundary may recycle a raw address, so only use the
+        // stronger string fact inside a synchronization-free native trace.
+        let invariant = mem == Mem::Binding || (mem == Mem::Str && self.invariant_loads);
+        self.load_aligned_tagged(ty, ptr, mem.tag(), align, invariant)
     }
 
     fn load(&mut self, ty: Ty, ptr: &V, mem: Mem) -> V {
@@ -1282,6 +1445,12 @@ impl LlvmLowering<'_> {
     /// The successful path of a guard establishes the inequality. Each epoch
     /// gets *fresh* scopes: after a runtime call a handle can be recycled.
     fn prove_distinct(&mut self, a: TraceValueId, b: TraceValueId) {
+        // Scoped noalias metadata is static. Region members are re-entered
+        // with new entry values within one invocation, so an "invariant"
+        // identity root is no longer invariant there: no scopes in regions.
+        if self.region.is_some() {
+            return;
+        }
         let (a, b) = Self::identity_pair(a, b);
         if a == b || !self.active_identity_proofs.insert((a, b)) {
             return;
@@ -1492,7 +1661,11 @@ impl LlvmLowering<'_> {
         if let Some(value) = &self.vm_bindings_base {
             return value.clone();
         }
-        let value = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, vm_bindings));
+        // Only the region head is entered with its own table in `vm_bindings`.
+        let value = match self.region.as_ref().and_then(|region| region.bindings.clone()) {
+            Some(table) => table,
+            None => self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, vm_bindings)),
+        };
         self.vm_bindings_base = Some(value.clone());
         value
     }
@@ -1553,6 +1726,14 @@ impl LlvmLowering<'_> {
     }
 
     fn method_epoch_value(&mut self) -> V {
+        if self.region.is_some() {
+            // Runtime helpers refresh `method_epoch`; a region member may run
+            // after another member's runtime call within the same invocation.
+            // Load at the use (never cached: no dominance assumptions); GVN
+            // merges loads between runtime boundaries.
+            let activation = Self::activation();
+            return self.load_at(Ty::I64, &activation, offset_of!(TraceActivation, method_epoch) as i64, Mem::Act);
+        }
         if let Some(value) = &self.method_epoch_value {
             return value.clone();
         }
@@ -1604,6 +1785,11 @@ impl LlvmLowering<'_> {
                 self.load_frame_slot(slot, rep)
             }
             TraceValueOrigin::GuardedEntry { value: source, exit } => {
+                // Region members may receive this slot already unboxed.
+                if let Some(passed) = self.region_typed_entry(source, rep, exit)? {
+                    self.cache_value(value, passed.clone());
+                    return Ok(passed);
+                }
                 let tagged = self.lower_value(source)?;
                 match rep {
                     TraceRep::F64 => self.guard_numeric(&tagged, exit)?,
@@ -1654,8 +1840,17 @@ impl LlvmLowering<'_> {
     }
 
     fn load_frame_slot(&mut self, slot: FrameSlot, rep: TraceRep) -> V {
-        let ptr = self.bank_slot(slot);
-        let raw = self.load(Ty::I64, &ptr, Mem::Reg);
+        // A deferred region slot's architectural value is its alloca.
+        let raw = match self.region.as_ref().and_then(|region| region.deferred_slot(slot)) {
+            Some(alloca) => {
+                let alloca = alloca.to_owned();
+                self.def(Ty::I64, &format!("load i64, ptr {alloca}, align 8"))
+            }
+            None => {
+                let ptr = self.bank_slot(slot);
+                self.load(Ty::I64, &ptr, Mem::Reg)
+            }
+        };
         match rep {
             TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => raw,
             TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => self.trunc(&raw, Ty::I32),
@@ -1664,9 +1859,26 @@ impl LlvmLowering<'_> {
     }
 
     fn store_frame_word(&mut self, slot: FrameSlot, word: &V) {
-        let ptr = self.bank_slot(slot);
         let word = self.word(word);
+        if let Some(alloca) = self.region.as_ref().and_then(|region| region.deferred_slot(slot)) {
+            let alloca = alloca.to_owned();
+            self.line(&format!("store i64 {}, ptr {alloca}, align 8", word.op));
+            return;
+        }
+        let ptr = self.bank_slot(slot);
         self.store(&word, &ptr, Mem::Reg);
+    }
+
+    /// Write every deferred region slot back to the frame, in the region's
+    /// single `region_exit` block that every `ret` branches to: whatever
+    /// returns control to code outside this function sees the exact frame.
+    fn flush_deferred_frame(&mut self) {
+        let Some(deferred) = self.region.as_ref().map(|region| region.deferred_slots()) else { return; };
+        for (slot, alloca) in deferred.iter() {
+            let word = self.def(Ty::I64, &format!("load i64, ptr {alloca}, align 8"));
+            let ptr = self.bank_slot(*slot);
+            self.store(&word, &ptr, Mem::Reg);
+        }
     }
 
     fn normalize_to_word(&mut self, value: &V, rep: TraceRep) -> V {
@@ -1925,7 +2137,13 @@ impl LlvmLowering<'_> {
         if !plan.native_linkable {
             return self.materialize_side_exit(plan);
         }
-        let links = Self::links();
+        // A link to another member of this region is a direct branch.
+        if let ExitTarget::Trace(child) = plan.target {
+            if let Some(start) = self.region.as_ref().and_then(|region| region.start_of(child)) {
+                return self.materialize_region_link(plan, child, &start);
+            }
+        }
+        let links = self.region.as_ref().map_or_else(Self::links, |region| region.links.clone());
         let child = self.load_at(Ty::I32, &links, plan.id.0 as i64 * 4, Mem::Links);
         let linked = self.icmp("ne", &child, &V::i32(-1));
         let linked_block = self.new_block();
@@ -1963,6 +2181,16 @@ impl LlvmLowering<'_> {
 
     fn materialize_native_link(&mut self, plan: &CompiledExitPlan, child: &V) -> Result<(), String> {
         self.store_completed_iterations();
+        self.store_link_writes(plan)?;
+        let activation = Self::activation();
+        self.store_at(child, &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
+        self.ret(TRACE_RESULT_LINK);
+        Ok(())
+    }
+
+    /// Frame writes that turn this exit's state into the linked child's entry
+    /// state (dynamic values and reconstructible constants).
+    fn store_link_writes(&mut self, plan: &CompiledExitPlan) -> Result<(), String> {
         for write in &plan.writes {
             let word = match write.source {
                 ExitWriteSource::Dynamic(index) => {
@@ -1983,9 +2211,6 @@ impl LlvmLowering<'_> {
             };
             self.store_frame_word(write.slot, &word);
         }
-        let activation = Self::activation();
-        self.store_at(child, &activation, offset_of!(TraceActivation, next_trace) as i64, Mem::Act);
-        self.ret(TRACE_RESULT_LINK);
         Ok(())
     }
 
@@ -2165,6 +2390,15 @@ impl LlvmLowering<'_> {
         self.emit_side_exit(exit, &invalid)
     }
 
+    /// The List's contracts are all `List<Num>` (TRACE_LIST_ELEMENTS_NUMBER).
+    fn guard_numeric_list_store(&mut self, entry: &V, exit: SideExitId) -> Result<(), String> {
+        let metadata = self.heap_entry_metadata(entry, false);
+        let payload = self.heap_metadata_payload(&metadata);
+        let expected = crate::napalm_tracing_jit::TRACE_LIST_ELEMENTS_NUMBER as i32;
+        let invalid = self.icmp("ne", &payload, &V::i32(expected));
+        self.emit_side_exit(exit, &invalid)
+    }
+
     fn guard_map_shape_once(&mut self, map: TraceValueId, metadata: &V, expected: u32, exit: SideExitId) -> Result<(), String> {
         let key = (self.trace.canonical_value(map), expected);
         if self.map_shape_proofs.contains(&key) {
@@ -2174,6 +2408,10 @@ impl LlvmLowering<'_> {
         let expected_shape = self.vm_binding_i32(VmBindingKind::ShapeId, expected)?;
         let fail = self.icmp("ne", &shape, &expected_shape);
         self.emit_side_exit(exit, &fail)?;
+        // The proof is path-sensitive: this assume is dominated by the guard.
+        // It never asserts that the shape is immutable across a runtime call.
+        let matched = self.icmp("eq", &shape, &expected_shape);
+        self.assume(&matched);
         self.map_shape_proofs.insert(key);
         Ok(())
     }
@@ -2239,7 +2477,10 @@ impl LlvmLowering<'_> {
             return Ok(());
         }
         let failure = self.icmp("ule", len, &V::i64(index as i64));
-        self.emit_side_exit(exit, &failure)
+        self.emit_side_exit(exit, &failure)?;
+        let in_range = self.icmp("ugt", len, &V::i64(index as i64));
+        self.assume(&in_range);
+        Ok(())
     }
 
     fn normalize_list_index(&mut self, index: &V, len: &V, exit: SideExitId) -> Result<V, String> {
@@ -2249,6 +2490,8 @@ impl LlvmLowering<'_> {
         let normalized = self.select(&negative, &from_end, &index);
         let fail = self.icmp("uge", &normalized, len);
         self.emit_side_exit(exit, &fail)?;
+        let in_range = self.icmp("ult", &normalized, len);
+        self.assume(&in_range);
         Ok(normalized)
     }
 
@@ -2299,16 +2542,25 @@ impl LlvmLowering<'_> {
             distinct.contains(&Self::identity_pair(reader, writer))
         });
         self.forwarded_heap_loads.insert(location, value);
-        // An absolute address is arbitrary from the perspective of LLVM IR;
-        // do not claim that it cannot refer to a mutated heap word.
-        self.forwarded_absolute_loads.clear();
+        // VM absolute ValueAddress bindings are validated module/static fields
+        // in separate Rust allocations. GC payload stores cannot invalidate
+        // their forwarded values (a runtime/GC epoch still clears both caches).
     }
 
     fn call_heap_barrier(&mut self, owner: &V) {
         let callee = self.heap_barrier_callee();
         let runtime = self.runtime_context();
         let owner = self.as_ptr(owner);
-        self.line(&format!("call void {}(ptr {}, ptr {}) #3", callee.op, runtime.op, owner.op));
+        // StickyImmix probable_write() only inspects/modifies GC metadata
+        // associated with `owner`, the interpreter's mutator and MMTk's log.
+        // It does not touch the interpreter/JIT buffers tagged by scope 72.
+        // Keep the ordinary memory effects (#3) on this *indirect* call:
+        // `memory(none)` or an argmem-only contract would be unsound, and
+        // noalias on managed payload stores could move them before the barrier.
+        self.line(&format!(
+            "call void {}(ptr {}, ptr {}) #3, !noalias !{MD_GC_BARRIER_DISJOINT}",
+            callee.op, runtime.op, owner.op
+        ));
     }
 
     fn emit_heap_write_barrier(&mut self, owner: &V, value_id: TraceValueId, tagged: &V) -> Result<(), String> {
@@ -2462,7 +2714,7 @@ impl LlvmLowering<'_> {
                     value.clone()
                 } else {
                     let pointer = self.vm_binding_word(VmBindingKind::ValueAddress, *address)?;
-                    let value = self.load(Ty::I64, &pointer, Mem::Heap);
+                    let value = self.load(Ty::I64, &pointer, Mem::VmValue);
                     self.forwarded_absolute_loads.insert(*address, value.clone());
                     value
                 };
@@ -2473,22 +2725,25 @@ impl LlvmLowering<'_> {
                 let value = self.lower_value(*value)?;
                 let value = self.word(&value);
                 let pointer = self.vm_binding_word(VmBindingKind::ValueAddress, *address)?;
-                self.store(&value, &pointer, Mem::Heap);
-                // VM addresses are not a heap-kind proof. Stay conservative.
-                self.forwarded_heap_loads.clear();
-                self.forwarded_absolute_loads.clear();
+                self.store(&value, &pointer, Mem::VmValue);
+                // The binding resolver restricts ValueAddress to a module
+                // register or class static field. These independent Vec slots
+                // cannot overlap any GC payload or another ValueAddress slot.
+                // Preserve other forwarded values within this runtime epoch.
                 self.forwarded_absolute_loads.insert(*address, value);
             }
 
             IncrementProfileCounter { address } => {
                 let pointer = self.vm_binding_word(VmBindingKind::ProfileCounterAddress, *address)?;
-                let current = self.load(Ty::I64, &pointer, Mem::Heap);
+                // Profile counters reside in a separate allocation family from
+                // GC payload and module/static Value slots. The typed VM binding
+                // resolver enforces this separation, so no heap/absolute cache
+                // must be invalidated by a counter increment.
+                let current = self.load(Ty::I64, &pointer, Mem::Profile);
                 let saturated = self.icmp("eq", &current, &V::i64(-1));
                 let incremented = self.bin("add", &current, &V::i64(1));
                 let next = self.select(&saturated, &current, &incremented);
-                self.store(&next, &pointer, Mem::Heap);
-                self.forwarded_heap_loads.clear();
-                self.forwarded_absolute_loads.clear();
+                self.store(&next, &pointer, Mem::Profile);
             }
 
             IsInstanceObserved { value, class, expected_class, instance_classes, known_classes, exit } => {
@@ -2621,6 +2876,10 @@ impl LlvmLowering<'_> {
                     let too_large = self.icmp("sge", &index_value, &length_value);
                     let failure = self.or1(&negative, &too_large);
                     self.emit_side_exit(*exit, &failure)?;
+                    let nonnegative = self.icmp("sge", &index_value, &zero);
+                    let less_than_length = self.icmp("slt", &index_value, &length_value);
+                    let in_bounds = self.and1(&nonnegative, &less_than_length);
+                    self.assume(&in_bounds);
                 }
                 if let Some(&list) = self.list_lengths.get(&length_id) {
                     let normalized = self.zext(&index_value, Ty::I64);
@@ -3052,9 +3311,15 @@ impl LlvmLowering<'_> {
                 let out_of_range = self.icmp("ule", &count, &V::i32(*index as i32));
                 self.emit_side_exit(*exit, &out_of_range)?;
                 let captures = self.heap_entry_data(&entry);
-                // Captures are immutable after allocation, in a Closure-only payload.
+                // The interpreter constructs a boxed capture array once and
+                // never modifies its entries. Mutable captures point to Cell
+                // objects; the pointer in the closure remains immutable.
+                // Invariant metadata is safe only when no runtime/GC boundary
+                // can move/recycle the allocation within this native trace.
                 let slot = self.gep8(&captures, *index as i64 * 8);
-                let value = self.load(Ty::I64, &slot, Mem::Capture);
+                let value = self.load_aligned_tagged(
+                    Ty::I64, &slot, Mem::Capture.tag(), 8, self.invariant_loads
+                );
                 self.cache_value(self.one_result(node)?, value);
             }
 
@@ -3105,7 +3370,7 @@ impl LlvmLowering<'_> {
                     value.clone()
                 } else {
                     let data = self.heap_entry_data(&entry);
-                    let address = self.gep_words(&data, &index);
+                    let address = self.gep_bounded_words(&data, &index);
                     let value = self.load_owned(Ty::I64, &address, Mem::List.tag(), *list);
                     self.forwarded_heap_loads.insert(location, value.clone());
                     value
@@ -3123,14 +3388,18 @@ impl LlvmLowering<'_> {
                 self.guard_uncontracted_store(&entry, *exit)?;
             }
 
-            HeapListSet { list, index, value, exit } => {
+            HeapListSet { list, index, value, exit, numeric } => {
                 let tagged = self.lower_value(*value)?;
                 let tagged = self.word(&tagged);
                 let (entry, owner) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                self.guard_uncontracted_store(&entry, *exit)?;
+                if *numeric {
+                    self.guard_numeric_list_store(&entry, *exit)?;
+                } else {
+                    self.guard_uncontracted_store(&entry, *exit)?;
+                }
                 let index = self.validated_list_index(*list, *index, &entry, *exit)?;
                 let data = self.heap_entry_data(&entry);
-                let address = self.gep_words(&data, &index);
+                let address = self.gep_bounded_words(&data, &index);
                 self.observe_identity_access(*list, &entry, IdentityAccess::List, true, *exit)?;
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
                 self.store_owned(&tagged, &address, Mem::List.tag(), *list);
@@ -3298,9 +3567,12 @@ impl LlvmLowering<'_> {
         let native_budget_enabled =
             native_budget != 0 && matches!(trace.terminator, TraceTerminator::LoopBack);
 
-        // `start` is the first non-entry block.
-        let _ = writeln!(self.body, "start:");
-        self.current = "start".to_owned();
+        // `start` is the first non-entry block. Region members prefix every
+        // fixed label and stack slot (`m{k}_start`, `%m{k}_phi0`, ...).
+        let prefix = self.region.as_ref().map_or(String::new(), |region| region.prefix.clone());
+        let start_label = format!("{prefix}start");
+        let loop_label = format!("{prefix}loop");
+        self.begin(&start_label);
 
         for index in 0..trace.values.len() {
             let value = &trace.values[index];
@@ -3323,9 +3595,7 @@ impl LlvmLowering<'_> {
 
         // Same conservative invariant-guard prefix hoisting as the Cranelift tier.
         let epoch_free_loop = matches!(trace.terminator, TraceTerminator::LoopBack)
-            && !trace.nodes.iter().any(|node| {
-                matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. })
-            });
+            && self.epoch_free_trace;
         if epoch_free_loop {
             for node in &trace.nodes {
                 if preheader_nodes[node.id] || matches!(node.kind, TraceInst::Nop) {
@@ -3343,20 +3613,49 @@ impl LlvmLowering<'_> {
             }
         }
 
+        // A shaped-map load at the very start of a synchronization-free loop
+        // can have its kind/shape checks hoisted without reordering prior guards
+        // or stores. The map is a preheader-invariant SSA value, and the exit
+        // snapshot must be materializable before the loop begins. Subsequent
+        // specialized stores can change slot values, never the map's shape.
+        // Do not hoist later accesses: their side-exit PC would skip earlier
+        // operations, even when those operations look side-effect-free.
+        if epoch_free_loop {
+            if let Some(first) = trace.nodes.iter().find(|node| {
+                !preheader_nodes[node.id] && !matches!(node.kind, TraceInst::Nop)
+            }) {
+                if let TraceInst::HeapMapGetShaped { map, shape, exit, .. } = &first.kind {
+                    if trace_value_available_in_preheader(trace, *map, &preheader_nodes)
+                        && trace_exit_available_in_preheader(trace, *exit, &preheader_nodes)
+                    {
+                        let (_, _, metadata) = self.heap_entry_with_metadata_for_value(
+                            *map, TraceHeapKind::Map, *exit
+                        )?;
+                        self.guard_map_shape_once(*map, &metadata, *shape, *exit)?;
+                    }
+                }
+            }
+        }
+
         // Loop-carried state lives in entry-block allocas; SROA/mem2reg turns them
         // into SSA phis (the LLVM analogue of Cranelift's frontend Variables).
         let mut phi_slots = Vec::with_capacity(trace.loop_phis.len());
         for (index, phi) in trace.loop_phis.iter().enumerate() {
             let ty = Ty::of_rep(phi.rep);
-            let slot = format!("%phi{index}");
+            let slot = format!("%{prefix}phi{index}");
             let _ = writeln!(self.entry, "  {slot} = alloca {}, align {}", ty.ir(), ty.align());
+            let _ = writeln!(self.entry, "  call void @llvm.lifetime.start.p0(i64 {}, ptr {slot})", ty.align());
+            self.nonescaping_stack_slots.push((slot.clone(), ty.align() as usize));
             let mut initial = self.lower_value(phi.initial)?;
             if let Some(exit) = phi.entry_exit {
-                initial = match phi.rep {
+                initial = match self.region_typed_entry(phi.initial, phi.rep, exit)? {
+                    Some(passed) => passed,
+                    None => match phi.rep {
                     TraceRep::F64 => self.guard_numeric(&initial, exit)?,
                     TraceRep::Int32 => self.guard_int32_numeric(&initial, exit)?,
                     TraceRep::UInt32 => self.guard_uint32_numeric(&initial, exit)?,
                     other => return Err(self.error(format!("unsupported promoted LoopPhi representation {other:?}"))),
+                    },
                 };
             }
             let initial = self.coerce(&initial, ty);
@@ -3364,15 +3663,18 @@ impl LlvmLowering<'_> {
             phi_slots.push((slot, ty));
         }
         let budget_slot = if native_budget_enabled {
-            let _ = writeln!(self.entry, "  %budget = alloca i64, align 8");
-            self.line(&format!("store i64 {native_budget}, ptr %budget, align 8"));
-            Some("%budget".to_owned())
+            let slot = format!("%{prefix}budget");
+            let _ = writeln!(self.entry, "  {slot} = alloca i64, align 8");
+            let _ = writeln!(self.entry, "  call void @llvm.lifetime.start.p0(i64 8, ptr {slot})");
+            self.nonescaping_stack_slots.push((slot.clone(), 8));
+            self.line(&format!("store i64 {native_budget}, ptr {slot}, align 8"));
+            Some(slot)
         } else {
             None
         };
 
-        self.br("loop");
-        self.begin("loop");
+        self.br(&loop_label);
+        self.begin(&loop_label);
         self.in_preheader = false;
 
         if trace.nodes.iter().any(|node| {
@@ -3428,12 +3730,12 @@ impl LlvmLowering<'_> {
                         }
                         None => MD_COLD_TRUE,
                     };
-                    self.cond_br(&exhausted, &stop, "loop", Some(latch_md));
+                    self.cond_br(&exhausted, &stop, &loop_label, Some(latch_md));
                     self.begin(&stop);
                     self.native_budget_remaining = Some(next_budget);
                     self.emit_unconditional_side_exit(exit)?;
                 } else {
-                    self.br("loop");
+                    self.br(&loop_label);
                 }
             }
             TraceTerminator::Exit(exit) => self.emit_unconditional_side_exit(*exit)?,
@@ -3469,6 +3771,9 @@ impl LlvmLowering<'_> {
             "declare { i32, i1 } @llvm.sadd.with.overflow.i32(i32, i32)\n",
             "declare { i32, i1 } @llvm.ssub.with.overflow.i32(i32, i32)\n",
             "declare { i32, i1 } @llvm.smul.with.overflow.i32(i32, i32)\n",
+            "declare void @llvm.assume(i1)\n",
+            "declare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture)\n",
+            "declare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture)\n",
             "declare double @llvm.fabs.f64(double)\n",
             "declare double @llvm.floor.f64(double)\n",
             "declare double @llvm.ceil.f64(double)\n",
@@ -3494,7 +3799,7 @@ impl LlvmLowering<'_> {
         );
         out.push_str("entry:\n");
         out.push_str(&self.entry);
-        out.push_str("  br label %start\n");
+        let _ = writeln!(out, "  br label %{}", self.entry_branch_target);
         out.push_str(&self.body);
         out.push_str("}\n\n");
         let escape = |text: &str| text.replace('\\', "\\5C").replace('"', "\\22");
@@ -3522,6 +3827,8 @@ impl LlvmLowering<'_> {
             "!65 = !{!\"napalm.sidecar.len\", !3, i64 0}\n",
             "!66 = !{!\"napalm.sidecar.promise_value\", !3, i64 0}\n",
             "!4 = !{!\"napalm.heap\", !0, i64 0}\n",
+            "!8 = !{!\"napalm.profile.counter\", !0, i64 0}\n",
+            "!9 = !{!\"napalm.vm.value_slot\", !0, i64 0}\n",
             "!5 = !{!\"napalm.str\", !0, i64 0}\n",
             "!6 = !{!\"napalm.binding\", !0, i64 0}\n",
             "!7 = !{!\"napalm.links\", !0, i64 0}\n",
@@ -3536,6 +3843,8 @@ impl LlvmLowering<'_> {
             "!12 = !{!2, !2, i64 0}\n",
             "!13 = !{!3, !3, i64 0}\n",
             "!14 = !{!4, !4, i64 0}\n",
+            "!18 = !{!8, !8, i64 0}\n",
+            "!19 = !{!9, !9, i64 0}\n",
             "!15 = !{!5, !5, i64 0}\n",
             "!16 = !{!6, !6, i64 0}\n",
             "!17 = !{!7, !7, i64 0}\n",
@@ -3554,6 +3863,13 @@ impl LlvmLowering<'_> {
             "!20 = !{!\"branch_weights\", i32 1, i32 2000000}\n",
             "!21 = !{!\"branch_weights\", i32 2000000, i32 1}\n",
             "!22 = !{}\n",
+            // One function-local alias domain for buffers that the VM's
+            // StickyImmix probable-write callback provably never accesses.
+            // All loads belonging to it carry alias.scope; only the callback
+            // carries the complementary noalias metadata.
+            "!70 = distinct !{!70, !\"napalm.gc_barrier.disjoint\"}\n",
+            "!71 = distinct !{!71, !70, !\"napalm.gc_barrier.non_gc_buffer\"}\n",
+            "!72 = !{!71}\n",
         ));
         // Keep metadata numbering unique even when both payload families
         // happen to use the same physical offset. Emit in stable ID order.
@@ -3578,6 +3894,12 @@ impl LlvmLowering<'_> {
         }
         if let Some(profile) = self.profile {
             Self::write_profile_metadata(&mut out, profile, &self.prof_metadata);
+        } else {
+            // Region members can carry measured weights even when the head has
+            // no profile; every referenced `!prof` node must still exist.
+            for (id, text) in &self.prof_metadata {
+                let _ = writeln!(out, "!{id} = {text}");
+            }
         }
         out
     }
@@ -3902,6 +4224,213 @@ mod tests {
         }
     }
 
+    fn proof_test_host() -> &'static HostInfo {
+        host_info().expect("LLVM native target")
+    }
+
+    fn validate_proof_ir(ir: &str) {
+        let context = Context::create();
+        let module = context.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "proof-test"),
+        ).expect("proof IR must parse");
+        module.verify().expect("proof IR must pass verification");
+    }
+
+    #[test]
+    fn bounds_guard_emits_dominated_range_assumptions() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor { kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+        let mut builder = TraceBuilder::new(TraceId(60001), anchor);
+        let index = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Int32, TraceRep::Int32);
+        let length = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Int32, TraceRep::Int32);
+        let exit = builder.add_side_exit(ExitReason::GuardBounds, BytecodePc(0));
+        builder.emit0(TraceInst::GuardBounds { index, length, exit });
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        let trace = builder.finish().expect("well-formed guarded trace");
+        let plans = trace.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+            "guarded_index_range", proof_test_host()).expect("lowering");
+        let assume = ir.find("call void @llvm.assume(i1").expect("assumption");
+        let guard = ir.find("br i1 ").expect("guard");
+        assert!(assume > guard, "range assumption must follow its guard: {ir}");
+        validate_proof_ir(&ir);
+    }
+
+    #[test]
+    fn closure_captures_are_immutable_only_in_safe_epochs() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor { kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+        let mut builder = TraceBuilder::new(TraceId(60002), anchor);
+        let closure = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        builder.emit1(TraceInst::ClosureCapture { closure, index: 0, exit },
+            TraceType::Any, TraceRep::Tagged);
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        let trace = builder.finish().expect("well-formed capture trace");
+        let plans = trace.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+            "immutable_capture", proof_test_host()).expect("lowering");
+        assert!(ir.contains("!tbaa !44, !invariant.load !22"), "{ir}");
+        validate_proof_ir(&ir);
+
+        let mut changed_epoch = trace.clone();
+        // Keep the original result ID so the mutated test trace stays in SSA.
+        changed_epoch.nodes[0].kind = TraceInst::ReadBarrier { value: closure };
+        assert!(trace_has_heap_epoch_boundary(&changed_epoch));
+        let plans = changed_epoch.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&changed_epoch, exit).unwrap()).collect::<Vec<_>>();
+        let ir = lower_trace(&changed_epoch, &plans, HashMap::default(), 0,
+            "capture_with_barrier", proof_test_host()).expect("lowering");
+        assert!(!ir.contains("!tbaa !44, !invariant.load"), "{ir}");
+        validate_proof_ir(&ir);
+    }
+
+    #[test]
+    fn first_shaped_load_hoists_guard_without_reordering_side_exits() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor { kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+        let mut builder = TraceBuilder::new(TraceId(60004), anchor);
+        let map = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let key = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Any, TraceRep::Tagged);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        builder.emit1(TraceInst::HeapMapGetShaped {
+            map, key, expected_key: b"x".to_vec(), shape: 17, slot: 0, exit,
+        }, TraceType::Any, TraceRep::Tagged);
+        builder.set_terminator(TraceTerminator::LoopBack);
+        let trace = builder.finish().expect("well-formed shaped-map loop");
+        let plans = trace.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+        let mut slots = HashMap::default();
+        slots.insert(VmBindingKey::new(VmBindingKind::ShapeId, 17), 0);
+        slots.insert(VmBindingKey::new(VmBindingKind::DenseSlot, 0), 1);
+        let ir = lower_trace(&trace, &plans, slots, 0,
+            "shape_preheader_guard", proof_test_host()).expect("lowering");
+        let main_loop = ir.find("loop:\n").expect("loop label");
+        let shape_assumption = ir.find("call void @llvm.assume(i1")
+            .expect("shape assumption");
+        assert!(shape_assumption < main_loop, "shape proof not hoisted: {ir}");
+        assert_eq!(ir.matches("call void @llvm.assume(i1").count(), 1,
+            "shape guard unexpectedly reexecuted in body: {ir}");
+        validate_proof_ir(&ir);
+    }
+
+    #[test]
+    fn native_loop_stack_budget_has_proven_lifetime() {
+        use crate::napalm_trace_ir::{TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor { kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+        let mut builder = TraceBuilder::new(TraceId(60003), anchor);
+        builder.add_native_budget_exit(BytecodePc(0));
+        builder.set_terminator(TraceTerminator::LoopBack);
+        let trace = builder.finish().expect("well-formed loop trace");
+        let plans = trace.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 4,
+            "non_escaping_budget", proof_test_host()).expect("lowering");
+        assert!(ir.contains("@llvm.lifetime.start.p0(i64 8, ptr %budget)"), "{ir}");
+        assert!(ir.contains("@llvm.lifetime.end.p0(i64 8, ptr %budget)"), "{ir}");
+        validate_proof_ir(&ir);
+    }
+
+    #[test]
+    fn profile_counter_tbaa_does_not_clobber_gc_payload() {
+        let host = host_info().expect("LLVM host");
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context = Context::create();
+        let input = r#"
+            define i64 @profile_disjoint(ptr %heap, ptr %counter) {
+            entry:
+                %before = load i64, ptr %heap, align 8, !tbaa !14
+                store i64 13, ptr %counter, align 8, !tbaa !18
+                %after = load i64, ptr %heap, align 8, !tbaa !14
+                %sum = add i64 %before, %after
+                ret i64 %sum
+            }
+            define i64 @vm_value_disjoint(ptr %heap, ptr %value) {
+            entry:
+                %before = load i64, ptr %heap, align 8, !tbaa !14
+                store i64 13, ptr %value, align 8, !tbaa !19
+                %after = load i64, ptr %heap, align 8, !tbaa !14
+                %sum = add i64 %before, %after
+                ret i64 %sum
+            }
+            define i64 @broad_write(ptr %heap, ptr %unknown) {
+            entry:
+                %before = load i64, ptr %heap, align 8, !tbaa !14
+                store i64 13, ptr %unknown, align 8, !tbaa !14
+                %after = load i64, ptr %heap, align 8, !tbaa !14
+                %sum = add i64 %before, %after
+                ret i64 %sum
+            }
+            !0 = !{!"napalm.tbaa"}
+            !4 = !{!"napalm.heap", !0, i64 0}
+            !8 = !{!"napalm.profile.counter", !0, i64 0}
+            !9 = !{!"napalm.vm.value_slot", !0, i64 0}
+            !14 = !{!4, !4, i64 0}
+            !18 = !{!8, !8, i64 0}
+            !19 = !{!9, !9, i64 0}
+        "#;
+        let module = context.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(input.as_bytes(), "profile-proof"),
+        ).expect("LLVM parsed profile proof");
+        module.verify().expect("valid profile TBAA");
+        module.run_passes("default<O3>", &machine, PassBuilderOptions::create())
+            .expect("LLVM O3");
+        let optimized = module.print_to_string().to_string();
+        let split = |name: &str| {
+            optimized.split(&format!(" @{name}("))
+                .nth(1).expect("proof function present")
+                .split('}').next().expect("proof function body")
+                .to_owned()
+        };
+        let specific = split("profile_disjoint");
+        let module_value = split("vm_value_disjoint");
+        let generic = split("broad_write");
+        assert_eq!(specific.matches("load i64, ptr %heap").count(), 1, "{specific}");
+        assert_eq!(module_value.matches("load i64, ptr %heap").count(), 1, "{module_value}");
+        assert_eq!(generic.matches("load i64, ptr %heap").count(), 2, "{generic}");
+    }
+
+    #[test]
+    fn profile_write_preserves_absolute_value_forwarding() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor { kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+        let mut builder = TraceBuilder::new(TraceId(60005), anchor);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        builder.emit1(TraceInst::LoadAbsoluteValue { address: 0x1000 },
+            TraceType::Any, TraceRep::Tagged);
+        builder.emit0(TraceInst::IncrementProfileCounter { address: 0x2000 });
+        builder.emit1(TraceInst::LoadAbsoluteValue { address: 0x1000 },
+            TraceType::Any, TraceRep::Tagged);
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        let trace = builder.finish().expect("well-formed profile trace");
+        let plans = trace.exits.iter()
+            .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+        let mut slots = HashMap::default();
+        slots.insert(VmBindingKey::new(VmBindingKind::ValueAddress, 0x1000), 0);
+        slots.insert(VmBindingKey::new(VmBindingKind::ProfileCounterAddress, 0x2000), 1);
+        let ir = lower_trace(&trace, &plans, slots, 0,
+            "profile_preserves_value", proof_test_host()).expect("lowering");
+        assert_eq!(ir.matches("!tbaa !19").count(), 1, "absolute value reloaded: {ir}");
+        assert_eq!(ir.matches("!tbaa !18").count(), 2, "profile load/store missing: {ir}");
+        validate_proof_ir(&ir);
+    }
+
+    #[test]
+    fn full_runtime_effects_remain_conservative() {
+        let original = identity_test_trace(false);
+        assert!(!trace_has_heap_epoch_boundary(&original));
+        let mut changed = original.clone();
+        changed.nodes[0].kind = TraceInst::ReadBarrier { value: TraceValueId(0) };
+        assert!(trace_has_heap_epoch_boundary(&changed));
+    }
+
     #[test]
     fn pgo_profile_becomes_llvm_metadata_and_compiles() {
         let trace = identity_test_trace(true);
@@ -3980,5 +4509,84 @@ mod tests {
         let result = unsafe { function(std::ptr::null_mut(), links.as_ptr()) };
         assert_eq!(result, 42);
         std::mem::forget(engines); // the leaked test context outlives them
+    }
+
+    #[test]
+    fn gc_barrier_scopes_preserve_heap_store_order_and_aliasing() {
+        use crate::napalm_trace_ir::{ExitReason, TraceAnchor, TraceBuilder, TraceKind, TraceTerminator};
+        let anchor = TraceAnchor {
+            kind: TraceKind::Entry,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)),
+        };
+        let mut builder = TraceBuilder::new(TraceId(121212), anchor);
+        let cell = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let replacement = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Any, TraceRep::Tagged);
+        let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        builder.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged);
+        builder.emit0(TraceInst::HeapStoreCell { cell, value: replacement, exit });
+        builder.set_terminator(TraceTerminator::Exit(exit));
+        let trace = builder.finish().expect("valid heap-barrier trace");
+        let plans = trace.exits.iter().map(|exit| {
+            CompiledExitPlan::from_exit(&trace, exit).expect("valid side exit")
+        }).collect::<Vec<_>>();
+        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+            "gc_barrier_scoped", host_info().expect("LLVM host"))
+            .expect("LLVM lowering");
+
+        assert!(ir.contains("!72 = !{!71}"), "{ir}");
+        assert!(ir.contains("#3, !noalias !72"), "barrier lost full memory effects: {ir}");
+        assert!(ir.contains("!tbaa !54, !alias.scope !72"), "sidecar data read has no proof: {ir}");
+        assert!(ir.contains("!tbaa !43"), "managed cell store missing: {ir}");
+        assert!(!ir.contains("!tbaa !43, !alias.scope !72"),
+            "managed write incorrectly marked disjoint: {ir}");
+        assert!(ir.contains("attributes #3 = { nounwind }"),
+            "barrier wrongly given restrictive memory effects: {ir}");
+        let ctx = Context::create();
+        let module = ctx.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
+            ir.as_bytes(), "gc_barrier_scoped"))
+            .expect("parsed trace IR");
+        module.verify().expect("verified trace IR");
+    }
+
+    #[test]
+    fn gc_barrier_metadata_enables_gvn_only_for_proven_non_gc_buffers() {
+        let host = host_info().expect("LLVM host");
+        let machine = create_host_target_machine(host).expect("target machine");
+        let context = Context::create();
+        let input = r#"
+            declare void @barrier(ptr, ptr) nounwind
+            define i64 @non_gc(ptr %sidecar, ptr %runtime, ptr %owner) {
+            entry:
+                %before = load i64, ptr %sidecar, !alias.scope !72
+                call void @barrier(ptr %runtime, ptr %owner), !noalias !72
+                %after = load i64, ptr %sidecar, !alias.scope !72
+                %result = add i64 %before, %after
+                ret i64 %result
+            }
+            define i64 @managed(ptr %heap, ptr %runtime, ptr %owner) {
+            entry:
+                %before = load i64, ptr %heap
+                call void @barrier(ptr %runtime, ptr %owner), !noalias !72
+                %after = load i64, ptr %heap
+                %result = add i64 %before, %after
+                ret i64 %result
+            }
+            !70 = distinct !{!70, !"napalm.gc_barrier.disjoint"}
+            !71 = distinct !{!71, !70, !"napalm.gc_barrier.non_gc_buffer"}
+            !72 = !{!71}
+        "#;
+        let module = context.create_module_from_ir(
+            MemoryBuffer::create_from_memory_range_copy(input.as_bytes(), "gc-proof-test"))
+            .expect("parse GC proof test IR");
+        module.verify().expect("verify GC proof test IR");
+        module.run_passes("default<O3>", &machine, PassBuilderOptions::create())
+            .expect("LLVM O3");
+        let ir = module.print_to_string().to_string();
+        let non_gc = ir.split(" @non_gc(").nth(1).expect("non-GC function")
+            .split('}').next().expect("non-GC body");
+        let managed = ir.split(" @managed(").nth(1).expect("managed function")
+            .split('}').next().expect("managed body");
+        assert_eq!(non_gc.matches("load i64").count(), 1, "{non_gc}");
+        assert_eq!(managed.matches("load i64").count(), 2, "{managed}");
     }
 }

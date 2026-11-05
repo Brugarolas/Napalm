@@ -2354,6 +2354,18 @@ mod tests {
             .count()
     }
 
+    /// Rematerialized stores whose presence is really decided at run time.
+    /// Required fields are also emitted as StorePropertyIfPresent, but with a
+    /// constant `true` presence flag.
+    fn conditional_presence_stores(function: &Function) -> usize {
+        count(function, |kind| match kind {
+            Inst::StorePropertyIfPresent { present, .. } => {
+                resolve_constant(function, *present) != Some(&Constant::Bool(true))
+            }
+            _ => false,
+        })
+    }
+
     fn is_alloc(kind: &Inst) -> bool {
         matches!(
             kind,
@@ -2630,11 +2642,7 @@ mod tests {
         let function = program.function(entry).unwrap();
         assert_eq!(stats.sunk_allocations, 1, "{function}");
         assert_eq!(count(function, |i| matches!(i, Inst::AllocMap)), 1, "{function}");
-        assert_eq!(
-            count(function, |i| matches!(i, Inst::StorePropertyIfPresent { .. })),
-            1,
-            "{function}"
-        );
+        assert_eq!(conditional_presence_stores(function), 1, "{function}");
         assert_eq!(count(function, |i| matches!(i, Inst::LoadProperty { .. })), 0, "{function}");
 
         let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
@@ -2745,11 +2753,7 @@ mod tests {
 
         sroa(&mut program, entry);
         let function = program.function(entry).unwrap();
-        assert_eq!(
-            count(function, |i| matches!(i, Inst::StorePropertyIfPresent { .. })),
-            1,
-            "{function}"
-        );
+        assert_eq!(conditional_presence_stores(function), 1, "{function}");
 
         let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
         for (present, expected_len) in [(false, 1.0), (true, 2.0)] {
@@ -3458,7 +3462,11 @@ var result = Pair.new(3, 4).t
             verify_function(function).unwrap_or_else(|errors| panic!("{errors:#?}\n{function}"));
         }
         let after = loads(&hir);
-        // Only the `t` getter's load must remain; the four constructor reads go.
-        assert_eq!(before - after, 4, "field loads {before} -> {after}");
+        // Three constructor reads are forwarded from the preceding stores. The
+        // second `_a` read follows `_a + _b` on untyped values: that `+` is a
+        // dynamic Invoke (it may run a user operator with side effects), so the
+        // field must be reloaded after it. The `t` getter's load also remains.
+        assert_eq!(before - after, 3, "field loads {before} -> {after}");
+        assert_eq!(after, 2, "field loads {before} -> {after}");
     }
 }

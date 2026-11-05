@@ -17,7 +17,7 @@ try {
 }
 print("after handled throw");
 
-fn return_from_try() {
+function return_from_try() {
   try {
     print("return_from_try: body");
     return 42;
@@ -29,19 +29,20 @@ fn return_from_try() {
 
 print(["return_from_try result", return_from_try()]);
 
-fn return_from_finally() {
+// `return` inside `finally` is a compile error (NAPALM-L043): cleanup code
+// cannot override the pending result, so the body's value is returned.
+function return_from_finally() {
   try {
     print("return_from_finally: body");
     return 1;
   } finally {
-    print("return_from_finally: overriding return");
-    return 77;
+    print("return_from_finally: cleanup runs, result is kept");
   }
 }
 
 print(["return_from_finally result", return_from_finally()]);
 
-fn throw_from_finally() {
+function throw_from_finally() {
   try {
     print("throw_from_finally: body");
   } finally {

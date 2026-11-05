@@ -290,6 +290,31 @@ Do not use `String(value)`, `Number(value)`, `Boolean(value)`, or
 `JSON.stringify` by analogy with JavaScript: equivalent APIs are not provided
 here. The textual output of Maps and lists is for presentation, **not JSON**.
 
+### 3.5 typeof
+
+`typeof value` returns a String naming the runtime kind of a value. Values that
+carry generic or contract information include it:
+
+| Value | `typeof` |
+| --- | --- |
+| `1`, `true`, `null`, `"s"` | `Number`, `Boolean`, `Null`, `String` |
+| `[1, 2]` typed `number[]` / untyped list | `Array<Number>` / `Array` |
+| `new Map()`, typed `Map<string, number>` | `Map`, `Map<String, Number>` |
+| `{}` / object bound to interface or type `Named` | `Object` / `Object implementation of Named` |
+| `new Set()`, typed `Set<number>` | `Set`, `Set<Number>` |
+| interface name / type alias name | `Interface` / `Type` |
+| class object | `Class` |
+| instance of `Dog`; of `Holder<number>` | `Instance of Dog`; `Instance of Holder<Number>` |
+| function or closure | `Function` |
+| Promise; pending `Timer.delay`/`Timer.every` | `Promise`; `Timer` |
+| `new Emitter<number>()`, its `.event` | `Emitter<Number>`, `Event<Number>` |
+| Channel / Receiver | `Channel`, `Receiver` (with `<T>` when typed) |
+| Date, Proxy, Range, Fiber, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Module` |
+| native decorator | `NativeDecorator` |
+
+A settled timer Promise reports `Promise`. User decorators are ordinary
+functions (`Function`).
+
 ## 4. Variables, Scopes, and Constants
 
 ### 4.1 Declarations
@@ -379,7 +404,7 @@ type.
 | Multiplicative | `*`, `/`, `%`. |
 | Additive | `+`, `-`. |
 | Shifts | `<<`, `>>`. |
-| Comparison | `<`, `<=`, `>`, `>=`, `in`, `instanceof`. |
+| Comparison | `<`, `<=`, `>`, `>=`, `in`, `instanceof`, `implements`, `inherits` (see §14.7). |
 | Equality | `==`, `!=`, `===`, `!==`. |
 | Bitwise | `&`, `^`, `|`. |
 | Logical | `&&`, `||`, `??`. |
@@ -758,9 +783,11 @@ It is not accurate to say that all its annotations are erased.
 | Annotated or inferred class fields | Constrain writes and reads of uninitialized fields. |
 | Interfaces, structural aliases, typed lists, generic Map/Set | Can install persistent contracts on objects. |
 | Return annotation | Accepted, but is not a return-value contract. |
-| `implements`, visibility modifiers, `override` | Do not by themselves implement access control or interface checking. |
+| `class C implements I` | Adds the fields of `I` to `C` and requires the required ones to be initialized (§14.7). |
+| Visibility modifiers, `override` | Do not by themselves implement access control. |
 | `as T`, `<T>value`, `satisfies T`, `value!` | Syntax accepted without converting or checking the value at runtime. |
-| Function/class generics | Do not instantiate reified generic types. |
+| Generic interfaces, types and classes | Each concrete use (`Box<number>`, `Holder<string>`) is checked; the bare generic name is unconstrained (§8.8). |
+| Generic functions | Type parameters are erased to `any`. |
 
 A known violation can prevent compilation. A runtime contract violation
 produces **`Structural type error`** and terminates the program.
@@ -871,10 +898,17 @@ appear later, provided they do not form recursive schemas.
 - A `readonly` field cannot be changed or deleted after the contract is
   installed. The protection is shallow: a contained object can still be
   mutable.
-- `method(): number` in an interface describes a closure field. It does not
-  check its arity or return value.
-- Structural interfaces describe **Maps/object literals**, not class
-  instances. `class X implements I` does not change this rule.
+- Interfaces and object types describe **data only**. A method signature such
+  as `area(): number;` (or `map<T>(value: T): T;`) is a compile error:
+  declare a class when you need methods. A function-typed field such as
+  `onDone: () => void;` is still allowed; it is a closure field whose arity
+  and return value are not checked.
+- An interface- or type-annotated binding (`const p: Player = ...`, a
+  `p: Player` parameter, a `Player[]` element) accepts a Map/object literal
+  that satisfies the contract, or an instance of a class that declares
+  `implements Player` (directly, through an ancestor, or through an interface
+  that extends `Player`). Class instances are matched nominally: a class with
+  the right fields but no `implements` clause is rejected (§14.7).
 
 ### 8.4 type: Closed Objects
 
@@ -905,18 +939,8 @@ It does not recursively change the semantics of a child declared with another
 open interface. Structural alternatives in an alias union are also closed
 where applicable.
 
-Generic aliases retain their shape, but **do not fully substitute their type
-arguments**:
-
-```napalm
-type Box<T> = {value: T};
-const box: Box<number> = {value: "admitido actualmente"};
-System.print(box.value);
-```
-
-Here the T placeholder is erased to `any`; the `value` key remains part of the
-closed schema. For a real constraint, use a non-generic alias with
-`value: number`, or a native generic Map/Set when appropriate.
+Generic aliases substitute their type arguments (§8.8):
+`type Box<T> = {value: T}` bound as `Box<number>` requires a Number `value`.
 
 ### 8.5 The Contract Belongs to the Object
 
@@ -960,7 +984,8 @@ hierarchy. Do not assume a `Base` annotation automatically accepts every
 
 Among other forms, the following are accepted:
 
-- Generic parameters on functions and classes, and type arguments in calls.
+- Generic parameters on functions and type arguments in calls (erased; generic
+  interfaces, types and classes are checked, see §8.8).
 - Overload signatures without bodies, followed by the implementation.
 - `abstract class`, `abstract` or `declare` members.
 - `declare function`, `declare const/let/var`, `declare class`,
@@ -972,6 +997,45 @@ Among other forms, the following are accepted:
 Signatures without bodies do not create an executable overload.
 `abstract` should not be interpreted as a complete guarantee that the class
 cannot be instantiated. Type imports do not carry contracts between modules.
+
+### 8.8 Generics
+
+Generic interfaces, object types and classes are checked per concrete use. Using
+the generic name without arguments keeps the old unconstrained behavior: every
+type parameter is `any`.
+
+```napalm
+interface Box<T> { value: T; }
+type Pair<A, B> = { first: A; second: B };
+class Holder<T> {
+    item: T;
+    constructor(item: T) { this.item = item; }
+}
+
+const box: Box<number> = { value: 1 };        // value must be a Number
+const pair: Pair<string, number[]> = { first: "a", second: [1] };
+const loose: Box = { value: "anything" };      // unconstrained
+
+const holder = new Holder<number>(1);          // this instance holds Numbers
+holder.item = 2;                               // checked against Number
+const free = new Holder(1);                    // no arguments: unconstrained
+free.item = "text";
+```
+
+- `Box<number>` and `Pair<string, number[]>` become ordinary contracts with the
+  arguments substituted, so nested contents (`number[]`) are protected too.
+- A generic class instance created as `new Holder<number>(...)` or bound to a
+  `Holder<number>` annotation carries its arguments. Every later write to a
+  field declared with a type parameter (`item: T`) is checked against them,
+  including writes from methods and from optimized native code.
+- `Promise<T>`: the settled value is checked against `T` at `await`.
+- `Map<K, V>`, `Set<T>`, `T[]`/`Array<T>`, `Event<T>`, `Emitter<T>`,
+  `Channel<T>` and `Receiver<T>` work as before (§10.5, §15.3).
+- Recursive generic contracts (`next: Node<T>`) are not supported, like
+  recursive interfaces in general. Type parameters of generic functions are
+  erased to `any`.
+
+`typeof` reports generic arguments carried by a value (§3.5).
 
 ## 9. Lists and Arrays
 
@@ -1232,9 +1296,8 @@ groups.set("items", items);
 System.print(groups.get("items").size); // 1
 ```
 
-An invalid write through `any` is still fatal.
-Do not confuse these native generics with the erased placeholders of a
-user-defined generic class or alias.
+An invalid write through `any` is still fatal. User-defined generic
+interfaces, types and classes are checked as well (§8.8).
 
 ## 11. Ranges and Custom Iteration
 
@@ -1484,9 +1547,11 @@ arguments.
 Always use `this.member` in methods. `function method(...) {...}` is also
 accepted inside a class; `fn` is not.
 
-Instances are not open Maps. Do not assume that `object.extra = value` adds an
-arbitrary field or that all instances have `keys()`, `values()`, `entries()`,
-or `size`. Declare the fields that make up their API.
+Instances are not open Maps: `object.extra = value` cannot add an arbitrary
+field. Declare the fields that make up their API. Instances provide `keys()`,
+`values()`, `entries()` and `size` for their stored fields, including inherited
+fields, in field-slot order. Computed getters and static fields are excluded.
+User-defined members can override these defaults.
 
 ### 14.2 Inheritance and super
 
@@ -1522,8 +1587,10 @@ forwards all arguments or runs all initializers.
 When derived initializers are present, the parser requires a direct call to
 super before inserting them.
 
-`instanceof` is useful for user class hierarchies. Do not use it as a universal
-`typeof` for builtins: for example, a list is not reliably identified by
+`instanceof` is useful for user class hierarchies: `value instanceof C` is true
+for instances of `C` and of any subclass. Its right-hand side can also be an
+interface or object type (§14.7). Do not use it as a universal `typeof` for
+builtins: for example, a list is not reliably identified by
 `list instanceof List` in the current implementation.
 
 ### 14.3 Static Members and static Blocks
@@ -1611,6 +1678,95 @@ These are concrete, synchronous instance methods; they cannot be `static`,
 `async`, `foreign`, `abstract`, or decorated.
 `&&`, `||`, `??`, assignment, and subscripts cannot be overloaded using an
 `operator []` declaration.
+
+### 14.7 Implementing Interfaces and Types
+
+`implements` lists interfaces and object type aliases declared in the same
+module. Each contract field, including fields inherited through an interface's
+`extends`, becomes an instance field of the class with the declared type:
+
+```napalm
+interface Named {
+    name: string;
+    nickname?: string;
+}
+interface Aged extends Named {
+    age: number;
+}
+type Point = {x: number; y: number; label: string | null};
+
+class Animal implements Named {
+    constructor(name: string) { this.name = name; }
+}
+class Dog extends Animal implements Aged, Point {
+    x = 0;
+    y = 0;
+    constructor(name: string, age: number) {
+        super(name);
+        this.age = age;
+    }
+}
+
+const dog = new Dog("Rex", 3);
+System.print(dog.keys());                // [name, nickname, x, y, age, label]
+System.print([dog.nickname, dog.label]); // [null, null]
+```
+
+- A field is **required** unless it is optional (`field?: T`), its type
+  accepts `null` (`T | null`), or it is `any`. Optional and nullable fields
+  start as `null`.
+- A required field must be initialized by the class: a field initializer,
+  a definite field (`field!: T`), a parameter property, a `this.field = ...`
+  assignment in the constructor, or an ancestor class that already does so.
+  Otherwise compilation fails.
+- An `abstract` class may leave required fields uninitialized; its first
+  concrete subclass must initialize them.
+- Fields already declared by the class or inherited from a superclass are
+  reused, not duplicated. Writes are checked against the contract's type.
+- Generic aliases can be implemented with type arguments, as in
+  `implements Box<number>`.
+- An unknown name, a non-object alias (`type Id = string | number`), a field
+  declared with conflicting types by two contracts, or a method with the same
+  name as a contract field is a compile error.
+
+```napalm compile-error
+interface Named { name: string; }
+class Anonymous implements Named {
+    constructor() {} // `name` is required and never initialized
+}
+```
+
+```napalm compile-error
+interface Shape {
+    name: string;
+    area(): number; // interfaces and types cannot declare methods
+}
+```
+
+Three operators inspect classes and contracts. All of them return `false` for
+`null` and primitive values:
+
+| Expression | True when |
+| --- | --- |
+| `value instanceof C` | `value` is an instance of class `C` or of a subclass. |
+| `value instanceof I` | `value` is an instance whose class or an ancestor implements `I` (or contracts that cover all of its fields), or a Map/object literal that currently satisfies `I` structurally. |
+| `value implements I` | Same as `instanceof I`, but a class object also qualifies: `Dog implements Named`. The right-hand side must be an interface or object type. |
+| `value inherits C` | `value` is an instance or class object whose class **strictly** descends from `C`: `Dog inherits Animal` is true, `Dog inherits Dog` is false. |
+
+```napalm
+interface Named { name: string; }
+class Animal implements Named { constructor() { this.name = "a"; } }
+class Dog extends Animal {}
+
+const dog = new Dog();
+System.print([dog instanceof Animal, dog instanceof Named]);   // [true, true]
+System.print([Dog implements Named, Dog instanceof Named]);    // [true, false]
+System.print([dog inherits Animal, Dog inherits Animal, Animal inherits Animal]); // [true, true, false]
+System.print([{name: "Ada"} implements Named, 42 implements Named]); // [true, false]
+```
+
+A structural check on a Map does not install a contract on it; use a typed
+binding for that (§8.5).
 
 ## 15. Reactive Properties and Watchers
 
@@ -2517,11 +2673,16 @@ Negative indices in `text[index]` count from the end.
 | `isEmpty` | Whether it is empty. |
 | `[index]` | One-scalar string, or null out of range. |
 | `+ value` | Concatenation through textual conversion. |
-| `contains(text)` | Searches for a substring. |
+| `contains(text)`, `includes(text)` | Searches for a literal substring; both names are aliases. |
 | `startsWith(text, position?)` | Prefix from the specified position. |
 | `endsWith(text, endPosition?)` | Suffix up to the specified endpoint. |
 | `indexOf(text, start?)` | First index or `-1`. |
 | `lastIndexOf(text, position?)` | Last index no later than the position. |
+| `padStart(targetLength, padding?)`, `padEnd(targetLength, padding?)` | Pads to a scalar length; default padding is a space. |
+| `split(separator?, limit?)` | List of substrings separated by literal text, optionally limited in length. |
+| `repeat(count)` | Repeats the string a non-negative integer number of times. |
+| `replace(search, replacement)` | Replaces the first literal match. |
+| `replaceAll(search, replacement)` | Replaces every non-overlapping literal match. |
 | `slice(start, end?)` | Segment with an exclusive end; negatives are relative to the end. |
 | `substring(start, end?)` | Clamps negatives to zero and swaps reversed endpoints. |
 | `trim()`, `trimStart()`, `trimEnd()` | Removes Unicode whitespace at the corresponding ends. |
@@ -2544,9 +2705,33 @@ as in JS. `slice`/`substring` operations clamp their endpoints according to
 their rules; `indexOf` returns `-1` if no match is found.
 Uppercase conversion can change the length.
 
-`includes`, `concat`, `split`, `replace`, `replaceAll`, `padStart`, `padEnd`,
-`repeat`, regular expressions, and regular-expression methods are not
-provided, even if some appear in a historical example.
+`padStart`/`padEnd` repeat and truncate the padding at scalar boundaries to
+reach the target length. A target no larger than the current length (including
+a negative target), or empty padding, leaves the text unchanged.
+
+`split()` returns a one-element List containing the original string.
+`split('')` returns individual Unicode scalar values; splitting an empty string
+this way returns an empty List. Other separators preserve empty parts at either
+end and between adjacent separators. The optional limit is a non-negative
+integer: zero returns an empty List, and any excess parts are discarded.
+
+Replacement strings are literal: `$&`, `$1` and other `$` patterns have no
+special meaning. An empty search inserts the replacement at the start for
+`replace`, or at every scalar boundary (including both ends) for `replaceAll`.
+Replacements are not searched again. Text arguments must be strings; lengths,
+counts and limits must be finite integers. Invalid arguments and unrepresentable
+result sizes produce catchable runtime errors.
+
+```napalm
+System.print('7'.padStart(3, '0'));       // 007
+System.print('a,b,c'.split(',', 2));      // [a, b]
+System.print('é😀'.split(''));            // [é, 😀]
+System.print('ha'.repeat(3));             // hahaha
+System.print('aba'.replace('a', 'x'));    // xba
+System.print('aba'.replaceAll('a', 'x')); // xbx
+```
+
+`concat`, regular expressions, and regular-expression methods are not provided.
 
 ## 25. Numbers and Randomness
 
@@ -3174,7 +3359,8 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 | A return annotation guarantees the return value. | That annotation is not currently checked. |
 | `as` converts or validates. | It does not change the value. |
 | Structural `interface` and `type` are interchangeable. | Interface is open; object alias is closed. |
-| `implements` lets an instance pass as an interface. | Structural interfaces require Maps. |
+| `implements` lets an instance bind to an interface annotation. | It adds and checks fields; interface/type annotations still require Maps. Test instances with `instanceof`. |
+| Interfaces and types can declare methods. | They are data-only; use a class for methods. |
 | Class `const` or private/readonly freezes a value. | No; structural readonly is a different case. |
 | `Array(n)` creates zeros. | It creates null; `Array<Number>(n)` creates zeros. |
 | `map.keys` and `map.keys()` are the same. | Live insertion-order view vs. sorted list. |
@@ -3194,7 +3380,7 @@ Do not use the following as though they were available features:
 
 - `switch`, generators, `yield` as generator syntax, regex literals,
   JSX, executable namespaces, and `const enum`.
-- `typeof`, `void` as an operator, and `>>>`.
+- `void` as an operator, and `>>>`.
 - Rest parameters and full default-initializer parameters.
 - The general comma operator and `matrix[x, y]` subscripts.
 - Namespace imports, export-star, dynamic import, and require.
@@ -3339,6 +3525,7 @@ semantic specification nor a universal performance test.
 | [destructuring_spread.napalm](scripts/destructuring_spread.napalm) | Patterns, defaults, rest, spread, and calls. |
 | [enums.napalm](scripts/enums.napalm) | Numeric and string enums, reverse mapping, and local enum. |
 | [interfaces.napalm](scripts/interfaces.napalm) | Open contracts, aliases, and valid mutation. |
+| [types.napalm](scripts/types.napalm) | Classes implementing interfaces and types, instance `keys()`, and the `instanceof`/`implements`/`inherits` operators. |
 | [intrinsics.napalm](scripts/intrinsics.napalm) | Arrays, lambdas, Unicode, strings, nullish operations, and optional chaining. |
 | [map.napalm](scripts/map.napalm) | Map, Set, and native generics. |
 | [proxy.napalm](scripts/proxy.napalm) | Traps and enumeration/spread. |
@@ -3368,7 +3555,6 @@ they are engine-specific benchmarks.
 | [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
 | [trycatch.napalm](scripts/trycatch.napalm) | Uses `fn` declarations; the manual's exception examples use `function`. |
 | [defer.napalm](scripts/defer.napalm) | The `errdefer (error)` binding must be written with bars. |
-| [types.napalm](scripts/types.napalm) | Attempts to pass class instances to a structural-interface list. The current contract rejects that mixture; later blocks do not make fatal violations recoverable. |
 
 Those programs have not been modified to hide differences. This manual
 documents the available language and shows usable alternatives.

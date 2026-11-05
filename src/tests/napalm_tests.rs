@@ -9,7 +9,7 @@ fn napalm_destructuring_assignments_parameters_and_captures() {
             constructor({value}) { this.value = value; }
             add([a, b]) { return this.value + a + b; }
         }
-        let a = 0; let rest = null; let x = 0;
+        let a = 0; let rest: any = null; let x = 0;
         function change() { [a, ...rest] = [7, 8, 9]; ({missing: x = 10} = {}); }
         change();
         const object = {};
@@ -599,7 +599,7 @@ fn napalm_spread_and_destructuring_in_native_loops_with_gc() {
             const {x, ...rest} = {...{x: first, y: tail}};
             total += add(...[x, rest.y[0]]);
         }
-        let source = {};
+        let source: any = {};
         for (let i = 0; i < 40; i++) source[`key${i}`] = [i];
         const copied = {...source};
         const {key0, ...rest} = copied;
@@ -629,12 +629,12 @@ fn napalm_spread_preserves_custom_iteration_and_evaluation_order() {
 #[test]
 fn napalm_destructuring_defaults_merge_local_state_and_only_export_bindings() {
     run_napalm("function f() { let n = 0; const [a = ++n, b = ++n] = []; return [a, b, n]; } const result = f();", "[1, 2, 2]");
-    run_napalm("function f() { let n = 0; let a; let b; [a = ++n, b = ++n] = []; return [a, b, n]; } const result = f();", "[1, 2, 2]");
+    run_napalm("function f() { let n = 0; let a: any = null; let b: any = null; [a = ++n, b = ++n] = []; return [a, b, n]; } const result = f();", "[1, 2, 2]");
     run_napalm(r#"
         function values() {
             let n = 0;
             const [a = ++n, b = ++n] = [];
-            let c; let d;
+            let c: any = null; let d: any = null;
             [c = ++n, d = ++n] = [];
             let sum = 0;
             for (let i = 0; i < 4; i++) [sum] = [sum + i];
@@ -1040,6 +1040,33 @@ fn interface_error(source: &str, require_native: bool) {
 }
 
 #[test]
+fn napalm_classes_without_constructor_inherit_superclass_constructors() {
+    run_napalm(r#"
+        class Empty {}
+        class CallsEmptySuper extends Empty { constructor() { super(); this.ok = true; } }
+        class Base { constructor(x) { this.v = x; } }
+        class Middle extends Base {}
+        class Leaf extends Middle { constructor(x) { super(x + 1); } }
+        class Initialized { v: number = 1; }
+        class InheritsFields extends Initialized {}
+        class Typed { v: number = 1; constructor(x: number) { this.v = x; } }
+        class WithExtra extends Typed { extra = 3; }
+        class Two { constructor(a, b) { this.s = a + b; } }
+        class OneLevel extends Two { t = 10; }
+        class TwoLevels extends OneLevel { u = 100; }
+        class First { constructor() { this.log = "A"; } }
+        class Second extends First { tag = "B"; }
+        class Third extends Second { constructor() { super(); this.log = this.log + this.tag + "C"; } }
+        const extra = new WithExtra(4);
+        const levels = new TwoLevels(1, 2);
+        const result = [
+            new CallsEmptySuper().ok, new Middle(4).v, new Middle().v, new Leaf(5).v,
+            new InheritsFields().v, extra.v, extra.extra, levels.s, levels.t, levels.u, new Third().log,
+        ];
+    "#, "[true, 4, null, 6, 1, 4, 3, 3, 10, 100, ABC]");
+}
+
+#[test]
 fn napalm_interfaces_reject_all_mutation_routes_and_cannot_be_caught() {
     let prefix = r#"
         interface Child { value: number; }
@@ -1101,7 +1128,9 @@ fn napalm_interfaces_jit_preexisting_alias_and_late_failure() {
 
 #[test]
 fn napalm_interfaces_ir_retains_contract_and_typed_reads() {
-    let source = "interface P { x: number; } function f() { const p: P = {x: 1}; return p.x; } const result = f();";
+    // The bound value comes from an untyped parameter: a literal initializer
+    // would let the optimizer prove the contract statically and drop the bind.
+    let source = "interface P { x: number; } function f(o) { const p: P = o; return p.x; } const result = f({x: 1});";
     let parsed = crate::napalm_front_main::parse("typed.nap", source);
     let mut hir = Program::new();
     napalm_builtin::install_hir_builtins(&mut hir);
@@ -1112,7 +1141,9 @@ fn napalm_interfaces_ir_retains_contract_and_typed_reads() {
     assert!(program.functions.iter().any(|f| Decoder::new(&f.chunk.code)
         .any(|op| op.unwrap().opcode == Opcode::BindInterface)));
     assert!(hir.functions.iter().any(|f| f.nodes.iter().any(|node| {
-        matches!(node.kind, crate::napalm_ir::Inst::MapGet { .. })
+        // Typed reads are a MapGet or, with a known structural layout, a
+        // fixed-slot LoadProperty; either way the result is typed Num.
+        matches!(node.kind, crate::napalm_ir::Inst::MapGet { .. } | crate::napalm_ir::Inst::LoadProperty { .. })
             && f.value(node.results[0]).unwrap().ty == Type::Num
     })));
     // A corrupted descriptor must fail verification before VM preparation.
