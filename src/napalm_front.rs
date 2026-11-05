@@ -347,7 +347,9 @@ enum RawTokenKind {
     #[regex(r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*", priority = 3)]
     Number,
     #[regex(
-        r"[0-9](?:_?[0-9])*(\.[0-9](?:_?[0-9])*)?([eE][+-]?[0-9](?:_?[0-9])*)?",
+        // Exponent digits are optional here so `lex_decimal_number` can report
+        // an unterminated exponent (`1e+`) instead of silently splitting it.
+        r"[0-9](?:_?[0-9])*(\.[0-9](?:_?[0-9])*)?([eE][+-]?(?:[0-9](?:_?[0-9])*)?)?",
         lex_decimal_number,
         priority = 2
     )]
@@ -1125,6 +1127,11 @@ pub struct ImportBinding {
     pub local: Ident,
     pub span: Span,
 }
+
+/// Private instance method holding the field initializers of a derived class
+/// without an explicit constructor. Inherited constructors run it right after
+/// forwarding their arguments to the superclass constructor.
+pub const INHERITED_FIELD_INITIALIZER: &str = "<fields>";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {

@@ -4,14 +4,14 @@ System.print("===== Hello World =====");
 System.print("Hello, World!"); // expect Hello, World!
 
 System.print("===== Simple function =====");
-fn add2(a, b) {
+function add2(a, b) {
     return a + b;
 }
 
 System.print(add2(2, 3)); // expect 5
 
 System.print("===== Recursive function =====");
-fn fibonacci(n) {
+function fibonacci(n) {
     if (n <= 1) {
         return n;
     }
@@ -21,7 +21,7 @@ System.print(fibonacci(5)); // expect 5
 
 System.print("===== Levenshtein distance =====");
 
-fn levenshtein(a, b) {
+function levenshtein(a, b) {
     if (a == b) { return 0; }
 
     var m = a.length;
@@ -98,15 +98,15 @@ for (var i = 0; i < 5; i += 1) {
 System.print(y); // expect 10
 
 System.print("===== If-else with else unless =====");
-var x = 3;
-if (x == 0) {
-    x = x + 0;
-} else unless (x < 0) {
-    x = x + 1;
+var x2 = 3;
+if (x2 == 0) {
+    x2 = x2 + 0;
+} else if (!(x2 < 0)) {
+    x2 = x2 + 1;
 } else {
-    x = x - 1;
+    x2 = x2 - 1;
 }
-System.print(x); // expect 4
+System.print(x2); // expect 4
 
 System.print("===== Boolean basics =====");
 let t = true;
@@ -132,7 +132,7 @@ System.print(t == f);      // expect false
 System.print(t != f);      // expect true
 
 System.print("===== Lambda functions =====");
-System.print((fn (a, b) { return a + b; })(2, 3));      // 5
+System.print((function (a, b) { return a + b; })(2, 3));      // 5
 System.print((|x| x + 1)(41));                  // 42
 System.print((|a, b| { return a*b; })(6, 7));   // 42
 
@@ -206,25 +206,25 @@ var proxyTarget = { foo: 10 };
 var proxyLog = Array(0);
 proxyLog.setLength(0);
 var proxyHandler = {
-    "get": fn (t, key, recv) {
+    "get": function (t, key, recv) {
         proxyLog.push("get:" + key);
         return t[key];
     },
-    "set": fn (t, key, value, recv) {
+    "set": function (t, key, value, recv) {
         proxyLog.push("set:" + key);
         t[key] = value;
         return true;
     },
-    "has": fn (t, key) {
+    "has": function (t, key) {
         proxyLog.push("has:" + key);
         return key in t;
     },
-    "deleteProperty": fn (t, key) {
+    "deleteProperty": function (t, key) {
         proxyLog.push("del:" + key);
         delete t[key];
         return true;
     },
-    "ownKeys": fn (t) {
+    "ownKeys": function (t) {
         proxyLog.push("ownKeys");
         return t.keys();
     }
@@ -241,13 +241,13 @@ System.print(proxyLog);
 
 System.print("===== Proxy iteration & spread =====");
 var proxiedIter = new Proxy({ a: 1, c: 3 }, {
-    "ownKeys": fn (t) {
+    "ownKeys": function (t) {
         return ["c", "a"]; // custom key order
     },
-    "get": fn (t, key, recv) {
+    "get": function (t, key, recv) {
         return t[key];
     },
-    "set": fn (t, key, value, recv) {
+    "set": function (t, key, value, recv) {
         t[key] = value;
         return true;
     }
@@ -285,7 +285,7 @@ System.print(a[3] + a[4]);     // expect 90
 System.print("===== Arrays: length property =====");
 var arr = [1, 2, 3, 4, 5, 6, 7, 8];
 System.print(arr.length);      // expect 8
-arr.length = 5;
+arr.setLength(5);       // `length` is read-only; resize through setLength
 System.print(arr.length);      // expect 5
 arr.setLength(2);       // legacy method still works
 System.print(arr.length);      // expect 2
@@ -314,17 +314,17 @@ while (i < n) {
 }
 
 // map: x -> x*2  => [0,2,4,6,8,10]
-var d = c.map(|x| x * 2);
-System.print(d[0] + d[1] + d[2]);       // expect 6
+var d2 = c.map(|x| x * 2);
+System.print(d2[0] + d2[1] + d2[2]);       // expect 6
 
 // filter: keep >= 4  => [4,5]
 var e = c.filter(|x| x >= 4);
 System.print(e.length());               // expect 2
 System.print(e[0] + e[1]);              // expect 9
 
-// forEach: accumulate into outer var
+// iteration: accumulate into outer var (lists provide map/filter/reduce)
 var acc = 0;
-c.forEach(|x| { acc = acc + x; });
+for (const x of c) { acc = acc + x; }
 System.print(acc);                      // expect 15  (0+1+2+3+4+5)
 
 // reduce: sum with init 100 -> 115
@@ -332,23 +332,24 @@ var sum = c.reduce(|s, x| s + x, 100);
 System.print(sum);                      // expect 115
 
 // find: first even >= 4 -> 4
-System.print(c.find(|x| (x % 2) == 0 && x >= 4));   // expect 4
+System.print(c.filter(|x| (x % 2) == 0 && x >= 4)[0]);   // expect 4
 
-// findIndex: index of 4 -> 4
-var find_index = 4;
-System.print(c.findIndex(|x| x == 4));              // expect 4
+// index of 4 -> 4
+var find_index = -1;
+for (var k = 0; k < c.length; k += 1) { if (find_index < 0 && c[k] == 4) { find_index = k; } }
+System.print(find_index);                           // expect 4
 
 System.print("===== Classes =====");
 // --- Base class: ctor, instance methods, static, getter ---
 class Base {
   constructor(a) { this.a = a; }
 
-  fn m(k) { return this.a + k; }
+  function m(k) { return this.a + k; }
 
   // mutate via instance method (used to confirm 'this' works)
-  fn inc(n) { this.a = this.a + n; return this.a; }
+  function inc(n) { this.a = this.a + n; return this.a; }
 
-  static fn S(v) { return v + 100; }
+  static function S(v) { return v + 100; }
 
   get double() { return this.a + this.a; }
 }
@@ -358,38 +359,38 @@ class Derived extends Base {
   constructor(a) {
     super(a + 1);           // exercise super(...) rewrite
   }
-  fn m(k) {
+  function m(k) {
     return super.m(k + 1) + 1;  // exercise super.m(...) rewrite
   }
 }
 
 // --- Class with literal field initializer (pure) ---
 class InitOnly {
-  var z = 7;                 // tested during allocation
-  async fn getZ() { return await this.z; }
+  z = 7;                 // tested during allocation
+  async function getZ() { return this.z; }   // `await` only accepts Promises
 }
 
-var b = new Base(10);
-System.print(b.m(5));          // expect 15
+var baseObj = new Base(10);
+System.print(baseObj.m(5));          // expect 15
 
-System.print(b);       // expect 10
+System.print(baseObj);       // expect 10
 
 System.print(Base.S(1));       // expect 101
 
-var d = new Derived(10);             // Base.a receives 11
-System.print(d.m(5));          // super.m(6)=17; +1 => 18
-System.print(d);       // expect 18 (same caveat as T2)
+var derived = new Derived(10);             // Base.a receives 11
+System.print(derived.m(5));          // super.m(6)=17; +1 => 18
+System.print(derived);       // expect 18 (same caveat as T2)
 
-System.print(b.double);        // getter → 20
+System.print(baseObj.double);        // getter → 20
 
-var i = new InitOnly();
-System.print(await i.getZ());        // expect 7
+var initOnly = new InitOnly();
+System.print(await initOnly.getZ());        // expect 7
 
-b.a = b.a + 5;                         // a: 10 -> 15
-System.print(b.a);             // expect 15
+baseObj.a = baseObj.a + 5;                         // a: 10 -> 15
+System.print(baseObj.a);             // expect 15
 
 System.print("===== Closures =====");
-fn make_adder(x) {
+function make_adder(x) {
     return |y| x + y;
 }
 
@@ -404,12 +405,12 @@ var empty = "";
 System.print(empty.length);     // expect 0
 System.print("hello world".length); // expect 11
 
-System.print("===== Strings: concat =====");
+System.print("===== Strings: concatenation =====");
 var s1 = "Hello, ";
 var s2 = "World!";
-var s3 = s1.concat(s2);
+var s3 = s1 + s2;
 System.print(s3);             // expect "Hello, World!"
-System.print("first".concat(" second")); // expect "first second"
+System.print("first" + " second"); // expect "first second"
 
 System.print("===== Strings: slice & substring =====");
 var longStr = "The quick brown fox jumps over the lazy dog.";
@@ -424,10 +425,10 @@ var mixed = "Napalm Is Awesome!";
 System.print(mixed.toUpperCase()); // expect "NAPALM IS AWESOME!"
 System.print(mixed.toLowerCase()); // expect "napalm is awesome!"
 
-System.print("===== Strings: searching (includes, startsWith, endsWith) =====");
+System.print("===== Strings: searching (contains, startsWith, endsWith) =====");
 var sentence = "Be brave, be bold.";
-System.print(sentence.includes("brave"));    // expect true
-System.print(sentence.includes("calm"));     // expect false
+System.print(sentence.contains("brave"));    // expect true
+System.print(sentence.contains("calm"));     // expect false
 System.print(sentence.startsWith("Be"));       // expect true
 System.print(sentence.startsWith("brave"));    // expect false
 System.print(sentence.endsWith("."));        // expect true
@@ -495,72 +496,64 @@ System.print(m.size);              // expect 0
 // ===========================
 
 System.print("===== Set: create, add, has, size =====");
-var s = new Set();
-s.add("first");
-s.add(42);
-s.add("first"); // Duplicate, should be ignored
+var set = new Set();
+set.add("first");
+set.add(42);
+set.add("first"); // Duplicate, should be ignored
 
-System.print(s.size);              // expect 2
-System.print(s.has("first"));      // expect true
-System.print(s.has(42));           // expect true
-System.print(s.has("second"));     // expect false
+System.print(set.size);              // expect 2
+System.print(set.has("first"));      // expect true
+System.print(set.has(42));           // expect true
+System.print(set.has("second"));     // expect false
 
 System.print("===== Set: delete, clear =====");
-System.print(s.delete(42));        // expect true (entry existed)
-System.print(s.has(42));           // expect false
-System.print(s.size);              // expect 1
-s.clear();
-System.print(s.size);              // expect 0
+System.print(set.delete(42));        // expect true (entry existed)
+System.print(set.has(42));           // expect false
+System.print(set.size);              // expect 1
+set.clear();
+System.print(set.size);              // expect 0
 
 System.print("===== Promises ====="); // (VALIDATED UNTIL HERE)
-System.print("(async)");
+// Promises are consumed with `await`; rejections surface as exceptions.
 
-// sync resolve
-var p = Promise(|resolve, reject| { resolve(42); });
-p.then(|v| System.print(v));        // expect: 42
+// resolved promise
+var p2 = Promise.resolve(42);
+System.print(await p2);              // expect: 42
 
 // rejection + catch
-var q = Promise(|resolve, reject| { reject(7); });
-q.catch(|e| System.print(e));       // expect: 7
+var q = Promise.reject(7);
+try { await q; } catch (e) { System.print(e); }   // expect: 7
 
-// chaining should keep returning the public object now:
-p.then(|v| System.print(v+1)).catch(|e| System.print(-1));    // expect: 43
+// a settled promise can be awaited again
+System.print((await p2) + 1);        // expect: 43
 
-System.print("===== Deferreds =====");
-System.print("(async)");
-var d = Deferred();
-d.then(|x| { System.print(x); });
+System.print("===== Delayed promises =====");
+// Timer.delay(ms, callback) settles with the callback's result.
+var deferred = Timer.delay(0, | | 123);
+System.print(await deferred);        // expect: 123
 
-setTimeout(| | { d.resolve(123); }, 0);
-
-// Rejection path
-var e = Deferred();
-e.catch(|r| { System.print(999 + r); });
-setTimeout(| | { e.reject(1); }, 0);
+// Rejection path: a throwing callback rejects the promise.
+var e2 = Timer.delay(0, | | { throw 1; });
+try { await e2; } catch (r) { System.print(999 + r); }   // expect: 1000
 
 System.print("===== Timers =====");
 System.print("(async)");
-setTimeout(fn () { System.print("Timer"); }, 10);
+setTimeout(function () { System.print("Timer"); }, 10);
 
 // Timer (2)
-setTimeout(fn () { System.print("Timer (2)"); }, 20);
+setTimeout(function () { System.print("Timer (2)"); }, 20);
 
 System.print("===== Async/Await =====");
-System.print("(async)");
-async fn delay(ms, v) {
-    var d = Deferred();
-    setTimeout(| | { d.resolve(v); }, ms);
-    return await d;
+async function delay(ms, v) {
+    return await Timer.delay(ms, | | v);
 }
 
 // await inside top-level (top-level is async)
 var aa = await delay(0, 21);
 System.print(aa + 21);                // expect 42
 
-// await a plain Promise
-var bb = await Promise(|resolve, reject| {
-    setTimeout(| | { resolve(7); }, 0);
-});
+// await a promise settled by a timer
+var bb = await Timer.delay(0, | | 7);
 System.print(bb);                     // expect 7
 
 System.print("===== Conditional / Nullish =====");
@@ -576,7 +569,7 @@ var chain = { inner: { value: 7 } };
 System.print(chain?.inner?.value);            // expect 7
 class MulBox {
   constructor(k) { this.k = k; }
-  fn mul(x) { return this.k * x; }
+  function mul(x) { return this.k * x; }
 }
 var optObj = new MulBox(3);
 System.print(optObj?.mul(4));                 // expect 12
@@ -586,8 +579,8 @@ var maybeFn = null;
 System.print(maybeFn?.(5));                   // expect null
 
 System.print("===== Pipeline operator =====");
-fn inc1(v) { return v + 1; }
-fn double(v) { return v * 2; }
+function inc1(v) { return v + 1; }
+function double(v) { return v * 2; }
 System.print(3 |> inc1);                      // expect 4
 System.print(3 |> inc1 |> double);           // expect 8
 

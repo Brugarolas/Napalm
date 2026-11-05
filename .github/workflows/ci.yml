@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  LLVM_VERSION: 23.1.4
+  # Overrides the developer-local path in .cargo/config.toml ([env] never
+  # replaces a variable that is already set in the environment).
+  LLVM_SYS_231_PREFIX: C:\llvm
+
+jobs:
+  test:
+    name: Tests (Windows, release, LLVM tier)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain (nightly + components) comes from rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # LLVM 23 for the `llvm-jit` feature (see build.rs): the official Windows
+      # release tarball, cached between runs.
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+
+      - name: Download LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc"
+          $archive = Join-Path $env:RUNNER_TEMP "$name.tar.xz"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/$name.tar.xz" -OutFile $archive
+          tar -xf $archive -C $env:RUNNER_TEMP
+          Move-Item (Join-Path $env:RUNNER_TEMP $name) C:\llvm
+
+      # Parallel test runs deadlock; the suite must run single-threaded.
+      - name: Rust unit tests
+        run: npm run test::rust
+
+      # Builds napalm in release mode and runs every program in ./scripts.
+      - name: Napalm scripts
+        run: npm run test::scripts

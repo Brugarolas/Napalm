@@ -848,10 +848,27 @@ impl FunctionOptimization for DominatorCSE {
             }
         }
 
+        // The exceptional edge leaves a protected block from the middle (at any
+        // throwing instruction), not from its end. A handler dominated by one of
+        // its own protected blocks therefore must not reuse values that block
+        // defines: they may not have been computed when the throw happened.
+        let exceptional_edges: HashSet<(usize, usize)> = function
+            .exception_regions
+            .iter()
+            .flat_map(|region| {
+                let handler = region.handler.0 as usize;
+                region
+                    .protected_blocks
+                    .iter()
+                    .map(move |protected| (protected.0 as usize, handler))
+            })
+            .collect();
+
         fn visit(
             function: &mut Function,
             block: usize,
             children: &[SmallVec<[usize; 2]>],
+            exceptional_edges: &HashSet<(usize, usize)>,
             values: &mut HashMap<PureKey, ValueId>,
             arena: &Bump,
             changed: &mut bool,
@@ -872,20 +889,38 @@ impl FunctionOptimization for DominatorCSE {
                         *changed = true;
                     }
                 } else {
-                    inserted.push(key.clone());
+                    inserted.push((key.clone(), result));
                     values.insert(key, result);
                 }
             }
             for &child in &children[block] {
-                visit(function, child, children, values, arena, changed);
+                if exceptional_edges.contains(&(block, child)) {
+                    for (key, _) in &inserted {
+                        values.remove(key);
+                    }
+                    visit(function, child, children, exceptional_edges, values, arena, changed);
+                    for (key, result) in &inserted {
+                        values.insert(key.clone(), *result);
+                    }
+                } else {
+                    visit(function, child, children, exceptional_edges, values, arena, changed);
+                }
             }
-            for key in inserted {
+            for (key, _) in inserted {
                 values.remove(&key);
             }
         }
 
         let mut changed = false;
-        visit(function, entry, &children, &mut HashMap::default(), &arena, &mut changed);
+        visit(
+            function,
+            entry,
+            &children,
+            &exceptional_edges,
+            &mut HashMap::default(),
+            &arena,
+            &mut changed,
+        );
         changed
     }
 }

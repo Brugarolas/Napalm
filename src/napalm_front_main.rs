@@ -1899,11 +1899,17 @@ impl<'a> Parser<'a> {
                     Spanned::new(format!("<parameter:{}>", span.start), span)
                 }
             };
-            // Optionality is a type-system marker. The current VM still has fixed
-            // arity, so callers must supply the argument until default/optional
-            // argument lowering is added deliberately.
-            self.eat("?");
-            let annotation = self.variable_annotation()?;
+            // Optionality is a type-system marker: an omitted argument arrives as
+            // `null`, so `x?: T` is checked as `T | null`.
+            let optional = self.eat("?");
+            let annotation = self.variable_annotation()?.map(|annotation| {
+                if !optional || matches!(annotation.kind, TypeAnnotationKind::Null) {
+                    return annotation;
+                }
+                let span = annotation.span;
+                let null = TypeAnnotation::new(TypeAnnotationKind::Null, span);
+                TypeAnnotation::new(TypeAnnotationKind::Union(vec![annotation, null]), span)
+            });
             if let Some(annotation) = annotation.as_ref() {
                 self.parameter_types.insert(param.span, annotation.clone());
             }
@@ -3856,24 +3862,41 @@ impl<'a> Parser<'a> {
             methods.push(setter);
         }
         initializers.splice(0..0, method_initializers);
-        if !initializers.is_empty() || !parameter_initializers.is_empty() || !watch_initializers.is_empty() {
+        let has_initializers =
+            !initializers.is_empty() || !parameter_initializers.is_empty() || !watch_initializers.is_empty();
+        if has_initializers && constructor.is_none() && superclass.is_some() {
+            // A derived class without an explicit constructor inherits every
+            // superclass constructor. The lowerer synthesizes one forwarding
+            // initializer per inherited arity (`super(...args)`), then runs
+            // these field initializers through `INHERITED_FIELD_INITIALIZER`.
+            let mut statements = Vec::with_capacity(initializers.len() + watch_initializers.len());
+            statements.append(&mut initializers);
+            // Register effects last so their initial microtask observes the
+            // fully initialized object state.
+            statements.append(&mut watch_initializers);
+            methods.push(MethodDecl {
+                signature: MethodSignatureAst::Method {
+                    name: Spanned::new(INHERITED_FIELD_INITIALIZER.into(), name.span),
+                    params: Vec::new(),
+                },
+                is_constructor: false,
+                is_static: false,
+                is_foreign: false,
+                is_async: false,
+                attributes: Vec::new(),
+                body: Some(FunctionBody {
+                    params: Vec::new(),
+                    param_types: Vec::new(),
+                    return_type: None,
+                    kind: FunctionBodyKind::Statements(statements),
+                    span: self.end(start),
+                }),
+                span: self.end(start),
+            });
+        } else if has_initializers {
             if constructor.is_none() {
                 constructor = Some(methods.len());
-                let statements = if superclass.is_some() {
-                    vec![Stmt {
-                        kind: StmtKind::Expression(Expr::new(
-                            ExprKind::Super(SuperExpr {
-                                method: None,
-                                args: Vec::new(),
-                                syntax: InvokeSyntax::Method,
-                            }),
-                            name.span,
-                        )),
-                        span: name.span,
-                    }]
-                } else {
-                    Vec::new()
-                };
+                let statements = Vec::new();
                 methods.push(MethodDecl {
                     signature: MethodSignatureAst::Method {
                         name: Spanned::new("new".into(), name.span),
@@ -5837,7 +5860,9 @@ mod napalm_syntax_tests {
             assert_eq!(*actual, expected);
         }
 
-        for invalid in ["1__000", "1_", "0x_FF", "1_.0", "1._0", "1e_3"] {
+        // `1._0` is not listed: a fraction needs a digit after `.`, so it is the
+        // valid member access `(1)._0`, exactly like `1.toString()`.
+        for invalid in ["1__000", "1_", "0x_FF", "1_.0", "1e_3"] {
             let parsed = parse("numeric-separator-invalid.np", invalid);
             assert!(parsed.has_errors(), "invalid numeric separator unexpectedly parsed: {invalid}");
         }

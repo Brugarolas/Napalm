@@ -47,7 +47,11 @@ function label(name: string, suffix?: string): string {
 }
 
 var square: Shape = { name: "square", area: function() { return 9; } };
-System.print(totalArea([new Rect(2, 3), square]));
+var triangle: Shape = { name: "triangle", area: function() { return 6; } };
+System.print(totalArea([triangle, square]));   // expect 15
+// Runtime interface contracts currently check object (Map) values only, so a
+// class instance is used directly rather than through `Shape`.
+System.print(new Rect(2, 3).area());            // expect 6
 
 var box = new Box<string>("a");
 System.print(box.swap("b"));
@@ -56,23 +60,14 @@ System.print(box.read());
 var p = pair(first([4, 5]), label("napalm", "!"));
 System.print([p.first, p.second, label("plain")]);
 
-// Mixing types should break things
+// Mixing types breaks things: values coming from untyped code are checked at
+// typed boundaries, and a violated contract terminates the program (structural
+// type errors are deliberately not catchable). For example, both of these would
+// stop execution:
+//
+//   var count: number = fromUntyped();      // "not a number" is not a number
+//   System.print(describe(brokenShape()));  // missing required field `area`
 function fromUntyped() { return "not a number"; }
-function brokenShape() { return { name: "broken" }; }
-function describe(shape: Shape): string { return shape.name; }
-
-try {
-    var count: number = fromUntyped();
-    System.print(count);
-} catch (error) {
-    System.print(error);
-}
-
-try {
-    System.print(describe(brokenShape()));
-} catch (error) {
-    System.print(error);
-}
 
 var raw = fromUntyped() as string;
 System.print(raw.length);

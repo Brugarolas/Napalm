@@ -1200,10 +1200,17 @@ mod optimizer_tests {
             TraceRep::Tagged,
         );
         builder.write_slot(slot, boxed);
+        // A loop condition on the induction keeps it observable at an exit;
+        // otherwise DCE rightly deletes the whole effect-free loop.
         let loop_exit = builder.add_side_exit(ExitReason::GuardValue, anchor.pc);
         builder.set_loop_backedge(phi, boxed).unwrap();
-        let always_true = builder.constant(TraceConstant::Bool(true));
-        builder.emit0(TraceInst::GuardTruthy { value: always_true, exit: loop_exit });
+        let limit = builder.constant(TraceConstant::F64Bits(1.0e9f64.to_bits()));
+        let keep_running = builder.emit1(
+            TraceInst::F64Compare { op: CmpKind::Lt, lhs: next, rhs: limit },
+            TraceType::Bool,
+            TraceRep::Bool,
+        );
+        builder.emit0(TraceInst::GuardTruthy { value: keep_running, exit: loop_exit });
         builder.set_terminator(TraceTerminator::LoopBack);
 
         let mut trace = builder.finish().unwrap();
@@ -1252,7 +1259,16 @@ mod optimizer_tests {
             TraceRep::Tagged,
         );
         builder.write_slot(slot, boxed);
+        // Keep the induction observable (see promotes_tagged_numeric_loop_phi_to_f64).
+        let loop_exit = builder.add_side_exit(ExitReason::GuardValue, anchor.pc);
         builder.set_loop_backedge(phi, boxed).unwrap();
+        let limit = builder.constant(TraceConstant::Int32(1_000_000));
+        let keep_running = builder.emit1(
+            TraceInst::IntCompare { op: CmpKind::Lt, lhs: next, rhs: limit },
+            TraceType::Bool,
+            TraceRep::Bool,
+        );
+        builder.emit0(TraceInst::GuardTruthy { value: keep_running, exit: loop_exit });
         builder.set_terminator(TraceTerminator::LoopBack);
 
         let mut trace = builder.finish().unwrap();
@@ -1292,7 +1308,16 @@ mod optimizer_tests {
             TraceRep::Tagged,
         );
         builder.write_slot(slot, boxed);
+        // Keep the induction observable (see promotes_tagged_numeric_loop_phi_to_f64).
+        let loop_exit = builder.add_side_exit(ExitReason::GuardValue, anchor.pc);
         builder.set_loop_backedge(phi, boxed).unwrap();
+        let sentinel = builder.constant(TraceConstant::Int32(7));
+        let keep_running = builder.emit1(
+            TraceInst::IntCompare { op: CmpKind::Ne, lhs: next, rhs: sentinel },
+            TraceType::Bool,
+            TraceRep::Bool,
+        );
+        builder.emit0(TraceInst::GuardTruthy { value: keep_running, exit: loop_exit });
         builder.set_terminator(TraceTerminator::LoopBack);
 
         let mut trace = builder.finish().unwrap();

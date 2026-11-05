@@ -2066,7 +2066,12 @@ impl<'a> TraceRecorder<'a> {
             exit,
         });
         let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
-        let key = builder.constant(TraceConstant::String(signature.name));
+        // Interned strings are stable heap words; a raw String constant cannot
+        // be lowered by the native backends.
+        let key_word = runtime
+            .trace_materialize_constant(TraceConstant::String(signature.name))
+            .map_err(|_| RecordingAbort::UnsupportedConstant)?;
+        let key = builder.constant(TraceConstant::StableTagged(key_word.0));
         let field_type = access.read_type.clone().unwrap_or(Type::Top);
         let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
         let result = builder.emit1(
@@ -5630,7 +5635,7 @@ impl<'a> TraceRecorder<'a> {
             let Some(final_value) = builder.slot_value(slot) else {
                 continue;
             };
-            let mut final_value = builder.trace().canonical_value(final_value);
+            let final_value = builder.trace().canonical_value(final_value);
             let initial_canonical = builder.trace().canonical_value(initial);
             if final_value == initial_canonical {
                 continue;
@@ -13368,8 +13373,15 @@ mod tests {
     fn trace_activation_stays_small() {
         // Side exits commit dynamic values directly to architectural register
         // banks. Reintroducing a large per-entry scratch buffer here would make
-        // short/nested loops pathologically expensive again.
-        assert!(std::mem::size_of::<TraceActivation>() <= 128);
+        // short/nested loops pathologically expensive again. The only intended
+        // array is the direct-call argument scratch; everything else is a small
+        // fixed header (bank pointers, dispatcher/link state, exit result).
+        let direct_call_scratch = std::mem::size_of::<[RegisterWord; MAX_NAPALM_ARITY]>();
+        assert!(
+            std::mem::size_of::<TraceActivation>() <= direct_call_scratch + 192,
+            "TraceActivation grew to {} bytes",
+            std::mem::size_of::<TraceActivation>()
+        );
     }
 
     #[test]

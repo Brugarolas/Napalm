@@ -21,9 +21,9 @@
 #![allow(clippy::type_complexity)]
 
 use crate::napalm_front::{
-    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticLabel, DiagnosticSeverity, Expr,
+    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticSeverity, Expr, INHERITED_FIELD_INITIALIZER,
     ExprKind, FunctionBody, FunctionBodyKind, Ident, ImportDecl, InvokeSyntax, LogicalOp,
-    MethodDecl, MethodSignatureAst, ModuleAst, OperatorName, Span, Stmt, StmtKind, StringPart,
+    MethodDecl, MethodSignatureAst, ModuleAst, Span, Stmt, StmtKind, StringPart,
     TypeAnnotation, TypeAnnotationKind, UnaryOp,
 };
 use crate::napalm_ir::{
@@ -297,8 +297,13 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             BinaryOp::Add => {
                 let left = infer_surface_type_annotation(left);
                 let right = infer_surface_type_annotation(right);
-                if matches!(left.as_ref().map(|t| &t.kind), Some(K::String))
-                    || matches!(right.as_ref().map(|t| &t.kind), Some(K::String))
+                // `+` dispatches on the left operand. Only builtin primitives are
+                // known to concatenate with a String; an unknown receiver may
+                // overload `+` and return anything.
+                let left_kind = left.as_ref().map(|t| &t.kind);
+                if matches!(left_kind, Some(K::String))
+                    || (matches!(right.as_ref().map(|t| &t.kind), Some(K::String))
+                        && matches!(left_kind, Some(K::Num | K::Bool | K::Null)))
                 {
                     direct(K::String)
                 } else if matches!(left.as_ref().map(|t| &t.kind), Some(K::Num))
@@ -1819,6 +1824,10 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // inside methods, so gather the complete set before assigning slots.
         let mut local_instance_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::default();
         let mut local_static_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::default();
+        // Instance properties every class exposes itself: its accessors plus the
+        // implicit fixed fields planned below. Subclasses consult this to avoid
+        // reserving shadow slots for inherited properties.
+        let mut inherited_properties: HashMap<Span, HashSet<&str>> = HashMap::default();
         for &(class_ptr, _) in &declarations {
             let class = unsafe { &*class_ptr };
             let mut instance = SmallVec::<[&str; 8]>::new();
@@ -1854,8 +1863,46 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
             dedup_preserve_order(&mut instance);
             dedup_preserve_order(&mut statics);
+            let mut exposed = accessor_names;
+            exposed.extend(instance.iter().copied());
+            inherited_properties.insert(class.name.span, exposed);
             local_instance_fields.insert(class.name.span, instance);
             local_static_fields.insert(class.name.span, statics);
+        }
+
+        // A `this.x = ...` write in a subclass whose statically-known superclass
+        // already owns `x` (as an accessor or a fixed field) must reach that
+        // inherited property. Reserving a subclass-local slot would shadow it:
+        // superclass methods and external reads would never observe the write.
+        let class_by_name: HashMap<&str, &ClassDecl> = declarations
+            .iter()
+            .map(|&(class_ptr, _)| {
+                let class = unsafe { &*class_ptr };
+                (class.name.value.as_str(), class)
+            })
+            .collect();
+        for &(class_ptr, _) in &declarations {
+            let class = unsafe { &*class_ptr };
+            let mut inherited = HashSet::<&str>::default();
+            let mut visited = HashSet::<Span>::default();
+            let mut superclass = class.superclass.as_ref();
+            while let Some(ExprKind::Name(name)) = superclass.map(|expr| &expr.kind) {
+                let Some(parent) = class_by_name.get(name.value.as_str()) else { break };
+                if !visited.insert(parent.name.span) {
+                    break; // Cycles are diagnosed by resolve_class_layout.
+                }
+                if let Some(exposed) = inherited_properties.get(&parent.name.span) {
+                    inherited.extend(exposed.iter().copied());
+                }
+                superclass = parent.superclass.as_ref();
+            }
+            if !inherited.is_empty() {
+                if let Some(instance) = local_instance_fields.get_mut(&class.name.span) {
+                    // `_name` fields keep the classic per-class private storage;
+                    // only JS-style `this.name` properties are shared.
+                    instance.retain(|name| name.starts_with('_') || !inherited.contains(name));
+                }
+            }
         }
 
         // Resolve statically-known superclass identities for metadata/cycle
@@ -1986,6 +2033,14 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             }
         }
 
+        // Public property names by slot: a declared `x: T` field is stored as
+        // `_x` behind `x` accessors, so it is reported as `x`.
+        let mut field_names = vec![ir::StringId(0); fields.len()];
+        for (name, slot) in &fields {
+            let public = name.strip_prefix('_').unwrap_or(name);
+            field_names[slot.0 as usize] = self.program.intern_string(public);
+        }
+
         let id = self.class_plans[&key].id;
         if let Some(info) = self.program.classes.iter_mut().find(|info| info.id == id) {
             info.superclass = static_super;
@@ -1995,6 +2050,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 info.own_instance_field_types[slot.0 as usize] =
                     field_types.get(name).cloned().unwrap_or(Type::Top);
             }
+            info.own_instance_field_names = field_names;
             info.static_field_count = static_fields.len() as u16;
             info.static_field_types = vec![Type::Top; static_fields.len()];
             for (name, slot) in &static_fields {
@@ -2209,17 +2265,62 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     });
                 }
             }
-            // NapalmJIT convenience: a class with no declared constructors gets
-            // an empty new(). Do not replace an explicitly defined static new().
-            if !class.is_foreign && !class.methods.iter().any(|method| method.is_constructor)
-                && !class.methods.iter().any(|method| method.is_static
-                    && method_signature_key(&method.signature) == Some(("new".to_owned(), MethodKind::Method, 0)))
-            {
-                let symbol = self.program.intern_method("new", MethodKind::Method, 0);
-                let factory = self.compile_constructor_factory(module, &class_plan, "new", 0, None);
-                plans.push(MethodPlan {
-                    symbol, function: Some(factory), foreign: None, bind_static: true,
-                });
+            // A class without declared constructors inherits its superclass's
+            // constructors (a root class gets an empty `new()`), so `new C(...)`
+            // and `super(...)` always reach the same initializers they would
+            // with an explicit `constructor(...args) { super(...args); }`.
+            // Do not replace an explicitly defined static new().
+            if !class.is_foreign && !class.methods.iter().any(|method| method.is_constructor) {
+                let explicit_static = |arity: usize| class.methods.iter().any(|method| method.is_static
+                    && method_signature_key(&method.signature) == Some(("new".to_owned(), MethodKind::Method, arity)));
+                let fields = class
+                    .methods
+                    .iter()
+                    .find(|method| !method.is_static
+                        && method_signature_key(&method.signature)
+                            == Some((INHERITED_FIELD_INITIALIZER.to_owned(), MethodKind::Method, 0)))
+                    .and_then(|method| self.method_functions.get(&method.span).copied());
+                // (own arity, superclass initializer arity to forward to)
+                let forwards: Vec<(usize, Option<usize>)> = if class.superclass.is_none() {
+                    vec![(0, None)]
+                } else {
+                    match self.superclass_constructor_arities(class) {
+                        // Statically known: fewer arguments are padded with null,
+                        // like omitted JavaScript constructor arguments.
+                        Some(parent) => {
+                            let max = parent.iter().copied().max().unwrap_or(0);
+                            (0..=max)
+                                .filter_map(|arity| {
+                                    parent.iter().copied().filter(|&p| p >= arity).min()
+                                        .map(|target| (arity, Some(target)))
+                                })
+                                .collect()
+                        }
+                        // Dynamic or imported superclass: forward every arity and
+                        // let dispatch report a missing superclass constructor.
+                        None => (0..=MAX_NAPALM_ARITY).map(|arity| (arity, Some(arity))).collect(),
+                    }
+                };
+                for (arity, target) in forwards {
+                    let initializer =
+                        self.compile_inherited_initializer(module, &class_plan, arity, target, fields);
+                    let key = MethodKey {
+                        name: "<init>new".to_owned(), kind: MethodKind::Method, arity: arity as u8,
+                    };
+                    let init_symbol = self.program.intern_method(&key.name, key.kind, key.arity);
+                    self.symbols.methods.insert(key, init_symbol);
+                    plans.push(MethodPlan {
+                        symbol: init_symbol, function: Some(initializer), foreign: None, bind_static: false,
+                    });
+                    if !explicit_static(arity) {
+                        let symbol = self.program.intern_method("new", MethodKind::Method, arity as u8);
+                        let factory =
+                            self.compile_constructor_factory(module, &class_plan, "new", arity, Some(initializer));
+                        plans.push(MethodPlan {
+                            symbol, function: Some(factory), foreign: None, bind_static: true,
+                        });
+                    }
+                }
             }
             self.class_plans.get_mut(&class.name.span).unwrap().methods = plans;
         }
@@ -2246,6 +2347,70 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee, args }, Type::Top);
         }
         builder.ret(instance);
+        builder.finish()
+    }
+
+    /// Constructor arities a class without explicit constructors inherits from
+    /// its superclass chain, or `None` when the chain is not statically known
+    /// in this module (dynamic superclass expressions, imported classes).
+    fn superclass_constructor_arities(&self, class: &ClassDecl) -> Option<Vec<usize>> {
+        let mut current = class;
+        let mut visited = HashSet::<Span>::default();
+        loop {
+            let ExprKind::Name(name) = &current.superclass.as_ref()?.kind else { return None };
+            let id = *self.top_level_classes.get(&name.value)?;
+            let (parent, _) = find_class_by_id(self.program, id, self.ast)?;
+            if !visited.insert(parent.name.span) {
+                return None; // Cycles are diagnosed elsewhere.
+            }
+            let mut arities: Vec<usize> = parent
+                .methods
+                .iter()
+                .filter(|method| method.is_constructor)
+                .filter_map(|method| method_signature_key(&method.signature).map(|(_, _, arity)| arity))
+                .collect();
+            if !arities.is_empty() {
+                arities.sort_unstable();
+                arities.dedup();
+                return Some(arities);
+            }
+            if parent.superclass.is_none() {
+                return Some(vec![0]); // Root without constructors: empty new().
+            }
+            current = parent;
+        }
+    }
+
+    /// `<init>new/arity` for a class without explicit constructors: forward the
+    /// arguments to the superclass initializer of arity `target` (padding the
+    /// missing ones with null), then run the class's own field initializers.
+    fn compile_inherited_initializer(
+        &mut self,
+        module: ModuleId,
+        class: &ClassPlan,
+        arity: usize,
+        target: Option<usize>,
+        fields: Option<FuncId>,
+    ) -> FuncId {
+        let mut params = vec![Type::Instance(ClassSet::singleton(class.id))];
+        params.extend((0..arity).map(|_| Type::Top));
+        let mut builder = Builder::new(
+            self.program, module, format!("{}.new/{arity}<inherited>", class.name),
+            FunctionKind::Method, params, Type::Instance(ClassSet::singleton(class.id)),
+        );
+        let this = builder.param(0);
+        if let Some(target) = target {
+            let mut args: Vec<ValueId> = (1..=arity).map(|index| builder.param(index)).collect();
+            while args.len() < target {
+                args.push(builder.const_null());
+            }
+            let symbol = builder.intern_method("<init>new", MethodKind::Method, target as u8);
+            builder.invoke_super(class.id, this, symbol, args);
+        }
+        if let Some(fields) = fields {
+            builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee: fields, args: vec![this] }, Type::Top);
+        }
+        builder.ret(this);
         builder.finish()
     }
 
@@ -4264,7 +4429,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.builder.const_null();
         };
         let receiver = self.lower_this(span);
-        let (name, kind, arity) = if let Some(name) = &super_expr.method {
+        let (name, kind, _arity) = if let Some(name) = &super_expr.method {
             (
                 name.value.clone(),
                 match super_expr.syntax {
@@ -4686,6 +4851,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let source_type = semantic_source_type(self.builder.value_type(source));
         if matches!(source_type, Type::Map | Type::Interface(_) | Type::Record(_)) {
             self.builder.emit0(Inst::MapSpread { map, source });
+            return;
+        }
+        // As in JavaScript, spreading `null` into an object literal adds nothing.
+        if matches!(source_type, Type::Null) {
             return;
         }
 
@@ -7745,16 +7914,16 @@ class Child is Parent {
     }
 
     #[test]
-    fn any_and_uninitialized_untyped_bindings_remain_dynamic() {
+    fn any_bindings_remain_dynamic_and_uninitialized_bindings_are_rejected() {
         let source = r#"
             {
                 let explicit: any = 1;
                 explicit = "text";
                 explicit = true;
 
-                let implicit;
-                implicit = 1;
-                implicit = "text";
+                let nullable: any = null;
+                nullable = 1;
+                nullable = "text";
             }
         "#;
         let module = parse_typescript(source);
@@ -7766,6 +7935,14 @@ class Child is Parent {
                 .all(|diagnostic| diagnostic.code != "NAPALM-T001"),
             "unexpected type diagnostics: {:#?}",
             output.diagnostics
+        );
+
+        // Bindings need an initializer; only class properties may start empty.
+        let parsed = crate::napalm_front_main::parse("types.nap", "let implicit;\nimplicit = 1;\n");
+        assert!(
+            parsed.diagnostics.iter().any(|diagnostic| diagnostic.code == "NAPALM-P001"),
+            "{:#?}",
+            parsed.diagnostics
         );
     }
 
@@ -7904,7 +8081,7 @@ class Child is Parent {
             r#"
                 function run() {
                     let value: any = 0;
-                    let pending;
+                    let pending: any = null;
                     let i = 0;
                     while (i < 3) {
                         if (i == 0) { value = "text"; pending = 1; }
@@ -8442,7 +8619,7 @@ class Child is Alias {
         let output = lower_new_program("arrays.nap", source, "arrays", &module);
         assert!(output.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "NAPALM-T001"
-                && diagnostic.message.contains("array element expects Number")
+                && diagnostic.message.contains("array element expects number")
         }));
     }
 

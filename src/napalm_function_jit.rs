@@ -350,7 +350,7 @@ impl WholeFunctionJit {
             let runtime_ref = self.module.declare_func_in_func(runtime_module_id, b.func);
             let direct_ref = self.module.declare_func_in_func(direct_module_id, b.func);
             let _small_map_ref = self.module.declare_func_in_func(small_map_module_id, b.func);
-            let native_self_ref = self.module.declare_func_in_func(native_self_module_id, b.func);
+            let _native_self_ref = self.module.declare_func_in_func(native_self_module_id, b.func);
             let self_ref = self.module.declare_func_in_func(func_id, b.func);
             let small_map_regs_ref =
                 self.module.declare_func_in_func(small_map_regs_module_id, b.func);

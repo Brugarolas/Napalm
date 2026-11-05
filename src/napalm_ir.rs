@@ -678,6 +678,12 @@ pub struct ClassInfo {
     /// `Type::Top` represents `any`/untyped fields and intentionally contributes
     /// no specialization fact to the interpreter or JIT.
     pub own_instance_field_types: Vec<Type>,
+    /// Source-visible property names of the fields declared directly by this
+    /// class, indexed by class-local slot (`keys()`/`entries()` on instances).
+    pub own_instance_field_names: Vec<StringId>,
+    /// Interfaces and object types this class declares with `implements`.
+    /// Subclasses implement everything their ancestors implement.
+    pub implements: Vec<Type>,
     /// Static storage slots owned by this class. Static fields are not folded
     /// into the inherited instance layout.
     pub static_field_count: u16,
@@ -2512,6 +2518,8 @@ impl Program {
             superclass,
             own_instance_field_count,
             own_instance_field_types: vec![Type::Top; own_instance_field_count as usize],
+            own_instance_field_names: Vec::new(),
+            implements: Vec::new(),
             static_field_count,
             static_field_types: vec![Type::Top; static_field_count as usize],
             is_foreign,

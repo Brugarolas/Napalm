@@ -138,16 +138,21 @@ fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
 
 #[test]
 fn napalm_inline_maps_grow_promote_and_keep_live_sidecars() {
+    // The loop lives in a function: module-scope variables use runtime opcodes
+    // and would never let the trace reach native code.
     run_napalm_checked(r#"
-        const map = {a: {value: 41}, b: 2};
-        let sum = 0;
-        for (let i = 0; i < 100; i++) {
-            sum += map.a.value;
-            if (i == 30) { map.c = 3; map.d = 4; map.e = 5; }
-            if (i == 60) map[7] = 'seven';
-            if (i % 10 == 0) System.gc();
+        function run() {
+            const map = {a: {value: 41}, b: 2};
+            let sum = 0;
+            for (let i = 0; i < 100; i++) {
+                sum += map.a.value;
+                if (i == 30) { map.c = 3; map.d = 4; map.e = 5; }
+                if (i == 60) map[7] = 'seven';
+                if (i % 10 == 0) System.gc();
+            }
+            return [sum, map.a.value, map.e, map[7]];
         }
-        const result = [sum, map.a.value, map.e, map[7]];
+        const result = run();
     "#, "[4100, 41, 5, seven]", true);
 }
 

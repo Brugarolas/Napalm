@@ -41,7 +41,12 @@
         "node::bench::entries": "node bench/jit_entries.js",
         "py::bench::fib": "python bench/fib.py",
         "py::bench::trees": "python bench/trees.py",
-        "cargo::build": "cargo build --release"
+        "cargo::build": "cargo build --release",
+        "test::scripts": "node tools/run-scripts.ts",
+        "test::rust": "cargo test --release -- --test-threads=1"
+    },
+    "engines": {
+        "node": ">=22.18"
     },
     "author": "Andrés Brugarolas Martínez",
     "license": "MIT",
