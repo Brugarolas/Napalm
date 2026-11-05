@@ -44,10 +44,11 @@ use crate::napalm_bytecode::{
     DeoptLocation, ExceptionHandlerEntry, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
     LiveRegisterEntry, LiveRegisterMap, Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
-    TypeGuardId, GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
+    TypeGuardId, SpecializedDescriptor, SpecializedMethod, SpecializedMethodTarget,
+    GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
-use crate::napalm_collections::HashMap;
-use crate::napalm_bytecode_optimizer::{optimization_passes, find_superinstruction_sites};
+use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_bytecode_optimizer::{optimization_passes, superinstruction_emission_passes, find_superinstruction_sites};
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
     Function, FunctionKind, Inst, InstId, MethodSymbol, Program, ResumeId, SiteId, SnapshotSlot,
@@ -80,6 +81,9 @@ pub struct CompileOptions {
     pub verify_bytecode: bool,
     /// Run the semantics-preserving post-lowering bytecode optimizer.
     pub optimize_bytecode: bool,
+    /// Emit the new specialized opcodes. Requires interpreter and tracing JIT
+    /// handlers before the resulting bytecode is executable. Off by default.
+    pub emit_specialized_bytecode: bool,
     /// Verify the bytecode after every optimization pass in all build modes.
     pub verify_each_bytecode_pass: bool,
     /// Remove pure SSA nodes whose results cannot affect observable execution.
@@ -107,6 +111,7 @@ impl Default for CompileOptions {
             verify_ir: true,
             verify_bytecode: true,
             optimize_bytecode: true,
+            emit_specialized_bytecode: false,
             verify_each_bytecode_pass: cfg!(debug_assertions),
             eliminate_dead_code: true,
             coalesce_registers: true,
@@ -133,6 +138,10 @@ pub struct FunctionCompileStats {
     pub safepoints: usize,
     pub edge_moves: usize,
     pub edge_trampolines: usize,
+    /// Specialized opcodes emitted by the compiler or the fusion pipeline.
+    pub specialized_opcodes: usize,
+    /// Method bindings subsumed by an atomic class definition.
+    pub fused_class_method_bindings: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2050,6 +2059,157 @@ struct FunctionCompileInfo {
     pc_map: PcMap,
 }
 
+#[derive(Default)]
+struct ClassFusionPlan {
+    by_creation: HashMap<InstId, Vec<SpecializedMethod>>,
+    suppressed_bindings: HashSet<InstId>,
+}
+
+impl ClassFusionPlan {
+    fn build(function: &Function, options: &CompileOptions) -> Self {
+        let mut plan = Self::default();
+        if !options.emit_specialized_bytecode {
+            return plan;
+        }
+        let mut protected_nodes = HashSet::default();
+        for binding in options.resume_bindings.values() {
+            if binding.function != function.id {
+                continue;
+            }
+            if let ResumeTarget::BeforeInst(id) | ResumeTarget::AfterInst(id) = binding.target {
+                protected_nodes.insert(id);
+            }
+        }
+        let mut binding_counts: HashMap<ValueId, usize> = HashMap::default();
+        for node in &function.nodes {
+            if let Inst::BindMethod { class, .. } | Inst::BindForeignMethod { class, .. } = &node.kind {
+                *binding_counts.entry(*class).or_default() += 1;
+            }
+        }
+        for block in &function.blocks {
+            for (position, &creation_id) in block.insts.iter().enumerate() {
+                let Some(creation) = function.node(creation_id) else { continue; };
+                let Inst::CreateClass { .. } = &creation.kind else { continue; };
+                if protected_nodes.contains(&creation_id) { continue; }
+                let Some(&class_value) = creation.results.first() else { continue; };
+                let mut collected = Vec::new();
+                let mut suppressed = Vec::new();
+                for &id in block.insts.iter().skip(position + 1) {
+                    let Some(node) = function.node(id) else { break; };
+                    if protected_nodes.contains(&id) { break; }
+                    let method = match &node.kind {
+                        Inst::BindMethod { class, method, function, is_static }
+                            if *class == class_value => SpecializedMethod {
+                                symbol: *method,
+                                target: SpecializedMethodTarget::Function(*function),
+                                is_static: *is_static,
+                            },
+                        Inst::BindForeignMethod { class, method, foreign, is_static }
+                            if *class == class_value => SpecializedMethod {
+                                symbol: *method,
+                                target: SpecializedMethodTarget::Foreign(*foreign),
+                                is_static: *is_static,
+                            },
+                        _ => break,
+                    };
+                    collected.push(method);
+                    suppressed.push(id);
+                }
+                // Never absorb a subset of bindings: a later mutation could
+                // otherwise observe a different method registration order.
+                let expected = binding_counts.get(&class_value).copied().unwrap_or(0);
+                if collected.len() != expected {
+                    continue;
+                }
+                plan.by_creation.insert(creation_id, collected);
+                plan.suppressed_bindings.extend(suppressed);
+            }
+        }
+        plan
+    }
+}
+
+#[derive(Clone)]
+struct InstanceFusion {
+    constructor: FuncId,
+    args: Vec<ValueId>,
+}
+
+#[derive(Default)]
+struct InstanceFusionPlan {
+    by_allocation: HashMap<InstId, InstanceFusion>,
+    suppressed_calls: HashSet<InstId>,
+}
+
+impl InstanceFusionPlan {
+    fn build(program: &Program, function: &Function, options: &CompileOptions) -> Self {
+        let mut plan = Self::default();
+        if !options.emit_specialized_bytecode {
+            return plan;
+        }
+        let mut protected = HashSet::default();
+        for binding in options.resume_bindings.values() {
+            if binding.function == function.id {
+                if let ResumeTarget::BeforeInst(id) | ResumeTarget::AfterInst(id) = binding.target {
+                    protected.insert(id);
+                }
+            }
+        }
+        for block in &function.blocks {
+            for pair in block.insts.windows(2) {
+                let (alloc_id, call_id) = (pair[0], pair[1]);
+                if protected.contains(&alloc_id) || protected.contains(&call_id) {
+                    continue;
+                }
+                let (Some(alloc), Some(call)) = (function.node(alloc_id), function.node(call_id)) else {
+                    continue;
+                };
+                let Inst::AllocInstance { class: _ } = &alloc.kind else { continue; };
+                let Some(&instance) = alloc.results.first() else { continue; };
+                let Inst::CallDirect { conv, callee, args } = &call.kind else { continue; };
+                if *conv != crate::napalm_ir::CallConv::Napalm
+                    || args.first() != Some(&instance)
+                    || args[1..].contains(&instance) {
+                    continue;
+                }
+                let Some(target) = program.functions.iter().find(|f| f.id == *callee) else {
+                    continue;
+                };
+                if target.kind != FunctionKind::Constructor
+                    || target.is_async || target.is_concurrent
+                    || target.signature.params.len() != args.len()
+                {
+                    // Constructors receive the instance as THIS; the explicit
+                    // args are the remaining elements in the complete call frame.
+                    continue;
+                }
+                // The original CallDirect result is ignored by the factory.
+                // If it is observable anywhere, fusing would lose that value.
+                let result_is_used = call.results.iter().any(|result| {
+                    function.nodes.iter().any(|node| node.id != call_id &&
+                        node.kind.operands().contains(result))
+                    || function.deopts.iter().any(|point| {
+                        point.snapshot.slots.iter().any(|slot| slot.value == *result)
+                        || point.snapshot.inlined_frames.iter().any(|frame| {
+                            frame.slots.iter().any(|slot| slot.value == *result)
+                        })
+                    })
+                });
+                if result_is_used { continue; }
+                // A class factory is a direct allocation followed by its
+                // statically known constructor. The instance does not escape
+                // to an unrelated effect between these adjacent HIR nodes.
+                plan.by_allocation.insert(alloc_id, InstanceFusion {
+                    constructor: *callee,
+                    args: args[1..].to_vec(),
+                });
+                plan.suppressed_calls.insert(call_id);
+            }
+        }
+        plan
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CopySource {
     General(Reg),
@@ -2074,6 +2234,8 @@ struct FunctionEmitter<'a> {
     trampoline_cache: HashMap<EdgeTransferKey, Label>,
     trampolines: Vec<DeferredTrampoline>,
     stats: FunctionCompileStats,
+    class_fusions: ClassFusionPlan,
+    instance_fusions: InstanceFusionPlan,
 }
 
 impl<'a> FunctionEmitter<'a> {
@@ -2092,6 +2254,8 @@ impl<'a> FunctionEmitter<'a> {
             .iter()
             .map(|_| assembler.label())
             .collect::<Vec<_>>();
+        let class_fusions = ClassFusionPlan::build(function, options);
+        let instance_fusions = InstanceFusionPlan::build(program, function, options);
         Self {
             program,
             function,
@@ -2114,6 +2278,8 @@ impl<'a> FunctionEmitter<'a> {
             ic_cache: HashMap::default(),
             trampoline_cache: HashMap::default(),
             trampolines: Vec::new(),
+            class_fusions,
+            instance_fusions,
             stats: FunctionCompileStats {
                 function: function.id,
                 hir_nodes: function.nodes.len(),
@@ -2383,12 +2549,17 @@ impl<'a> FunctionEmitter<'a> {
         use Opcode::*;
         match opcode {
             Safepoint => SafepointKind::ExplicitPoll,
-            Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | Launch | CallPrimitive => SafepointKind::Call,
+            Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | Launch | CallPrimitive
+            | NewClassInstance | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
+            | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
+            | ArrayMapReducePacked | LaunchConcurrentTask => SafepointKind::Call,
             CallForeign => SafepointKind::Foreign,
             ImportModule | ImportVariable => SafepointKind::Module,
-            Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
-            | FiberSuspend => SafepointKind::FiberSwitch,
-            BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => {
+            Await | AwaitPromise | MakeFiber | FiberCall | FiberTry | FiberTransfer
+            | FiberTransferError | FiberYield | FiberSuspend => SafepointKind::FiberSwitch,
+            BindMethod | BindForeignMethod | ImplementInterface | ImplementType
+            | SetFieldShape | ListAppend | ListInsert | MapSet | StoreProperty
+            | StorePropertyIfPresent => {
                 SafepointKind::RuntimeMutation
             }
             _ => SafepointKind::Allocation,
@@ -2676,12 +2847,71 @@ enum CallTransfer<'a> {
 }
 
 impl FunctionEmitter<'_> {
+    /// A static list contract allows the interpreter to select a packed fast
+    /// path after confirming the runtime storage kind and original method
+    /// identity. The IC remains available for the exact slow-path dispatch.
+    fn specialize_method_call(
+        &self,
+        receiver: ValueId,
+        site: SiteId,
+        method: MethodSymbol,
+        cache: IcSlot,
+    ) -> Option<(Opcode, SpecializedDescriptor)> {
+        let ty = &self.function.value(receiver)?.ty;
+        let signature = self.program.method(method)?;
+        let method_name = self.program.string(signature.name)?;
+        if let Type::List(Some(element)) = ty {
+            let opcode = match method_name {
+                "map" => Some(Opcode::ArrayMapPacked),
+                "filter" => Some(Opcode::ArrayFilterPacked),
+                "forEach" => Some(Opcode::ArrayForEachPacked),
+                // A generic reduce callback is not a proved numeric reduction.
+                _ => None,
+            };
+            if let Some(opcode) = opcode {
+                return Some((opcode, SpecializedDescriptor::PackedArray {
+                    element: (**element).clone(),
+                    reduction: None,
+                    numeric_callback: None,
+                    fallback_cache: cache,
+                    second_fallback_cache: None,
+                }));
+            }
+        }
+        // A monomorphic profile is an optimization hint, not a proof. The
+        // interpreter must guard the concrete method identity before executing
+        // this target; the exact original IC remains the failure path.
+        if let Type::Instance(classes) = ty {
+            let [owner] = classes.as_slice() else { return None; };
+            let profile = self.function.profiles.call_sites.get(&site)?;
+            let [(target, samples)] = profile.targets.as_slice() else { return None; };
+            if *samples < 32 { return None; }
+            let function = self.program.functions.iter().find(|f| f.id == *target)?;
+            if function.kind == FunctionKind::Method && function.signature.params.len() == signature.arity as usize + 1 {
+                return Some((Opcode::InvokeMethodDirect, SpecializedDescriptor::DirectMethod {
+                    owner: *owner, symbol: method, target: *target, fallback_cache: cache,
+                }));
+            }
+        }
+        None
+    }
+
     fn emit_non_control_node(
         &mut self,
         node: &crate::napalm_ir::Node,
     ) -> Result<(), CompileError> {
         use Inst::*;
 
+        if self.instance_fusions.suppressed_calls.contains(&node.id) {
+            return Ok(());
+        }
+        if self.class_fusions.suppressed_bindings.contains(&node.id) {
+            self.stats.fused_class_method_bindings += 1;
+            return Ok(());
+        }
+        // Keep the fused constructor arguments alive until its allocation-and-call
+        // opcode has been assigned a precise GC map.
+        let constructor_fusion = self.instance_fusions.by_allocation.get(&node.id).cloned();
         let mut safepoint_transfer = CallTransfer::None;
         let pc = match &node.kind {
             Jump { .. } | Branch { .. } | Switch { .. } => {
@@ -2728,8 +2958,27 @@ impl FunctionEmitter<'_> {
             }
 
             BindInterface { value, expected, .. } => {
-                let guard = self.type_guard(expected);
-                self.assembler.emit_x32(Opcode::BindInterface, self.result_reg(node)?.0, self.reg(*value)?.0, 0, guard.0)
+                let dst = self.result_reg(node)?;
+                let src = self.reg(*value)?;
+                if self.options.emit_specialized_bytecode
+                    && matches!(expected, Type::Interface(_) | Type::Record(_))
+                {
+                    let opcode = if matches!(expected, Type::Interface(_)) {
+                        Opcode::ImplementInterface
+                    } else {
+                        Opcode::ImplementType
+                    };
+                    let descriptor = SpecializedDescriptor::Contract {
+                        name: None,
+                        contract: expected.clone(),
+                    };
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(opcode, dst, src, &[], descriptor)
+                        .map_err(|error| self.assemble_error(error))?
+                } else {
+                    let guard = self.type_guard(expected);
+                    self.assembler.emit_x32(Opcode::BindInterface, dst.0, src.0, 0, guard.0)
+                }
             }
             GuardType {
                 value,
@@ -2812,10 +3061,22 @@ impl FunctionEmitter<'_> {
                     .iter()
                     .map(|value| self.reg(*value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pc = self
-                    .assembler
-                    .emit_invoke(self.result_reg(node)?, self.reg(*receiver)?, &arg_regs, cache)
-                    .map_err(|error| self.assemble_error(error))?;
+                let specialized = if self.options.emit_specialized_bytecode {
+                    self.specialize_method_call(*receiver, *site, *method, cache)
+                } else {
+                    None
+                };
+                let pc = if let Some((opcode, descriptor)) = specialized {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        opcode, self.result_reg(node)?, self.reg(*receiver)?,
+                        &arg_regs, descriptor,
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler
+                        .emit_invoke(self.result_reg(node)?, self.reg(*receiver)?, &arg_regs, cache)
+                        .map_err(|error| self.assemble_error(error))?
+                };
                 safepoint_transfer = CallTransfer::Invoke {
                     receiver: *receiver,
                     args,
@@ -2893,14 +3154,24 @@ impl FunctionEmitter<'_> {
                     .iter()
                     .map(|value| self.reg(*value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pc = self
-                    .assembler
-                    .emit_launch(
-                        self.result_reg(node)?,
-                        self.reg(*closure)?,
-                        &arg_regs,
-                    )
-                    .map_err(|error| self.assemble_error(error))?;
+                let target = self.function.value(*closure).and_then(|value| match &value.ty {
+                    Type::Closure(Some(function)) => Some(*function),
+                    _ => None,
+                }).filter(|id| self.program.functions.iter().any(|function| {
+                    function.id == *id && function.is_concurrent
+                }));
+                let pc = if let (true, Some(function)) = (self.options.emit_specialized_bytecode, target) {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        Opcode::LaunchConcurrentTask, self.result_reg(node)?,
+                        self.reg(*closure)?, &arg_regs,
+                        SpecializedDescriptor::Concurrent { function },
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_launch(
+                        self.result_reg(node)?, self.reg(*closure)?, &arg_regs,
+                    ).map_err(|error| self.assemble_error(error))?
+                };
                 safepoint_transfer = CallTransfer::Closure {
                     closure: *closure,
                     args,
@@ -3044,13 +3315,36 @@ impl FunctionEmitter<'_> {
                     Some(value) => (self.reg(*value)?.0, 1),
                     None => (0, 0),
                 };
-                self.assembler.emit_x32(
-                    Opcode::CreateClass,
-                    self.result_reg(node)?.0,
-                    super_reg,
-                    has_superclass,
-                    class.0,
-                )
+                if let (true, Some(methods), Some(info)) = (
+                    self.options.emit_specialized_bytecode,
+                    self.class_fusions.by_creation.get(&node.id),
+                    self.program.classes.iter().find(|info| info.id == *class),
+                ) {
+                    let has_implements = !info.implements.is_empty();
+                    let opcode = match (has_superclass != 0, has_implements) {
+                        (false, false) => Opcode::DefineClass,
+                        (true, false) => Opcode::DefineDerivedClass,
+                        (false, true) => Opcode::DefineClassWithImplements,
+                        (true, true) => Opcode::DefineDerivedClassWithImplements,
+                    };
+                    let descriptor = SpecializedDescriptor::Class {
+                        class: *class,
+                        methods: methods.clone(),
+                        implements: info.implements.clone(),
+                    };
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        opcode, self.result_reg(node)?, Reg(super_reg), &[], descriptor,
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32(
+                        Opcode::CreateClass,
+                        self.result_reg(node)?.0,
+                        super_reg,
+                        has_superclass,
+                        class.0,
+                    )
+                }
             },
             BindMethod {
                 class,
@@ -3078,13 +3372,37 @@ impl FunctionEmitter<'_> {
                 method.0,
                 foreign.0,
             ),
-            AllocInstance { class } => self.assembler.emit_x32(
-                Opcode::AllocInstance,
-                self.result_reg(node)?.0,
-                0,
-                0,
-                class.0,
-            ),
+            AllocInstance { class } => {
+                if let Some(fusion) = constructor_fusion.as_ref() {
+                    // The native handler transfers the newly allocated instance
+                    // through THIS and the explicit parameters through ARG0+.
+                    // Both banks must be rooted for a nested constructor call.
+                    let instance = *node.results.first().ok_or_else(|| CompileError::Internal {
+                        function: Some(self.function.id),
+                        message: "fused instance allocation has no result".to_owned(),
+                    })?;
+                    safepoint_transfer = CallTransfer::Invoke {
+                        receiver: instance,
+                        args: &fusion.args,
+                    };
+                    let args = fusion.args.iter().map(|arg| self.reg(*arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        Opcode::NewClassInstance, self.result_reg(node)?, Reg(0),
+                        &args,
+                        SpecializedDescriptor::Instance {
+                            class: *class,
+                            constructor: Some(fusion.constructor),
+                        },
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32(
+                        Opcode::AllocInstance, self.result_reg(node)?.0,
+                        0, 0, class.0,
+                    )
+                }
+            },
             AllocForeign { class, size } => self.assembler.emit_x32(
                 Opcode::AllocForeign,
                 self.result_reg(node)?.0,
@@ -3092,24 +3410,34 @@ impl FunctionEmitter<'_> {
                 0,
                 class.0,
             ),
-            LoadField { object, slot } => self.assembler.emit_x32(
-                Opcode::LoadField,
-                self.result_reg(node)?.0,
-                self.reg(*object)?.0,
-                0,
-                slot.0 as u32,
-            ),
-            StoreField {
-                object,
-                slot,
-                value,
-            } => self.assembler.emit_x32(
-                Opcode::StoreField,
-                self.reg(*object)?.0,
-                self.reg(*value)?.0,
-                0,
-                slot.0 as u32,
-            ),
+            LoadField { object, slot } => {
+                if let (true, Some(class)) = (self.options.emit_specialized_bytecode, self.function.field_owner) {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        Opcode::GetFieldClass, self.result_reg(node)?, self.reg(*object)?, &[],
+                        SpecializedDescriptor::FieldClass { class, local_slot: slot.0 as u32 },
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32(
+                        Opcode::LoadField, self.result_reg(node)?.0,
+                        self.reg(*object)?.0, 0, slot.0 as u32,
+                    )
+                }
+            },
+            StoreField { object, slot, value } => {
+                if let (true, Some(class)) = (self.options.emit_specialized_bytecode, self.function.field_owner) {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        Opcode::SetFieldClass, self.reg(*object)?, self.reg(*value)?, &[],
+                        SpecializedDescriptor::FieldClass { class, local_slot: slot.0 as u32 },
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32(
+                        Opcode::StoreField, self.reg(*object)?.0,
+                        self.reg(*value)?.0, 0, slot.0 as u32,
+                    )
+                }
+            },
             LoadStaticField { class, slot } => self.assembler.emit_x32(
                 Opcode::LoadStaticField,
                 self.result_reg(node)?.0,
@@ -3194,16 +3522,29 @@ impl FunctionEmitter<'_> {
                     .map_err(|error| self.assemble_error(error))?
             }
 
-            AllocList { capacity: None } => {
-                self.assembler.emit_a(Opcode::AllocList, self.result_reg(node)?.0)
-            }
-            AllocList {
-                capacity: Some(capacity),
-            } => self.assembler.emit_ab(
-                Opcode::AllocListCap,
-                self.result_reg(node)?.0,
-                self.reg(*capacity)?.0,
-            ),
+            AllocList { capacity } => {
+                let element = node.results.first().and_then(|id| self.function.value(*id))
+                    .and_then(|v| match &v.ty {
+                        Type::List(Some(element)) => Some((**element).clone()),
+                        _ => None,
+                    });
+                if let (true, Some(element)) = (self.options.emit_specialized_bytecode, element) {
+                    let capacity_reg = match capacity {
+                        Some(value) => self.reg(*value)?,
+                        None => Reg(0),
+                    };
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized(
+                        Opcode::DefineArrayWithGenerics, self.result_reg(node)?,
+                        capacity_reg, &[],
+                        SpecializedDescriptor::ArrayType { element, with_capacity: capacity.is_some() },
+                    ).map_err(|error| self.assemble_error(error))?
+                } else if let Some(capacity) = capacity {
+                    self.assembler.emit_ab(Opcode::AllocListCap, self.result_reg(node)?.0, self.reg(*capacity)?.0)
+                } else {
+                    self.assembler.emit_a(Opcode::AllocList, self.result_reg(node)?.0)
+                }
+            },
             ListLen { list } => self.assembler.emit_ab(
                 Opcode::ListLen,
                 self.result_reg(node)?.0,
@@ -3258,7 +3599,14 @@ impl FunctionEmitter<'_> {
                 self.reg(*index)?.0,
             ),
 
-            AllocMap => self.assembler.emit_a(Opcode::AllocMap, self.result_reg(node)?.0),
+            AllocMap => {
+                if self.options.emit_specialized_bytecode {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_a(Opcode::NewObjectEmpty, self.result_reg(node)?.0)
+                } else {
+                    self.assembler.emit_a(Opcode::AllocMap, self.result_reg(node)?.0)
+                }
+            },
             MapLen { map } => self.assembler.emit_ab(
                 Opcode::MapLen,
                 self.result_reg(node)?.0,
@@ -3270,28 +3618,42 @@ impl FunctionEmitter<'_> {
                 self.reg(*map)?.0,
                 self.reg(*key)?.0,
             ),
-            LoadProperty { object, key, layout, slot } => self.assembler.emit_x32_y32(
-                Opcode::LoadProperty,
-                self.result_reg(node)?.0,
-                self.reg(*object)?.0,
-                self.reg(*key)?.0,
-                layout.0,
-                slot.0 as u32,
-            ),
+            LoadProperty { object, key, layout, slot } => {
+                if self.options.emit_specialized_bytecode {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized_shape(
+                        Opcode::GetFieldShape, self.result_reg(node)?,
+                        self.reg(*object)?, self.reg(*key)?, *layout, *slot,
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32_y32(
+                        Opcode::LoadProperty, self.result_reg(node)?.0,
+                        self.reg(*object)?.0, self.reg(*key)?.0,
+                        layout.0, slot.0 as u32,
+                    )
+                }
+            },
             MapSet { map, key, value } => self.assembler.emit_abc(
                 Opcode::MapSet,
                 self.reg(*map)?.0,
                 self.reg(*key)?.0,
                 self.reg(*value)?.0,
             ),
-            StoreProperty { object, key, value, layout, slot } => self.assembler.emit_x32_y32(
-                Opcode::StoreProperty,
-                self.reg(*object)?.0,
-                self.reg(*key)?.0,
-                self.reg(*value)?.0,
-                layout.0,
-                slot.0 as u32,
-            ),
+            StoreProperty { object, key, value, layout, slot } => {
+                if self.options.emit_specialized_bytecode {
+                    self.stats.specialized_opcodes += 1;
+                    self.assembler.emit_specialized_shape(
+                        Opcode::SetFieldShape, self.reg(*object)?,
+                        self.reg(*key)?, self.reg(*value)?, *layout, *slot,
+                    ).map_err(|error| self.assemble_error(error))?
+                } else {
+                    self.assembler.emit_x32_y32(
+                        Opcode::StoreProperty, self.reg(*object)?.0,
+                        self.reg(*key)?.0, self.reg(*value)?.0,
+                        layout.0, slot.0 as u32,
+                    )
+                }
+            },
             StorePropertyIfPresent { object, key, value, present, layout, slot } => {
                 let packed = slot.0 as u32 | ((self.reg(*present)?.0 as u32) << 16);
                 self.assembler.emit_x32_y32(
@@ -3411,11 +3773,18 @@ impl FunctionEmitter<'_> {
                 self.reg(*value)?.0,
             ),
 
-            Await { promise } => self.assembler.emit_ab(
-                Opcode::Await,
-                self.result_reg(node)?.0,
-                self.reg(*promise)?.0,
-            ),
+            Await { promise } => {
+                let known_promise = self.function.value(*promise).is_some_and(|value| {
+                    matches!(&value.ty, Type::Builtin(crate::napalm_ir::BuiltinId::Promise, _))
+                });
+                let opcode = if self.options.emit_specialized_bytecode && known_promise {
+                    self.stats.specialized_opcodes += 1;
+                    Opcode::AwaitPromise
+                } else {
+                    Opcode::Await
+                };
+                self.assembler.emit_ab(opcode, self.result_reg(node)?.0, self.reg(*promise)?.0)
+            },
 
             MakeFiber { closure } => self.assembler.emit_ab(
                 Opcode::MakeFiber,
@@ -4057,8 +4426,42 @@ fn compile_program_impl(
         }
     }
 
+    // The standard optimizer only emits opcodes supported by the existing VM.
+    // The optional second pipeline emits multi-operation native dispatches and
+    // relocates all affected PC-indexed metadata. This must run after the HIR
+    // compiler has finished all cross-function deopt fixups.
+    if options.emit_specialized_bytecode {
+        let before = bytecode.functions.iter()
+            .map(|function| function.chunk.code.len()).sum::<usize>();
+        let report = superinstruction_emission_passes()
+            .verify_after_each_pass(options.verify_each_bytecode_pass)
+            .optimize_program(&mut bytecode)
+            .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?;
+        stats.bytecode_words_removed += report.words_removed;
+        stats.bytecode_passes_changed += report.passes_changed;
+        stats.total_bytecode_words = report.output_words;
+        for function_stats in &mut stats.functions {
+            if let Some(function) = bytecode.function(function_stats.function) {
+                function_stats.bytecode_words = function.chunk.code.len();
+                function_stats.safepoints = function.chunk.safepoints.len();
+            }
+        }
+        debug_assert!(report.output_words <= before);
+    }
     stats.superinstruction_candidates_detected = find_superinstruction_sites(&bytecode)
         .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?.len();
+
+    if options.emit_specialized_bytecode {
+        use crate::napalm_bytecode::Decoder;
+        for item in &mut stats.functions {
+            if let Some(function) = bytecode.function(item.function) {
+                item.specialized_opcodes = Decoder::new(&function.chunk.code)
+                    .filter_map(|decoded| decoded.ok())
+                    .filter(|decoded| decoded.opcode.is_specialized())
+                    .count();
+            }
+        }
+    }
 
     if options.verify_bytecode {
         BytecodeVerifier::verify_program(&bytecode)

@@ -3802,6 +3802,28 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Type::Class(ClassSet::singleton(plan.id)),
         );
 
+        // Bind methods before publishing the class into a module slot. The
+        // bytecode compiler may now emit a single atomic Define*Class opcode
+        // with the complete statically known method table. Publication happens
+        // only after the class has been fully initialized.
+        for method in &plan.methods {
+            if let Some(function) = method.function {
+                self.builder.emit0(Inst::BindMethod {
+                    class: class_value,
+                    method: method.symbol,
+                    function,
+                    is_static: method.bind_static,
+                });
+            } else if let Some(foreign) = method.foreign {
+                self.builder.emit0(Inst::BindForeignMethod {
+                    class: class_value,
+                    method: method.symbol,
+                    foreign,
+                    is_static: method.bind_static,
+                });
+            }
+        }
+
         self.builder.emit0(Inst::StoreModuleVar {
             module: self.context.module,
             slot: plan.class_slot,
@@ -3826,23 +3848,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.bind_initial(binding, class_value);
         }
 
-        for method in &plan.methods {
-            if let Some(function) = method.function {
-                self.builder.emit0(Inst::BindMethod {
-                    class: class_value,
-                    method: method.symbol,
-                    function,
-                    is_static: method.bind_static,
-                });
-            } else if let Some(foreign) = method.foreign {
-                self.builder.emit0(Inst::BindForeignMethod {
-                    class: class_value,
-                    method: method.symbol,
-                    foreign,
-                    is_static: method.bind_static,
-                });
-            }
-        }
+
     }
 
     fn lower_import(&mut self, import: &ImportDecl, module_level: bool) {

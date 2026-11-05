@@ -19,8 +19,10 @@ use smallbox::{SmallBox, smallbox, space::S1};
 
 use crate::napalm_bytecode::{
     BytecodePc, BytecodeProgram, BytecodeVerifier, Decoder, Opcode, Word,
+    BytecodeFusion, SpecializedDescriptor, FusionContinuation, Reg, pack_registers,
+    decode_call_conv,
 };
-use crate::napalm_ir::{Constant, FuncId};
+use crate::napalm_ir::{Constant, FuncId, ClassId, StructuralLayoutId, PropertySlotId, DeoptId, StringId};
 
 #[derive(Debug, Clone)]
 pub struct OptimizationError {
@@ -838,19 +840,313 @@ impl BytecodeOptimization for CompactBytecode {
     }
 }
 
-/// Runtime-facing fusion opportunities. These are **not** opcodes and do not
-/// change execution until matching native interpreter handlers are implemented.
-/// Kept separate from the safe default pipeline to prevent silently emitting
-/// an instruction that an older interpreter would reject.
+
+/// Fused bytecode emission pass. It works on completed physical bytecode, so
+/// operands are already allocated, profiles have been lowered, and the original
+/// PC-indexed GC/deopt information is available for validation.
+///
+/// This pass maintains the original code length with `Nop` padding. The later
+/// `CompactBytecode` pass performs a single relocation of every PC-indexed
+/// table, including references from other functions' inlined frame snapshots.
+///
+/// The second instruction's GC/liveness snapshot is *not thrown away*: it is
+/// captured by `FusionContinuation`, which the future VM handler must consult
+/// when it reaches that internal stage. No external control-flow entry is
+/// allowed at the eliminated boundary.
+pub struct FuseSurvivorSuperinstructions;
+
+struct FusionRewrite {
+    first_pc: usize,
+    second_pc: usize,
+    total_len: usize,
+    words: Vec<Word>,
+    semantic: BytecodeFusion,
+}
+
+fn build_survivor_fusion(
+    program: &BytecodeProgram,
+    fidx: usize,
+    first: InstView,
+    second: InstView,
+) -> Option<FusionRewrite> {
+    use Opcode::*;
+    let function = &program.functions[fidx];
+    let code = &function.chunk.code;
+    let d = first.first.a();
+    let special = |view: InstView| function.chunk.specializations
+        .get(code.get(view.pc + 1)?.0 as usize);
+    let typed_list = match first.op {
+        Opcode::AllocList => Some((None, None)),
+        Opcode::DefineArrayWithGenerics => match special(first)? {
+            SpecializedDescriptor::ArrayType { element, with_capacity } => Some((
+                Some(element.clone()), if *with_capacity { Some(Reg(first.first.b())) } else { None },
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    let field_load = match first.op {
+        Opcode::LoadField => Some((None, code[first.pc + 1].0)),
+        Opcode::GetFieldClass => match special(first)? {
+            SpecializedDescriptor::FieldClass { class, local_slot } => Some((Some(*class), *local_slot)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let property_load = match first.op {
+        Opcode::LoadProperty => Some((
+            StructuralLayoutId(code[first.pc + 1].0),
+            PropertySlotId(u16::try_from(code[first.pc + 2].0).ok()?),
+        )),
+        Opcode::GetFieldShape => match special(first)? {
+            SpecializedDescriptor::FieldShape { layout, slot } => Some((*layout, *slot)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let field_store_slot = match second.op {
+        Opcode::StoreField => Some(code[second.pc + 1].0),
+        Opcode::SetFieldClass => match special(second)? {
+            SpecializedDescriptor::FieldClass { class, local_slot }
+                if *class == ClassId(code[first.pc + 1].0) => Some(*local_slot),
+            _ => None,
+        },
+        _ => None,
+    };
+    let property_store_slot = match second.op {
+        Opcode::StoreProperty => Some((
+            StructuralLayoutId(code[second.pc + 1].0),
+            PropertySlotId(u16::try_from(code[second.pc + 2].0).ok()?),
+        )),
+        Opcode::SetFieldShape => match special(second)? {
+            SpecializedDescriptor::FieldShape { layout, slot } => Some((*layout, *slot)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (opcode, a, b, c, semantic, args): (Opcode, u8, u8, u8, BytecodeFusion, Vec<Reg>) =
+        match (first.op, second.op) {
+        (LoadI8, IAdd | ISub | IMul | IDivS | IRemS | IBitAnd | IBitOr
+            | IBitXor | IShl | IShrU | ISar | ICmpEq | ICmpNe | ICmpLt | ICmpLe
+            | ICmpGt | ICmpGe)
+            if second.first.a() == d
+                && (second.first.b() == d) != (second.first.c() == d) => {
+            let immediate_first = second.first.b() == d;
+            let other = if immediate_first { second.first.c() } else { second.first.b() };
+            let opcode = if matches!(second.op, ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe) {
+                LoadI8IntegerComparison
+            } else {
+                LoadI8IntegerArithmetic
+            };
+            (opcode, second.first.a(), other, first.first.b(),
+                BytecodeFusion::IntegerImmediate {operation: second.op, immediate_first}, Vec::new())
+        }
+        (LoadI8, Return) if second.first.a() == d =>
+            (LoadI8Return, first.first.b(), 0, 0, BytecodeFusion::ReturnInteger, Vec::new()),
+        (LoadNull | LoadFalse | LoadTrue, Return) if second.first.a() == d => {
+            let tag = match first.op { LoadNull => 0, LoadFalse => 1, _ => 2 };
+            (LoadLiteralReturn, tag, 0, 0, BytecodeFusion::ReturnLiteral, Vec::new())
+        }
+        (AllocList | DefineArrayWithGenerics, ListAppend)
+            if second.first.a() == d && typed_list.is_some() => {
+            let (element, capacity) = typed_list?;
+            (AllocListAndAppend, d, second.first.b(), 0,
+                BytecodeFusion::ListWithFirstElement { element, capacity }, Vec::new())
+        },
+        (AllocInstance, StoreField | SetFieldClass)
+            if second.first.a() == d && field_store_slot.is_some() =>
+            (AllocInstanceAndInitializeField, d, second.first.b(), 0,
+                BytecodeFusion::InstanceWithField {
+                    class: ClassId(code[first.pc + 1].0), slot: field_store_slot?,
+                }, Vec::new()),
+        (AllocInstance, StoreProperty | SetFieldShape)
+            if second.first.a() == d && property_store_slot.is_some() => {
+            let (layout, slot) = property_store_slot?;
+            (AllocInstanceAndInitializeProperty, d, second.first.c(), second.first.b(),
+                BytecodeFusion::InstanceWithProperty {
+                    class: ClassId(code[first.pc + 1].0), layout, slot,
+                }, Vec::new())
+        },
+        (LoadField | GetFieldClass, CallClosure)
+            if second.first.b() == d && second.first.a() == d && field_load.is_some() =>
+            (LoadFieldAndCall, second.first.a(), first.first.b(), second.first.c(),
+                BytecodeFusion::FieldClosureCall {
+                    class: field_load?.0,
+                    slot: field_load?.1,
+                    convention: decode_call_conv(code[second.pc + 1].0 as u8)?,
+                }, crate::napalm_bytecode::unpack_registers(
+                    &code[second.pc + 2..second.pc + second.len], second.first.c() as usize).ok()?),
+        (LoadProperty | GetFieldShape, CallClosure)
+            if second.first.b() == d && second.first.a() == d && property_load.is_some() =>
+            (LoadPropertyAndCall, second.first.a(), first.first.b(), second.first.c(),
+                BytecodeFusion::PropertyClosureCall {
+                    layout: property_load?.0,
+                    slot: property_load?.1,
+                    key: Reg(first.first.c()),
+                    convention: decode_call_conv(code[second.pc + 1].0 as u8)?,
+                }, crate::napalm_bytecode::unpack_registers(
+                    &code[second.pc + 2..second.pc + second.len], second.first.c() as usize).ok()?),
+        (GuardType | GuardClass, LoadField | GetFieldClass)
+            if first.first.a() == first.first.b() && second.first.b() == d =>
+            (GuardThenFieldLoad, second.first.a(), first.first.b(), 0,
+                BytecodeFusion::GuardedField {
+                    class_guard: first.op == GuardClass,
+                    guard_id: code[first.pc + 1].0,
+                    deopt: DeoptId(code[first.pc + 2].0),
+                    slot: match second.op {
+                        GetFieldClass => match special(second)? {
+                            SpecializedDescriptor::FieldClass { local_slot, .. } => *local_slot,
+                            _ => return None,
+                        },
+                        _ => code[second.pc + 1].0,
+                    },
+                }, Vec::new()),
+        (GuardType | GuardClass, LoadProperty | GetFieldShape)
+            if first.first.a() == first.first.b() && second.first.b() == d =>
+            (GuardThenPropertyLoad, second.first.a(), first.first.b(), second.first.c(),
+                BytecodeFusion::GuardedProperty {
+                    class_guard: first.op == GuardClass,
+                    guard_id: code[first.pc + 1].0,
+                    deopt: DeoptId(code[first.pc + 2].0),
+                    layout: match second.op {
+                        GetFieldShape => match special(second)? {
+                            SpecializedDescriptor::FieldShape { layout, .. } => *layout,
+                            _ => return None,
+                        },
+                        _ => StructuralLayoutId(code[second.pc + 1].0),
+                    },
+                    slot: match second.op {
+                        GetFieldShape => match special(second)? {
+                            SpecializedDescriptor::FieldShape { slot, .. } => *slot,
+                            _ => return None,
+                        },
+                        _ => PropertySlotId(u16::try_from(code[second.pc + 2].0).ok()?),
+                    },
+                }, Vec::new()),
+        (ImportModule, ImportVariable)
+            if second.first.b() == d && second.first.a() == d =>
+            (ImportAndReadVariable, d, 0, 0,
+                BytecodeFusion::ImportAndRead {
+                    module: StringId(code[first.pc + 1].0),
+                    variable: StringId(code[second.pc + 1].0),
+                }, Vec::new()),
+        (CallDirect, Return) if second.first.a() == d =>
+            (DirectCallAndReturn, d, 0, first.first.c(),
+                BytecodeFusion::DirectCallAndReturn {
+                    function: FuncId(code[first.pc + 1].0),
+                    convention: decode_call_conv(first.first.b())?,
+                }, crate::napalm_bytecode::unpack_registers(
+                    &code[first.pc + 2..first.pc + first.len], first.first.c() as usize).ok()?),
+        (CallClosure, Return) if second.first.a() == d =>
+            (ClosureCallAndReturn, d, first.first.b(), first.first.c(),
+                BytecodeFusion::ClosureCallAndReturn {
+                    convention: decode_call_conv(code[first.pc + 1].0 as u8)?,
+                }, crate::napalm_bytecode::unpack_registers(
+                    &code[first.pc + 2..first.pc + first.len], first.first.c() as usize).ok()?),
+        (Launch | LaunchConcurrentTask, Await | AwaitPromise)
+            if second.first.b() == d && second.first.a() == d =>
+            (ConcurrentLaunchAndAwait, d, first.first.b(), first.first.c(),
+                BytecodeFusion::ConcurrentLaunchAndAwait {
+                    target: if first.op == LaunchConcurrentTask {
+                        match special(first)? {
+                            SpecializedDescriptor::Concurrent { function } => Some(*function),
+                            _ => return None,
+                        }
+                    } else { None },
+                },
+                crate::napalm_bytecode::unpack_registers(
+                    &code[first.pc + 2..first.pc + first.len], first.first.c() as usize).ok()?),
+        _ => return None,
+    };
+
+    if args.len() > crate::napalm_bytecode::MAX_DIRECT_FRAME_VALUES { return None; }
+    let mut words = vec![Word::abc(opcode, a, b, c), Word(0)];
+    words.extend(pack_registers(&args));
+    let total_len = first.len + second.len;
+    if words.len() > total_len { return None; }
+    Some(FusionRewrite { first_pc: first.pc, second_pc: second.pc, total_len, words, semantic })
+}
+
+impl BytecodeOptimization for FuseSurvivorSuperinstructions {
+    fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
+        let mut changed = false;
+        for index in 0..program.functions.len() {
+            let barriers = entries(program, index)?;
+            let code = &program.functions[index].chunk.code;
+            let instructions = decode(code, self.name())?;
+            let mut rewrites = Vec::<FusionRewrite>::new();
+            let mut next_free = 0;
+            for pair in instructions.windows(2) {
+                let first = pair[0];
+                let second = pair[1];
+                if first.pc < next_free || barriers.contains(&second.pc) { continue; }
+                let Some(rewrite) = build_survivor_fusion(program, index, first, second) else { continue; };
+                // Two different exception handlers must never be collapsed into
+                // one dispatch. An exception-range boundary was already treated
+                // as a barrier in `entries` above.
+                next_free = second.pc + second.len;
+                rewrites.push(rewrite);
+            }
+            if rewrites.is_empty() { continue; }
+            let chunk = &mut program.functions[index].chunk;
+            for rewrite in rewrites {
+                // Capture snapshots of the second primitive instruction before
+                // removing its code and PC-keyed metadata.
+                let second_pc = BytecodePc(rewrite.second_pc as u32);
+                let second_safepoint = chunk.safepoints.iter().find(|item| item.pc == second_pc)
+                    .map(|item| (item.kind, item.references.clone()));
+                let second_live = chunk.live_registers.iter().find(|item| item.pc == second_pc);
+                let continuation = FusionContinuation {
+                    gc: second_safepoint,
+                    live: second_live.map(|entry| entry.live),
+                    constants: second_live.map_or_else(Vec::new, |entry| entry.constants.clone()),
+                    types: second_live.map_or_else(Vec::new, |entry| entry.types.clone()),
+                };
+                let descriptor = chunk.push_specialization(SpecializedDescriptor::Fusion {
+                    operation: rewrite.semantic,
+                    continuation,
+                });
+                let mut words = rewrite.words;
+                words[1] = Word(descriptor);
+                let first_pc = BytecodePc(rewrite.first_pc as u32);
+                chunk.code[rewrite.first_pc..rewrite.first_pc + words.len()].copy_from_slice(&words);
+                for pc in rewrite.first_pc + words.len()..rewrite.first_pc + rewrite.total_len {
+                    nop(&mut chunk.code, pc);
+                }
+                chunk.safepoints.retain(|entry| entry.pc != second_pc);
+                chunk.live_registers.retain(|entry| entry.pc != second_pc);
+                // Only source spans are allowed to refer to an eliminated PC.
+                // An external control entry, resume or exception boundary is
+                // forbidden by the barrier test performed before the rewrite.
+                for entry in &mut chunk.source_map {
+                    if entry.start_pc == second_pc { entry.start_pc = first_pc; }
+                    if entry.end_pc == second_pc { entry.end_pc = first_pc; }
+                }
+                chunk.source_map.retain(|entry| entry.start_pc.0 < entry.end_pc.0);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+}
+
+/// Enables emitted, descriptor-backed superinstructions. Do NOT run against an
+/// interpreter that lacks the matching native handlers. `CompactBytecode` must
+/// follow the fuser so the reserved Nop padding is removed and all PCs relocate.
+pub fn superinstruction_emission_passes() -> Optimize {
+    Optimize::new().with_pass(FuseSurvivorSuperinstructions).with_pass(CompactBytecode)
+}
+
+/// Deduplicated candidate set. Each item maps to its own opcode ID 164..179.
+/// `MapLookupOrInsert` has a first-class emitter but is not inferred from an
+/// unconditional MapGet/MapSet pair, which would change runtime semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SuperinstructionCandidate {
     LoadI8IntegerArithmetic,
     LoadI8IntegerComparison,
     LoadI8Return,
     LoadLiteralReturn,
-    MoveReturn,
     AllocListAndAppend,
-    AllocMapAndInsert,
     AllocInstanceAndInitializeField,
     AllocInstanceAndInitializeProperty,
     LoadFieldAndCall,
@@ -858,18 +1154,6 @@ pub enum SuperinstructionCandidate {
     GuardThenFieldLoad,
     GuardThenPropertyLoad,
     MapLookupOrInsert,
-    ArrayMap,
-    ArrayForEach,
-    ArrayFilter,
-    ArrayReduce,
-    CreateClassWithSuperclass,
-    CreateClassWithMethods,
-    RegisterInterfaceContract,
-    RegisterTypeContract,
-    BindClassInterface,
-    BindClassType,
-    AllocateStructuralObject,
-    CreateObjectWithProperties,
     ImportAndReadVariable,
     DirectCallAndReturn,
     ClosureCallAndReturn,
@@ -880,15 +1164,11 @@ pub const fn superinstruction_candidates() -> &'static [SuperinstructionCandidat
     use SuperinstructionCandidate::*;
     &[
         LoadI8IntegerArithmetic, LoadI8IntegerComparison, LoadI8Return,
-        LoadLiteralReturn, MoveReturn, AllocListAndAppend, AllocMapAndInsert,
-        AllocInstanceAndInitializeField, AllocInstanceAndInitializeProperty,
-        LoadFieldAndCall, LoadPropertyAndCall, GuardThenFieldLoad,
-        GuardThenPropertyLoad, MapLookupOrInsert, ArrayMap, ArrayForEach,
-        ArrayFilter, ArrayReduce, CreateClassWithSuperclass,
-        CreateClassWithMethods, RegisterInterfaceContract, RegisterTypeContract,
-        BindClassInterface, BindClassType, AllocateStructuralObject,
-        CreateObjectWithProperties, ImportAndReadVariable, DirectCallAndReturn,
-        ClosureCallAndReturn, ConcurrentLaunchAndAwait,
+        LoadLiteralReturn, AllocListAndAppend, AllocInstanceAndInitializeField,
+        AllocInstanceAndInitializeProperty, LoadFieldAndCall, LoadPropertyAndCall,
+        GuardThenFieldLoad, GuardThenPropertyLoad, MapLookupOrInsert,
+        ImportAndReadVariable, DirectCallAndReturn, ClosureCallAndReturn,
+        ConcurrentLaunchAndAwait,
     ]
 }
 
@@ -905,9 +1185,8 @@ pub struct SuperinstructionSite {
     pub crosses_gc_boundary: bool,
 }
 
-/// Finds candidate sites after bytecode emission. The planner is useful for
-/// coverage/profiling and for selecting which native handlers to implement.
-/// It never modifies an executable bytecode stream.
+/// Finds raw, unproven candidate sites. Only `FuseSurvivorSuperinstructions`
+/// performs the checked, metadata-preserving emission described below.
 pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<SuperinstructionSite>, OptimizationError> {
     use SuperinstructionCandidate::*;
     let mut sites = Vec::new();
@@ -930,9 +1209,7 @@ pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<Supe
                 (Opcode::LoadI8,Opcode::Return) if second.first.a() == d => Some(LoadI8Return),
                 (Opcode::LoadNull|Opcode::LoadTrue|Opcode::LoadFalse,Opcode::Return)
                     if second.first.a()==d => Some(LoadLiteralReturn),
-                (Opcode::Move,Opcode::Return) if second.first.a()==d => Some(MoveReturn),
                 (Opcode::AllocList,Opcode::ListAppend) if second.first.a()==d => Some(AllocListAndAppend),
-                (Opcode::AllocMap,Opcode::MapSet) if second.first.a()==d => Some(AllocMapAndInsert),
                 (Opcode::AllocInstance,Opcode::StoreProperty) if second.first.a()==d => Some(AllocInstanceAndInitializeProperty),
                 (Opcode::AllocInstance,Opcode::StoreField) if second.first.a()==d => Some(AllocInstanceAndInitializeField),
                 (Opcode::LoadField,Opcode::CallClosure) if second.first.b()==d => Some(LoadFieldAndCall),
@@ -941,7 +1218,6 @@ pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<Supe
                     if second.first.b()==d => Some(GuardThenPropertyLoad),
                 (Opcode::GuardType|Opcode::GuardClass,Opcode::LoadField)
                     if second.first.b()==d => Some(GuardThenFieldLoad),
-                (Opcode::CreateClass,Opcode::BindMethod) if second.first.a()==d => Some(CreateClassWithMethods),
                 (Opcode::ImportModule,Opcode::ImportVariable) if second.first.b()==d => Some(ImportAndReadVariable),
                 (Opcode::CallDirect,Opcode::Return) if second.first.a()==d => Some(DirectCallAndReturn),
                 (Opcode::CallClosure,Opcode::Return) if second.first.a()==d => Some(ClosureCallAndReturn),
@@ -959,44 +1235,7 @@ pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<Supe
                 });
             }
         }
-        for i in &insts {
-            if i.op==Opcode::CreateClass && i.first.c()==1 {
-                sites.push(SuperinstructionSite {
-                    function:f.id,
-                    start_pc:BytecodePc(i.pc as u32),
-                    end_pc:BytecodePc((i.pc+i.len) as u32),
-                    candidate:CreateClassWithSuperclass,
-                    has_external_entry:false,
-                    crosses_gc_boundary:i.op.may_gc(),
-                });
-            }
-            let method = match i.op {
-                Opcode::Invoke | Opcode::InvokeSuper => chunk.inline_caches.get(chunk.code[i.pc+1].0 as usize).map(|cache|cache.method),
-                Opcode::InvokeSpread => Some(crate::napalm_ir::MethodSymbol(chunk.code[i.pc+1].0)),
-                _ => None,
-            };
-            if let Some(method) = method {
-                if let Some(signature) = program.metadata.method(method) {
-                    let candidate = match program.metadata.string(signature.name) {
-                        Some("map") => Some(ArrayMap),
-                        Some("forEach") => Some(ArrayForEach),
-                        Some("filter") => Some(ArrayFilter),
-                        Some("reduce") => Some(ArrayReduce),
-                        _ => None,
-                    };
-                    if let Some(candidate)=candidate {
-                        sites.push(SuperinstructionSite {
-                            function:f.id,
-                            start_pc:BytecodePc(i.pc as u32),
-                            end_pc:BytecodePc((i.pc+i.len) as u32),
-                            candidate,
-                            has_external_entry:false,
-                            crosses_gc_boundary:true,
-                        });
-                    }
-                }
-            }
-        }
+
     }
     Ok(sites)
 }
@@ -1005,6 +1244,82 @@ pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<Supe
 mod tests {
     use super::*;
     use crate::napalm_bytecode::Assembler;
+
+    fn stub_function(code: Vec<Word>) -> BytecodeProgram {
+        use crate::napalm_bytecode::{BytecodeFunction, BytecodeChunk, FrameLayout, RegisterKind};
+        use crate::napalm_ir::{ModuleId, StringId, FunctionKind, MemoizationKind, Type};
+        let mut program = BytecodeProgram::new();
+        let mut chunk = BytecodeChunk::default();
+        chunk.code = code;
+        program.push_function(BytecodeFunction {
+            id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
+            is_async: false, is_concurrent: false, memoization: MemoizationKind::None,
+            field_owner: None, name: StringId(0), arity: 0, result_type: Type::Top,
+            capture_count: 0,
+            frame: FrameLayout {
+                general_register_count: 8, parameters: Vec::new(), captures: Vec::new(),
+                return_kind: RegisterKind::Value,
+            },
+            chunk,
+        }).unwrap();
+        program
+    }
+
+    #[test]
+    fn fused_arithmetic_has_one_dispatch_and_no_spurious_temp() {
+        let mut program = stub_function(vec![
+            Word::abc(Opcode::LoadI8, 2, 7, 0),
+            Word::abc(Opcode::IAdd, 2, 2, 1),
+            Word::abc(Opcode::Return, 2, 0, 0),
+        ]);
+        assert!(FuseSurvivorSuperinstructions.optimize(&mut program).unwrap());
+        let insts = decode(&program.functions[0].chunk.code, "test").unwrap();
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].op, Opcode::LoadI8IntegerArithmetic);
+        assert_eq!(insts[0].first.c(), 7);
+        assert_eq!(insts[1].op, Opcode::Return);
+    }
+
+    #[test]
+    fn refuses_fusion_when_register_lifetime_would_change() {
+        let mut program = stub_function(vec![
+            Word::abc(Opcode::LoadI8, 2, 7, 0),
+            Word::abc(Opcode::IAdd, 3, 2, 1),
+            Word::abc(Opcode::Return, 2, 0, 0),
+        ]);
+        assert!(!FuseSurvivorSuperinstructions.optimize(&mut program).unwrap());
+    }
+
+    #[test]
+    fn preserves_second_stage_precise_gc_metadata() {
+        use crate::napalm_bytecode::{SafepointEntry, SafepointKind, ReferenceMap};
+        let mut program = stub_function(vec![
+            Word::abc(Opcode::AllocList, 2, 0, 0),
+            Word::abc(Opcode::ListAppend, 2, 3, 0),
+            Word::abc(Opcode::Return, 2, 0, 0),
+        ]);
+        let mut stage_one = ReferenceMap::default();
+        stage_one.set_general(Reg(3), true);
+        let mut stage_two = ReferenceMap::default();
+        stage_two.set_general(Reg(2), true);
+        stage_two.set_general(Reg(3), true);
+        program.functions[0].chunk.safepoints = vec![
+            SafepointEntry { pc: BytecodePc(0), kind: SafepointKind::Allocation, references: stage_one },
+            SafepointEntry { pc: BytecodePc(1), kind: SafepointKind::RuntimeMutation, references: stage_two.clone() },
+        ];
+        assert!(FuseSurvivorSuperinstructions.optimize(&mut program).unwrap());
+        let chunk = &program.functions[0].chunk;
+        assert_eq!(chunk.safepoints.len(), 1);
+        let decoded = decode(&chunk.code, "test").unwrap();
+        assert_eq!(decoded[0].op, Opcode::AllocListAndAppend);
+        let descriptor = &chunk.specializations[chunk.code[1].0 as usize];
+        match descriptor {
+            SpecializedDescriptor::Fusion { continuation, .. } => {
+                assert_eq!(continuation.gc.as_ref().map(|entry| &entry.1), Some(&stage_two));
+            }
+            _ => panic!("expected a fused continuation"),
+        }
+    }
 
     #[test]
     fn small_constant_folding_only_uses_representable_results() {
