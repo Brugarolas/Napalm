@@ -44,6 +44,7 @@ pub mod napalm_builtin;
 pub mod napalm_collections;
 pub mod napalm_bytecode;
 pub mod napalm_bytecodecompiler;
+pub mod napalm_bytecode_optimizer;
 pub mod napalm_front;
 pub mod napalm_front_main;
 pub mod napalm_gc;
