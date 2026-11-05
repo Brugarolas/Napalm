@@ -32,9 +32,84 @@ const REGION_TEST_SOURCE: &str = r#"
     var result = Test.run()
 "#;
 
+/// Values crossing internal links unboxed: NaN, -0, infinities, numbers
+/// outside int32, fractions and negative integers, through the inner-loop
+/// exit (root -> side trace) and back (side -> root).
+#[cfg(feature = "llvm-jit")]
+const REGION_SPECIAL_VALUES_SOURCE: &str = r#"
+    class Test {
+        static run() {
+            var nans = 0
+            var negzeros = 0
+            var infs = 0
+            var acc = 0
+            var v = 0
+            var y = 0
+            while (y < 120) {
+                var x = 0
+                while (x < 90) {
+                    var k = (x * 13 + y) % 7
+                    if (k == 0) {
+                        v = 0 / 0
+                    } else {
+                        if (k == 1) {
+                            v = 0 * -1
+                        } else {
+                            if (k == 2) {
+                                v = 1 / 0
+                            } else {
+                                if (k == 3) {
+                                    v = 3000000000 + x
+                                } else {
+                                    if (k == 4) {
+                                        v = x + 0.5
+                                    } else {
+                                        v = x - y
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    var i = 0
+                    var t = 0
+                    while (i < 3) {
+                        t = v * 1
+                        i = i + 1
+                    }
+                    if (t != t) {
+                        nans = nans + 1
+                    } else {
+                        if (t == 0 && 1 / t < 0) {
+                            negzeros = negzeros + 1
+                        } else {
+                            if (t > 1e300) {
+                                infs = infs + 1
+                            } else {
+                                acc = acc + t * i
+                            }
+                        }
+                    }
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            return acc + nans * 7 + negzeros * 3 + infs * 5
+        }
+    }
+    var result = Test.run()
+"#;
+
 #[cfg(feature = "llvm-jit")]
 fn run_region_test(options: Option<TracingJitOptions>) -> (f64, Option<crate::napalm_tracing_jit::TracingJitStats>) {
-    let (program, entry, manifest) = compile_napalm_module(REGION_TEST_SOURCE);
+    run_region_source(REGION_TEST_SOURCE, options)
+}
+
+#[cfg(feature = "llvm-jit")]
+fn run_region_source(
+    source: &str,
+    options: Option<TracingJitOptions>,
+) -> (f64, Option<crate::napalm_tracing_jit::TracingJitStats>) {
+    let (program, entry, manifest) = compile_napalm_module(source);
     let mut vm = source_vm(&program, &manifest);
     vm.set_jit_options(options);
     vm.run_module(entry).unwrap();
@@ -60,6 +135,25 @@ fn llvm_region_nested_loops_match_interpreter() {
             assert!(stats.llvm_region_members >= 2, "{stats:?}");
         } else {
             assert_eq!(stats.llvm_regions_installed, 0, "{stats:?}");
+        }
+    }
+}
+
+#[cfg(feature = "llvm-jit")]
+#[test]
+fn llvm_region_unboxed_links_preserve_special_numbers() {
+    let (expected, _) = run_region_source(REGION_SPECIAL_VALUES_SOURCE, None);
+    for regions in [false, true] {
+        let (result, stats) = run_region_source(REGION_SPECIAL_VALUES_SOURCE, Some(TracingJitOptions {
+            llvm_hot_threshold: 1,
+            llvm_background_compile: false,
+            llvm_trace_regions: regions,
+            ..Default::default()
+        }));
+        let stats = stats.unwrap();
+        assert_eq!(result.to_bits(), expected.to_bits(), "regions={regions} {result} != {expected} {stats:?}");
+        if regions {
+            assert!(stats.llvm_regions_installed >= 1, "{stats:?}");
         }
     }
 }

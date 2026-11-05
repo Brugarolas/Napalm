@@ -1779,6 +1779,11 @@ impl LlvmLowering<'_> {
                 self.load_frame_slot(slot, rep)
             }
             TraceValueOrigin::GuardedEntry { value: source, exit } => {
+                // Region members may receive this slot already unboxed.
+                if let Some(passed) = self.region_typed_entry(source, rep, exit)? {
+                    self.cache_value(value, passed.clone());
+                    return Ok(passed);
+                }
                 let tagged = self.lower_value(source)?;
                 match rep {
                     TraceRep::F64 => self.guard_numeric(&tagged, exit)?,
@@ -3598,11 +3603,14 @@ impl LlvmLowering<'_> {
             self.nonescaping_stack_slots.push((slot.clone(), ty.align() as usize));
             let mut initial = self.lower_value(phi.initial)?;
             if let Some(exit) = phi.entry_exit {
-                initial = match phi.rep {
+                initial = match self.region_typed_entry(phi.initial, phi.rep, exit)? {
+                    Some(passed) => passed,
+                    None => match phi.rep {
                     TraceRep::F64 => self.guard_numeric(&initial, exit)?,
                     TraceRep::Int32 => self.guard_int32_numeric(&initial, exit)?,
                     TraceRep::UInt32 => self.guard_uint32_numeric(&initial, exit)?,
                     other => return Err(self.error(format!("unsupported promoted LoopPhi representation {other:?}"))),
+                    },
                 };
             }
             let initial = self.coerce(&initial, ty);

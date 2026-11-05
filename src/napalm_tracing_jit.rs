@@ -11037,6 +11037,14 @@ fn jit_events_enabled() -> bool {
 fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
     use crate::napalm_trace_ir::TraceInst;
     eprintln!("[napalm-jit] trace {:?} anchor {:?}", trace.id, trace.anchor);
+    for value in &trace.values {
+        if matches!(
+            value.origin,
+            TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::GuardedEntry { .. } | TraceValueOrigin::Alias(_)
+        ) {
+            eprintln!("  value {:?} {:?} {:?} {:?}", value.id, value.origin, value.ty, value.rep);
+        }
+    }
     for phi in &trace.loop_phis {
         let ty = trace.value(phi.value).map(|value| (value.ty, value.rep));
         eprintln!("  phi {:?} {:?}", phi, ty);
@@ -11056,6 +11064,20 @@ fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
                 .map(|&value| (value, trace.value(value).map(|value| (value.ty, value.rep))))
                 .collect();
             eprintln!("  {label} #{id} {:?} -> {:?}", node.kind, results);
+        }
+    }
+    eprintln!("  terminator {:?}", trace.terminator);
+    if let crate::napalm_trace_ir::TraceTerminator::Exit(exit) = trace.terminator {
+        if let Some(exit) = trace.exits.get(exit.0 as usize) {
+            for frame in &exit.frames {
+                for write in &frame.writes {
+                    let rep = match write.value {
+                        SnapshotValue::Value(value) => trace.value(trace.canonical_value(value)).map(|value| value.rep),
+                        SnapshotValue::Constant(_) => None,
+                    };
+                    eprintln!("  exit write {:?} <- {:?} (source rep {:?}, target {:?})", write.slot, write.value, rep, write.target_rep);
+                }
+            }
         }
     }
 }
@@ -12505,6 +12527,9 @@ impl TracingJit {
             .trace_pre_eliminated
             .saturating_add(trace.stats.pre_eliminated as u64);
 
+        if std::env::var_os("NAPALM_JIT_DUMP").is_some() {
+            dump_trace(&trace);
+        }
         let mut compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
             Err(error) => {

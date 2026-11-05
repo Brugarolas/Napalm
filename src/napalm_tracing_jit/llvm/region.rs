@@ -16,6 +16,13 @@
 //! The frame writes of the link are still emitted (any later real side exit
 //! relies on them), but they are plain stores that the child's entry loads
 //! immediately follow, so GVN forwards them and the values stay in registers.
+//!
+//! Type-guarded entry reads are not re-guarded either: a link passes the
+//! child the exact value its guard would compute from the written word (the
+//! unboxed operand of a box, a reconstructible constant, or the parent's own
+//! guarded entry value for a slot it never wrote), see `TypedEntry`. The head
+//! guards on the function-entry edge only, in its `m0_entry` prologue.
+//! `NAPALM_LLVM_REGION_TYPED=0` disables this (A/B measurements).
 //! Nested loops become real LLVM loop nests: the head is the only entry, so
 //! the outer cycle is reducible and its header is `m0_start`.
 //!
@@ -34,6 +41,7 @@
 //! runtime/GC epoch.
 
 use super::*;
+use std::rc::Rc;
 
 /// One member of a region job: data cloned by the manager.
 pub(in crate::napalm_tracing_jit) struct RegionMemberJob {
@@ -57,12 +65,205 @@ pub(super) struct RegionMember {
     pub(super) bindings: Option<V>,
     /// `TraceActivation::tier_up_pending` (entry-block value).
     tier_up: V,
+    /// Typed entry slots of every member, by trace id (see `TypedEntry`).
+    typed_entries: Rc<HashMap<TraceId, Vec<TypedEntry>>>,
+}
+
+/// An entry slot that a member reads through a type guard (`GuardedEntry` or a
+/// promoted loop phi's entry guard), passed unboxed by internal links in the
+/// entry-block alloca `value` (mem2reg turns it into a phi).
+///
+/// Non-head members are entered only through internal links. A link that
+/// can pass the value stores it and sets the `known` alloca, otherwise clears
+/// it; every edge writes `known`, so a stale `true` is never observed, and
+/// when all edges pass, `known` folds to true and the guard disappears.
+///
+/// The head is also entered by the function entry. A merged `known` flag
+/// there would put control flow on the outer cycle's header, so the head only
+/// takes slots that *every* internal link can pass (`always_known`): the
+/// `m0_entry` prologue performs the guard on the function-entry edge alone.
+#[derive(Clone)]
+struct TypedEntry {
+    slot: FrameSlot,
+    rep: TraceRep,
+    exit: SideExitId,
+    known: String,
+    value: String,
+    always_known: bool,
 }
 
 impl RegionMember {
     pub(super) fn start_of(&self, trace: TraceId) -> Option<String> {
         self.starts.get(&trace).cloned()
     }
+}
+
+/// `(slot, rep, exit)` of every type-guarded entry read of `trace`.
+fn typed_entry_slots(trace: &Trace) -> Vec<(FrameSlot, TraceRep, SideExitId)> {
+    let entry_slot = |value: TraceValueId| {
+        let value = trace.canonical_value(value);
+        match trace.value(value).map(|info| &info.origin) {
+            Some(TraceValueOrigin::EntrySlot { frame, slot }) if frame.0 == 0 => Some(*slot),
+            _ => None,
+        }
+    };
+    let guarded = trace.values.iter().filter_map(|info| match info.origin {
+        TraceValueOrigin::GuardedEntry { value, exit } => entry_slot(value).map(|slot| (slot, info.rep, exit)),
+        _ => None,
+    });
+    let phis = trace.loop_phis.iter().filter_map(|phi| {
+        let exit = phi.entry_exit?;
+        entry_slot(phi.initial).map(|slot| (slot, phi.rep, exit))
+    });
+    let mut slots = Vec::new();
+    for entry in guarded.chain(phis) {
+        if matches!(entry.1, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32) && !slots.contains(&entry) {
+            slots.push(entry);
+        }
+    }
+    slots
+}
+
+/// What a link (`plan` of `trace`) can pass for a child entry read as `rep`
+/// from `slot`: exactly the value the child's guard would produce from the
+/// written word, when the guard is statically certain to pass. Only words
+/// written as Tagged qualify (a raw F64 word with a NaN payload may fail).
+enum PassSource {
+    /// A trace value of the given representation (a box is looked through:
+    /// BoxF64/BoxInt32/BoxUInt32 lower exactly like the exit materialization).
+    /// `boxed`: the child sees the value through a box, which canonicalizes
+    /// NaN; an untouched slot is seen as the very same raw word.
+    Value { value: TraceValueId, rep: TraceRep, boxed: bool },
+    Constant(V),
+}
+
+fn unboxed_operand(trace: &Trace, value: TraceValueId) -> TraceValueId {
+    let value = trace.canonical_value(value);
+    let Some(TraceValueOrigin::InstResult { node }) = trace.value(value).map(|info| &info.origin) else {
+        return value;
+    };
+    match trace.nodes.get(*node).map(|node| &node.kind) {
+        Some(TraceInst::BoxF64 { value: inner })
+        | Some(TraceInst::BoxInt32 { value: inner })
+        | Some(TraceInst::BoxUInt32 { value: inner }) => trace.canonical_value(*inner),
+        _ => value,
+    }
+}
+
+fn pass_source(trace: &Trace, plan: &CompiledExitPlan, slot: FrameSlot, rep: TraceRep) -> Option<PassSource> {
+    let Some(write) = plan.writes.iter().rev().find(|write| write.slot == slot) else {
+        return untouched_pass_source(trace, slot, rep);
+    };
+    if write.target_rep != TraceRep::Tagged {
+        return None;
+    }
+    match write.source {
+        ExitWriteSource::Dynamic(index) => {
+            let dynamic = plan.dynamic_values.get(index as usize)?;
+            let value = unboxed_operand(trace, dynamic.value);
+            let source = trace.value(value)?.rep;
+            let compatible = matches!(
+                (source, rep),
+                (TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32, TraceRep::F64)
+                    | (TraceRep::Int32, TraceRep::Int32)
+                    | (TraceRep::UInt32, TraceRep::UInt32)
+            );
+            compatible.then_some(PassSource::Value { value, rep: source, boxed: true })
+        }
+        ExitWriteSource::Constant(constant) => {
+            let number = match constant {
+                TraceConstant::Int32(value) => value as f64,
+                TraceConstant::F64Bits(bits) => {
+                    let value = f64::from_bits(bits);
+                    if value.is_nan() { f64::from_bits(CANONICAL_NAN) } else { value }
+                }
+                TraceConstant::NumBits(bits) => word_num(RegisterWord(bits))?,
+                _ => return None,
+            };
+            match rep {
+                TraceRep::F64 => Some(PassSource::Constant(V::f64(number))),
+                TraceRep::Int32
+                    if number.to_bits() != (-0.0f64).to_bits() && number == (number as i32) as f64 =>
+                {
+                    Some(PassSource::Constant(V::i32(number as i32)))
+                }
+                TraceRep::UInt32 if number == (number as u32) as f64 => {
+                    Some(PassSource::Constant(V::i32(number as u32 as i32)))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// A slot the link does not write still holds the parent's entry word, unless
+/// a runtime helper rewrote the frame meanwhile. If the parent already guarded
+/// that word, its unboxed entry value is exactly what the child's guard would
+/// produce, for compatible representations. (A UInt32 guard accepts -0.0, so
+/// it does not determine the F64 value.) GuardedEntry values are all lowered
+/// in the parent's start block, so they dominate every exit.
+fn untouched_pass_source(trace: &Trace, slot: FrameSlot, rep: TraceRep) -> Option<PassSource> {
+    if trace_has_heap_epoch_boundary(trace) {
+        return None;
+    }
+    trace.values.iter().find_map(|info| {
+        let TraceValueOrigin::GuardedEntry { value: source, .. } = info.origin else { return None; };
+        let source = trace.canonical_value(source);
+        let reads_slot = matches!(
+            trace.value(source).map(|source| &source.origin),
+            Some(TraceValueOrigin::EntrySlot { frame, slot: read }) if frame.0 == 0 && *read == slot
+        );
+        let compatible = matches!(
+            (info.rep, rep),
+            (TraceRep::F64 | TraceRep::Int32, TraceRep::F64)
+                | (TraceRep::Int32, TraceRep::Int32)
+                | (TraceRep::UInt32, TraceRep::UInt32)
+        );
+        // The canonical id is what the parent's lowering caches.
+        (reads_slot && compatible && trace.canonical_value(info.id) == info.id)
+            .then_some(PassSource::Value { value: info.id, rep: info.rep, boxed: false })
+    })
+}
+
+/// Typed entries of every member (see `TypedEntry`).
+fn region_typed_entries(members: &[RegionMemberJob]) -> HashMap<TraceId, Vec<TypedEntry>> {
+    let mode = std::env::var("NAPALM_LLVM_REGION_TYPED").ok();
+    if mode.as_deref() == Some("0") {
+        return members.iter().map(|member| (member.trace.id, Vec::new())).collect();
+    }
+    let head = members[0].trace.id;
+    // Every internal link into the head.
+    let head_links: Vec<(&Trace, &CompiledExitPlan)> = members
+        .iter()
+        .flat_map(|member| member.exits.iter().map(move |plan| (&member.trace, plan)))
+        .filter(|(_, plan)| plan.native_linkable && matches!(plan.target, ExitTarget::Trace(child) if child == head))
+        .collect();
+    members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let entries = typed_entry_slots(&member.trace)
+                .into_iter()
+                .filter(|&(slot, rep, exit)| {
+                    index > 0
+                        || (member.exits.get(exit.0 as usize).is_some_and(|plan| plan.writes.is_empty())
+                            && head_links
+                                .iter()
+                                .all(|(trace, plan)| pass_source(trace, plan, slot, rep).is_some()))
+                })
+                .enumerate()
+                .map(|(n, (slot, rep, exit))| TypedEntry {
+                    slot,
+                    rep,
+                    exit,
+                    known: format!("%m{index}_known{n}"),
+                    value: format!("%m{index}_typed{n}"),
+                    always_known: index == 0,
+                })
+                .collect::<Vec<_>>();
+            (member.trace.id, entries)
+        })
+        .collect()
 }
 
 pub(super) fn lower_region(
@@ -81,6 +282,7 @@ pub(super) fn lower_region(
         return Err("trace-tree region lists a trace twice".to_owned());
     }
     let invariant_loads = members.iter().all(|member| !trace_has_heap_epoch_boundary(&member.trace));
+    let typed_entries: Rc<HashMap<TraceId, Vec<TypedEntry>>> = Rc::new(region_typed_entries(members));
 
     let mut previous: Option<LlvmLowering> = None;
     // Entry-block pointers shared by all members.
@@ -108,6 +310,17 @@ pub(super) fn lower_region(
                 let tier_up = state.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, tier_up_pending));
                 let values = (link_tables, binding_tables, tier_up);
                 shared = Some(values.clone());
+                // Typed-entry allocas of all members (the head's prologue
+                // fills its own on the function-entry edge).
+                for member in members {
+                    for typed in &typed_entries[&member.trace.id] {
+                        let ty = Ty::of_rep(typed.rep);
+                        if !typed.always_known {
+                            let _ = writeln!(state.entry, "  {} = alloca i1, align 1", typed.known);
+                        }
+                        let _ = writeln!(state.entry, "  {} = alloca {}, align {}", typed.value, ty.ir(), ty.align());
+                    }
+                }
                 values
             }
         };
@@ -126,7 +339,11 @@ pub(super) fn lower_region(
             links,
             bindings,
             tier_up,
+            typed_entries: typed_entries.clone(),
         });
+        if index == 0 {
+            state.emit_head_prologue("m0_start")?;
+        }
         state.lower_function(native_budget)?;
         previous = Some(state);
     }
@@ -135,7 +352,7 @@ pub(super) fn lower_region(
     // The module is described by its head: entry count and profile summary.
     state.trace = &head.trace;
     state.profile = head.profile.as_ref().filter(|profile| profile.entries > 0);
-    state.entry_branch_target = "m0_start".to_owned();
+    state.entry_branch_target = "m0_entry".to_owned();
     Ok(state.finish_module(symbol, host))
 }
 
@@ -177,6 +394,136 @@ impl<'p> LlvmLowering<'p> {
         )
     }
 
+    /// For each typed entry of `child`: store the value its guard would
+    /// produce from the word this link just wrote (`pass_source`), or clear
+    /// `known`. An `always_known` (head) entry is passable by construction.
+    fn pass_typed_entries(&mut self, plan: &CompiledExitPlan, child: TraceId) -> Result<(), String> {
+        let Some(entries) = self
+            .region
+            .as_ref()
+            .and_then(|region| region.typed_entries.get(&child).cloned())
+        else {
+            return Ok(());
+        };
+        for typed in &entries {
+            let passed = match pass_source(self.trace, plan, typed.slot, typed.rep) {
+                // Already lowered (cached): it dominates this exit.
+                Some(PassSource::Value { value, rep: source, boxed }) => {
+                    let value = self.lower_value(value)?;
+                    Some(match (source, typed.rep) {
+                        (TraceRep::F64, TraceRep::F64) if !boxed => value,
+                        (TraceRep::F64, TraceRep::F64) => {
+                            // Boxing canonicalizes NaN; so does the unboxed pass.
+                            let is_nan = self.fcmp("uno", &value, &value);
+                            self.select(&is_nan, &V::f64_bits(CANONICAL_NAN), &value)
+                        }
+                        (TraceRep::Int32, TraceRep::F64) => self.cast("sitofp", &value, Ty::F64),
+                        (TraceRep::UInt32, TraceRep::F64) => self.cast("uitofp", &value, Ty::F64),
+                        _ => self.coerce(&value, Ty::I32),
+                    })
+                }
+                Some(PassSource::Constant(value)) => Some(value),
+                None => None,
+            };
+            match passed {
+                Some(value) => {
+                    let ty = Ty::of_rep(typed.rep);
+                    self.line(&format!("store {} {}, ptr {}, align {}", ty.ir(), value.op, typed.value, ty.align()));
+                    if !typed.always_known {
+                        self.line(&format!("store i1 true, ptr {}, align 1", typed.known));
+                    }
+                }
+                None if typed.always_known => {
+                    return Err(self.error(format!("link cannot pass head entry {:?}", typed.slot)));
+                }
+                None => self.line(&format!("store i1 false, ptr {}, align 1", typed.known)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The head's `m0_entry` prologue, on the function-entry edge only: guard
+    /// and unbox every `always_known` entry straight from the frame. Those
+    /// guards' exits write nothing and resume at the anchor, so performing
+    /// them before the head's other entry checks preserves semantics.
+    pub(super) fn emit_head_prologue(&mut self, start: &str) -> Result<(), String> {
+        let entries = self
+            .region
+            .as_ref()
+            .and_then(|region| region.typed_entries.get(&region.trace).cloned())
+            .unwrap_or_default();
+        self.begin("m0_entry");
+        for typed in entries.iter().filter(|typed| typed.always_known) {
+            // Not cached: this block does not dominate the head's body.
+            let word = self.load_frame_slot(typed.slot, TraceRep::Tagged);
+            let value = match typed.rep {
+                TraceRep::F64 => self.guard_numeric(&word, typed.exit)?,
+                TraceRep::Int32 => self.guard_int32_numeric(&word, typed.exit)?,
+                TraceRep::UInt32 => self.guard_uint32_numeric(&word, typed.exit)?,
+                other => return Err(self.error(format!("unsupported typed region entry {other:?}"))),
+            };
+            let ty = Ty::of_rep(typed.rep);
+            self.line(&format!("store {} {}, ptr {}, align {}", ty.ir(), value.op, typed.value, ty.align()));
+        }
+        self.br(start);
+        Ok(())
+    }
+    /// Entry read of a type-guarded slot inside a region: the unboxed value an
+    /// internal link passed, or the ordinary guard when the edge (the function
+    /// entry, or a link that only had a boxed word) passed nothing.
+    pub(super) fn region_typed_entry(
+        &mut self,
+        source: TraceValueId,
+        rep: TraceRep,
+        exit: SideExitId,
+    ) -> Result<Option<V>, String> {
+        let Some(region) = self.region.as_ref() else { return Ok(None); };
+        let source = self.trace.canonical_value(source);
+        let slot = match self.trace.value(source).map(|info| &info.origin) {
+            Some(TraceValueOrigin::EntrySlot { frame, slot }) if frame.0 == 0 => *slot,
+            _ => return Ok(None),
+        };
+        let Some(typed) = region
+            .typed_entries
+            .get(&region.trace)
+            .and_then(|entries| {
+                entries.iter().find(|typed| typed.slot == slot && typed.rep == rep && typed.exit == exit)
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let ty = Ty::of_rep(rep);
+        if typed.always_known {
+            // Every edge into the head stored it: the prologue or a link.
+            return Ok(Some(self.def(ty, &format!("load {}, ptr {}, align {}", ty.ir(), typed.value, ty.align()))));
+        }
+        // The boxed word stays loaded unconditionally: other users (exit
+        // snapshots) may need it, and it must dominate them.
+        let tagged = self.lower_value(source)?;
+        let known = self.def(Ty::I1, &format!("load i1, ptr {}, align 1", typed.known));
+        let passed = self.def(ty, &format!("load {}, ptr {}, align {}", ty.ir(), typed.value, ty.align()));
+        let before = self.current.clone();
+        let check = self.new_block();
+        let have = self.new_block();
+        self.cond_br(&known, &have, &check, None);
+        self.begin(&check);
+        let guarded = match rep {
+            TraceRep::F64 => self.guard_numeric(&tagged, exit)?,
+            TraceRep::Int32 => self.guard_int32_numeric(&tagged, exit)?,
+            TraceRep::UInt32 => self.guard_uint32_numeric(&tagged, exit)?,
+            other => return Err(self.error(format!("unsupported typed region entry {other:?}"))),
+        };
+        let checked = self.current.clone();
+        self.br(&have);
+        self.begin(&have);
+        let merged = self.def(
+            ty,
+            &format!("phi {} [ {}, %{before} ], [ {}, %{checked} ]", ty.ir(), passed.op, guarded.op),
+        );
+        Ok(Some(merged))
+    }
+
     /// A native link to another region member: materialize the child's entry
     /// state, honor the dispatcher's tier-up and link-budget protocol, then
     /// branch to the member instead of returning to the dispatcher.
@@ -187,6 +534,7 @@ impl<'p> LlvmLowering<'p> {
         start: &str,
     ) -> Result<(), String> {
         self.store_link_writes(plan)?;
+        self.pass_typed_entries(plan, child)?;
         let tier_up = self
             .region
             .as_ref()
