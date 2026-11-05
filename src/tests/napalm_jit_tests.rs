@@ -321,21 +321,26 @@ fn native_inlining_handles_integer_math_comparisons_and_float_negation() {
 
 #[test]
 fn native_inlining_reads_lists_and_replays_failed_bounds_at_the_call() {
-    for index in [-1i32, 0, 2, 3, -4] {
+    for (items, index) in [vec![], vec![Value::TRUE, Value::FALSE, Value::NULL]]
+        .into_iter()
+        .flat_map(|items| [i32::MIN, -4, -3, -1, 0, 2, 3, i32::MAX]
+            .into_iter().map(move |index| (items.clone(), index)))
+    {
         let mut body = Assembler::new();
         body.emit_ab(Opcode::NumToInt32, 2, 1);
         body.emit_abc(Opcode::ListGet, 3, 0, 2);
         body.emit_a(Opcode::Return, 3);
         let program = inline_program(body.finish().unwrap());
         let mut native = setup(&program, Opcode::CallDirect);
-        let list = native.heap.alloc(HeapObject::List(vec![Value::TRUE, Value::FALSE, Value::NULL]));
+        let list = native.heap.alloc(HeapObject::List(items.clone()));
         native.trace_write_slot(FrameSlot::General(Reg(1)), list.word()).unwrap();
         native.trace_write_slot(FrameSlot::General(Reg(2)), Value::from_num(index as f64).word()).unwrap();
         let mut jit = TracingJit::new(TracingJitOptions::default());
         jit.execute_one_for_test(&mut native).unwrap();
         assert_eq!(jit.trace(TraceId(0)).unwrap().stats.inlined_calls, 1);
-        if (-3..3).contains(&index) {
-            let expected = [Value::TRUE, Value::FALSE, Value::NULL][(if index < 0 { index + 3 } else { index }) as usize];
+        let absolute = if index < 0 { items.len() as i64 + i64::from(index) } else { i64::from(index) };
+        if (0..items.len() as i64).contains(&absolute) {
+            let expected = items[absolute as usize];
             assert_eq!(native.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(), expected.word());
         } else {
             assert_eq!(native.trace_current_location(), TraceLocation::new(FuncId(0), BytecodePc(0)));

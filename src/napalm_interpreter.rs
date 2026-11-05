@@ -17206,7 +17206,7 @@ fn normalize_index(index: i32, len: usize) -> Option<usize> {
         return (index < len).then_some(index);
     }
     let distance = index.unsigned_abs() as usize;
-    (distance <= len).then_some(len - distance)
+    len.checked_sub(distance)
 }
 
 unsafe fn h_alloc_list(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::List(Vec::new()));vm.set_reg(op.a,v.word());vm.advance(op)}
