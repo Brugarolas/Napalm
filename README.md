@@ -20,7 +20,7 @@ Variable types are optional: the compiler checks known incompatible assignments.
 </p>
 
 <p align="center">
-  <img src="[https://img.shields.io/badge/license-MIT-blue?style=flat-square](https://repobeats.axiom.co/api/embed/44379307ec6623c00131593148f800c0122f9562.svg)" alt="Repobeats analytics image">
+  <img src="https://repobeats.axiom.co/api/embed/44379307ec6623c00131593148f800c0122f9562.svg" alt="Repobeats analytics image">
 </p>
 
 ## Run
