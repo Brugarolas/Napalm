@@ -5846,6 +5846,21 @@ impl PreparedProgram {
                     op.cache = map_inline_cache_count as u32;
                     map_inline_cache_count += 1;
                 }
+                Opcode::NewClassInstance => {
+                    // X keeps the descriptor index (JIT tiers read it at compile
+                    // time). Resolve the hot-path identities once: Y = dense class
+                    // slot, CACHE = prepared constructor index or NO_INDEX.
+                    let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) =
+                        function.chunk.specializations.get(temp.x as usize)
+                    else { return Err(RuntimeError::new("invalid NewClassInstance descriptor")); };
+                    op.y = *class_by_id.get(class).ok_or_else(||
+                        RuntimeError::new(format!("unknown class {:?}", class)))?;
+                    op.cache = match constructor {
+                        Some(id) => *function_by_id.get(id).ok_or_else(||
+                            RuntimeError::new("unknown class constructor"))?,
+                        None => NO_INDEX,
+                    };
+                }
                 Opcode::InvokeMethodDirect => {
                     let Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod {
                         target, fallback_cache, ..
@@ -16611,7 +16626,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 180;
+const OPCODE_COUNT: usize = Opcode::InvokeMethodDirect as usize + 1;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -16756,7 +16771,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_define_class_specialized, // DefineClassWithImplements
     h_define_class_specialized, // DefineDerivedClassWithImplements
     h_implement_structural_contract, // ImplementInterfaceOrType
-    h_unsupported_specialized_opcode, // ReservedImplementType
+    h_unsupported_specialized_opcode, // MapLookupOrInsert (pending master merge)
     h_define_typed_array, // DefineArrayWithGenerics
     h_new_class_instance, // NewClassInstance
     h_new_interface_or_type_object, // NewInterfaceOrTypeObject
@@ -16768,32 +16783,6 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_get_field_class, // GetFieldClass
     h_set_field_class, // SetFieldClass
     h_invoke_method_direct, // InvokeMethodDirect
-    h_unsupported_specialized_opcode, // ArrayMapPacked
-    h_unsupported_specialized_opcode, // ArrayFilterPacked
-    h_unsupported_specialized_opcode, // ArrayReduceNumeric
-    h_unsupported_specialized_opcode, // ArrayForEachPacked
-    h_unsupported_specialized_opcode, // ArrayFilterReducePacket
-    h_unsupported_specialized_opcode, // ArrayMapReducePacked
-    h_unsupported_specialized_opcode, // ApplyDecoratorToFunction
-    h_unsupported_specialized_opcode, // ApplyDecoratorToClass
-    h_unsupported_specialized_opcode, // AwaitPromise
-    h_unsupported_specialized_opcode, // LaunchConcurrentTask
-    h_unsupported_specialized_opcode, // LoadI8IntegerArithmetic
-    h_unsupported_specialized_opcode, // LoadI8IntegerComparison
-    h_unsupported_specialized_opcode, // LoadI8Return
-    h_unsupported_specialized_opcode, // LoadLiteralReturn
-    h_unsupported_specialized_opcode, // AllocListAndAppend
-    h_unsupported_specialized_opcode, // AllocInstanceAndInitializeField
-    h_unsupported_specialized_opcode, // AllocInstanceAndInitializeProperty
-    h_unsupported_specialized_opcode, // LoadFieldAndCall
-    h_unsupported_specialized_opcode, // LoadPropertyAndCall
-    h_unsupported_specialized_opcode, // GuardThenFieldLoad
-    h_unsupported_specialized_opcode, // GuardThenPropertyLoad
-    h_unsupported_specialized_opcode, // MapLookupOrInsert
-    h_unsupported_specialized_opcode, // ImportAndReadVariable
-    h_unsupported_specialized_opcode, // DirectCallAndReturn
-    h_unsupported_specialized_opcode, // ClosureCallAndReturn
-    h_unsupported_specialized_opcode, // ConcurrentLaunchAndAwait
 ];
 
 #[inline(always)]
@@ -17800,56 +17789,81 @@ fn allocate_specialized_object(
     vm: &mut Interpreter<'_>, op: &PreparedOp, opcode: Opcode,
 ) -> Result<Value, RuntimeError> {
     use crate::napalm_bytecode::SpecializedDescriptor;
-    match opcode {
-        Opcode::NewObjectEmpty => {
-            Ok(vm.heap.alloc(HeapObject::Map(NapalmMap::default())))
+    if opcode == Opcode::NewObjectEmpty {
+        return Ok(vm.heap.alloc(HeapObject::Map(NapalmMap::default())));
+    }
+    // `vm.program` outlives the &mut borrow of the VM: descriptors, names and
+    // contracts are borrowed, never cloned, on every path below.
+    let program = vm.program;
+    let descriptor = program.functions[vm.current_function_index()]
+        .chunk.specializations.get(op.x as usize);
+    let contract = match (opcode, descriptor) {
+        (Opcode::NewObjectWithProperties, Some(SpecializedDescriptor::ObjectProperties { .. })) => None,
+        (Opcode::NewInterfaceOrTypeObject, Some(SpecializedDescriptor::ObjectShape { contract: Some(contract), .. })) =>
+            Some(contract),
+        (Opcode::NewObjectShape, Some(SpecializedDescriptor::ObjectShape { contract, .. })) => contract.as_ref(),
+        (Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject | Opcode::NewObjectShape, _) =>
+            return Err(RuntimeError::new(format!("{} descriptor is invalid", opcode.name()))),
+        _ => return Err(RuntimeError::new("unsupported structural factory opcode")),
+    };
+
+    // Steady state. Each factory op owns its allocation site (op.cache), and
+    // its keys are compile-time program strings, so once the site has learned
+    // the shape no key handle or property name needs to be read again: place
+    // the values by slot and allocate the inline map directly. Preparation
+    // assigns a site to every NewObjectShape and to 1..=4-value factories.
+    let has_site = opcode == Opcode::NewObjectShape || (1..=SMALL_MAP_INLINE_FIELDS).contains(&(op.c as usize));
+    if has_site {
+        let site = vm.prepared.functions[vm.hot_function_index as usize]
+            .small_map_literal_sites.get(op.cache as usize).copied();
+        if let Some(site) = site {
+            let count = if opcode == Opcode::NewObjectShape { site.field_count as usize } else { op.c as usize };
+            if site.initialized && !site.disabled && site.stable_program_keys
+                && count != 0 && site.field_count as usize == count
+                && site.value_count as usize <= SMALL_MAP_INLINE_FIELDS
+                && site.slots[..count].iter().all(|&slot| slot < site.value_count as u16)
+            {
+                let mut values = InlineMapValues::new();
+                values.resize(site.value_count as usize, Value::NULL);
+                if opcode != Opcode::NewObjectShape {
+                    let sources = unsafe { gather_specialized_values(vm, op) };
+                    // In source order: a duplicated key keeps its last value.
+                    for index in 0..count {
+                        unsafe { *values.get_unchecked_mut(site.slots[index] as usize) = sources[index]; }
+                    }
+                }
+                let object = vm.heap.alloc_inline_map(site.shape, values);
+                if let Some(contract) = contract {
+                    vm.heap.bind_contract(object, contract)?;
+                }
+                return Ok(object);
+            }
         }
-        Opcode::NewObjectWithProperties => {
+    }
+
+    match (opcode, descriptor) {
+        (Opcode::NewObjectWithProperties, Some(SpecializedDescriptor::ObjectProperties { names })) => {
             let values = unsafe { gather_specialized_values(vm, op) };
-            let descriptor = vm.program.functions[vm.current_function_index()]
-                .chunk.specializations.get(op.x as usize);
-            let Some(SpecializedDescriptor::ObjectProperties { names }) = descriptor else {
-                return Err(RuntimeError::new("NewObjectWithProperties descriptor is invalid"));
-            };
-            let names = names.clone();
-            allocate_named_object(vm, &names, &values[..op.c as usize], None,
-                (op.c > 0 && op.c <= 4).then_some(op.cache as usize))
+            allocate_named_object(vm, names, &values[..op.c as usize], None,
+                has_site.then_some(op.cache as usize))
         }
-        Opcode::NewInterfaceOrTypeObject => {
-            let values = unsafe { gather_specialized_values(vm, op) };
-            let descriptor = vm.program.functions[vm.current_function_index()]
-                .chunk.specializations.get(op.x as usize);
-            let Some(SpecializedDescriptor::ObjectShape { layout, contract: Some(contract) }) = descriptor else {
-                return Err(RuntimeError::new("NewInterfaceOrTypeObject descriptor is invalid"));
-            };
-            let Some(layout) = vm.program.metadata.structural_layout(*layout) else {
+        (_, Some(SpecializedDescriptor::ObjectShape { layout, .. })) => {
+            let Some(layout) = program.metadata.structural_layout(*layout) else {
                 return Err(RuntimeError::new("unknown structural layout"));
             };
-            let names: Vec<StringId> = layout.properties.iter().map(|field| field.name).collect();
-            let contract = contract.clone();
-            allocate_named_object(vm, &names, &values[..op.c as usize], Some(&contract),
-                (op.c > 0 && op.c <= 4).then_some(op.cache as usize))
-        }
-        Opcode::NewObjectShape => {
-            let descriptor = vm.program.functions[vm.current_function_index()]
-                .chunk.specializations.get(op.x as usize);
-            let Some(SpecializedDescriptor::ObjectShape { layout, contract }) = descriptor else {
-                return Err(RuntimeError::new("NewObjectShape descriptor is invalid"));
-            };
-            let Some(layout) = vm.program.metadata.structural_layout(*layout) else {
-                return Err(RuntimeError::new("unknown structural layout"));
-            };
-            let names: Vec<StringId> = layout.properties.iter().map(|field| field.name).collect();
-            let contract = contract.clone();
-            if names.len() <= SMALL_MAP_INLINE_FIELDS {
+            let names: smallvec::SmallVec<[StringId; SMALL_MAP_INLINE_FIELDS]> =
+                layout.properties.iter().map(|field| field.name).collect();
+            if opcode == Opcode::NewInterfaceOrTypeObject {
+                let values = unsafe { gather_specialized_values(vm, op) };
+                allocate_named_object(vm, &names, &values[..op.c as usize], contract,
+                    has_site.then_some(op.cache as usize))
+            } else if names.len() <= SMALL_MAP_INLINE_FIELDS {
                 let null_values = [Value::NULL; SMALL_MAP_INLINE_FIELDS];
-                allocate_named_object(
-                    vm, &names, &null_values[..names.len()], contract.as_ref(),
-                    (!names.is_empty()).then_some(op.cache as usize),
-                )
+                allocate_named_object(vm, &names, &null_values[..names.len()], contract,
+                    (!names.is_empty()).then_some(op.cache as usize))
             } else {
                 let values = vec![Value::NULL; names.len()];
-                allocate_named_object(vm, &names, &values, contract.as_ref(), None)
+                allocate_named_object(vm, &names, &values, contract, None)
             }
         }
         _ => Err(RuntimeError::new("unsupported structural factory opcode")),
@@ -17885,29 +17899,17 @@ unsafe fn h_new_object_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
 /// The constructor's return value is discarded: the destination remains the
 /// allocated receiver, including when a constructor returns an explicit value.
 unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
-    use crate::napalm_bytecode::SpecializedDescriptor;
     let op = unsafe { &*ptr };
-    let descriptor = vm.program.functions[vm.current_function_index()]
-        .chunk.specializations.get(op.x as usize);
-    let Some(SpecializedDescriptor::Instance { class, constructor }) = descriptor else {
-        vm.fail_at(op, "NewClassInstance descriptor is invalid");
-        return;
-    };
-    let class_id = *class;
-    let constructor = *constructor;
-    let Some(&slot) = vm.prepared.class_by_id.get(&class_id) else {
-        vm.fail_at(op, "unknown instance class");
-        return;
-    };
-    let Some(layout) = vm.classes.get(slot as usize) else {
-        vm.fail_at(op, "instance class slot out of bounds");
-        return;
-    };
-    if !layout.layout_finalized {
+    // Preparation resolved Y = class slot and CACHE = constructor index.
+    let slot = op.y;
+    debug_assert!((slot as usize) < vm.classes.len(), "prepared NewClassInstance class slot out of range");
+    let layout = unsafe { vm.classes.get_unchecked(slot as usize) };
+    if unlikely(!layout.layout_finalized) {
         vm.fail_at(op, "NewClassInstance requires a finalized class layout");
         return;
     }
     let count = layout.total_instance_field_count as usize;
+    // Read the operands before writing A: the destination may alias one.
     let args = unsafe { gather_specialized_values(vm, op) };
     vm.mark_gc_point(op);
     vm.maybe_collect();
@@ -17916,16 +17918,17 @@ unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
         fields: vec![Value::NULL; count].into_boxed_slice(),
     });
     unsafe { vm.set_reg(op.a, instance.word()); }
-    if let Some(constructor) = constructor {
-        let Some(&callee) = vm.prepared.function_by_id.get(&constructor) else {
-            vm.fail_at(op, "unknown class constructor");
-            return;
-        };
+    if op.cache != NO_INDEX {
         let caller_pc = vm.raw_pc_for_op(op);
         unsafe { vm.advance(op); }
         vm.flush_hot_pc();
-        let explicit = args[..op.c as usize].iter().map(|value| value.word()).collect::<Vec<_>>();
-        match vm.push_frame(callee, Some(instance.word()), &explicit, None, None) {
+        let mut explicit = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+        for (index, value) in args[..op.c as usize].iter().enumerate() {
+            explicit[index] = value.word();
+        }
+        // No result register: the destination keeps the instance, whatever the
+        // constructor returns. Constructors are never memoized (verifier).
+        match vm.push_frame(op.cache, Some(instance.word()), &explicit[..op.c as usize], None, None) {
             Ok(()) => vm.current_frame_mut().caller_pc = caller_pc,
             Err(error) => vm.fail_at_raw_pc(caller_pc, error.message),
         }
@@ -20221,18 +20224,20 @@ unsafe extern "C" fn trace_native_factory_probe(
     {
         return 0;
     }
-    let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
+    let vm = unsafe { &*(activation.runtime as *const Interpreter<'_>) };
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() {
         return 0;
     }
-    if vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc))).is_err() {
-        return 0;
-    }
-    let prepared = vm.current_prepared();
+    // Truly side-effect free: resolve the op without moving the VM PC (the
+    // commit or the slow helper positions the VM). The commit resumes in the
+    // *current* frame, so a location in any other function never reserves.
+    if vm.current_prepared().id != FuncId(function) { return 0; }
+    let function_index = vm.hot_function_index as usize;
+    let prepared = &vm.prepared.functions[function_index];
     let Some(&op_index) = prepared.word_to_op.get(pc as usize) else { return 0; };
     if op_index == NO_INDEX { return 0; }
     let Some(op) = prepared.ops.get(op_index as usize) else { return 0; };
-    let Some(opcode) = vm.program.functions.get(vm.hot_function_index as usize)
+    let Some(opcode) = vm.program.functions.get(function_index)
         .and_then(|f| f.chunk.code.get(pc as usize)).and_then(|word| word.opcode())
     else { return 0; };
 
@@ -20267,16 +20272,10 @@ unsafe extern "C" fn trace_native_factory_probe(
             )
         }
         Opcode::NewClassInstance => {
-            let descriptor = vm.program.functions[vm.hot_function_index as usize]
-                .chunk.specializations.get(op.x as usize);
-            let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) = descriptor else {
-                return 0;
-            };
-            let Some(&slot) = vm.prepared.class_by_id.get(class) else { return 0; };
-            let Some(layout) = vm.classes.get(slot as usize) else { return 0; };
+            // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+            let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
             !layout.is_foreign && layout.layout_finalized
                 && layout.total_instance_field_count == 0
-                && constructor.is_none_or(|id| vm.prepared.function_by_id.contains_key(&id))
         }
         _ => false,
     };
@@ -20357,34 +20356,18 @@ unsafe extern "C" fn trace_native_factory_commit(
                 vm.heap.bind_contract(value, &contract)?;
                 value
             }
-            Opcode::NewClassInstance => {
-                let descriptor = vm.program.functions[caller_function as usize]
-                    .chunk.specializations.get(op.x as usize);
-                let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, .. }) = descriptor else {
-                    return Err(RuntimeError::new("invalid native class descriptor"));
-                };
-                let slot = *vm.prepared.class_by_id.get(class)
-                    .ok_or_else(|| RuntimeError::new("unknown native class"))?;
-                unsafe {
-                    vm.heap.alloc_reserved_managed(address, HeapObject::Instance {
-                        class_slot: slot, fields: Box::new([]),
-                    })
-                }
-            }
+            Opcode::NewClassInstance => unsafe {
+                vm.heap.alloc_reserved_managed(address, HeapObject::Instance {
+                    class_slot: op.y, fields: Box::new([]),
+                })
+            },
             _ => return Err(RuntimeError::new("unsupported native factory kind")),
         };
         unsafe { vm.set_reg(op.a, object.word()) };
         if opcode == Opcode::NewClassInstance {
-            let descriptor = vm.program.functions[caller_function as usize]
-                .chunk.specializations.get(op.x as usize);
-            let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { constructor, .. }) = descriptor else {
-                return Err(RuntimeError::new("invalid constructor descriptor"));
-            };
-            let constructor = *constructor;
             let args = constructor_args.expect("validated constructor arguments");
-            if let Some(constructor) = constructor {
-                let callee = *vm.prepared.function_by_id.get(&constructor)
-                    .ok_or_else(|| RuntimeError::new("native constructor does not exist"))?;
+            if op.cache != NO_INDEX {
+                let callee = op.cache;
                 let caller_pc = vm.raw_pc_for_op(&op);
                 unsafe { vm.advance(&op) };
                 vm.flush_hot_pc();

@@ -346,7 +346,12 @@ mod tests {
     #[test]
     fn default_pipeline_folds_hir_before_bytecode_generation() {
         let (mut hir, entry) = arithmetic_program();
-        let baseline = BytecodeCompiler::default().compile(&hir).unwrap();
+        // The post-lowering bytecode optimizer folds constant IAdd on its own;
+        // disable it so this checks only the HIR pipeline's folding.
+        let baseline = BytecodeCompiler::new(CompileOptions {
+            optimize_bytecode: false,
+            ..CompileOptions::default()
+        }).compile(&hir).unwrap();
         assert!(
             disassemble(&baseline.functions[0])
                 .unwrap()
@@ -372,6 +377,7 @@ mod tests {
         let output = CompilationPipeline::new(Optimize::new())
             .with_bytecode_options(CompileOptions {
                 eliminate_dead_code: false,
+                optimize_bytecode: false,
                 ..CompileOptions::default()
             })
             .compile_with_stats(&mut hir)

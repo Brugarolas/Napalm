@@ -330,7 +330,12 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
         allocating.extend(additional);
     }
     for function in &mut program.functions {
-        let next = if pure.contains(&function.id) {
+        // A constructor initializes a fresh `this` on every call: caching it
+        // would hand out a shared instance. Constructors are never memoized
+        // (NewClassInstance also relies on this and pushes the frame directly).
+        let next = if function.kind == crate::napalm_ir::FunctionKind::Constructor {
+            MemoizationKind::None
+        } else if pure.contains(&function.id) {
             match (recursive.contains(&function.id), allocating.contains(&function.id)) {
                 (true, true) => MemoizationKind::RecursiveShared,
                 // Allocating purity is useful for proving recursive producers,

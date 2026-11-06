@@ -15,6 +15,9 @@ impl Host for TestHost {
 /// encoding (and usually a dedicated setup) before they can join the matrix.
 fn has_fixture_encoding(opcode: Opcode) -> bool {
     use Opcode::*;
+    // Specialized opcodes need a chunk descriptor plus runtime metadata; they are
+    // covered differentially by the source-level specialized-bytecode tests.
+    if opcode.is_specialized() { return false; }
     matches!(
         opcode,
         Invoke | InvokeSuper | CallDirect | MakeClosure | CallClosure | CallPrimitive | CallForeign

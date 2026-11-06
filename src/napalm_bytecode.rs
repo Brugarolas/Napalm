@@ -1092,7 +1092,9 @@ define_opcodes! {
     DefineClassWithImplements = 139,
     DefineDerivedClassWithImplements = 140,
     ImplementInterfaceOrType = 141,
-    ReservedImplementType = 142, // Reserved for compatibility; invalid in new programs.
+    // A=result, B=Map/Set, C=key; x0=value GPR. Runtime implementation pending
+    // (lands with the master merge); never emitted by the compiler yet.
+    MapLookupOrInsert = 142,
     DefineArrayWithGenerics = 143,
     NewClassInstance = 144,
     NewInterfaceOrTypeObject = 145,
@@ -1104,44 +1106,16 @@ define_opcodes! {
     GetFieldClass = 151,
     SetFieldClass = 152,
     InvokeMethodDirect = 153,
-    ArrayMapPacked = 154,
-    ArrayFilterPacked = 155,
-    ArrayReduceNumeric = 156,
-    ArrayForEachPacked = 157,
-    ArrayFilterReducePacket = 158,
-    ArrayMapReducePacked = 159,
-    ApplyDecoratorToFunction = 160,
-    ApplyDecoratorToClass = 161,
-    AwaitPromise = 162,
-    LaunchConcurrentTask = 163,
-
-    // Non-overlapping post-bytecode fusion families. Execution requires VM handlers.
-    LoadI8IntegerArithmetic = 164,
-    LoadI8IntegerComparison = 165,
-    LoadI8Return = 166,
-    LoadLiteralReturn = 167,
-    AllocListAndAppend = 168,
-    AllocInstanceAndInitializeField = 169,
-    AllocInstanceAndInitializeProperty = 170,
-    LoadFieldAndCall = 171,
-    LoadPropertyAndCall = 172,
-    GuardThenFieldLoad = 173,
-    GuardThenPropertyLoad = 174,
-    MapLookupOrInsert = 175,
-    ImportAndReadVariable = 176,
-    DirectCallAndReturn = 177,
-    ClosureCallAndReturn = 178,
-    ConcurrentLaunchAndAwait = 179,
 }
 
 impl Opcode {
     pub const fn is_specialized(self) -> bool {
         (self as u8) >= Opcode::DefineClass as u8
-            && (self as u8) <= Opcode::ConcurrentLaunchAndAwait as u8
+            && (self as u8) <= Opcode::InvokeMethodDirect as u8
     }
 
     pub const fn has_specialization_descriptor(self) -> bool {
-        self.is_specialized() && !matches!(self, Opcode::NewObjectEmpty | Opcode::AwaitPromise | Opcode::ReservedImplementType)
+        self.is_specialized() && !matches!(self, Opcode::NewObjectEmpty | Opcode::MapLookupOrInsert)
     }
 }
 
@@ -1153,10 +1127,7 @@ impl Opcode {
         match self {
             Invoke | InvokeSuper | CallDirect | CallClosure | Launch | CallPrimitive | CallForeign
             | MakeClosure | NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
-            | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
-            | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
-            | LaunchConcurrentTask
-            | LoadFieldAndCall | LoadPropertyAndCall | DirectCallAndReturn | ClosureCallAndReturn | ConcurrentLaunchAndAwait => None,
+            | InvokeMethodDirect => None,
 
             LoadProperty | StoreProperty | StorePropertyIfPresent
             | GetFieldShape | SetFieldShape => Some(3),
@@ -1166,9 +1137,8 @@ impl Opcode {
             | DefineClassWithImplements | DefineDerivedClassWithImplements
             | ImplementInterfaceOrType | DefineArrayWithGenerics
             | NewObjectShape
-            | GetFieldClass | SetFieldClass | ApplyDecoratorToFunction
-            | ApplyDecoratorToClass
-            | LoadI8IntegerArithmetic | LoadI8IntegerComparison | LoadI8Return | LoadLiteralReturn | AllocListAndAppend | AllocInstanceAndInitializeField | AllocInstanceAndInitializeProperty | GuardThenFieldLoad | GuardThenPropertyLoad | MapLookupOrInsert | ImportAndReadVariable
+            | GetFieldClass | SetFieldClass
+            | MapLookupOrInsert
             | LoadI32
             | LoadConst
             | Jump
@@ -1214,10 +1184,6 @@ impl Opcode {
                 | Self::Switch
                 | Self::Return
                 | Self::Return2
-                | Self::LoadI8Return
-                | Self::LoadLiteralReturn
-                | Self::DirectCallAndReturn
-                | Self::ClosureCallAndReturn
                 | Self::Bailout
                 | Self::FiberAbort
         )
@@ -1268,14 +1234,8 @@ impl Opcode {
                 | ImplementInterfaceOrType | DefineArrayWithGenerics
                 | NewClassInstance | NewInterfaceOrTypeObject | NewObjectShape | NewObjectEmpty
                 | NewObjectWithProperties | SetFieldShape
-                | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
-                | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
-                | ApplyDecoratorToFunction | ApplyDecoratorToClass | AwaitPromise
-                | LaunchConcurrentTask
-                | AllocListAndAppend | AllocInstanceAndInitializeField
-                | AllocInstanceAndInitializeProperty | LoadFieldAndCall | LoadPropertyAndCall
-                | MapLookupOrInsert | ImportAndReadVariable | DirectCallAndReturn
-                | ClosureCallAndReturn | ConcurrentLaunchAndAwait
+                | InvokeMethodDirect
+                | MapLookupOrInsert
         )
     }
 }
@@ -1303,10 +1263,7 @@ pub fn instruction_word_len(first: Word) -> Result<usize, DecodeError> {
         CallPrimitive | CallForeign => 2 + packed_register_word_count(first.c() as usize),
         MakeClosure => 2 + packed_register_word_count(first.bx() as usize),
         NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
-        | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
-        | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
-        | LaunchConcurrentTask
-        | LoadFieldAndCall | LoadPropertyAndCall | DirectCallAndReturn | ClosureCallAndReturn | ConcurrentLaunchAndAwait => 2 + packed_register_word_count(first.c() as usize),
+        | InvokeMethodDirect => 2 + packed_register_word_count(first.c() as usize),
         _ => unreachable!("fixed-size opcode reached variable-size decoder"),
     };
     Ok(len)
@@ -1362,89 +1319,6 @@ pub struct SpecializedMethod {
     pub is_static: bool,
 }
 
-/// Pure numeric accumulator operations; IEEE-754 order must remain observable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NumericReduction {
-    Sum,
-    Product,
-    Min,
-    Max,
-}
-
-
-/// Semantic payload for a single-dispatch, multi-operation bytecode.
-///
-/// A fusion must not cross an externally reachable instruction boundary. In
-/// particular, its originating register writes must either be preserved by the
-/// handler or proven dead by the fuser. The interpreter's fused handler must
-/// provide roots for intermediate values held entirely inside that handler.
-#[derive(Clone, Debug)]
-pub enum BytecodeFusion {
-    IntegerImmediate { operation: Opcode, immediate_first: bool },
-    ReturnInteger,
-    ReturnLiteral,
-    ListWithFirstElement { element: Option<Type>, capacity: Option<Reg> },
-    InstanceWithField { class: ClassId, slot: u32 },
-    InstanceWithProperty { class: ClassId, layout: StructuralLayoutId, slot: PropertySlotId },
-    FieldClosureCall { class: Option<ClassId>, slot: u32, convention: CallConv },
-    PropertyClosureCall {
-        layout: StructuralLayoutId,
-        slot: PropertySlotId,
-        key: Reg,
-        convention: CallConv,
-    },
-    GuardedField {
-        class_guard: bool,
-        guard_id: u32,
-        deopt: DeoptId,
-        slot: u32,
-    },
-    GuardedProperty {
-        class_guard: bool,
-        guard_id: u32,
-        deopt: DeoptId,
-        layout: StructuralLayoutId,
-        slot: PropertySlotId,
-    },
-    MapGetOrInsert { default_value: Reg },
-    ImportAndRead { module: StringId, variable: StringId },
-    DirectCallAndReturn { function: FuncId, convention: CallConv },
-    ClosureCallAndReturn { convention: CallConv },
-    ConcurrentLaunchAndAwait { target: Option<FuncId> },
-}
-
-impl BytecodeFusion {
-    pub const fn matches_opcode(&self, opcode: Opcode) -> bool {
-        matches!((self, opcode),
-            (Self::IntegerImmediate { .. }, Opcode::LoadI8IntegerArithmetic | Opcode::LoadI8IntegerComparison)
-            | (Self::ReturnInteger, Opcode::LoadI8Return)
-            | (Self::ReturnLiteral, Opcode::LoadLiteralReturn)
-            | (Self::ListWithFirstElement { .. }, Opcode::AllocListAndAppend)
-            | (Self::InstanceWithField { .. }, Opcode::AllocInstanceAndInitializeField)
-            | (Self::InstanceWithProperty { .. }, Opcode::AllocInstanceAndInitializeProperty)
-            | (Self::FieldClosureCall { .. }, Opcode::LoadFieldAndCall)
-            | (Self::PropertyClosureCall { .. }, Opcode::LoadPropertyAndCall)
-            | (Self::GuardedField { .. }, Opcode::GuardThenFieldLoad)
-            | (Self::GuardedProperty { .. }, Opcode::GuardThenPropertyLoad)
-            | (Self::MapGetOrInsert { .. }, Opcode::MapLookupOrInsert)
-            | (Self::ImportAndRead { .. }, Opcode::ImportAndReadVariable)
-            | (Self::DirectCallAndReturn { .. }, Opcode::DirectCallAndReturn)
-            | (Self::ClosureCallAndReturn { .. }, Opcode::ClosureCallAndReturn)
-            | (Self::ConcurrentLaunchAndAwait { .. }, Opcode::ConcurrentLaunchAndAwait))
-    }
-}
-
-/// A later stage of an atomic fused instruction. GC and tracing may inspect
-/// this data only after completing the first primitive operation. The normal
-/// chunk-side entry remains attached to the fused opcode's start PC.
-#[derive(Clone, Debug, Default)]
-pub struct FusionContinuation {
-    pub gc: Option<(SafepointKind, ReferenceMap)>,
-    pub live: Option<LiveRegisterMap>,
-    pub constants: Vec<(Reg, Constant)>,
-    pub types: Vec<(Reg, Type)>,
-}
-
 /// Typed runtime specialization payload. Indices are local to a BytecodeChunk.
 /// Runtime handlers MUST validate dynamic shapes/method identities and fall back
 /// to the original semantics on a failed speculation. No speculative assumption
@@ -1470,21 +1344,6 @@ pub enum SpecializedDescriptor {
         /// The runtime must validate method identity before a direct call.
         fallback_cache: IcSlot,
     },
-    PackedArray {
-        element: Type,
-        reduction: Option<NumericReduction>,
-        /// Identity of a mathematically proven native numeric reducer.
-        /// A callback of unknown identity must never use ArrayReduceNumeric.
-        numeric_callback: Option<FuncId>,
-        /// The original inline-cache descriptor for exact generic fallback.
-        fallback_cache: IcSlot,
-        /// Required for map+reduce/filter+reduce fusions. Both callbacks must
-        /// preserve order, exceptions, reentrant mutations and array holes.
-        second_fallback_cache: Option<IcSlot>,
-    },
-    Decorator { function: FuncId },
-    Concurrent { function: FuncId },
-    Fusion { operation: BytecodeFusion, continuation: FusionContinuation },
 }
 
 impl SpecializedDescriptor {
@@ -1502,13 +1361,6 @@ impl SpecializedDescriptor {
             GetFieldShape | SetFieldShape => matches!(self, Self::FieldShape { .. }),
             GetFieldClass | SetFieldClass => matches!(self, Self::FieldClass { .. }),
             InvokeMethodDirect => matches!(self, Self::DirectMethod { .. }),
-            ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric | ArrayForEachPacked
-            | ArrayFilterReducePacket | ArrayMapReducePacked =>
-                matches!(self, Self::PackedArray { .. }),
-            ApplyDecoratorToFunction | ApplyDecoratorToClass =>
-                matches!(self, Self::Decorator { .. }),
-            LaunchConcurrentTask => matches!(self, Self::Concurrent { .. }),
-            LoadI8IntegerArithmetic | LoadI8IntegerComparison | LoadI8Return | LoadLiteralReturn | AllocListAndAppend | AllocInstanceAndInitializeField | AllocInstanceAndInitializeProperty | LoadFieldAndCall | LoadPropertyAndCall | GuardThenFieldLoad | GuardThenPropertyLoad | MapLookupOrInsert | ImportAndReadVariable | DirectCallAndReturn | ClosureCallAndReturn | ConcurrentLaunchAndAwait => matches!(self, Self::Fusion { operation, .. } if operation.matches_opcode(opcode)),
             _ => false,
         }
     }
@@ -2078,12 +1930,7 @@ impl<'a> DecodedInstruction<'a> {
             | Opcode::CallPrimitive
             | Opcode::CallForeign
             | Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
-            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect
-            | Opcode::ArrayMapPacked | Opcode::ArrayFilterPacked
-            | Opcode::ArrayReduceNumeric | Opcode::ArrayForEachPacked
-            | Opcode::ArrayFilterReducePacket | Opcode::ArrayMapReducePacked
-            | Opcode::LaunchConcurrentTask
-            | Opcode::LoadFieldAndCall | Opcode::LoadPropertyAndCall | Opcode::DirectCallAndReturn | Opcode::ClosureCallAndReturn | Opcode::ConcurrentLaunchAndAwait => Some(self.first.c() as usize),
+            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect => Some(self.first.c() as usize),
             _ => None,
         }
     }
@@ -2520,11 +2367,7 @@ impl Assembler {
         }
         let variable = matches!(opcode,
             Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
-            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect
-            | Opcode::ArrayMapPacked | Opcode::ArrayFilterPacked
-            | Opcode::ArrayReduceNumeric | Opcode::ArrayForEachPacked
-            | Opcode::ArrayFilterReducePacket | Opcode::ArrayMapReducePacked
-            | Opcode::LaunchConcurrentTask);
+            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect);
         if args.len() > MAX_NAPALM_ARITY || (!variable && !args.is_empty()) {
             return Err(AssembleError::InvalidSpecialization(
                 "invalid argument count for specialized opcode".into(),
@@ -2546,42 +2389,10 @@ impl Assembler {
         Ok(pc)
     }
 
-    /// Builds one fused instruction and its interned semantic descriptor.
-    /// The fusing pass is responsible for CFG/deopt/safepoint preservation.
-    pub fn emit_fusion(
-        &mut self,
-        opcode: Opcode,
-        a: u8,
-        b: u8,
-        c: u8,
-        args: &[Reg],
-        descriptor: BytecodeFusion,
-    ) -> Result<BytecodePc, AssembleError> {
-        if !descriptor.matches_opcode(opcode) {
-            return Err(AssembleError::InvalidSpecialization(format!(
-                "invalid fused payload for {}", opcode.name()
-            )));
-        }
-        let packed = matches!(opcode,
-            Opcode::LoadFieldAndCall | Opcode::LoadPropertyAndCall
-            | Opcode::DirectCallAndReturn | Opcode::ClosureCallAndReturn
-            | Opcode::ConcurrentLaunchAndAwait);
-        if (!packed && !args.is_empty()) || args.len() > MAX_DIRECT_FRAME_VALUES
-            || (packed && c as usize != args.len()) {
-            return Err(AssembleError::InvalidSpecialization(
-                "invalid packed arguments for fused opcode".to_owned(),
-            ));
-        }
-        let id = self.chunk.push_specialization(SpecializedDescriptor::Fusion { operation: descriptor, continuation: FusionContinuation::default() });
-        let pc = self.emit_x32(opcode, a, b, c, id);
-        self.chunk.code.extend(pack_registers(args));
-        Ok(pc)
-    }
-
     /// Atomic lookup-or-insert with explicit default value. A normal
     /// `MapGet` followed by `MapSet` must not be converted to this opcode:
     /// the unconditional store has different semantics on an existing key.
-    /// This API is available for a future dedicated HIR operation.
+    /// Same encoding as master: A=result, B=map, C=key, x0=value GPR.
     pub fn emit_map_lookup_or_insert(
         &mut self,
         destination: Reg,
@@ -2589,41 +2400,10 @@ impl Assembler {
         key: Reg,
         default_value: Reg,
     ) -> Result<BytecodePc, AssembleError> {
-        self.emit_fusion(
+        Ok(self.emit_x32(
             Opcode::MapLookupOrInsert,
-            destination.0, map.0, key.0, &[],
-            BytecodeFusion::MapGetOrInsert { default_value },
-        )
-    }
-
-    /// Rewrites a complete fusion descriptor after the optimizer has saved
-    /// continuation-stage stack maps. This is not an interpreter dispatch.
-    pub fn emit_staged_fusion(
-        &mut self,
-        opcode: Opcode,
-        a: u8,
-        b: u8,
-        c: u8,
-        args: &[Reg],
-        operation: BytecodeFusion,
-        continuation: FusionContinuation,
-    ) -> Result<BytecodePc, AssembleError> {
-        if !operation.matches_opcode(opcode) {
-            return Err(AssembleError::InvalidSpecialization("fusion opcode/payload mismatch".into()));
-        }
-        let packed = matches!(opcode,
-            Opcode::LoadFieldAndCall | Opcode::LoadPropertyAndCall
-            | Opcode::DirectCallAndReturn | Opcode::ClosureCallAndReturn
-            | Opcode::ConcurrentLaunchAndAwait);
-        if args.len() > MAX_DIRECT_FRAME_VALUES
-            || (packed && args.len() != c as usize)
-            || (!packed && !args.is_empty()) {
-            return Err(AssembleError::InvalidSpecialization("invalid fusion arguments".into()));
-        }
-        let id = self.chunk.push_specialization(SpecializedDescriptor::Fusion { operation, continuation });
-        let pc = self.emit_x32(opcode, a, b, c, id);
-        self.chunk.code.extend(pack_registers(args));
-        Ok(pc)
+            destination.0, map.0, key.0, default_value.0 as u32,
+        ))
     }
 
     /// Field shape operations retain A/B/C and a second extension word holding
@@ -3235,191 +3015,6 @@ impl BytecodeVerifier {
                     return Err(fail("direct method call/cache signature mismatch"));
                 }
             }
-            SpecializedDescriptor::PackedArray {
-                element, reduction, numeric_callback,
-                fallback_cache, second_fallback_cache,
-            } => {
-                Self::verify_type(program, element)?;
-                let ic = function.chunk.inline_caches.get(fallback_cache.0 as usize)
-                    .ok_or_else(|| fail("missing packed-array fallback IC"))?;
-                if ic.home_class.is_some() {
-                    return Err(fail("packed-array fallback cannot be a super call"));
-                }
-                let sig = program.metadata.method(ic.method)
-                    .ok_or_else(|| fail("invalid packed-array fallback method"))?;
-                let expected = match op {
-                    ArrayMapPacked | ArrayMapReducePacked => "map",
-                    ArrayFilterPacked | ArrayFilterReducePacket => "filter",
-                    ArrayReduceNumeric => "reduce",
-                    ArrayForEachPacked => "forEach",
-                    _ => unreachable!(),
-                };
-                if program.metadata.string(sig.name) != Some(expected) {
-                    return Err(fail("packed-array operation does not match fallback method"));
-                }
-                if op == ArrayReduceNumeric && reduction.is_none() {
-                    return Err(fail("numeric reduction opcode requires a numeric reduction kind"));
-                }
-                if op != ArrayReduceNumeric && reduction.is_some() {
-                    return Err(fail("non-numeric packed-array op has numeric reduction kind"));
-                }
-                if op == ArrayReduceNumeric {
-                    let target = numeric_callback.ok_or_else(|| fail("numeric reduce requires a proven callback"))?;
-                    if program.function(target).is_none() {
-                        return Err(fail("numeric reduction references unknown callback"));
-                    }
-                } else if numeric_callback.is_some() {
-                    return Err(fail("unexpected numeric callback for packed-array method"));
-                }
-                if matches!(op, ArrayFilterReducePacket | ArrayMapReducePacked) {
-                    let second = second_fallback_cache.ok_or_else(|| fail("fusion needs reduce fallback cache"))?;
-                    let reduce = function.chunk.inline_caches.get(second.0 as usize)
-                        .ok_or_else(|| fail("missing reduce fallback inline cache"))?;
-                    let method = program.metadata.method(reduce.method)
-                        .ok_or_else(|| fail("unknown reduce method"))?;
-                    if reduce.home_class.is_some() || program.metadata.string(method.name) != Some("reduce") {
-                        return Err(fail("second fusion operation must be reduce"));
-                    }
-                } else if second_fallback_cache.is_some() {
-                    return Err(fail("unexpected second inline cache for packed-array method"));
-                }
-            }
-            SpecializedDescriptor::Decorator { function: decorator } => {
-                if program.function(*decorator).is_none() {
-                    return Err(fail("unknown decorator function"));
-                }
-            }
-            SpecializedDescriptor::Fusion { operation: payload, continuation } => {
-                if let Some((_, references)) = &continuation.gc {
-                    for index in function.frame.general_register_count as usize..GENERAL_REGISTER_COUNT {
-                        if references.general_is_reference(Reg(index as u8)) {
-                            return Err(fail("fused continuation roots a non-existent register"));
-                        }
-                    }
-                }
-                if let Some(live) = &continuation.live {
-                    for index in function.frame.general_register_count as usize..GENERAL_REGISTER_COUNT {
-                        if live.general_is_live(Reg(index as u8)) {
-                            return Err(fail("fused continuation contains invalid liveness"));
-                        }
-                    }
-                }
-                for (reg, ty) in &continuation.types {
-                    Self::verify_reg(function, inst.pc, *reg)?;
-                    Self::verify_type(program, ty)?;
-                }
-                for (reg, _) in &continuation.constants {
-                    Self::verify_reg(function, inst.pc, *reg)?;
-                }
-                // Calls and mutations at stage two require a distinct GC
-                // root map. Those roots refer to values created by stage one,
-                // and cannot be replaced by a union with the entry map.
-                if matches!(payload,
-                    BytecodeFusion::ListWithFirstElement { .. }
-                    | BytecodeFusion::InstanceWithProperty { .. }
-                    | BytecodeFusion::FieldClosureCall { .. }
-                    | BytecodeFusion::PropertyClosureCall { .. }
-                    | BytecodeFusion::ConcurrentLaunchAndAwait { .. })
-                    && continuation.gc.is_none() {
-                    return Err(fail("fused opcode is missing the second-stage GC map"));
-                }
-                match payload {
-                    BytecodeFusion::IntegerImmediate { operation, .. } => {
-                        let arithmetic = matches!(operation,
-                            Opcode::IAdd | Opcode::ISub | Opcode::IMul | Opcode::IDivS
-                            | Opcode::IRemS | Opcode::IBitAnd | Opcode::IBitOr
-                            | Opcode::IBitXor | Opcode::IShl | Opcode::IShrU | Opcode::ISar);
-                        let comparison = matches!(operation,
-                            Opcode::ICmpEq | Opcode::ICmpNe | Opcode::ICmpLt
-                            | Opcode::ICmpLe | Opcode::ICmpGt | Opcode::ICmpGe);
-                        if !((op == LoadI8IntegerArithmetic && arithmetic)
-                            || (op == LoadI8IntegerComparison && comparison)) {
-                            return Err(fail("integer fusion has an invalid primitive"));
-                        }
-                    }
-                    BytecodeFusion::ListWithFirstElement { element, capacity } => {
-                        if let Some(element) = element { Self::verify_type(program, element)?; }
-                        if let Some(capacity) = capacity { Self::verify_reg(function, inst.pc, *capacity)?; }
-                    }
-                    BytecodeFusion::FieldClosureCall { class, .. } => {
-                        if let Some(class) = class {
-                            if program.metadata.class(*class).is_none() {
-                                return Err(fail("field call references missing class"));
-                            }
-                        }
-                    }
-                    BytecodeFusion::ConcurrentLaunchAndAwait { target } => {
-                        if let Some(target) = target {
-                            let function = program.function(*target)
-                                .ok_or_else(|| fail("fused launch has unknown target"))?;
-                            if !function.is_concurrent || function.arity != inst.first.c() {
-                                return Err(fail("fused launch target is not concurrent or has wrong arity"));
-                            }
-                        }
-                    }
-                    BytecodeFusion::InstanceWithField { class, slot } => {
-                        let info = program.metadata.class(*class)
-                            .ok_or_else(|| fail("instance fusion has unknown class"))?;
-                        if *slot >= info.own_instance_field_count as u32 {
-                            return Err(fail("instance field slot exceeds own field layout"));
-                        }
-                    }
-                    BytecodeFusion::InstanceWithProperty { class, layout, slot } => {
-                        if program.metadata.class(*class).is_none() {
-                            return Err(fail("instance fusion has unknown class"));
-                        }
-                        if program.metadata.structural_layout(*layout)
-                            .and_then(|info| info.property(*slot)).is_none() {
-                            return Err(fail("instance fusion has invalid structural slot"));
-                        }
-                    }
-                    BytecodeFusion::PropertyClosureCall { layout, slot, key, .. } => {
-                        if program.metadata.structural_layout(*layout)
-                            .and_then(|info| info.property(*slot)).is_none() {
-                            return Err(fail("property call has unknown structural property"));
-                        }
-                        Self::verify_reg(function, inst.pc, *key)?;
-                    }
-                    BytecodeFusion::GuardedField { class_guard, guard_id, deopt, .. }
-                    | BytecodeFusion::GuardedProperty { class_guard, guard_id, deopt, .. } => {
-                        let valid = if *class_guard {
-                            (*guard_id as usize) < function.chunk.class_guards.len()
-                        } else {
-                            (*guard_id as usize) < function.chunk.type_guards.len()
-                        };
-                        if !valid { return Err(fail("fused guard has unknown guard descriptor")); }
-                        Self::require_deopt(&function.chunk, inst.pc, deopt.0)?;
-                        if let BytecodeFusion::GuardedProperty { layout, slot, .. } = payload {
-                            if program.metadata.structural_layout(*layout)
-                                .and_then(|info| info.property(*slot)).is_none() {
-                                return Err(fail("guarded property has invalid slot"));
-                            }
-                        }
-                    }
-                    BytecodeFusion::MapGetOrInsert { default_value } => {
-                        Self::verify_reg(function, inst.pc, *default_value)?;
-                    }
-                    BytecodeFusion::ImportAndRead { module, variable } => {
-                        if program.metadata.string(*module).is_none()
-                            || program.metadata.string(*variable).is_none() {
-                            return Err(fail("fused import has unknown string ID"));
-                        }
-                    }
-                    BytecodeFusion::DirectCallAndReturn { function: target, .. } => {
-                        if program.function(*target).is_none() {
-                            return Err(fail("fused tail call references unknown function"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            SpecializedDescriptor::Concurrent { function: target } => {
-                let target_fn = program.function(*target)
-                    .ok_or_else(|| fail("unknown concurrent function"))?;
-                if !target_fn.is_concurrent || target_fn.arity != inst.first.c() {
-                    return Err(fail("launch target is not concurrent or has wrong arity"));
-                }
-            }
         }
         Ok(())
     }
@@ -3447,6 +3042,12 @@ impl BytecodeVerifier {
                 return Err(VerificationError::function(format!(
                     "function {:?} references unknown name {:?}",
                     function.id, function.name
+                )));
+            }
+            if function.kind == FunctionKind::Constructor && function.memoization.enabled() {
+                return Err(VerificationError::function(format!(
+                    "constructor {:?} cannot be memoized",
+                    function.id
                 )));
             }
             if let Some(owner) = function.field_owner {
@@ -4165,9 +3766,6 @@ impl BytecodeVerifier {
         }
 
         match inst.opcode {
-            ReservedImplementType => {
-                return Err(VerificationError::at(inst.pc, "opcode 142 is reserved; use ImplementInterfaceOrType (141)"));
-            }
             Nop | Trap | Safepoint | OsrPoint | Breakpoint => {}
 
             Move | Swap => {
@@ -4526,56 +4124,15 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, c)?;
             }
 
-            LoadI8IntegerArithmetic | LoadI8IntegerComparison => {
-                Self::verify_reg(function, inst.pc, a)?;
-                Self::verify_reg(function, inst.pc, b)?;
-            }
-            LoadI8Return | LoadLiteralReturn => {
-                if b.0 != 0 || c.0 != 0 {
-                    return Err(VerificationError::at(inst.pc, "fused return has nonzero reserved bits"));
-                }
-                if inst.opcode == LoadLiteralReturn && a.0 > 2 {
-                    return Err(VerificationError::at(inst.pc, "invalid literal return tag"));
-                }
-            }
-            AllocListAndAppend | AllocInstanceAndInitializeField
-            | ImportAndReadVariable => {
-                Self::verify_reg(function, inst.pc, a)?;
-                if inst.opcode != ImportAndReadVariable {
-                    Self::verify_reg(function, inst.pc, b)?;
-                }
-            }
-            AllocInstanceAndInitializeProperty | MapLookupOrInsert => {
+            MapLookupOrInsert => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
-            }
-            GuardThenFieldLoad | GuardThenPropertyLoad => {
-                Self::verify_reg(function, inst.pc, a)?;
-                Self::verify_reg(function, inst.pc, b)?;
-                if inst.opcode == GuardThenPropertyLoad {
-                    Self::verify_reg(function, inst.pc, c)?;
+                let value = inst.extension(0).unwrap();
+                if value > u8::MAX as u32 {
+                    return Err(VerificationError::at(inst.pc, "invalid MapLookupOrInsert value register"));
                 }
-            }
-            LoadFieldAndCall | LoadPropertyAndCall | ClosureCallAndReturn
-            | ConcurrentLaunchAndAwait | DirectCallAndReturn => {
-                Self::verify_reg(function, inst.pc, a)?;
-                if inst.opcode != DirectCallAndReturn {
-                    Self::verify_reg(function, inst.pc, b)?;
-                }
-                let max_arity = if inst.opcode == DirectCallAndReturn {
-                    MAX_DIRECT_FRAME_VALUES
-                } else {
-                    MAX_NAPALM_ARITY
-                };
-                if inst.first.c() as usize > max_arity {
-                    return Err(VerificationError::at(inst.pc, "fused call arity exceeds limit"));
-                }
-                for reg in inst.call_arguments().map_err(|e| VerificationError {
-                    pc: e.pc, message: e.message,
-                })? {
-                    Self::verify_reg(function, inst.pc, reg)?;
-                }
+                Self::verify_reg(function, inst.pc, Reg(value as u8))?;
             }
 
             // Descriptor-backed specializations all use x0=chunk.specializations[id].
@@ -4587,8 +4144,7 @@ impl BytecodeVerifier {
                 }
             }
             DefineDerivedClass | DefineDerivedClassWithImplements
-            | DefineArrayWithGenerics | GetFieldClass | SetFieldClass
-            | ApplyDecoratorToFunction | ApplyDecoratorToClass => {
+            | DefineArrayWithGenerics | GetFieldClass | SetFieldClass => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 if inst.first.c() != 0 && !matches!(inst.opcode, DefineDerivedClass | DefineDerivedClassWithImplements) {
@@ -4619,9 +4175,7 @@ impl BytecodeVerifier {
                     return Err(VerificationError::at(inst.pc, "reserved C must be zero"));
                 }
             }
-            NewClassInstance | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
-            | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
-            | ArrayMapReducePacked | LaunchConcurrentTask => {
+            NewClassInstance | InvokeMethodDirect => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 if inst.first.c() as usize > MAX_NAPALM_ARITY {
@@ -4644,14 +4198,6 @@ impl BytecodeVerifier {
                     return Err(VerificationError::at(inst.pc, "NewObjectEmpty reserved B/C must be zero"));
                 }
             }
-            AwaitPromise => {
-                Self::verify_reg(function, inst.pc, a)?;
-                Self::verify_reg(function, inst.pc, b)?;
-                if !function.is_async && !function.is_concurrent && function.kind != FunctionKind::ModuleBody {
-                    return Err(VerificationError::at(inst.pc, "AwaitPromise requires async or module context"));
-                }
-            }
-
             Catch => Self::verify_reg(function, inst.pc, a)?,
             Await => {
                 Self::verify_reg(function, inst.pc, a)?;
@@ -4780,7 +4326,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         AllocList | AllocMap => [General, None, None],
         AllocListCap | ListLen | MapLen | StringLen => [General, General, None],
         ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => [General, General, General],
-        ListSet | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => [General, General, General],
+        ListSet | ListInsert | MapSet | MapLookupOrInsert | StoreProperty | StorePropertyIfPresent => [General, General, General],
         ListAppend => [General, General, None],
         StringConcat | StringSlice | MakeRange => [General, General, General],
         INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => [General, General, None],
@@ -4793,24 +4339,9 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
             [General, None, SmallImmediate],
         DefineDerivedClass | DefineDerivedClassWithImplements => [General, General, Flag],
         GetFieldShape | SetFieldShape => [General, General, General],
-        DefineArrayWithGenerics | GetFieldClass | SetFieldClass
-        | ApplyDecoratorToFunction | ApplyDecoratorToClass => [General, General, None],
+        DefineArrayWithGenerics | GetFieldClass | SetFieldClass => [General, General, None],
         ImplementInterfaceOrType => [General, General, None],
-        NewClassInstance | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
-        | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
-        | ArrayMapReducePacked | LaunchConcurrentTask => [General, General, SmallImmediate],
-        LoadI8IntegerArithmetic | LoadI8IntegerComparison => [General, General, SmallImmediate],
-        LoadI8Return => [SmallImmediate, None, None],
-        LoadLiteralReturn => [Flag, None, None],
-        AllocListAndAppend | AllocInstanceAndInitializeField => [General, General, None],
-        AllocInstanceAndInitializeProperty | MapLookupOrInsert => [General, General, General],
-        GuardThenFieldLoad => [General, General, None],
-        GuardThenPropertyLoad => [General, General, General],
-        ImportAndReadVariable => [General, None, None],
-        LoadFieldAndCall | LoadPropertyAndCall | ClosureCallAndReturn
-        | ConcurrentLaunchAndAwait => [General, General, SmallImmediate],
-        DirectCallAndReturn => [General, None, SmallImmediate],
-        AwaitPromise => [General, General, None],
+        NewClassInstance | InvokeMethodDirect => [General, General, SmallImmediate],
         Await => [General, General, None],
         Catch => [General, None, None],
         MakeFiber => [General, General, None],
@@ -4819,7 +4350,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         FiberSuspend | FiberAbort => [General, None, None],
         WriteBarrier | ReadBarrier => [General, General, None],
         ProfileNumeric => [General, None, None],
-        Nop | Trap | Safepoint | OsrPoint | ProfileBlock | Breakpoint | ReservedImplementType => [None, None, None],
+        Nop | Trap | Safepoint | OsrPoint | ProfileBlock | Breakpoint => [None, None, None],
     }
 }
 
@@ -4829,17 +4360,13 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         DefineClass | DefineInterface | DefineType | DefineDerivedClass
         | DefineClassWithImplements | DefineDerivedClassWithImplements
         | ImplementInterfaceOrType | DefineArrayWithGenerics
-        | NewObjectShape | GetFieldClass | SetFieldClass
-        | ApplyDecoratorToFunction | ApplyDecoratorToClass =>
+        | NewObjectShape | GetFieldClass | SetFieldClass =>
             "x0=SpecializedDescriptor index",
-        LoadI8IntegerArithmetic | LoadI8IntegerComparison | LoadI8Return | LoadLiteralReturn | AllocListAndAppend | AllocInstanceAndInitializeField | AllocInstanceAndInitializeProperty | GuardThenFieldLoad | GuardThenPropertyLoad | MapLookupOrInsert | ImportAndReadVariable => "x0=SpecializedDescriptor::Fusion",
-        LoadFieldAndCall | LoadPropertyAndCall | DirectCallAndReturn | ClosureCallAndReturn | ConcurrentLaunchAndAwait => "x0=SpecializedDescriptor::Fusion, then packed registers",
+        MapLookupOrInsert => "x0=value GPR",
         GetFieldShape | SetFieldShape =>
             "x0=SpecializedDescriptor index, x1=original PropertySlotId for slow path",
         NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
-        | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
-        | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
-        | LaunchConcurrentTask =>
+        | InvokeMethodDirect =>
             "x0=SpecializedDescriptor index, then C packed register operands",
         InvokeSpread => "x0=MethodSymbol (runtime arity), x1=home ClassId or u32::MAX",
         LoadI32 => "x0=i32 bits",
@@ -4951,33 +4478,32 @@ mod tests {
 
     #[test]
     fn specialized_opcode_ids_are_stable_and_decodable() {
-        for id in 135u8..=179u8 {
+        for id in 135u8..=153u8 {
             let opcode = Opcode::from_u8(id).expect("specialized opcode must decode");
             assert!(opcode.is_specialized());
             assert_eq!(opcode as u8, id);
         }
         assert!(!Opcode::Launch.is_specialized());
-        assert_eq!(Opcode::from_u8(179), Some(Opcode::ConcurrentLaunchAndAwait));
-        assert_eq!(Opcode::from_u8(180), None);
+        assert_eq!(Opcode::from_u8(153), Some(Opcode::InvokeMethodDirect));
+        assert_eq!(Opcode::from_u8(154), None);
     }
 
     #[test]
     fn specialized_calls_retain_packed_arguments_and_descriptor() {
         let mut assembler = Assembler::new();
-        let descriptor = SpecializedDescriptor::PackedArray {
-            element: Type::Num,
-            reduction: None,
-            numeric_callback: None,
+        let descriptor = SpecializedDescriptor::DirectMethod {
+            owner: ClassId(1),
+            symbol: MethodSymbol(2),
+            target: FuncId(3),
             fallback_cache: IcSlot(7),
-            second_fallback_cache: None,
         };
         assembler.emit_specialized(
-            Opcode::ArrayMapPacked, R1, R2,
+            Opcode::InvokeMethodDirect, R1, R2,
             &[R3, R4, R5, R6, R7], descriptor,
         ).unwrap();
         let chunk = assembler.finish().unwrap();
         let instruction = Decoder::new(&chunk.code).next().unwrap().unwrap();
-        assert_eq!(instruction.opcode, Opcode::ArrayMapPacked);
+        assert_eq!(instruction.opcode, Opcode::InvokeMethodDirect);
         assert_eq!(instruction.len_words(), 4);
         assert_eq!(instruction.call_arguments().unwrap(), [R3, R4, R5, R6, R7]);
         assert_eq!(instruction.extension(0), Some(0));
@@ -5025,31 +4551,6 @@ mod tests {
     }
 
     #[test]
-    fn fused_integer_encoding_and_tail_call_roundtrip() {
-        let mut assembler = Assembler::new();
-        assembler.emit_fusion(
-            Opcode::LoadI8IntegerArithmetic, 4, 3, (-7_i8) as u8, &[],
-            BytecodeFusion::IntegerImmediate {
-                operation: Opcode::ISub, immediate_first: false,
-            },
-        ).unwrap();
-        assembler.emit_fusion(
-            Opcode::DirectCallAndReturn, 2, 0, 3, &[R1, R2, R3],
-            BytecodeFusion::DirectCallAndReturn {
-                function: FuncId(8), convention: CallConv::Napalm,
-            },
-        ).unwrap();
-        let chunk = assembler.finish().unwrap();
-        let decoded = Decoder::new(&chunk.code).collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].len_words(), 2);
-        assert_eq!(decoded[0].first.c() as i8, -7);
-        assert_eq!(decoded[1].len_words(), 3);
-        assert_eq!(decoded[1].call_arguments().unwrap(), vec![R1, R2, R3]);
-        assert!(Opcode::DirectCallAndReturn.is_terminator());
-    }
-
-    #[test]
     fn get_or_insert_requires_explicit_default_register() {
         let mut assembler = Assembler::new();
         assembler.emit_map_lookup_or_insert(R4, R1, R2, R3).unwrap();
@@ -5058,26 +4559,8 @@ mod tests {
         assert_eq!(instruction.opcode, Opcode::MapLookupOrInsert);
         assert_eq!(instruction.len_words(), 2);
         assert_eq!((instruction.first.a(), instruction.first.b(), instruction.first.c()), (4,1,2));
-        assert!(matches!(
-            &chunk.specializations[0],
-            SpecializedDescriptor::Fusion {
-                operation: BytecodeFusion::MapGetOrInsert { default_value: R3 },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn fused_assembler_rejects_mismatched_descriptor() {
-        let mut assembler = Assembler::new();
-        assert!(matches!(
-            assembler.emit_fusion(
-                Opcode::LoadI8Return, 1, 0, 0, &[],
-                BytecodeFusion::ReturnLiteral,
-            ),
-            Err(AssembleError::InvalidSpecialization(_))
-        ));
-        assert!(assembler.chunk.code.is_empty());
+        assert_eq!(instruction.extension(0), Some(R3.0 as u32));
+        assert!(chunk.specializations.is_empty());
     }
 
     #[test]
@@ -5101,7 +4584,7 @@ mod tests {
     #[test]
     fn structural_contract_unification_retains_stable_opcode_ids() {
         assert_eq!(Opcode::from_u8(141), Some(Opcode::ImplementInterfaceOrType));
-        assert_eq!(Opcode::from_u8(142), Some(Opcode::ReservedImplementType));
+        assert_eq!(Opcode::from_u8(142), Some(Opcode::MapLookupOrInsert));
         assert_eq!(Opcode::from_u8(145), Some(Opcode::NewInterfaceOrTypeObject));
         assert!(Opcode::ImplementInterfaceOrType.may_gc());
         assert!(Opcode::NewObjectWithProperties.may_gc());

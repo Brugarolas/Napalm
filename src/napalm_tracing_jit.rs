@@ -1395,6 +1395,45 @@ fn decode_at(
         }
     }
 
+    // Field/method super-instructions are alternative encodings of existing
+    // semantic operations. Decode them canonically here, once, so the recorder,
+    // both inliners and every Invoke quick path see a single opcode. Guards and
+    // runtime boundaries still replay *this* PC, which the VM executes with the
+    // specialized handler (same semantics).
+    let (opcode, x, y) = match opcode {
+        Opcode::GetFieldClass | Opcode::SetFieldClass => {
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { local_slot, .. }) =
+                function.chunk.specializations.get(x as usize)
+            else {
+                return Err(TracingJitError::Decode { location, message: "invalid FieldClass descriptor".to_owned() });
+            };
+            // trace_field_slot() resolves the relocated absolute slot from the
+            // prepared op at this PC; the class-local slot is only its fallback.
+            let canonical = if opcode == Opcode::GetFieldClass { Opcode::LoadField } else { Opcode::StoreField };
+            (canonical, *local_slot, 0)
+        }
+        Opcode::GetFieldShape | Opcode::SetFieldShape => {
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldShape { layout, slot }) =
+                function.chunk.specializations.get(x as usize)
+            else {
+                return Err(TracingJitError::Decode { location, message: "invalid FieldShape descriptor".to_owned() });
+            };
+            let canonical = if opcode == Opcode::GetFieldShape { Opcode::LoadProperty } else { Opcode::StoreProperty };
+            (canonical, layout.0, slot.0 as u32)
+        }
+        Opcode::InvokeMethodDirect => {
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod { fallback_cache, .. }) =
+                function.chunk.specializations.get(x as usize)
+            else {
+                return Err(TracingJitError::Decode { location, message: "invalid DirectMethod descriptor".to_owned() });
+            };
+            // The IC descriptor carries the method symbol; the existing Invoke
+            // lowering guards class + method_epoch and may inline the target.
+            (Opcode::Invoke, fallback_cache.0, 0)
+        }
+        _ => (opcode, x, y),
+    };
+
     Ok(RecordedOp {
         location,
         opcode,
@@ -2761,8 +2800,10 @@ impl<'a> TraceRecorder<'a> {
                 } else {
                     *builder = checkpoint;
                 }
-                builder.runtime_call(op.location,
-                    BytecodePc(op.next_pc.0 | TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY));
+                // Plain call-to-return. Only NewClassInstance uses the factory
+                // mode; probing here would add an indirect helper call to every
+                // non-inlined call in a trace.
+                builder.runtime_call(op.location, op.next_pc);
                 Ok(ExpectedStep::RuntimeCall)
             }
             Err(error) => Err(error),
@@ -5762,8 +5803,13 @@ impl<'a> TraceRecorder<'a> {
                 op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
             ),
+            // An empty Map gains nothing from the probe + TLAB + commit protocol
+            // (two helper calls): keep AllocMap's single runtime leaf.
+            NewObjectEmpty => self.runtime_gc_leaf(
+                op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
             NewInterfaceOrTypeObject | NewObjectShape
-            | NewObjectEmpty | NewObjectWithProperties => self.runtime_gc_specialized(
+            | NewObjectWithProperties => self.runtime_gc_specialized(
                 op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
             ),
@@ -13718,7 +13764,9 @@ mod tests {
         // fixed header (bank pointers, dispatcher/link state, exit result).
         let direct_call_scratch = std::mem::size_of::<[RegisterWord; MAX_NAPALM_ARITY]>();
         assert!(
-            std::mem::size_of::<TraceActivation>() <= direct_call_scratch + 192,
+            // +64 bytes: the six fixed Immix TLAB/factory words used by native
+            // object-factory fast paths.
+            std::mem::size_of::<TraceActivation>() <= direct_call_scratch + 256,
             "TraceActivation grew to {} bytes",
             std::mem::size_of::<TraceActivation>()
         );

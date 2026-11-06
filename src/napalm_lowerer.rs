@@ -5038,8 +5038,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // Pure, statically valid structural literals may defer property
         // installation until all constant values have been evaluated. There
         // can be no observable intermediate object or failing field check.
-        // This forms a contiguous AllocMap + MapSet + BindInterface sequence
-        // that the bytecode compiler can replace with one shape factory.
+        // This forms a contiguous AllocMap + StoreProperty + BindInterface
+        // sequence that the bytecode compiler can replace with one shape
+        // factory. It MUST stay StoreProperty (not MapSet): WIR escape analysis
+        // scalar-replaces structural objects only through layout-slot stores.
         let can_fuse_literal = fields.len() == entries.len()
             && fields.iter().zip(entries).all(|(field, entry)| {
                 if field.optional || field.readonly || entry.spread { return false; }
@@ -5056,14 +5058,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             });
         if can_fuse_literal {
             let mut initialized = Vec::with_capacity(entries.len());
-            for entry in entries {
+            for (index, (field, entry)) in fields.iter().zip(entries).enumerate() {
                 let value = self.lower_expr(&entry.value);
-                let key = self.lower_expr(&entry.key);
-                initialized.push((key, value));
+                let key = self.builder.const_string(&field.name);
+                initialized.push((key, value, ir::PropertySlotId(index as u16)));
             }
             let map = self.builder.emit1(Inst::AllocMap, Type::Map);
-            for (key, value) in initialized {
-                self.builder.emit0(Inst::MapSet { map, key, value });
+            for (key, value, slot) in initialized {
+                self.builder.emit0(Inst::StoreProperty { object: map, key, value, layout, slot });
             }
             return map;
         }

@@ -48,7 +48,7 @@ use crate::napalm_bytecode::{
     GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
 use crate::napalm_collections::{HashMap, HashSet};
-use crate::napalm_bytecode_optimizer::{optimization_passes, find_superinstruction_sites};
+use crate::napalm_bytecode_optimizer::optimization_passes;
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
     Function, FunctionKind, Inst, InstId, MethodSymbol, Program, ResumeId, SiteId, SnapshotSlot,
@@ -81,13 +81,8 @@ pub struct CompileOptions {
     pub verify_bytecode: bool,
     /// Run the semantics-preserving post-lowering bytecode optimizer.
     pub optimize_bytecode: bool,
-    /// Emit the new specialized opcodes. Requires interpreter and tracing JIT
-    /// handlers before the resulting bytecode is executable. Off by default.
+    /// Emit the specialized (super-instruction) opcodes 135..=153.
     pub emit_specialized_bytecode: bool,
-    /// Unsafe to enable until every remaining specialized opcode has a VM
-    /// handler. The six class/contract definitions are controlled separately
-    /// by `emit_specialized_bytecode`.
-    pub emit_unimplemented_specializations: bool,
     /// Verify the bytecode after every optimization pass in all build modes.
     pub verify_each_bytecode_pass: bool,
     /// Remove pure SSA nodes whose results cannot affect observable execution.
@@ -115,8 +110,7 @@ impl Default for CompileOptions {
             verify_ir: true,
             verify_bytecode: true,
             optimize_bytecode: true,
-            emit_specialized_bytecode: false,
-            emit_unimplemented_specializations: false,
+            emit_specialized_bytecode: true,
             verify_each_bytecode_pass: cfg!(debug_assertions),
             eliminate_dead_code: true,
             coalesce_registers: true,
@@ -158,8 +152,6 @@ pub struct CompileStats {
     pub bytecode_words_before_optimization: usize,
     pub bytecode_words_removed: usize,
     pub bytecode_passes_changed: usize,
-    /// Potential interpreter superinstruction sites, not emitted opcodes.
-    pub superinstruction_candidates_detected: usize,
 }
 
 pub struct CompilationOutput {
@@ -2183,6 +2175,9 @@ impl InstanceFusionPlan {
                 if target.kind != FunctionKind::Constructor
                     || target.field_owner != Some(*class)
                     || target.is_async || target.is_concurrent
+                    // The fused handler pushes the constructor frame directly
+                    // (no memo probe), exactly like a non-memoized CallDirect.
+                    || target.memoization != crate::napalm_ir::MemoizationKind::None
                     || target.signature.params.len() != args.len()
                 {
                     // Constructors receive the instance as THIS; the explicit
@@ -2272,7 +2267,13 @@ impl ObjectFusionPlan {
                     let id = ids[following];
                     if protected.contains(&id) || result.suppressed_sets.contains(&id) { break; }
                     let Some(node) = function.node(id) else { break; };
-                    let Inst::MapSet { map: receiver, key, value } = &node.kind else { break; };
+                    // A structural StoreProperty on the unpublished literal has
+                    // exactly MapSet's semantics; its layout slot is only a hint.
+                    let (receiver, key, value) = match &node.kind {
+                        Inst::MapSet { map: receiver, key, value }
+                        | Inst::StoreProperty { object: receiver, key, value, .. } => (receiver, key, value),
+                        _ => break,
+                    };
                     if *receiver != map { break; }
                     let Some(Constant::String(name)) = Self::constant_of(function, *key) else { break; };
                     names.push(*name);
@@ -2323,6 +2324,62 @@ impl ObjectFusionPlan {
     }
 }
 
+/// `DefineArrayWithGenerics` installs a *persistent* element contract at
+/// allocation. That is only equivalent to the generic bytecode when the list
+/// was going to receive exactly that contract anyway: an `AllocList` whose
+/// unpublished result is bound by `BindInterface(List<T>)` in the same block,
+/// with only appends to it and pure constants in between (no other code can
+/// observe the earlier contract installation). The inferred static type of a
+/// literal is NOT a contract (`const xs: any = [1]` stays untyped).
+#[derive(Default)]
+struct ArrayFusionPlan {
+    by_allocation: HashMap<InstId, Type>,
+    suppressed_bindings: HashMap<InstId, ValueId>,
+}
+
+impl ArrayFusionPlan {
+    fn build(function: &Function, options: &CompileOptions) -> Self {
+        let mut result = Self::default();
+        if !options.emit_specialized_bytecode { return result; }
+        let mut protected = HashSet::default();
+        for binding in options.resume_bindings.values() {
+            if binding.function == function.id {
+                if let ResumeTarget::BeforeInst(id) | ResumeTarget::AfterInst(id) = binding.target {
+                    protected.insert(id);
+                }
+            }
+        }
+        for block in &function.blocks {
+            let ids = &block.insts;
+            for (start, &allocation_id) in ids.iter().enumerate() {
+                if protected.contains(&allocation_id) { continue; }
+                let Some(allocation) = function.node(allocation_id) else { continue; };
+                if !matches!(allocation.kind, Inst::AllocList { .. }) { continue; }
+                let Some(&list) = allocation.results.first() else { continue; };
+                for &id in &ids[start + 1..] {
+                    if protected.contains(&id) { break; }
+                    let Some(node) = function.node(id) else { break; };
+                    match &node.kind {
+                        Inst::Const(_) => continue,
+                        Inst::ListAppend { list: target, value } if *target == list && *value != list => continue,
+                        Inst::BindInterface { value, expected: expected @ Type::List(Some(_)), .. }
+                            if *value == list =>
+                        {
+                            if let Type::List(Some(element)) = expected {
+                                result.by_allocation.insert(allocation_id, (**element).clone());
+                                result.suppressed_bindings.insert(id, list);
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CopySource {
     General(Reg),
@@ -2350,6 +2407,7 @@ struct FunctionEmitter<'a> {
     class_fusions: ClassFusionPlan,
     instance_fusions: InstanceFusionPlan,
     object_fusions: ObjectFusionPlan,
+    array_fusions: ArrayFusionPlan,
 }
 
 impl<'a> FunctionEmitter<'a> {
@@ -2371,6 +2429,7 @@ impl<'a> FunctionEmitter<'a> {
         let class_fusions = ClassFusionPlan::build(function, options);
         let instance_fusions = InstanceFusionPlan::build(program, function, options);
         let object_fusions = ObjectFusionPlan::build(program, function, options);
+        let array_fusions = ArrayFusionPlan::build(function, options);
         Self {
             program,
             function,
@@ -2396,6 +2455,7 @@ impl<'a> FunctionEmitter<'a> {
             class_fusions,
             instance_fusions,
             object_fusions,
+            array_fusions,
             stats: FunctionCompileStats {
                 function: function.id,
                 hir_nodes: function.nodes.len(),
@@ -2666,12 +2726,10 @@ impl<'a> FunctionEmitter<'a> {
         match opcode {
             Safepoint => SafepointKind::ExplicitPoll,
             Invoke | InvokeSuper | InvokeSpread | CallDirect | CallClosure | Launch | CallPrimitive
-            | NewClassInstance | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
-            | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
-            | ArrayMapReducePacked | LaunchConcurrentTask => SafepointKind::Call,
+            | NewClassInstance | InvokeMethodDirect => SafepointKind::Call,
             CallForeign => SafepointKind::Foreign,
             ImportModule | ImportVariable => SafepointKind::Module,
-            Await | AwaitPromise | MakeFiber | FiberCall | FiberTry | FiberTransfer
+            Await | MakeFiber | FiberCall | FiberTry | FiberTransfer
             | FiberTransferError | FiberYield | FiberSuspend => SafepointKind::FiberSwitch,
             BindMethod | BindForeignMethod | ImplementInterfaceOrType
             | SetFieldShape | ListAppend | ListInsert | MapSet | StoreProperty
@@ -2963,9 +3021,6 @@ enum CallTransfer<'a> {
 }
 
 impl FunctionEmitter<'_> {
-    /// A static list contract allows the interpreter to select a packed fast
-    /// path after confirming the runtime storage kind and original method
-    /// identity. The IC remains available for the exact slow-path dispatch.
     fn specialize_method_call(
         &self,
         receiver: ValueId,
@@ -2975,25 +3030,6 @@ impl FunctionEmitter<'_> {
     ) -> Option<(Opcode, SpecializedDescriptor)> {
         let ty = &self.function.value(receiver)?.ty;
         let signature = self.program.method(method)?;
-        let method_name = self.program.string(signature.name)?;
-        if let Type::List(Some(element)) = ty {
-            let opcode = match method_name {
-                "map" => Some(Opcode::ArrayMapPacked),
-                "filter" => Some(Opcode::ArrayFilterPacked),
-                "forEach" => Some(Opcode::ArrayForEachPacked),
-                // A generic reduce callback is not a proved numeric reduction.
-                _ => None,
-            };
-            if let Some(opcode) = opcode {
-                return Some((opcode, SpecializedDescriptor::PackedArray {
-                    element: (**element).clone(),
-                    reduction: None,
-                    numeric_callback: None,
-                    fallback_cache: cache,
-                    second_fallback_cache: None,
-                }));
-            }
-        }
         // A monomorphic profile is an optimization hint, not a proof. The
         // interpreter must guard the concrete method identity before executing
         // this target; the exact original IC remains the failure path.
@@ -3023,7 +3059,9 @@ impl FunctionEmitter<'_> {
         {
             return Ok(());
         }
-        if let Some(&original_map) = self.object_fusions.suppressed_bindings.get(&node.id) {
+        if let Some(&original_map) = self.object_fusions.suppressed_bindings.get(&node.id)
+            .or_else(|| self.array_fusions.suppressed_bindings.get(&node.id))
+        {
             let destination = self.result_reg(node)?;
             let source = self.reg(original_map)?;
             if destination != source {
@@ -3185,12 +3223,6 @@ impl FunctionEmitter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 let specialized = if self.options.emit_specialized_bytecode {
                     self.specialize_method_call(*receiver, *site, *method, cache)
-                        .filter(|(opcode, _)| {
-                            *opcode == Opcode::InvokeMethodDirect
-                                || self.options.emit_unimplemented_specializations
-                        })
-                } else if self.options.emit_unimplemented_specializations {
-                    self.specialize_method_call(*receiver, *site, *method, cache)
                 } else {
                     None
                 };
@@ -3282,24 +3314,9 @@ impl FunctionEmitter<'_> {
                     .iter()
                     .map(|value| self.reg(*value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let target = self.function.value(*closure).and_then(|value| match &value.ty {
-                    Type::Closure(Some(function)) => Some(*function),
-                    _ => None,
-                }).filter(|id| self.program.functions.iter().any(|function| {
-                    function.id == *id && function.is_concurrent
-                }));
-                let pc = if let (true, Some(function)) = (self.options.emit_unimplemented_specializations, target) {
-                    self.stats.specialized_opcodes += 1;
-                    self.assembler.emit_specialized(
-                        Opcode::LaunchConcurrentTask, self.result_reg(node)?,
-                        self.reg(*closure)?, &arg_regs,
-                        SpecializedDescriptor::Concurrent { function },
-                    ).map_err(|error| self.assemble_error(error))?
-                } else {
-                    self.assembler.emit_launch(
-                        self.result_reg(node)?, self.reg(*closure)?, &arg_regs,
-                    ).map_err(|error| self.assemble_error(error))?
-                };
+                let pc = self.assembler.emit_launch(
+                    self.result_reg(node)?, self.reg(*closure)?, &arg_regs,
+                ).map_err(|error| self.assemble_error(error))?;
                 safepoint_transfer = CallTransfer::Closure {
                     closure: *closure,
                     args,
@@ -3651,12 +3668,10 @@ impl FunctionEmitter<'_> {
             }
 
             AllocList { capacity } => {
-                let element = node.results.first().and_then(|id| self.function.value(*id))
-                    .and_then(|v| match &v.ty {
-                        Type::List(Some(element)) => Some((**element).clone()),
-                        _ => None,
-                    });
-                if let (true, Some(element)) = (self.options.emit_specialized_bytecode, element) {
+                // Only lists that the generic code binds to exactly List<T>
+                // (see ArrayFusionPlan); never the inferred literal type.
+                let element = self.array_fusions.by_allocation.get(&node.id).cloned();
+                if let Some(element) = element {
                     let capacity_reg = match capacity {
                         Some(value) => self.reg(*value)?,
                         None => Reg(0),
@@ -3925,18 +3940,11 @@ impl FunctionEmitter<'_> {
                 self.reg(*value)?.0,
             ),
 
-            Await { promise } => {
-                let known_promise = self.function.value(*promise).is_some_and(|value| {
-                    matches!(&value.ty, Type::Builtin(crate::napalm_ir::BuiltinId::Promise, _))
-                });
-                let opcode = if self.options.emit_unimplemented_specializations && known_promise {
-                    self.stats.specialized_opcodes += 1;
-                    Opcode::AwaitPromise
-                } else {
-                    Opcode::Await
-                };
-                self.assembler.emit_ab(opcode, self.result_reg(node)?.0, self.reg(*promise)?.0)
-            },
+            Await { promise } => self.assembler.emit_ab(
+                Opcode::Await,
+                self.result_reg(node)?.0,
+                self.reg(*promise)?.0,
+            ),
 
             MakeFiber { closure } => self.assembler.emit_ab(
                 Opcode::MakeFiber,
@@ -4675,9 +4683,6 @@ fn compile_program_impl(
             }
         }
     }
-
-    stats.superinstruction_candidates_detected = find_superinstruction_sites(&bytecode)
-        .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?.len();
 
     if options.verify_bytecode {
         BytecodeVerifier::verify_program(&bytecode)

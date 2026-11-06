@@ -2171,7 +2171,7 @@ fn native_profiled_small_map_site(
             result.value_regs[i] = function.call_args.get(offset + i * 2 + 1)?.0;
             result.key_words[i] = Value::from_heap(site.key_handles[i]).raw_bits();
         } else if !null_fields {
-            result.value_regs[i] = wfjit_call_source_reg(function, &op, i)?;
+            result.value_regs[i] = unsafe { wfjit_call_source_reg(function, &op, i) }?;
         }
         if result.slots[i] as usize >= site.value_count as usize {
             return None;
@@ -3028,25 +3028,19 @@ unsafe extern "C" fn napalm_wfjit_class_factory_probe(
     let Some(prepared) = vm.prepared.functions.get(function_index as usize) else {
         return 0;
     };
-    let Some(op) = prepared.ops.get(op_index as usize) else { return 0; };
-    let Some(raw) = prepared.raw_pcs.get(op_index as usize) else { return 0; };
+    let Some(&op) = prepared.ops.get(op_index as usize) else { return 0; };
+    let Some(&raw) = prepared.raw_pcs.get(op_index as usize) else { return 0; };
     if vm.program.functions.get(function_index as usize)
-        .and_then(|function| function.chunk.code.get(*raw as usize))
+        .and_then(|function| function.chunk.code.get(raw as usize))
         .and_then(|word| word.opcode()) != Some(Opcode::NewClassInstance)
     { return 0; }
     if !unsafe { wfjit_set_native_root_map(vm, function_index, op_index, registers) } {
         return 0;
     }
-    let descriptor = vm.program.functions[function_index as usize]
-        .chunk.specializations.get(op.x as usize);
-    let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) = descriptor else {
-        return 0;
-    };
-    let Some(&slot) = vm.prepared.class_by_id.get(class) else { return 0; };
-    let Some(layout) = vm.classes.get(slot as usize) else { return 0; };
+    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+    let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
     u32::from(!layout.is_foreign && layout.layout_finalized
-        && layout.total_instance_field_count == 0
-        && constructor.is_none_or(|id| vm.prepared.function_by_id.contains_key(&id)))
+        && layout.total_instance_field_count == 0)
 }
 
 /// Publish a TLAB-reserved class object and complete its constructor without
@@ -3067,28 +3061,16 @@ unsafe extern "C" fn napalm_wfjit_class_factory_commit(
     let Some(&op) = vm.prepared.functions[function_index as usize].ops.get(op_index as usize) else {
         return std::ptr::null_mut();
     };
-    let descriptor = vm.program.functions[function_index as usize]
-        .chunk.specializations.get(op.x as usize);
-    let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) = descriptor else {
-        return std::ptr::null_mut();
-    };
-    let class_id = *class;
-    let constructor = *constructor;
-    let Some(&slot) = vm.prepared.class_by_id.get(&class_id) else {
-        return std::ptr::null_mut();
-    };
+    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
     let args = unsafe { gather_specialized_values(vm, &op) };
     vm.mark_gc_point(&op);
     let instance = unsafe { vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::Instance {
-        class_slot: slot,
+        class_slot: op.y,
         fields: Box::new([]),
     }) };
     unsafe { vm.set_reg(op.a, instance.word()) };
-    if let Some(constructor) = constructor {
-        let Some(&callee) = vm.prepared.function_by_id.get(&constructor) else {
-            vm.fail_at(&op, "native constructor is not registered");
-            return std::ptr::null_mut();
-        };
+    if op.cache != NO_INDEX {
+        let callee = op.cache;
         let caller_pc = vm.raw_pc_for_op(&op);
         unsafe { vm.advance(&op) };
         vm.flush_hot_pc();
@@ -3144,7 +3126,7 @@ unsafe extern "C" fn napalm_wfjit_specialized_factory(
         return WFJIT_BAILOUT;
     };
     let Some(opcode) = vm.program.functions.get(function_index as usize)
-        .and_then(|f| f.chunk.code.get(function.raw_pcs[op_index] as usize))
+        .and_then(|f| f.chunk.code.get(function.raw_pcs[op_index as usize] as usize))
         .and_then(|word| word.opcode()) else {
         return WFJIT_BAILOUT;
     };
