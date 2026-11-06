@@ -1091,11 +1091,11 @@ define_opcodes! {
     DefineDerivedClass = 138,
     DefineClassWithImplements = 139,
     DefineDerivedClassWithImplements = 140,
-    ImplementInterface = 141,
-    ImplementType = 142,
+    ImplementInterfaceOrType = 141,
+    ReservedImplementType = 142, // Reserved for compatibility; invalid in new programs.
     DefineArrayWithGenerics = 143,
     NewClassInstance = 144,
-    NewInterfaceObject = 145,
+    NewInterfaceOrTypeObject = 145,
     NewObjectShape = 146,
     NewObjectEmpty = 147,
     NewObjectWithProperties = 148,
@@ -1141,7 +1141,7 @@ impl Opcode {
     }
 
     pub const fn has_specialization_descriptor(self) -> bool {
-        self.is_specialized() && !matches!(self, Opcode::NewObjectEmpty | Opcode::AwaitPromise)
+        self.is_specialized() && !matches!(self, Opcode::NewObjectEmpty | Opcode::AwaitPromise | Opcode::ReservedImplementType)
     }
 }
 
@@ -1152,7 +1152,7 @@ impl Opcode {
         use Opcode::*;
         match self {
             Invoke | InvokeSuper | CallDirect | CallClosure | Launch | CallPrimitive | CallForeign
-            | MakeClosure | NewClassInstance | NewInterfaceObject | NewObjectWithProperties
+            | MakeClosure | NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
             | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
             | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
             | LaunchConcurrentTask
@@ -1164,7 +1164,7 @@ impl Opcode {
             BindInterface
             | DefineClass | DefineInterface | DefineType | DefineDerivedClass
             | DefineClassWithImplements | DefineDerivedClassWithImplements
-            | ImplementInterface | ImplementType | DefineArrayWithGenerics
+            | ImplementInterfaceOrType | DefineArrayWithGenerics
             | NewObjectShape
             | GetFieldClass | SetFieldClass | ApplyDecoratorToFunction
             | ApplyDecoratorToClass
@@ -1263,10 +1263,10 @@ impl Opcode {
                 | FiberSuspend
                 | Await
                 | Catch
-                | DefineClass | DefineInterface | DefineType | DefineDerivedClass
+                | DefineClass | DefineDerivedClass
                 | DefineClassWithImplements | DefineDerivedClassWithImplements
-                | ImplementInterface | ImplementType | DefineArrayWithGenerics
-                | NewClassInstance | NewInterfaceObject | NewObjectShape | NewObjectEmpty
+                | ImplementInterfaceOrType | DefineArrayWithGenerics
+                | NewClassInstance | NewInterfaceOrTypeObject | NewObjectShape | NewObjectEmpty
                 | NewObjectWithProperties | SetFieldShape
                 | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
                 | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
@@ -1302,7 +1302,7 @@ pub fn instruction_word_len(first: Word) -> Result<usize, DecodeError> {
         CallClosure | Launch => 2 + packed_register_word_count(first.c() as usize),
         CallPrimitive | CallForeign => 2 + packed_register_word_count(first.c() as usize),
         MakeClosure => 2 + packed_register_word_count(first.bx() as usize),
-        NewClassInstance | NewInterfaceObject | NewObjectWithProperties
+        NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
         | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
         | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
         | LaunchConcurrentTask
@@ -1493,11 +1493,11 @@ impl SpecializedDescriptor {
         match opcode {
             DefineClass | DefineDerivedClass | DefineClassWithImplements
             | DefineDerivedClassWithImplements => matches!(self, Self::Class { .. }),
-            DefineInterface | DefineType | ImplementInterface | ImplementType =>
+            DefineInterface | DefineType | ImplementInterfaceOrType =>
                 matches!(self, Self::Contract { .. }),
             DefineArrayWithGenerics => matches!(self, Self::ArrayType { .. }),
             NewClassInstance => matches!(self, Self::Instance { .. }),
-            NewInterfaceObject | NewObjectShape => matches!(self, Self::ObjectShape { .. }),
+            NewInterfaceOrTypeObject | NewObjectShape => matches!(self, Self::ObjectShape { .. }),
             NewObjectWithProperties => matches!(self, Self::ObjectProperties { .. }),
             GetFieldShape | SetFieldShape => matches!(self, Self::FieldShape { .. }),
             GetFieldClass | SetFieldClass => matches!(self, Self::FieldClass { .. }),
@@ -2077,7 +2077,7 @@ impl<'a> DecodedInstruction<'a> {
             | Opcode::Launch
             | Opcode::CallPrimitive
             | Opcode::CallForeign
-            | Opcode::NewClassInstance | Opcode::NewInterfaceObject
+            | Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
             | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect
             | Opcode::ArrayMapPacked | Opcode::ArrayFilterPacked
             | Opcode::ArrayReduceNumeric | Opcode::ArrayForEachPacked
@@ -2519,7 +2519,7 @@ impl Assembler {
             ));
         }
         let variable = matches!(opcode,
-            Opcode::NewClassInstance | Opcode::NewInterfaceObject
+            Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
             | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect
             | Opcode::ArrayMapPacked | Opcode::ArrayFilterPacked
             | Opcode::ArrayReduceNumeric | Opcode::ArrayForEachPacked
@@ -3140,15 +3140,20 @@ impl BytecodeVerifier {
                     return Err(fail("declaration requires an interned contract name"));
                 }
                 Self::verify_type(program, contract)?;
-                if matches!(op, DefineInterface | ImplementInterface)
-                    && !matches!(contract, Type::Interface(_)) {
-                    return Err(fail("interface operation requires an interface contract"));
+                if matches!(op, DefineInterface | DefineType)
+                    && !program.metadata.contract_names.iter().any(|(registered_name, registered_type)| {
+                        Some(*registered_name) == *name && registered_type == contract
+                    })
+                {
+                    return Err(fail("named declaration does not match canonical contract metadata"));
                 }
-                // Named type aliases can denote any Napalm type (including
-                // primitives and unions); only ImplementsType on an object
-                // requires an enforceable closed structural record.
-                if op == ImplementType && !matches!(contract, Type::Record(_)) {
-                    return Err(fail("ImplementType requires a closed record contract"));
+                if op == DefineInterface && !matches!(contract, Type::Interface(_)) {
+                    return Err(fail("interface declaration requires an interface contract"));
+                }
+                if op == ImplementInterfaceOrType
+                    && !matches!(contract, Type::Interface(_) | Type::Record(_))
+                {
+                    return Err(fail("ImplementInterfaceOrType requires a structural contract"));
                 }
             }
             SpecializedDescriptor::ArrayType { element, with_capacity } => {
@@ -3170,6 +3175,7 @@ impl BytecodeVerifier {
                     let ctor = program.function(*constructor)
                         .ok_or_else(|| fail("unknown class constructor"))?;
                     if ctor.kind != FunctionKind::Constructor || ctor.is_async || ctor.is_concurrent
+                        || ctor.field_owner != Some(*class)
                         || ctor.arity as usize != inst.first.c() as usize {
                         return Err(fail("constructor target/argument count does not match"));
                     }
@@ -3178,7 +3184,7 @@ impl BytecodeVerifier {
             SpecializedDescriptor::ObjectShape { layout, contract } => {
                 let shape = program.metadata.structural_layout(*layout)
                     .ok_or_else(|| fail("unknown object structural layout"))?;
-                if op == NewInterfaceObject && inst.first.c() as usize != shape.properties.len() {
+                if op == NewInterfaceOrTypeObject && inst.first.c() as usize != shape.properties.len() {
                     return Err(fail("structural initializer count disagrees with layout"));
                 }
                 if let Some(contract) = contract {
@@ -3187,8 +3193,10 @@ impl BytecodeVerifier {
                         return Err(fail("object contract disagrees with structural layout"));
                     }
                 }
-                if op == NewInterfaceObject && contract.is_none() {
-                    return Err(fail("NewInterfaceObject requires a known contract"));
+                if op == NewInterfaceOrTypeObject
+                    && !matches!(contract, Some(Type::Interface(_) | Type::Record(_)))
+                {
+                    return Err(fail("NewInterfaceOrTypeObject requires an interface or closed record"));
                 }
             }
             SpecializedDescriptor::ObjectProperties { names } => {
@@ -4157,6 +4165,9 @@ impl BytecodeVerifier {
         }
 
         match inst.opcode {
+            ReservedImplementType => {
+                return Err(VerificationError::at(inst.pc, "opcode 142 is reserved; use ImplementInterfaceOrType (141)"));
+            }
             Nop | Trap | Safepoint | OsrPoint | Breakpoint => {}
 
             Move | Swap => {
@@ -4601,7 +4612,7 @@ impl BytecodeVerifier {
                     }
                 }
             }
-            ImplementInterface | ImplementType => {
+            ImplementInterfaceOrType => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
                 if inst.first.c() != 0 {
@@ -4620,7 +4631,7 @@ impl BytecodeVerifier {
                     pc: e.pc, message: e.message,
                 })? { Self::verify_reg(function, inst.pc, r)?; }
             }
-            NewInterfaceObject | NewObjectWithProperties => {
+            NewInterfaceOrTypeObject | NewObjectWithProperties => {
                 Self::verify_reg(function, inst.pc, a)?;
                 if inst.first.b() != 0 { return Err(VerificationError::at(inst.pc, "reserved B must be zero")); }
                 for r in inst.call_arguments().map_err(|e| VerificationError {
@@ -4778,13 +4789,13 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         | ICmpLt | ICmpLe | ICmpGt | ICmpGe | FCmpEq | FCmpNe | FCmpLt
         | FCmpLe | FCmpGt | FCmpGe | RefEq => [General, General, General],
         DefineClass | DefineInterface | DefineType | DefineClassWithImplements
-        | NewObjectShape | NewObjectEmpty | NewInterfaceObject | NewObjectWithProperties =>
+        | NewObjectShape | NewObjectEmpty | NewInterfaceOrTypeObject | NewObjectWithProperties =>
             [General, None, SmallImmediate],
         DefineDerivedClass | DefineDerivedClassWithImplements => [General, General, Flag],
         GetFieldShape | SetFieldShape => [General, General, General],
         DefineArrayWithGenerics | GetFieldClass | SetFieldClass
         | ApplyDecoratorToFunction | ApplyDecoratorToClass => [General, General, None],
-        ImplementInterface | ImplementType => [General, General, None],
+        ImplementInterfaceOrType => [General, General, None],
         NewClassInstance | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
         | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
         | ArrayMapReducePacked | LaunchConcurrentTask => [General, General, SmallImmediate],
@@ -4808,7 +4819,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         FiberSuspend | FiberAbort => [General, None, None],
         WriteBarrier | ReadBarrier => [General, General, None],
         ProfileNumeric => [General, None, None],
-        Nop | Trap | Safepoint | OsrPoint | ProfileBlock | Breakpoint => [None, None, None],
+        Nop | Trap | Safepoint | OsrPoint | ProfileBlock | Breakpoint | ReservedImplementType => [None, None, None],
     }
 }
 
@@ -4817,7 +4828,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
     match opcode {
         DefineClass | DefineInterface | DefineType | DefineDerivedClass
         | DefineClassWithImplements | DefineDerivedClassWithImplements
-        | ImplementInterface | ImplementType | DefineArrayWithGenerics
+        | ImplementInterfaceOrType | DefineArrayWithGenerics
         | NewObjectShape | GetFieldClass | SetFieldClass
         | ApplyDecoratorToFunction | ApplyDecoratorToClass =>
             "x0=SpecializedDescriptor index",
@@ -4825,7 +4836,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         LoadFieldAndCall | LoadPropertyAndCall | DirectCallAndReturn | ClosureCallAndReturn | ConcurrentLaunchAndAwait => "x0=SpecializedDescriptor::Fusion, then packed registers",
         GetFieldShape | SetFieldShape =>
             "x0=SpecializedDescriptor index, x1=original PropertySlotId for slow path",
-        NewClassInstance | NewInterfaceObject | NewObjectWithProperties
+        NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
         | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked | ArrayReduceNumeric
         | ArrayForEachPacked | ArrayFilterReducePacket | ArrayMapReducePacked
         | LaunchConcurrentTask =>
@@ -5085,6 +5096,33 @@ mod tests {
         assert_eq!(decoded.opcode, Opcode::Invoke);
         assert_eq!(decoded.len_words(), 4); // header + IC + two packed words
         assert_eq!(decoded.call_arguments().unwrap(), vec![R2, R3, R4, R5, R6]);
+    }
+
+    #[test]
+    fn structural_contract_unification_retains_stable_opcode_ids() {
+        assert_eq!(Opcode::from_u8(141), Some(Opcode::ImplementInterfaceOrType));
+        assert_eq!(Opcode::from_u8(142), Some(Opcode::ReservedImplementType));
+        assert_eq!(Opcode::from_u8(145), Some(Opcode::NewInterfaceOrTypeObject));
+        assert!(Opcode::ImplementInterfaceOrType.may_gc());
+        assert!(Opcode::NewObjectWithProperties.may_gc());
+    }
+
+    #[test]
+    fn structural_object_factory_packs_four_initializer_registers() {
+        let mut assembler = Assembler::new();
+        assembler.emit_specialized(
+            Opcode::NewObjectWithProperties, R6, R0,
+            &[R1, R2, R3, R4],
+            SpecializedDescriptor::ObjectProperties {
+                names: vec![StringId(1), StringId(2), StringId(3), StringId(4)],
+            },
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let inst = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(inst.opcode, Opcode::NewObjectWithProperties);
+        assert_eq!(inst.first.c(), 4);
+        assert_eq!(inst.call_arguments().unwrap(), vec![R1, R2, R3, R4]);
+        assert_eq!(inst.len_words(), 3);
     }
 
     #[test]

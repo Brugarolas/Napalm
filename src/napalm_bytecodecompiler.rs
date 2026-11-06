@@ -44,11 +44,11 @@ use crate::napalm_bytecode::{
     DeoptLocation, ExceptionHandlerEntry, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
     LiveRegisterEntry, LiveRegisterMap, Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
-    TypeGuardId, SpecializedDescriptor, SpecializedMethod, SpecializedMethodTarget,
+    TypeGuardId, Word, SpecializedDescriptor, SpecializedMethod, SpecializedMethodTarget,
     GENERAL_REGISTER_COUNT, MAX_NAPALM_ARITY,
 };
 use crate::napalm_collections::{HashMap, HashSet};
-use crate::napalm_bytecode_optimizer::{optimization_passes, superinstruction_emission_passes, find_superinstruction_sites};
+use crate::napalm_bytecode_optimizer::{optimization_passes, find_superinstruction_sites};
 use crate::napalm_ir::{
     verify_function, BlockId, ClassId, ClassSet, Constant, DeoptId, EffectBehavior, FuncId,
     Function, FunctionKind, Inst, InstId, MethodSymbol, Program, ResumeId, SiteId, SnapshotSlot,
@@ -84,6 +84,10 @@ pub struct CompileOptions {
     /// Emit the new specialized opcodes. Requires interpreter and tracing JIT
     /// handlers before the resulting bytecode is executable. Off by default.
     pub emit_specialized_bytecode: bool,
+    /// Unsafe to enable until every remaining specialized opcode has a VM
+    /// handler. The six class/contract definitions are controlled separately
+    /// by `emit_specialized_bytecode`.
+    pub emit_unimplemented_specializations: bool,
     /// Verify the bytecode after every optimization pass in all build modes.
     pub verify_each_bytecode_pass: bool,
     /// Remove pure SSA nodes whose results cannot affect observable execution.
@@ -112,6 +116,7 @@ impl Default for CompileOptions {
             verify_bytecode: true,
             optimize_bytecode: true,
             emit_specialized_bytecode: false,
+            emit_unimplemented_specializations: false,
             verify_each_bytecode_pass: cfg!(debug_assertions),
             eliminate_dead_code: true,
             coalesce_registers: true,
@@ -138,7 +143,7 @@ pub struct FunctionCompileStats {
     pub safepoints: usize,
     pub edge_moves: usize,
     pub edge_trampolines: usize,
-    /// Specialized opcodes emitted by the compiler or the fusion pipeline.
+    /// Specialized opcodes emitted by the compiler (not regular optimizer pass).
     pub specialized_opcodes: usize,
     /// Method bindings subsumed by an atomic class definition.
     pub fused_class_method_bindings: usize,
@@ -2164,7 +2169,7 @@ impl InstanceFusionPlan {
                 let (Some(alloc), Some(call)) = (function.node(alloc_id), function.node(call_id)) else {
                     continue;
                 };
-                let Inst::AllocInstance { class: _ } = &alloc.kind else { continue; };
+                let Inst::AllocInstance { class } = &alloc.kind else { continue; };
                 let Some(&instance) = alloc.results.first() else { continue; };
                 let Inst::CallDirect { conv, callee, args } = &call.kind else { continue; };
                 if *conv != crate::napalm_ir::CallConv::Napalm
@@ -2176,6 +2181,7 @@ impl InstanceFusionPlan {
                     continue;
                 };
                 if target.kind != FunctionKind::Constructor
+                    || target.field_owner != Some(*class)
                     || target.is_async || target.is_concurrent
                     || target.signature.params.len() != args.len()
                 {
@@ -2210,6 +2216,113 @@ impl InstanceFusionPlan {
     }
 }
 
+/// Whole literal construction is fused only when every MapSet is adjacent
+/// to its allocation in the same block, all keys are compile-time strings,
+/// and no covered node is a resume point. Values are evaluated before
+/// allocation, so this transformation preserves evaluation and exception order.
+#[derive(Clone)]
+struct ObjectFusion {
+    names: Vec<StringId>,
+    values: Vec<ValueId>,
+    contract: Option<(crate::napalm_ir::StructuralLayoutId, Type)>,
+    null_shape: Option<crate::napalm_ir::StructuralLayoutId>,
+}
+
+#[derive(Default)]
+struct ObjectFusionPlan {
+    by_allocation: HashMap<InstId, ObjectFusion>,
+    suppressed_sets: HashSet<InstId>,
+    suppressed_bindings: HashMap<InstId, ValueId>,
+}
+
+impl ObjectFusionPlan {
+    fn constant_of<'a>(function: &'a Function, value: ValueId) -> Option<&'a Constant> {
+        let ValueDef::InstResult(inst, _) = function.value(value)?.def else { return None; };
+        match &function.node(inst)?.kind {
+            Inst::Const(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn build(program: &Program, function: &Function, options: &CompileOptions) -> Self {
+        let mut result = Self::default();
+        if !options.emit_specialized_bytecode { return result; }
+        let mut protected = HashSet::default();
+        for binding in options.resume_bindings.values() {
+            if binding.function == function.id {
+                if let ResumeTarget::BeforeInst(id) | ResumeTarget::AfterInst(id) = binding.target {
+                    protected.insert(id);
+                }
+            }
+        }
+        for block in &function.blocks {
+            let ids = &block.insts;
+            for (start, &allocation_id) in ids.iter().enumerate() {
+                if protected.contains(&allocation_id) || result.by_allocation.contains_key(&allocation_id) {
+                    continue;
+                }
+                let Some(allocation) = function.node(allocation_id) else { continue; };
+                if !matches!(&allocation.kind, Inst::AllocMap) { continue; }
+                let Some(&map) = allocation.results.first() else { continue; };
+                let mut names = Vec::new();
+                let mut values = Vec::new();
+                let mut sets = Vec::new();
+                let mut following = start + 1;
+                while following < ids.len() && values.len() < MAX_NAPALM_ARITY {
+                    let id = ids[following];
+                    if protected.contains(&id) || result.suppressed_sets.contains(&id) { break; }
+                    let Some(node) = function.node(id) else { break; };
+                    let Inst::MapSet { map: receiver, key, value } = &node.kind else { break; };
+                    if *receiver != map { break; }
+                    let Some(Constant::String(name)) = Self::constant_of(function, *key) else { break; };
+                    names.push(*name);
+                    values.push(*value);
+                    sets.push(id);
+                    following += 1;
+                }
+                let mut bound = None;
+                if following < ids.len() && !protected.contains(&ids[following]) {
+                    if let Some(node) = function.node(ids[following]) {
+                        if let Inst::BindInterface { value, expected, layout: Some(layout) } = &node.kind {
+                            if *value == map && matches!(expected, Type::Interface(_) | Type::Record(_)) {
+                                if let Some(shape) = program.structural_layout(*layout) {
+                                    // Preserve key insertion order and optional-field presence.
+                                    if shape.properties.len() == names.len()
+                                        && shape.properties.iter().zip(&names).all(|(field, name)| field.name == *name)
+                                        && shape.contract == *expected
+                                    {
+                                        bound = Some((ids[following], *layout, expected.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if sets.is_empty() && bound.is_none() { continue; }
+                let null_shape = if bound.is_none()
+                    && !names.is_empty()
+                    && values.iter().all(|&value| matches!(Self::constant_of(function, value), Some(Constant::Null)))
+                {
+                    program.structural_layouts.iter().find(|shape| {
+                        shape.properties.len() == names.len()
+                            && shape.properties.iter().zip(&names).all(|(field, name)| field.name == *name)
+                    }).map(|shape| shape.id)
+                } else { None };
+                result.suppressed_sets.extend(sets);
+                if let Some((binding, _, _)) = &bound {
+                    result.suppressed_bindings.insert(*binding, map);
+                }
+                result.by_allocation.insert(allocation_id, ObjectFusion {
+                    names, values,
+                    contract: bound.map(|(_, layout, ty)| (layout, ty)),
+                    null_shape,
+                });
+            }
+        }
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CopySource {
     General(Reg),
@@ -2236,6 +2349,7 @@ struct FunctionEmitter<'a> {
     stats: FunctionCompileStats,
     class_fusions: ClassFusionPlan,
     instance_fusions: InstanceFusionPlan,
+    object_fusions: ObjectFusionPlan,
 }
 
 impl<'a> FunctionEmitter<'a> {
@@ -2256,6 +2370,7 @@ impl<'a> FunctionEmitter<'a> {
             .collect::<Vec<_>>();
         let class_fusions = ClassFusionPlan::build(function, options);
         let instance_fusions = InstanceFusionPlan::build(program, function, options);
+        let object_fusions = ObjectFusionPlan::build(program, function, options);
         Self {
             program,
             function,
@@ -2280,6 +2395,7 @@ impl<'a> FunctionEmitter<'a> {
             trampolines: Vec::new(),
             class_fusions,
             instance_fusions,
+            object_fusions,
             stats: FunctionCompileStats {
                 function: function.id,
                 hir_nodes: function.nodes.len(),
@@ -2557,7 +2673,7 @@ impl<'a> FunctionEmitter<'a> {
             ImportModule | ImportVariable => SafepointKind::Module,
             Await | AwaitPromise | MakeFiber | FiberCall | FiberTry | FiberTransfer
             | FiberTransferError | FiberYield | FiberSuspend => SafepointKind::FiberSwitch,
-            BindMethod | BindForeignMethod | ImplementInterface | ImplementType
+            BindMethod | BindForeignMethod | ImplementInterfaceOrType
             | SetFieldShape | ListAppend | ListInsert | MapSet | StoreProperty
             | StorePropertyIfPresent => {
                 SafepointKind::RuntimeMutation
@@ -2902,7 +3018,17 @@ impl FunctionEmitter<'_> {
     ) -> Result<(), CompileError> {
         use Inst::*;
 
-        if self.instance_fusions.suppressed_calls.contains(&node.id) {
+        if self.instance_fusions.suppressed_calls.contains(&node.id)
+            || self.object_fusions.suppressed_sets.contains(&node.id)
+        {
+            return Ok(());
+        }
+        if let Some(&original_map) = self.object_fusions.suppressed_bindings.get(&node.id) {
+            let destination = self.result_reg(node)?;
+            let source = self.reg(original_map)?;
+            if destination != source {
+                self.assembler.emit_move(destination, source);
+            }
             return Ok(());
         }
         if self.class_fusions.suppressed_bindings.contains(&node.id) {
@@ -2963,11 +3089,7 @@ impl FunctionEmitter<'_> {
                 if self.options.emit_specialized_bytecode
                     && matches!(expected, Type::Interface(_) | Type::Record(_))
                 {
-                    let opcode = if matches!(expected, Type::Interface(_)) {
-                        Opcode::ImplementInterface
-                    } else {
-                        Opcode::ImplementType
-                    };
+                    let opcode = Opcode::ImplementInterfaceOrType;
                     let descriptor = SpecializedDescriptor::Contract {
                         name: None,
                         contract: expected.clone(),
@@ -3062,6 +3184,12 @@ impl FunctionEmitter<'_> {
                     .map(|value| self.reg(*value))
                     .collect::<Result<Vec<_>, _>>()?;
                 let specialized = if self.options.emit_specialized_bytecode {
+                    self.specialize_method_call(*receiver, *site, *method, cache)
+                        .filter(|(opcode, _)| {
+                            *opcode == Opcode::InvokeMethodDirect
+                                || self.options.emit_unimplemented_specializations
+                        })
+                } else if self.options.emit_unimplemented_specializations {
                     self.specialize_method_call(*receiver, *site, *method, cache)
                 } else {
                     None
@@ -3160,7 +3288,7 @@ impl FunctionEmitter<'_> {
                 }).filter(|id| self.program.functions.iter().any(|function| {
                     function.id == *id && function.is_concurrent
                 }));
-                let pc = if let (true, Some(function)) = (self.options.emit_specialized_bytecode, target) {
+                let pc = if let (true, Some(function)) = (self.options.emit_unimplemented_specializations, target) {
                     self.stats.specialized_opcodes += 1;
                     self.assembler.emit_specialized(
                         Opcode::LaunchConcurrentTask, self.result_reg(node)?,
@@ -3600,7 +3728,31 @@ impl FunctionEmitter<'_> {
             ),
 
             AllocMap => {
-                if self.options.emit_specialized_bytecode {
+                if let Some(fusion) = self.object_fusions.by_allocation.get(&node.id).cloned() {
+                    self.stats.specialized_opcodes += 1;
+                    if let Some((layout, contract)) = fusion.contract {
+                        let args = fusion.values.iter().map(|value| self.reg(*value))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        self.assembler.emit_specialized(
+                            Opcode::NewInterfaceOrTypeObject, self.result_reg(node)?, Reg(0),
+                            &args, SpecializedDescriptor::ObjectShape {
+                                layout, contract: Some(contract),
+                            },
+                        ).map_err(|error| self.assemble_error(error))?
+                    } else if let Some(layout) = fusion.null_shape {
+                        self.assembler.emit_specialized(
+                            Opcode::NewObjectShape, self.result_reg(node)?, Reg(0),
+                            &[], SpecializedDescriptor::ObjectShape { layout, contract: None },
+                        ).map_err(|error| self.assemble_error(error))?
+                    } else {
+                        let args = fusion.values.iter().map(|value| self.reg(*value))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        self.assembler.emit_specialized(
+                            Opcode::NewObjectWithProperties, self.result_reg(node)?, Reg(0),
+                            &args, SpecializedDescriptor::ObjectProperties { names: fusion.names },
+                        ).map_err(|error| self.assemble_error(error))?
+                    }
+                } else if self.options.emit_specialized_bytecode {
                     self.stats.specialized_opcodes += 1;
                     self.assembler.emit_a(Opcode::NewObjectEmpty, self.result_reg(node)?.0)
                 } else {
@@ -3777,7 +3929,7 @@ impl FunctionEmitter<'_> {
                 let known_promise = self.function.value(*promise).is_some_and(|value| {
                     matches!(&value.ty, Type::Builtin(crate::napalm_ir::BuiltinId::Promise, _))
                 });
-                let opcode = if self.options.emit_specialized_bytecode && known_promise {
+                let opcode = if self.options.emit_unimplemented_specializations && known_promise {
                     self.stats.specialized_opcodes += 1;
                     Opcode::AwaitPromise
                 } else {
@@ -4381,6 +4533,91 @@ fn finalize_deopts(
     Ok(())
 }
 
+/// Insert module-owned contract declarations before the first original
+/// instruction. The runtime already has canonical contract_names; these
+/// explicit bytecodes verify that metadata without creating new identities.
+///
+/// All word PCs in metadata are shifted, including cross-function inlined
+/// deoptimization frames. Relative branch displacements are unchanged because
+/// both source and destination move by the same constant within the function.
+fn prepend_contract_declarations(
+    hir: &Program,
+    program: &mut BytecodeProgram,
+) -> Result<(), CompileError> {
+    use crate::napalm_ir::{ContractDeclarationKind, FunctionKind};
+
+    let mut shifts: HashMap<FuncId, u32> = HashMap::default();
+    for function in &mut program.functions {
+        if function.kind != FunctionKind::ModuleBody { continue; }
+        let declarations = hir.contract_declarations.iter()
+            .filter(|decl| decl.module == function.module)
+            .collect::<Vec<_>>();
+        if declarations.is_empty() { continue; }
+
+        let mut prefix = Vec::with_capacity(declarations.len() * 2);
+        for decl in declarations {
+            let opcode = match decl.kind {
+                ContractDeclarationKind::Interface => Opcode::DefineInterface,
+                ContractDeclarationKind::Type => Opcode::DefineType,
+            };
+            let descriptor = SpecializedDescriptor::Contract {
+                name: Some(decl.name),
+                contract: decl.contract.clone(),
+            };
+            let id = function.chunk.push_specialization(descriptor);
+            prefix.push(Word::abc(opcode, 0, 0, 0));
+            prefix.push(Word(id));
+        }
+        let shift = u32::try_from(prefix.len()).map_err(|_| CompileError::Internal {
+            function: Some(function.id),
+            message: "contract prelude word count overflows u32".into(),
+        })?;
+        if function.chunk.code.len() > (u32::MAX - shift) as usize {
+            return Err(CompileError::Internal {
+                function: Some(function.id),
+                message: "contract prelude exceeds bytecode PC range".into(),
+            });
+        }
+        prefix.extend(std::mem::take(&mut function.chunk.code));
+        function.chunk.code = prefix;
+        function.frame.general_register_count = function.frame.general_register_count.max(1);
+        shifts.insert(function.id, shift);
+    }
+
+    for function in &mut program.functions {
+        let shift = shifts.get(&function.id).copied().unwrap_or(0);
+        let bump = |pc: &mut BytecodePc, shift: u32| {
+            pc.0 += shift;
+        };
+        if shift != 0 {
+            let chunk = &mut function.chunk;
+            for table in &mut chunk.switch_tables {
+                bump(&mut table.default_target, shift);
+                for case in &mut table.cases { bump(&mut case.target, shift); }
+            }
+            for entry in &mut chunk.safepoints { bump(&mut entry.pc, shift); }
+            for entry in &mut chunk.live_registers { bump(&mut entry.pc, shift); }
+            for entry in &mut chunk.resume_points { bump(&mut entry.pc, shift); }
+            for entry in &mut chunk.source_map {
+                bump(&mut entry.start_pc, shift);
+                bump(&mut entry.end_pc, shift);
+            }
+            for entry in &mut chunk.exception_handlers {
+                bump(&mut entry.start_pc, shift);
+                bump(&mut entry.end_pc, shift);
+                bump(&mut entry.handler_pc, shift);
+            }
+        }
+        for point in &mut function.chunk.deopts {
+            bump(&mut point.resume_pc, shift);
+            for frame in &mut point.inlined_frames {
+                bump(&mut frame.resume_pc, shifts.get(&frame.function).copied().unwrap_or(0));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn compile_program_impl(
     hir: &Program,
     options: &CompileOptions,
@@ -4407,8 +4644,21 @@ fn compile_program_impl(
     }
 
     finalize_deopts(hir, &mut bytecode, &infos, options)?;
+    if options.emit_specialized_bytecode {
+        prepend_contract_declarations(hir, &mut bytecode)?;
+    }
     bytecode.rebuild_indexes().map_err(CompileError::Metadata)?;
 
+    stats.total_bytecode_words = bytecode.functions.iter().map(|function| function.chunk.code.len()).sum();
+    for entry in &mut stats.functions {
+        if let Some(function) = bytecode.function(entry.function) {
+            entry.bytecode_words = function.chunk.code.len();
+            entry.general_registers = function.frame.general_register_count;
+        }
+    }
+    stats.max_general_registers = bytecode.functions.iter()
+        .map(|function| function.frame.general_register_count)
+        .max().unwrap_or(0);
     stats.bytecode_words_before_optimization = stats.total_bytecode_words;
     if options.optimize_bytecode {
         let report = optimization_passes()
@@ -4426,42 +4676,8 @@ fn compile_program_impl(
         }
     }
 
-    // The standard optimizer only emits opcodes supported by the existing VM.
-    // The optional second pipeline emits multi-operation native dispatches and
-    // relocates all affected PC-indexed metadata. This must run after the HIR
-    // compiler has finished all cross-function deopt fixups.
-    if options.emit_specialized_bytecode {
-        let before = bytecode.functions.iter()
-            .map(|function| function.chunk.code.len()).sum::<usize>();
-        let report = superinstruction_emission_passes()
-            .verify_after_each_pass(options.verify_each_bytecode_pass)
-            .optimize_program(&mut bytecode)
-            .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?;
-        stats.bytecode_words_removed += report.words_removed;
-        stats.bytecode_passes_changed += report.passes_changed;
-        stats.total_bytecode_words = report.output_words;
-        for function_stats in &mut stats.functions {
-            if let Some(function) = bytecode.function(function_stats.function) {
-                function_stats.bytecode_words = function.chunk.code.len();
-                function_stats.safepoints = function.chunk.safepoints.len();
-            }
-        }
-        debug_assert!(report.output_words <= before);
-    }
     stats.superinstruction_candidates_detected = find_superinstruction_sites(&bytecode)
         .map_err(|e| CompileError::BytecodeVerification(e.to_string()))?.len();
-
-    if options.emit_specialized_bytecode {
-        use crate::napalm_bytecode::Decoder;
-        for item in &mut stats.functions {
-            if let Some(function) = bytecode.function(item.function) {
-                item.specialized_opcodes = Decoder::new(&function.chunk.code)
-                    .filter_map(|decoded| decoded.ok())
-                    .filter(|decoded| decoded.opcode.is_specialized())
-                    .count();
-            }
-        }
-    }
 
     if options.verify_bytecode {
         BytecodeVerifier::verify_program(&bytecode)
@@ -4694,4 +4910,80 @@ mod tests {
         assert!(output.stats.functions[0].eliminated_hir_nodes >= 2);
         BytecodeVerifier::verify_program(&output.program).expect("bytecode must verify");
     }
+
+    #[test]
+    fn contract_prologue_keeps_alias_declaration_kind_and_relocates_pcs() {
+        use crate::napalm_bytecode::{
+            BytecodeChunk, BytecodeFunction, BytecodeDeoptPoint, FrameLayout,
+            LiveRegisterMap, RegisterKind, ResumeEntry, SwitchTable, SwitchTarget,
+        };
+        use crate::napalm_ir::{
+            ContractDeclaration, ContractDeclarationKind, MemoizationKind, ModuleId,
+        };
+
+        let mut hir = Program::new();
+        let module = hir.add_module("test", 0);
+        let interface_name = hir.intern_string("Contract");
+        let alias_name = hir.intern_string("Alias");
+        // Both resolve to Interface, but the alias must emit DefineType.
+        let contract = Type::Interface(Vec::new());
+        hir.contract_declarations.extend([
+            ContractDeclaration {
+                module, name: interface_name, contract: contract.clone(),
+                kind: ContractDeclarationKind::Interface,
+            },
+            ContractDeclaration {
+                module, name: alias_name, contract,
+                kind: ContractDeclarationKind::Type,
+            },
+        ]);
+
+        let mut chunk = BytecodeChunk::default();
+        chunk.code = vec![
+            Word::abc(Opcode::LoadNull, 0, 0, 0),
+            Word::abc(Opcode::Return, 0, 0, 0),
+        ];
+        chunk.resume_points.push(ResumeEntry {
+            id: ResumeId(0), pc: BytecodePc(1),
+        });
+        chunk.deopts.push(BytecodeDeoptPoint {
+            id: DeoptId(0), resume_pc: BytecodePc(1),
+            slots: vec![], inlined_frames: vec![],
+        });
+        chunk.live_registers.push(LiveRegisterEntry {
+            pc: BytecodePc(0), live: LiveRegisterMap::default(),
+            constants: vec![], types: vec![],
+        });
+        chunk.switch_tables.push(SwitchTable {
+            default_target: BytecodePc(0),
+            cases: vec![SwitchTarget { value: 1, target: BytecodePc(1) }],
+        });
+
+        let mut bytecode = BytecodeProgram::new();
+        bytecode.push_function(BytecodeFunction {
+            id: FuncId(0), module, kind: FunctionKind::ModuleBody,
+            is_async: false, is_concurrent: false,
+            memoization: MemoizationKind::None, field_owner: None,
+            name: interface_name, arity: 0, result_type: Type::Top,
+            capture_count: 0,
+            frame: FrameLayout {
+                general_register_count: 0, parameters: vec![], captures: vec![],
+                return_kind: RegisterKind::Value,
+            },
+            chunk,
+        }).unwrap();
+        prepend_contract_declarations(&hir, &mut bytecode).unwrap();
+        let function = &bytecode.functions[0];
+        assert_eq!(function.chunk.code[0].opcode(), Some(Opcode::DefineInterface));
+        assert_eq!(function.chunk.code[2].opcode(), Some(Opcode::DefineType));
+        assert_eq!(function.chunk.code[4].opcode(), Some(Opcode::LoadNull));
+        assert_eq!(function.chunk.code[5].opcode(), Some(Opcode::Return));
+        assert_eq!(function.frame.general_register_count, 1);
+        assert_eq!(function.chunk.resume_points[0].pc, BytecodePc(5));
+        assert_eq!(function.chunk.deopts[0].resume_pc, BytecodePc(5));
+        assert_eq!(function.chunk.live_registers[0].pc, BytecodePc(4));
+        assert_eq!(function.chunk.switch_tables[0].default_target, BytecodePc(4));
+        assert_eq!(function.chunk.switch_tables[0].cases[0].target, BytecodePc(5));
+    }
+
 }

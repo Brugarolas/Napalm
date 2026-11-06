@@ -2301,6 +2301,22 @@ impl Function {
     }
 }
 
+/// Source declaration identity. A `type Alias = InterfaceName` remains a
+/// DefineType even when its resolved structural value is an Interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractDeclarationKind {
+    Interface,
+    Type,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContractDeclaration {
+    pub module: ModuleId,
+    pub name: StringId,
+    pub contract: Type,
+    pub kind: ContractDeclarationKind,
+}
+
 #[derive(Default)]
 pub struct Program {
     next_func: u32,
@@ -2323,6 +2339,9 @@ pub struct Program {
     /// Source names of declared interfaces and type aliases with their
     /// resolved contract, so the runtime can name contracts (`typeof`).
     pub contract_names: Vec<(StringId, Type)>,
+    /// Source declarations retained for optional DefineInterface/DefineType
+    /// bytecode at the owning module's entry, rather than guessing from Type.
+    pub contract_declarations: Vec<ContractDeclaration>,
 
     strings: Vec<CompactString>,
     string_index: HashMap<CompactString, StringId>,

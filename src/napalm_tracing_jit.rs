@@ -198,6 +198,13 @@ unsafe extern "C" fn native_decode_napalm_code_point(
 
 unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize) {}
 
+// Unit-test-only callbacks for tests without a live VM heap.
+#[cfg(test)]
+unsafe extern "C" fn test_factory_probe(_: *mut TraceActivation, _: u32, _: u32) -> u32 { 0 }
+#[cfg(test)]
+unsafe extern "C" fn test_factory_commit(_: *mut TraceActivation, _: u32, _: u32, _: u32, _: u64) -> u32 { 1 }
+
+
 // =============================================================================
 // Native trace ABI
 // =============================================================================
@@ -233,6 +240,10 @@ pub const TRACE_RUNTIME_MODE_DIRECT_CALL: u32 = 12 << TRACE_RUNTIME_MODE_SHIFT;
 /// prepared AllocMap + MapSet superinstruction and resumes after the complete
 /// literal, so generated traces pay one GC/runtime boundary instead of N+1.
 pub const TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL: u32 = 13 << TRACE_RUNTIME_MODE_SHIFT;
+/// Execute a verified structural-object factory directly through the prepared
+/// allocation core, avoiding baseline bytecode redispatch in both JIT tiers.
+pub const TRACE_RUNTIME_MODE_OBJECT_FACTORY: u32 = 14 << TRACE_RUNTIME_MODE_SHIFT;
+pub const TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY: u32 = 15 << TRACE_RUNTIME_MODE_SHIFT;
 
 /// Direct-call scratch describes closure ABI rather than method/receiver ABI.
 /// The source opcode may be CallClosure or an Invoke("call") proven to resolve
@@ -421,6 +432,15 @@ pub struct TraceActivation {
     /// dispatcher checks it on every trace link and yields to the manager, so
     /// trace trees that never leave the dispatcher still pick up the new tier.
     pub tier_up_pending: *const u32,
+    /// Current Immix TLAB addresses for allocation fast paths. These are
+    /// refreshed after every runtime boundary and before native trace entry.
+    pub factory_cursor: *mut usize,
+    pub factory_limit: *mut usize,
+    pub factory_bytes: usize,
+    pub factory_alignment: usize,
+    /// Side-effect-free specialization probe, followed by non-safepoint commit.
+    pub factory_probe: NativeFactoryProbeFn,
+    pub factory_commit: NativeFactoryCommitFn,
 }
 
 /// Default `tier_up_pending` target when no upgraded tier exists.
@@ -456,6 +476,12 @@ impl TraceActivation {
             result_code: TRACE_RESULT_CONTINUE,
             native_iterations: 0,
             tier_up_pending: NO_TIER_UP_PENDING.as_ptr() as *const u32,
+            factory_cursor: inputs.factory_cursor,
+            factory_limit: inputs.factory_limit,
+            factory_bytes: inputs.factory_bytes,
+            factory_alignment: inputs.factory_alignment,
+            factory_probe: inputs.factory_probe,
+            factory_commit: inputs.factory_commit,
         }
     }
 
@@ -477,11 +503,19 @@ pub struct TraceActivationInputs {
     pub execute: RuntimeTraceFn,
     pub heap_chunks: *const *mut TraceHeapEntry,
     pub heap_write_barrier: HeapWriteBarrierFn,
+    pub factory_cursor: *mut usize,
+    pub factory_limit: *mut usize,
+    pub factory_bytes: usize,
+    pub factory_alignment: usize,
+    pub factory_probe: NativeFactoryProbeFn,
+    pub factory_commit: NativeFactoryCommitFn,
 }
 
 pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation, *const u32) -> u32;
 pub type NativeDispatcherFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
 pub type RuntimeTraceFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32) -> u32;
+pub type NativeFactoryProbeFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32) -> u32;
+pub type NativeFactoryCommitFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32, u64) -> u32;
 
 /// For executables: call once at startup. Background LLVM compiler workers are
 /// then detached (not joined) when a VM is dropped, so program exit never waits
@@ -1344,6 +1378,7 @@ fn decode_at(
             | Opcode::Launch
             | Opcode::CallPrimitive
             | Opcode::CallForeign
+            | Opcode::InvokeMethodDirect
     ) {
         let count = first.c() as usize;
         args.reserve(count);
@@ -1935,6 +1970,7 @@ impl<'a> TraceRecorder<'a> {
                     | TRACE_RUNTIME_MODE_LIST_APPEND
                     | TRACE_RUNTIME_MODE_LIST_INSERT
                     | TRACE_RUNTIME_MODE_MAP_SET
+                    | TRACE_RUNTIME_MODE_OBJECT_FACTORY
             )
             || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
         {
@@ -2606,7 +2642,8 @@ impl<'a> TraceRecorder<'a> {
                 let terminal = matches!(op.opcode,
                     Opcode::Trap | Opcode::Return | Opcode::Return2 | Opcode::Bailout
                     | Opcode::Switch | Opcode::Invoke | Opcode::InvokeSpread | Opcode::InvokeSuper
-                    | Opcode::CallDirect | Opcode::CallClosure | Opcode::Launch | Opcode::ImportModule
+                    | Opcode::CallDirect | Opcode::CallClosure | Opcode::InvokeMethodDirect
+                    | Opcode::Launch | Opcode::ImportModule
                     | Opcode::FiberCall | Opcode::FiberTry | Opcode::FiberTransfer
                     | Opcode::FiberTransferError | Opcode::FiberYield | Opcode::FiberSuspend
                     | Opcode::FiberAbort | Opcode::Await);
@@ -2724,7 +2761,8 @@ impl<'a> TraceRecorder<'a> {
                 } else {
                     *builder = checkpoint;
                 }
-                builder.runtime_call(op.location, op.next_pc);
+                builder.runtime_call(op.location,
+                    BytecodePc(op.next_pc.0 | TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY));
                 Ok(ExpectedStep::RuntimeCall)
             }
             Err(error) => Err(error),
@@ -4248,6 +4286,45 @@ impl<'a> TraceRecorder<'a> {
 
             Bailout => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
+            // The specialized bytecodes are alternative encodings of existing
+            // semantic operations. Decode their immutable descriptors once while
+            // recording, then feed the existing native Trace IR lowering. Its
+            // shape/PIC guards, write barrier, read types and side exits remain
+            // identical. In particular, a failed guard replays the *specialized*
+            // opcode PC in the baseline VM, not a synthetic legacy PC.
+            GetFieldClass | SetFieldClass => {
+                let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { .. }) =
+                    function.chunk.specializations.get(op.x as usize)
+                else { return Err(RecordingAbort::UnsupportedOpcode(op.opcode)); };
+                let mut equivalent = op.clone();
+                equivalent.opcode = if op.opcode == GetFieldClass { LoadField } else { StoreField };
+                // trace_field_slot consults the relocated PreparedOp at this PC.
+                self.translate_native(runtime, program, function, &equivalent, builder)
+            }
+            GetFieldShape | SetFieldShape => {
+                let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldShape { layout, slot }) =
+                    function.chunk.specializations.get(op.x as usize)
+                else { return Err(RecordingAbort::UnsupportedOpcode(op.opcode)); };
+                let mut equivalent = op.clone();
+                equivalent.opcode = if op.opcode == GetFieldShape { LoadProperty } else { StoreProperty };
+                equivalent.x = layout.0;
+                equivalent.y = slot.0 as u32;
+                self.translate_native(runtime, program, function, &equivalent, builder)
+            }
+            InvokeMethodDirect => {
+                let Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod {
+                    fallback_cache, ..
+                }) = function.chunk.specializations.get(op.x as usize)
+                else { return Err(RecordingAbort::UnsupportedOpcode(op.opcode)); };
+                let mut equivalent = op.clone();
+                equivalent.opcode = Invoke;
+                equivalent.x = fallback_cache.0;
+                // Existing direct-call lowering checks the effective receiver
+                // method, class and method_epoch, and may inline a known body.
+                // If those proofs fail it records the exact dynamic fallback.
+                self.translate_native(runtime, program, function, &equivalent, builder)
+            }
+
             Invoke => {
                 if self.record_num_invoke(runtime, program, function, op, builder)?
                     || self.record_list_invoke(runtime, op, builder)?
@@ -5674,9 +5751,48 @@ impl<'a> TraceRecorder<'a> {
                 Ok(step)
             }
 
+            // Structural installation is transactional in the VM. Creation
+            // opcodes allocate complete, GC-rooted objects before publication;
+            // the trace keeps its unrelated SSA values across one GC boundary.
+            // LLVM uses the same TraceInst::Runtime GC-leaf ABI as Cranelift.
+            ImplementInterfaceOrType => self.runtime_gc_leaf(
+                op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+            DefineArrayWithGenerics => self.runtime_gc_specialized(
+                op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
+                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+            NewInterfaceOrTypeObject | NewObjectShape
+            | NewObjectEmpty | NewObjectWithProperties => self.runtime_gc_specialized(
+                op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
+                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+            NewClassInstance => {
+                // The constructor may grow the interpreter register stack.
+                // RuntimeCall is the only safe trace boundary; its native mode
+                // first attempts an inline Immix reservation and then executes
+                // the constructor, refreshing the register pointers on return.
+                builder.runtime_call(op.location,
+                    BytecodePc(op.next_pc.0 | TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY));
+                Ok(ExpectedStep::RuntimeCall)
+            }
+
             // Class creation/binding changes global layout or method-table epochs.
             // Keep those rare structural operations as full runtime boundaries.
-            CreateClass | BindMethod | BindForeignMethod => {
+            // Declarations are pure metadata assertions once BytecodeVerifier
+            // has checked their canonical names/types. No native instruction or
+            // runtime call is required in either Cranelift or LLVM.
+            DefineInterface | DefineType => Ok(ExpectedStep::Exact(next)),
+
+            CreateClass | BindMethod | BindForeignMethod
+            | DefineClass | DefineDerivedClass
+            | DefineClassWithImplements | DefineDerivedClassWithImplements => {
+                // Class linking can relocate field slots and invalidate method
+                // epochs. A full runtime transition preserves GC/deopt state and
+                // is lowered by BOTH Cranelift and LLVM through TraceInst::Runtime.
+                // The class definition itself is one interpreter dispatch and
+                // one JIT runtime call; the absorbed method bindings are NOT
+                // replayed as individual bytecodes.
                 builder.runtime(op.location, op.next_pc, false);
                 Ok(ExpectedStep::Runtime { terminal: false })
             }
@@ -5692,6 +5808,10 @@ impl<'a> TraceRecorder<'a> {
             | FiberSuspend
             | Launch
             | FiberAbort => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
+
+            // The remaining specialized opcodes are intentionally unrecordable
+            // until their interpreter and trace semantics are implemented.
+            _ => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
         }
     }
 
@@ -6908,6 +7028,8 @@ struct CraneliftLoweringState<'a, 'p> {
     current_links: Value,
     pointer_type: ClifType,
     runtime_signature: codegen::ir::SigRef,
+    factory_probe_signature: codegen::ir::SigRef,
+    factory_commit_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
     /// Direct CLIF references to JITModule-imported scalar helpers.
     scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
@@ -7203,6 +7325,20 @@ impl<'a> CraneliftTraceCompiler<'a> {
         runtime_signature.params.push(AbiParam::new(types::I32));
         runtime_signature.returns.push(AbiParam::new(types::I32));
 
+        let mut factory_probe_signature = module.make_signature();
+        factory_probe_signature.params.push(AbiParam::new(pointer_type));
+        factory_probe_signature.params.push(AbiParam::new(types::I32));
+        factory_probe_signature.params.push(AbiParam::new(types::I32));
+        factory_probe_signature.returns.push(AbiParam::new(types::I32));
+
+        let mut factory_commit_signature = module.make_signature();
+        factory_commit_signature.params.push(AbiParam::new(pointer_type));
+        factory_commit_signature.params.push(AbiParam::new(types::I32));
+        factory_commit_signature.params.push(AbiParam::new(types::I32));
+        factory_commit_signature.params.push(AbiParam::new(types::I32));
+        factory_commit_signature.params.push(AbiParam::new(types::I64));
+        factory_commit_signature.returns.push(AbiParam::new(types::I32));
+
         let mut heap_barrier_signature = module.make_signature();
         heap_barrier_signature.params.push(AbiParam::new(pointer_type));
         heap_barrier_signature.params.push(AbiParam::new(pointer_type));
@@ -7226,6 +7362,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
             let activation = builder.block_params(entry_block)[0];
             let current_links = builder.block_params(entry_block)[1];
             let runtime_signature = builder.import_signature(runtime_signature);
+            let factory_probe_signature = builder.import_signature(factory_probe_signature);
+            let factory_commit_signature = builder.import_signature(factory_commit_signature);
             let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
             let scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef> = scalar_helpers
                 .iter()
@@ -7241,6 +7379,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 current_links,
                 pointer_type,
                 runtime_signature,
+                factory_probe_signature,
+                factory_commit_signature,
                 heap_barrier_signature,
                 scalar_helper_refs,
                 values: arena.alloc_slice_fill_copy(self.trace.values.len(), None),
@@ -9148,6 +9288,82 @@ impl CraneliftLoweringState<'_, '_> {
         Ok(())
     }
 
+    /// Emit the Immix TLAB bump operation in generated machine code. This is
+    /// shared by all factory opcodes; the no-GC commit callback only installs the
+    /// already-reserved object and its GC handle. The ordinary VM factory is
+    /// preserved as a cold fallback for polymorphic shapes and allocations with
+    /// external storage or unknown layouts.
+    fn native_factory_runtime_status(
+        &mut self, function_id: u32, pc_word: u32, encoded_next: u32,
+    ) -> Value {
+        let function = self.builder.ins().iconst(types::I32, function_id as i64);
+        let pc = self.builder.ins().iconst(types::I32, pc_word as i64);
+        let next = self.builder.ins().iconst(types::I32, encoded_next as i64);
+        let probe_callee = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_probe) as i32);
+        let probe = self.builder.ins().call_indirect(self.factory_probe_signature, probe_callee,
+            &[self.activation, function, pc]);
+        let allowed = self.builder.inst_results(probe)[0];
+
+        let try_fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let commit = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(commit, self.pointer_type);
+        self.builder.append_block_param(done, types::I32);
+        let permitted = self.builder.ins().icmp_imm(IntCC::NotEqual, allowed, 0);
+        self.builder.ins().brif(permitted, try_fast, &[], slow, &[]);
+
+        self.builder.switch_to_block(try_fast);
+        let cursor_addr = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_cursor) as i32);
+        let limit_addr = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_limit) as i32);
+        let alignment = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_alignment) as i32);
+        let bytes = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_bytes) as i32);
+        let cursor = self.builder.ins().load(self.pointer_type, Self::trusted_mem(), cursor_addr, 0);
+        let limit = self.builder.ins().load(self.pointer_type, Self::trusted_mem(), limit_addr, 0);
+        let one = self.builder.ins().iconst(self.pointer_type, 1);
+        let align_minus_one = self.builder.ins().isub(alignment, one);
+        let biased = self.builder.ins().iadd(cursor, align_minus_one);
+        let neg_alignment = self.builder.ins().ineg(alignment);
+        let aligned = self.builder.ins().band(biased, neg_alignment);
+        let new_cursor = self.builder.ins().iadd(aligned, bytes);
+        let fits = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_cursor, limit);
+        let no_overflow = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, new_cursor, aligned);
+        let alignment_ok = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, biased, cursor);
+        let valid = self.builder.ins().band(fits, no_overflow);
+        let valid = self.builder.ins().band(valid, alignment_ok);
+        self.builder.ins().brif(valid, commit, &[BlockArg::Value(aligned)], slow, &[]);
+
+        self.builder.switch_to_block(commit);
+        let address = self.builder.block_params(commit)[0];
+        let new_cursor = self.builder.ins().iadd(address, bytes);
+        self.builder.ins().store(Self::trusted_mem(), new_cursor, cursor_addr, 0);
+        let commit_callee = self.builder.ins().load(self.pointer_type, Self::trusted_mem(),
+            self.activation, offset_of!(TraceActivation, factory_commit) as i32);
+        let call = self.builder.ins().call_indirect(self.factory_commit_signature, commit_callee,
+            &[self.activation, function, pc, next, address]);
+        let result = self.builder.inst_results(call)[0];
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+
+        self.builder.switch_to_block(slow);
+        let callee = self.execute_callee();
+        let call = self.builder.ins().call_indirect(self.runtime_signature, callee,
+            &[self.activation, function, pc, next]);
+        let result = self.builder.inst_results(call)[0];
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+
+        self.builder.seal_block(try_fast);
+        self.builder.seal_block(slow);
+        self.builder.seal_block(commit);
+        self.builder.seal_block(done);
+        self.builder.switch_to_block(done);
+        self.builder.block_params(done)[0]
+    }
+
     fn lower_node(
         &mut self,
         node: &crate::napalm_trace_ir::TraceNode,
@@ -9297,22 +9513,17 @@ impl CraneliftLoweringState<'_, '_> {
                     next.0
                 };
 
-                let callee = self.execute_callee();
-                let function = self
-                    .builder
-                    .ins()
-                    .iconst(types::I32, location.function.0 as i64);
-                let pc = self
-                    .builder
-                    .ins()
-                    .iconst(types::I32, location.pc.0 as i64);
-                let next = self.builder.ins().iconst(types::I32, encoded_next as i64);
-                let call = self.builder.ins().call_indirect(
-                    self.runtime_signature,
-                    callee,
-                    &[self.activation, function, pc, next],
-                );
-                let status = self.builder.inst_results(call)[0];
+                let status = if encoded_next & TRACE_RUNTIME_MODE_MASK == TRACE_RUNTIME_MODE_OBJECT_FACTORY {
+                    self.native_factory_runtime_status(location.function.0, location.pc.0, encoded_next)
+                } else {
+                    let callee = self.execute_callee();
+                    let function = self.builder.ins().iconst(types::I32, location.function.0 as i64);
+                    let pc = self.builder.ins().iconst(types::I32, location.pc.0 as i64);
+                    let next = self.builder.ins().iconst(types::I32, encoded_next as i64);
+                    let call = self.builder.ins().call_indirect(self.runtime_signature, callee,
+                        &[self.activation, function, pc, next]);
+                    self.builder.inst_results(call)[0]
+                };
                 // A runtime helper may allocate/collect or refresh the heap-chunk
                 // pointer array. Any proof created while staging a direct call is
                 // therefore dead on the successful continuation as well.
@@ -9344,8 +9555,23 @@ impl CraneliftLoweringState<'_, '_> {
                 // Calls may allocate/collect even when they synchronously return to
                 // the same Napalm frame, so moving addresses die at this boundary.
                 self.invalidate_heap_proofs();
-                if next.0 & TRACE_RUNTIME_MODE_MASK != 0 {
+                if next.0 & TRACE_RUNTIME_MODE_MASK != 0
+                    && next.0 & TRACE_RUNTIME_MODE_MASK != TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY
+                {
                     return Err(self.error("RuntimeCall continuation PC uses reserved runtime-mode bits"));
+                }
+                if next.0 & TRACE_RUNTIME_MODE_MASK == TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY {
+                    let status = self.native_factory_runtime_status(location.function.0, location.pc.0, next.0);
+                    self.invalidate_heap_proofs();
+                    let stop = self.builder.create_block();
+                    let resume = self.builder.create_block();
+                    self.builder.set_cold_block(stop);
+                    self.builder.ins().brif(status, stop, &[], resume, &[]);
+                    self.builder.switch_to_block(stop);
+                    let result = self.builder.ins().iconst(types::I32, TRACE_RESULT_RUNTIME as i64);
+                    self.builder.ins().return_(&[result]);
+                    self.builder.switch_to_block(resume);
+                    return Ok(());
                 }
                 let callee = self.execute_callee();
                 let function = self.builder.ins().iconst(types::I32, location.function.0 as i64);
@@ -13085,6 +13311,9 @@ mod tests {
             general: registers.as_mut_ptr(), arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
             special: std::ptr::null_mut(), runtime: std::ptr::null_mut(), execute: unexpected_runtime,
             heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
@@ -13207,6 +13436,9 @@ mod tests {
                     general: registers.as_mut_ptr(), arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
                     special: std::ptr::null_mut(), runtime: std::ptr::null_mut(), execute: unexpected_runtime,
                     heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
                 });
                 activation.current_links = compiled.native_links.as_ptr();
                 for initial in [42.0f64, -10.0] {
@@ -13293,6 +13525,9 @@ mod tests {
                     returns: std::ptr::null_mut(), special: std::ptr::null_mut(),
                     runtime: std::ptr::null_mut(), execute: unexpected_runtime,
                     heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
                 });
                 activation.current_links = compiled.native_links.as_ptr();
                 assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -13356,6 +13591,9 @@ mod tests {
                         execute: unexpected_runtime,
                         heap_chunks: std::ptr::null(),
                         heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -13400,6 +13638,9 @@ mod tests {
                         execute: unexpected_runtime,
                         heap_chunks: std::ptr::null(),
                         heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     if tagged {
@@ -13567,6 +13808,9 @@ mod tests {
             execute: runtime_leaf,
             heap_chunks: std::ptr::null(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -13637,6 +13881,9 @@ mod tests {
             execute: direct_call_runtime,
             heap_chunks: std::ptr::null(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -13724,6 +13971,9 @@ mod tests {
             execute: direct_call_runtime,
             heap_chunks: chunks.as_ptr(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -13820,6 +14070,9 @@ mod tests {
             execute: unexpected_runtime,
             heap_chunks: chunks.as_mut_ptr(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -13899,6 +14152,9 @@ mod tests {
             execute: unexpected_runtime,
             heap_chunks: std::ptr::null(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -13970,6 +14226,9 @@ mod tests {
             execute: unexpected_runtime,
             heap_chunks: std::ptr::null(),
             heap_write_barrier: noop_heap_write_barrier,
+            factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+            factory_bytes: 0, factory_alignment: 0,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
