@@ -12,7 +12,7 @@
 - [x] Incorporar `FuseSurvivorSuperinstructions` y reubicación del bytecode.
 - [x] Preservar las raíces GC y liveness de la segunda etapa en `FusionContinuation`.
 - [x] Añadir rutas de emisión automáticas comprobadas estructuralmente para 15 de 16 supervivientes.
-- [ ] Emitir `MapLookupOrInsert` desde un HIR dedicado que distinga clave ausente de valor nulo.
+- [x] Emitir `MapLookupOrInsert` desde un HIR dedicado que distinga clave ausente de valor nulo (`Inst::MapLookupOrInsert`, emitido por `Map/Set.set_if_not_exists`; falta el handler del VM).
 - [x] Añadir descriptores tipados por función en `BytecodeChunk.specializations`.
 - [x] Extender decodificador, desensamblador, ensamblador y verificador de bytecode.
 - [x] Incluir `CompileOptions.emit_specialized_bytecode` (predeterminado: `false`).
@@ -83,7 +83,7 @@ el intérprete ni los JITs lo ejecuten*.
 | `LoadPropertyAndCall` | 172 | Emisión automática restringida: LoadProperty/GetFieldShape + CallClosure; temporal sobrescrito | ☐ | ☐ | ☐ |
 | `GuardThenFieldLoad` | 173 | Emisión automática: GuardType/GuardClass + LoadField/GetFieldClass con registro del guard coalescido | ☐ | ☐ | ☐ |
 | `GuardThenPropertyLoad` | 174 | Emisión automática: GuardType/GuardClass + LoadProperty/GetFieldShape con guard coalescido | ☐ | ☐ | ☐ |
-| `MapLookupOrInsert` | 175 | Opcode + descriptor + `Assembler::emit_map_lookup_or_insert`; SIN emisión automática HIR segura | ☐ | ☐ | ☐ |
+| `MapLookupOrInsert` | 175 | Opcode + descriptor + `Assembler::emit_map_lookup_or_insert`; emitido desde `Inst::MapLookupOrInsert` (`set_if_not_exists`), nunca inferido de MapGet+MapSet | ☐ | ☐ | ☐ |
 | `ImportAndReadVariable` | 176 | Emisión automática: ImportModule + ImportVariable con registro temporal sobrescrito | ☐ | ☐ | ☐ |
 | `DirectCallAndReturn` | 177 | Emisión automática: CallDirect + Return del resultado | ☐ | ☐ | ☐ |
 | `ClosureCallAndReturn` | 178 | Emisión automática: CallClosure + Return del resultado | ☐ | ☐ | ☐ |

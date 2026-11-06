@@ -2558,8 +2558,8 @@ impl<'a> FunctionEmitter<'a> {
             Await | AwaitPromise | MakeFiber | FiberCall | FiberTry | FiberTransfer
             | FiberTransferError | FiberYield | FiberSuspend => SafepointKind::FiberSwitch,
             BindMethod | BindForeignMethod | ImplementInterface | ImplementType
-            | SetFieldShape | ListAppend | ListInsert | MapSet | StoreProperty
-            | StorePropertyIfPresent => {
+            | SetFieldShape | ListAppend | ListInsert | MapSet | MapLookupOrInsert
+            | StoreProperty | StorePropertyIfPresent => {
                 SafepointKind::RuntimeMutation
             }
             _ => SafepointKind::Allocation,
@@ -3633,6 +3633,11 @@ impl FunctionEmitter<'_> {
                     )
                 }
             },
+            // `set_if_not_exists`: the dedicated HIR operation for the fused
+            // lookup-or-insert opcode (default value travels in its descriptor).
+            MapLookupOrInsert { map, key, value } => self.assembler.emit_map_lookup_or_insert(
+                self.result_reg(node)?, self.reg(*map)?, self.reg(*key)?, self.reg(*value)?,
+            ).map_err(|error| self.assemble_error(error))?,
             MapSet { map, key, value } => self.assembler.emit_abc(
                 Opcode::MapSet,
                 self.reg(*map)?.0,

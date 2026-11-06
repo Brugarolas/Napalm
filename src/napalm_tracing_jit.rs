@@ -315,6 +315,10 @@ pub enum TraceHeapKind {
 #[repr(C)]
 pub struct TraceHeapEntry {
     pub(crate) has_contract: AtomicU32,
+    /// VmAdaptativeMutex word for objects reachable from shared collections
+    /// (see `napalm_vm_mutex.rs`). Occupies the former padding after
+    /// `has_contract`, so every JIT-visible offset is unchanged.
+    pub(crate) sync: AtomicU32,
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
     /// Packed metadata: low 8 bits are TraceHeapKind. The upper 24 bits are a
@@ -338,6 +342,7 @@ impl TraceHeapEntry {
             address: AtomicUsize::new(0),
             next_free: AtomicU32::new(free_none),
             has_contract: AtomicU32::new(0),
+            sync: AtomicU32::new(0),
             kind: AtomicU32::new(TraceHeapKind::Invalid as u32),
             receiver_class: AtomicU64::new(0),
             data: AtomicUsize::new(0),
@@ -349,6 +354,7 @@ impl TraceHeapEntry {
     #[inline]
     pub(crate) fn clear_jit_view(&self) {
         self.has_contract.store(0, Ordering::Relaxed);
+        self.sync.store(0, Ordering::Relaxed);
         self.kind.store(TraceHeapKind::Invalid as u32, Ordering::Relaxed);
         self.receiver_class.store(0, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
@@ -3571,6 +3577,23 @@ impl<'a> TraceRecorder<'a> {
         let next = TraceLocation::new(op.location.function, op.next_pc);
 
         match op.opcode {
+            // Specialized/fused opcodes need explicit recorder support before
+            // they can appear inside a trace (`Opcode::is_specialized`).
+            DefineClass | DefineInterface | DefineType | DefineDerivedClass
+            | DefineClassWithImplements | DefineDerivedClassWithImplements
+            | ImplementInterface | ImplementType | DefineArrayWithGenerics
+            | NewClassInstance | NewInterfaceObject | NewObjectShape | NewObjectEmpty
+            | NewObjectWithProperties | GetFieldShape | SetFieldShape | GetFieldClass
+            | SetFieldClass | InvokeMethodDirect | ArrayMapPacked | ArrayFilterPacked
+            | ArrayReduceNumeric | ArrayForEachPacked | ArrayFilterReducePacket
+            | ArrayMapReducePacked | ApplyDecoratorToFunction | ApplyDecoratorToClass
+            | AwaitPromise | LaunchConcurrentTask
+            | LoadI8IntegerArithmetic | LoadI8IntegerComparison | LoadI8Return
+            | LoadLiteralReturn | AllocListAndAppend | AllocInstanceAndInitializeField
+            | AllocInstanceAndInitializeProperty | LoadFieldAndCall | LoadPropertyAndCall
+            | GuardThenFieldLoad | GuardThenPropertyLoad | MapLookupOrInsert
+            | ImportAndReadVariable | DirectCallAndReturn | ClosureCallAndReturn
+            | ConcurrentLaunchAndAwait => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
             Nop | OsrPoint => Ok(ExpectedStep::Exact(next)),
 
             Move => {

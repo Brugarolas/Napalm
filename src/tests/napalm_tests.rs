@@ -133,6 +133,13 @@ fn native_decorators_executable_example() {
 }
 
 #[test]
+fn shared_concurrent_executable_example() {
+    // Shared Map/Set promotion, lock-free Papaya inserts, per-object
+    // VmAdaptativeMutex contention and cross-worker shapes (doubles as benchmark).
+    run_napalm(include_str!("..\\..\\scripts\\shared_concurrent.napalm"), "shared-concurrent-ok");
+}
+
+#[test]
 fn native_decorators_cache_null_errors_and_full_argument_keys() {
     run_napalm(r#"
         let calls = 0;
