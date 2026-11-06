@@ -536,10 +536,12 @@ pub enum BuiltinId {
     Channel = 35,
     /// FIFO native message receiver.
     Receiver = 36,
+    ConcurrentMap = 37,
+    ConcurrentSet = 38,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 39] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -549,6 +551,7 @@ impl BuiltinId {
         Self::Http, Self::HttpGet, Self::HttpGetJson, Self::HttpPostJson,
         Self::SetTimeout, Self::Print,
         Self::Event, Self::Emitter, Self::Channel, Self::Receiver,
+        Self::ConcurrentMap, Self::ConcurrentSet,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -582,6 +585,8 @@ impl BuiltinId {
             Self::Emitter => "Emitter",
             Self::Channel => "Channel",
             Self::Receiver => "Receiver",
+            Self::ConcurrentMap => "ConcurrentMap",
+            Self::ConcurrentSet => "ConcurrentSet",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden
@@ -652,6 +657,8 @@ pub struct ModuleInfo {
     /// Synchronous top-level functions that may be referenced by isolated
     /// concurrent workers without transferring the owning module's data state.
     pub worker_function_bindings: Vec<WorkerFunctionBinding>,
+    /// Source bindings whose concurrent collection identity is supplied at launch.
+    pub shared_slots: Vec<ModuleSlot>,
     /// Trailing slots appended by whole-program optimizations (for example
     /// shared constant literals). They follow every source-visible binding.
     pub hidden_variable_count: u32,
@@ -1220,6 +1227,9 @@ pub enum Inst {
         layout: StructuralLayoutId,
         slot: PropertySlotId,
     },
+    /// Returns the existing value, or inserts and returns `value` in one lookup.
+    /// Sets pass their element as both key and value.
+    MapLookupOrInsert { map: ValueId, key: ValueId, value: ValueId },
     MapSet {
         map: ValueId,
         key: ValueId,
@@ -1442,7 +1452,7 @@ impl Inst {
             | MapSet { .. }
             | StoreProperty { .. }
             | StorePropertyIfPresent { .. }
-            | MapRemove { .. } => B::Chain(E::Write),
+            | MapLookupOrInsert { .. } | MapRemove { .. } => B::Chain(E::Write),
 
             Await { .. } => B::Chain(E::Fiber),
             MakeFiber { .. } => B::Chain(E::Alloc),
@@ -1549,6 +1559,7 @@ impl Inst {
                 | MapSet { .. }
                 | StoreProperty { .. }
                 | StorePropertyIfPresent { .. }
+                | MapLookupOrInsert { .. }
                 | MapRemove { .. }
 
                 // String operations validate dynamic operands and bounds.
@@ -1641,7 +1652,8 @@ impl Inst {
             | MapLen { .. }
             | MapGet { .. }
             | LoadProperty { .. }
-            | MapRemove { .. }
+            | MapLookupOrInsert { .. }
+                | MapRemove { .. }
             | StringLen { .. }
             | StringConcat { .. }
             | StringSlice { .. }
@@ -1852,7 +1864,7 @@ impl Inst {
                 out.push(*object);
                 out.push(*key);
             }
-            MapSet { map, key, value } => {
+            MapLookupOrInsert { map, key, value } | MapSet { map, key, value } => {
                 out.push(*map);
                 out.push(*key);
                 out.push(*value);
@@ -2086,7 +2098,7 @@ impl Inst {
                 f(object);
                 f(key);
             }
-            MapSet { map, key, value } => {
+            MapLookupOrInsert { map, key, value } | MapSet { map, key, value } => {
                 f(map);
                 f(key);
                 f(value);
@@ -2456,6 +2468,7 @@ impl Program {
             exports: Vec::new(),
             builtin_bindings: Vec::new(),
             worker_function_bindings: Vec::new(),
+            shared_slots: Vec::new(),
             hidden_variable_count: 0,
         };
         let index = self.modules.len();
@@ -2485,6 +2498,12 @@ impl Program {
             );
         }
         module.exports = exports;
+    }
+
+    pub fn set_module_shared_slots(&mut self, id: ModuleId, slots: Vec<ModuleSlot>) {
+        let index = self.module_index[&id];
+        assert!(slots.iter().all(|slot| slot.0 < self.modules[index].variable_count));
+        self.modules[index].shared_slots = slots;
     }
 
     pub fn set_module_builtin_bindings(&mut self, id: ModuleId, bindings: Vec<BuiltinBinding>) {

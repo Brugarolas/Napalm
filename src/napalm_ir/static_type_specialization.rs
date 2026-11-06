@@ -653,7 +653,7 @@ fn requires_runtime_contract(ty: &Type) -> bool {
     match ty {
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::Builtin(
-            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
             Some(_),
         ) => true,
         Type::Union(types) => types.iter().any(requires_runtime_contract),

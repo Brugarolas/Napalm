@@ -1083,6 +1083,8 @@ define_opcodes! {
     // Isolated parallel call. A=result Promise, B=concurrent closure, C=argc;
     // x0 is reserved for transport flags, followed by packed argument GPRs.
     Launch = 134,
+    // A=result, B=Map/Set, C=key; x0=value GPR. Runtime implementation pending.
+    MapLookupOrInsert = 135,
 }
 
 impl Opcode {
@@ -1096,7 +1098,8 @@ impl Opcode {
 
             LoadProperty | StoreProperty | StorePropertyIfPresent => Some(3),
 
-            BindInterface
+            MapLookupOrInsert
+            | BindInterface
             | LoadI32
             | LoadConst
             | Jump
@@ -1173,6 +1176,7 @@ impl Opcode {
                 | ListInsert
                 | AllocMap
                 | MapSet
+                | MapLookupOrInsert
                 | StoreProperty
                 | StorePropertyIfPresent
                 | StringConcat
@@ -2515,6 +2519,12 @@ impl BytecodeVerifier {
 
         let mut module_ids = HashSet::default();
         for module in &program.metadata.modules {
+            let mut shared = HashSet::default();
+            for slot in &module.shared_slots {
+                if slot.0 >= module.source_variable_count() || !shared.insert(*slot) {
+                    return Err(VerificationError::function("invalid or duplicate shared module slot"));
+                }
+            }
             if !module_ids.insert(module.id) {
                 return Err(VerificationError::function(format!(
                     "duplicate module metadata {:?}",
@@ -3668,6 +3678,14 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, b)?;
                 Self::verify_reg(function, inst.pc, c)?;
             }
+            MapLookupOrInsert => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                Self::verify_reg(function, inst.pc, c)?;
+                let value = inst.words[1].0;
+                if value > u8::MAX as u32 { return Err(VerificationError::at(inst.pc, "invalid MapLookupOrInsert value register")); }
+                Self::verify_reg(function, inst.pc, Reg(value as u8))?;
+            }
             ListSet | ListInsert | MapSet | StoreProperty => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
@@ -3862,7 +3880,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         AllocList | AllocMap => [General, None, None],
         AllocListCap | ListLen | MapLen | StringLen => [General, General, None],
         ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => [General, General, General],
-        ListSet | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => [General, General, General],
+        ListSet | ListInsert | MapSet | MapLookupOrInsert | StoreProperty | StorePropertyIfPresent => [General, General, General],
         ListAppend => [General, General, None],
         StringConcat | StringSlice | MakeRange => [General, General, General],
         INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => [General, General, None],
@@ -3901,6 +3919,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         CallDirect => "x0=FuncId, then packed complete call-frame GPRs",
         CallClosure => "x0=CallConv, then packed argument GPRs",
         Launch => "x0=reserved(0), then packed argument GPRs",
+        MapLookupOrInsert => "x0=value GPR",
         CallPrimitive => "x0=PrimitiveId, then packed call-frame GPRs",
         CallForeign => "x0=ForeignFnId, then packed call-frame GPRs",
         CreateClass | AllocInstance | AllocForeign => "x0=ClassId",

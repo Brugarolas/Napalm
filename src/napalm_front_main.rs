@@ -315,6 +315,12 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                     .map(|part| Box::new(classify_compact_type(part, span)));
                 TypeAnnotation::new(K::List(element), span)
             }
+            "ConcurrentMap" if arguments.len() == 2 => TypeAnnotation::new(K::BuiltinGeneric(
+                base.to_owned(), Some(Box::new(TypeAnnotation::new(K::GenericMap(
+                    Box::new(classify_variable_type(arguments[0], span)),
+                    Box::new(classify_variable_type(arguments[1], span))), span)))), span),
+            "ConcurrentSet" if arguments.len() == 1 => TypeAnnotation::new(K::BuiltinGeneric(
+                base.to_owned(), Some(Box::new(classify_variable_type(arguments[0], span)))), span),
             "Map" | "ReadonlyMap" if arguments.len() == 2 => TypeAnnotation::new(K::GenericMap(
                 Box::new(classify_variable_type(arguments[0], span)),
                 Box::new(classify_variable_type(arguments[1], span))), span),
@@ -329,7 +335,7 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
                     span,
                 )
             }
-            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet"
+            "Map" | "ReadonlyMap" | "Set" | "ReadonlySet" | "ConcurrentMap" | "ConcurrentSet"
             | "Event" | "Emitter" | "Channel" | "Receiver" | "Promise" => {
                 TypeAnnotation::new(K::Never, span)
             }
@@ -977,6 +983,7 @@ impl<'a> Parser<'a> {
                 .push((name.clone(), Spanned::new("default".into(), name.span)));
             return Ok(vec![Stmt {
                 kind: StmtKind::Variable {
+                    shared: false,
                     name,
                     annotation: None,
                     initializer: Some(initializer),
@@ -1153,6 +1160,7 @@ impl<'a> Parser<'a> {
             );
             vec![Stmt {
                 kind: StmtKind::Variable {
+                    shared: false,
                     name,
                     annotation: None,
                     initializer: Some(initializer),
@@ -1370,6 +1378,7 @@ impl<'a> Parser<'a> {
         let empty_map = Expr::new(ExprKind::Map(Vec::new()), name.span);
         out.push(Stmt {
             kind: StmtKind::Variable {
+                    shared: false,
                 name: name.clone(),
                 annotation: None,
                 initializer: Some(empty_map),
@@ -1507,17 +1516,22 @@ impl<'a> Parser<'a> {
     }
 
     fn variables(&mut self, immutable: bool) -> Result<Vec<Stmt>> {
+        let shared = self.eat("shared");
         let mut out = Vec::new();
         loop {
             self.lines();
             let pattern = self.binding_pattern()?;
-            let annotation = self.variable_annotation()?;
-            let initializer = if self.eat("=") {
+            let mut annotation = self.variable_annotation()?;
+            let mut initializer = if self.eat("=") {
                 self.lines();
                 Some(self.expr(0)?)
             } else {
                 None
             };
+            if shared {
+                if let Some(annotation) = annotation.as_mut() { promote_shared_annotation(annotation); }
+                if let Some(initializer) = initializer.as_mut() { promote_shared_initializer(initializer); }
+            }
 
             if pattern.is_ident() {
                 let BindingPattern::Ident(name) = pattern else { unreachable!() };
@@ -1533,9 +1547,10 @@ impl<'a> Parser<'a> {
                 }
                 out.push(Stmt {
                     span: self.end(name.span.start),
-                    kind: StmtKind::Variable { name, annotation, initializer },
+                    kind: StmtKind::Variable { shared, name, annotation, initializer },
                 });
             } else {
+                if shared { return self.error("shared requires a named Map/Set variable; destructuring cannot be shared"); }
                 let Some(initializer) = initializer else {
                     return self.error("a destructuring declaration needs an initializer");
                 };
@@ -1548,6 +1563,7 @@ impl<'a> Parser<'a> {
                 out.push(Stmt {
                     span: span.join(initializer.span),
                     kind: StmtKind::Variable {
+                        shared,
                         name: temporary,
                         annotation,
                         initializer: Some(initializer),
@@ -1655,7 +1671,7 @@ impl<'a> Parser<'a> {
 
     fn pattern_temporary(&mut self, tag: &str, span: Span, value: Expr, out: &mut Vec<Stmt>) -> Expr {
         let name = Spanned::new(format!("<{tag}:{}>", span.start), Span::empty(span.start));
-        out.push(Stmt { span, kind: StmtKind::Variable { name: name.clone(), annotation: None, initializer: Some(value) } });
+        out.push(Stmt { span, kind: StmtKind::Variable { shared: false, name: name.clone(), annotation: None, initializer: Some(value) } });
         Expr::new(ExprKind::Name(name), span)
     }
 
@@ -1663,7 +1679,7 @@ impl<'a> Parser<'a> {
         match pattern {
             BindingPattern::Ident(name) => {
                 if immutable { self.immutable.insert(name.span); }
-                out.push(Stmt { span: name.span.join(source.span), kind: StmtKind::Variable { name, annotation: None, initializer: Some(source) } });
+                out.push(Stmt { span: name.span.join(source.span), kind: StmtKind::Variable { shared: false, name, annotation: None, initializer: Some(source) } });
             }
             BindingPattern::Default { pattern, value } => {
                 let span = source.span.join(value.span);
@@ -3494,7 +3510,7 @@ impl<'a> Parser<'a> {
                     let type_start = self.peek().span.start;
                     self.type_arguments()?;
                     let type_end = self.tokens[self.pos - 1].span.end;
-                    if matches!(collection_name.as_str(), "Map" | "Set" | "Emitter" | "Channel") {
+                    if matches!(collection_name.as_str(), "Map" | "Set" | "ConcurrentMap" | "ConcurrentSet" | "Emitter" | "Channel") {
                         let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
                         let annotation = classify_variable_type(&spelling, self.end(start));
                         if matches!(annotation.kind, TypeAnnotationKind::Never) {
@@ -3738,7 +3754,7 @@ impl<'a> Parser<'a> {
             "null" => ExprKind::Null,
             "this" => ExprKind::This,
             "construct" | "is" | "in" | "of" | "let" | "const" | "return" | "throw" | "class"
-            | "concurrent" | "launch"
+            | "concurrent" | "launch" | "shared"
             | "import" | "export" | "else" | "undefined" => {
                 return self.error("unexpected keyword in expression");
             }
@@ -4672,6 +4688,7 @@ fn synthesize_computed_property(
 
     let callback_decl = Stmt {
         kind: StmtKind::Variable {
+                    shared: false,
             name: callback_local.clone(),
             annotation: None,
             initializer: Some(callback_field()),
@@ -4859,7 +4876,7 @@ pub(crate) fn compact_type_spelling(spelling: &str) -> String {
 /// declaration/function; they are erased to `any`.
 fn erase_unknown_type_parameters(argument: &str, known: &HashSet<String>) -> String {
     const BUILTIN: &[&str] = &[
-        "Number", "String", "Boolean", "Array", "List", "Map", "Set", "Promise", "Event",
+        "ConcurrentMap", "ConcurrentSet", "Number", "String", "Boolean", "Array", "List", "Map", "Set", "Promise", "Event",
         "Emitter", "Channel", "Receiver", "Date", "Function", "Fn", "Object", "Range", "Fiber",
         "Record", "Proxy",
     ];
@@ -5427,6 +5444,7 @@ impl DecoratorAst<'_> {
     fn variable(&self, name: &Ident, value: Expr) -> Stmt {
         Stmt {
             kind: StmtKind::Variable {
+                    shared: false,
                 name: name.clone(),
                 annotation: None,
                 initializer: Some(value),
@@ -5526,6 +5544,7 @@ impl DecoratorAst<'_> {
             self.variable(&active, Expr::new(ExprKind::Bool(true), span)),
             Stmt {
                 kind: StmtKind::Variable {
+                    shared: false,
                     name: replacement.clone(),
                     annotation: Some(TypeAnnotation::new(TypeAnnotationKind::Any, span)),
                     initializer: Some(Expr::new(ExprKind::Null, span)),
@@ -5568,6 +5587,54 @@ impl DecoratorAst<'_> {
         }
         let helper = self.closure(params, vec![body]);
         self.expression(invoke(helper, "call", args, span))
+    }
+}
+
+/// `shared` keeps the user-facing Map/Set spelling, but a shared binding is
+/// always stored in the concurrent (Papaya) representation. Rewrite the
+/// declared type so `const shared m: Map<K, V>` means `ConcurrentMap<K, V>`.
+fn promote_shared_annotation(annotation: &mut TypeAnnotation) {
+    use TypeAnnotationKind as K;
+    let span = annotation.span;
+    let kind = std::mem::replace(&mut annotation.kind, K::Any);
+    annotation.kind = match kind {
+        K::Named(name) if matches!(name.as_str(), "Map" | "ReadonlyMap") => {
+            K::BuiltinGeneric("ConcurrentMap".into(), None)
+        }
+        K::Named(name) if matches!(name.as_str(), "Set" | "ReadonlySet") => {
+            K::BuiltinGeneric("ConcurrentSet".into(), None)
+        }
+        K::Set(None) => K::BuiltinGeneric("ConcurrentSet".into(), None),
+        K::GenericMap(key, value) => K::BuiltinGeneric(
+            "ConcurrentMap".into(),
+            Some(Box::new(TypeAnnotation::new(K::GenericMap(key, value), span))),
+        ),
+        K::Set(Some(element)) => K::BuiltinGeneric("ConcurrentSet".into(), Some(element)),
+        other => other,
+    };
+}
+
+/// Promote `new Map(...)` / `new Set(...)` (optionally generic or grouped) in
+/// a shared declaration to the concurrent constructors.
+fn promote_shared_initializer(expr: &mut Expr) {
+    match &mut expr.kind {
+        ExprKind::TypedCollection { expression, annotation } => {
+            promote_shared_annotation(annotation);
+            promote_shared_initializer(expression);
+        }
+        ExprKind::Grouped(inner) => promote_shared_initializer(inner),
+        ExprKind::Invoke(invoke)
+            if invoke.name.value == "new" && invoke.syntax == InvokeSyntax::Method =>
+        {
+            if let Some(ExprKind::Name(name)) = invoke.receiver.as_deref_mut().map(|r| &mut r.kind) {
+                match name.value.as_str() {
+                    "Map" => name.value = "ConcurrentMap".into(),
+                    "Set" => name.value = "ConcurrentSet".into(),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 

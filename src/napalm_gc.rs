@@ -1477,7 +1477,7 @@ impl Mutator {
         self.gc.weak.lock().push(Arc::downgrade(&cell));
         WeakRoot { cell }
     }
-    pub fn register_roots(&mut self, provider: Arc<dyn RootProvider>) -> RootRegistration {
+    pub fn register_roots(&self, provider: Arc<dyn RootProvider>) -> RootRegistration {
         self.check_running();
         self.gc.providers.lock().push(Arc::downgrade(&provider));
         RootRegistration {

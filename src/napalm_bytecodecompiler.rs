@@ -2388,7 +2388,7 @@ impl<'a> FunctionEmitter<'a> {
             ImportModule | ImportVariable => SafepointKind::Module,
             Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
             | FiberSuspend => SafepointKind::FiberSwitch,
-            BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => {
+            BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet | MapLookupOrInsert | StoreProperty | StorePropertyIfPresent => {
                 SafepointKind::RuntimeMutation
             }
             _ => SafepointKind::Allocation,
@@ -3277,6 +3277,10 @@ impl FunctionEmitter<'_> {
                 self.reg(*key)?.0,
                 layout.0,
                 slot.0 as u32,
+            ),
+            MapLookupOrInsert { map, key, value } => self.assembler.emit_x32(
+                Opcode::MapLookupOrInsert, self.result_reg(node)?.0,
+                self.reg(*map)?.0, self.reg(*key)?.0, self.reg(*value)?.0 as u32,
             ),
             MapSet { map, key, value } => self.assembler.emit_abc(
                 Opcode::MapSet,

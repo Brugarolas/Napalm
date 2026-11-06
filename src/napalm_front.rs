@@ -1076,6 +1076,7 @@ pub enum TypeAnnotationKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
     Variable {
+        shared: bool,
         name: Ident,
         annotation: Option<TypeAnnotation>,
         initializer: Option<Expr>,
@@ -1898,7 +1899,7 @@ impl<'a> Parser<'a> {
         };
         let end = initializer.as_ref().map_or(name.span.end, |expr| expr.span.end);
         Ok(Stmt {
-            kind: StmtKind::Variable { name, annotation: None, initializer },
+            kind: StmtKind::Variable { shared: false, name, annotation: None, initializer },
             span: Span::new(start, end),
         })
     }

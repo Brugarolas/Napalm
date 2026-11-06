@@ -11,12 +11,14 @@ fn mismatch(path: &str, expected: &Type) -> RuntimeError {
 
 impl Heap {
     pub(super) fn has_contract(&self, value: Value) -> bool {
+        if let Some(c) = self.concurrent_table(value).and_then(MapDictionary::concurrent_contracts) { return !c.read().is_empty(); }
         value
             .heap_handle()
             .is_some_and(|handle| self.handle_table.contracts(handle).is_some())
     }
 
     pub(super) fn interface_matches(&self, value: Value, expected: &Type) -> bool {
+        if let Some(c) = self.concurrent_table(value).and_then(MapDictionary::concurrent_contracts) { return c.read().contains(expected); }
         // A speculative guard may expose Interface-typed SSA values only when
         // a permanent contract already exists, not merely a matching shape.
         value
@@ -79,7 +81,7 @@ impl Heap {
                 | Type::GenericMap(_, _)
                 | Type::Set(Some(_))
                 | Type::Builtin(
-                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
                     Some(_),
                 )
         )
@@ -211,6 +213,20 @@ impl Heap {
                 plan.push((value, expected.clone()));
                 true
             }
+            Type::Builtin(builtin @ (BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet), element) => {
+                let Some(table) = self.concurrent_table(value) else { return Err(mismatch(path, expected)); };
+                let correct = matches!((builtin, table), (BuiltinId::ConcurrentMap, MapDictionary::ConcurrentMap(_)) | (BuiltinId::ConcurrentSet, MapDictionary::ConcurrentSet(_)));
+                if !correct { return Err(mismatch(path, expected)); }
+                if let Some(element) = element {
+                    let (owner, contract) = if *builtin == BuiltinId::ConcurrentSet {
+                        let Some(HeapObject::Set { map }) = self.get(value) else { return Err(mismatch(path, expected)); };
+                        (*map, Type::GenericMap(element.clone(), element.clone()))
+                    } else { (value, (**element).clone()) };
+                    self.plan_contract(owner, &contract, path, plan)?;
+                }
+                plan.push((value, expected.clone()));
+                true
+            }
             Type::Builtin(builtin, element) => {
                 let object = self.get(value);
                 let state_payload_type = match (builtin, object) {
@@ -309,7 +325,7 @@ impl Heap {
                 if matches!(managed.object, HeapObject::Promise { .. }) {
                     continue;
                 }
-                let installed = self.handle_table.contract_contains(managed.handle, &ty);
+                let installed = self.interface_matches(value, &ty);
                 let shape = match &managed.object {
                     HeapObject::Map(map) => map.shaped().map(|(shape, _)| shape),
                     _ => None,
@@ -328,6 +344,11 @@ impl Heap {
                 else { self.map_shapes.apply_contract(shape, &ty) }
             });
             let object = self.object(value).expect("validated contract owner");
+            if let Some(contracts) = self.concurrent_table(value).and_then(MapDictionary::concurrent_contracts) {
+                let mut contracts = contracts.write();
+                if !contracts.contains(&ty) { contracts.push(ty); }
+                continue;
+            }
             let managed = unsafe { managed_object_mut(object) };
             self.handle_table.stage_contract(handle, ty.clone());
 
@@ -335,7 +356,7 @@ impl Heap {
             // native sidecar state. This makes the contract capability-wide rather
             // than handle-local: an untyped alias cannot bypass a typed endpoint.
             if let Type::Builtin(
-                BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+                BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
                 Some(element),
             ) = &ty
             {
@@ -457,7 +478,8 @@ impl Heap {
             }
         });
         let handle = unsafe { managed_object(object) }.handle;
-        let contracts = self.handle_table.cloned_contracts(handle);
+        let contracts = self.concurrent_table(owner).and_then(MapDictionary::concurrent_contracts)
+            .map(|c| c.read().clone()).unwrap_or_else(|| self.handle_table.cloned_contracts(handle));
         if contracts.is_empty() {
             return Ok(());
         }
