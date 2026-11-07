@@ -3,7 +3,8 @@
 //! Worker threads never receive Napalm `Value`s from the caller. Arguments are
 //! converted to immutable Arc-backed transfer snapshots before enqueueing and are
 //! materialized into a worker-owned Interpreter/heap. Results take the reverse
-//! path. Consequently no mutable managed object is ever shared between VMs.
+//! path. Explicit shared concurrent collections retain their globally rooted handle.
+//! Their table operations are synchronized by Papaya; payload mutation is not.
 
 use super::*;
 use crate::napalm_builtin::{install_vm_builtins, BuiltinHost, BuiltinManifest};
@@ -30,6 +31,8 @@ pub(crate) enum ConcurrentKey {
 /// queue handoff cheap while keeping the graph inaccessible to Napalm code.
 #[derive(Clone, Debug)]
 pub(crate) enum ConcurrentValue {
+    /// Explicitly shared table. Queue ownership roots this handle.
+    Shared(Arc<SharedTransfer>),
     Null,
     Bool(bool),
     Num(u64),
@@ -44,6 +47,14 @@ pub(crate) enum ConcurrentValue {
     },
 }
 
+pub(crate) struct SharedTransfer {
+    pub value: Value,
+    pub(super) _registration: GcRootRegistration,
+}
+impl std::fmt::Debug for SharedTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_tuple("SharedTransfer").field(&self.value).finish() }
+}
+
 #[derive(Debug)]
 pub(crate) struct ConcurrentCompletion {
     pub id: ConcurrentJobId,
@@ -55,6 +66,8 @@ struct ConcurrentJob {
     id: ConcurrentJobId,
     function: FuncId,
     args: Vec<ConcurrentValue>,
+    captures: Vec<ConcurrentValue>,
+    shared_globals: Vec<(usize, usize, ConcurrentValue)>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -91,6 +104,7 @@ impl ConcurrentRuntime {
         shared_jit_profile: Arc<SharedJitProfile>,
         shared_jit_repository: Arc<SharedJitRepository>,
         shared_memo: Option<Arc<SharedMemoTables>>,
+        shared_shapes: Arc<MapShapeTable>,
     ) -> Result<Self, RuntimeError> {
         let worker_count = std::thread::available_parallelism()
             .map(|count| count.get())
@@ -140,6 +154,7 @@ impl ConcurrentRuntime {
             let worker_shared_jit_profile = shared_jit_profile.clone();
             let worker_shared_jit_repository = shared_jit_repository.clone();
             let worker_shared_memo = shared_memo.clone();
+            let worker_shared_shapes = shared_shapes.clone();
             let spawn = thread::Builder::new()
                 .name(format!("napalm-worker-{index}"))
                 .spawn(move || {
@@ -158,6 +173,7 @@ impl ConcurrentRuntime {
                         worker_shared_jit_profile,
                         worker_shared_jit_repository,
                         worker_shared_memo,
+                        worker_shared_shapes,
                     );
                 });
             match spawn {
@@ -197,6 +213,8 @@ impl ConcurrentRuntime {
         &mut self,
         function: FuncId,
         args: Vec<ConcurrentValue>,
+        captures: Vec<ConcurrentValue>,
+        shared_globals: Vec<(usize, usize, ConcurrentValue)>,
     ) -> ConcurrentJobId {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -216,6 +234,8 @@ impl ConcurrentRuntime {
                 id,
                 function,
                 args,
+                captures,
+                shared_globals,
                 cancelled,
             });
             signal.cv.notify_one();
@@ -313,71 +333,196 @@ fn worker_main(
     shared_jit_profile: Arc<SharedJitProfile>,
     shared_jit_repository: Arc<SharedJitRepository>,
     shared_memo: Option<Arc<SharedMemoTables>>,
+    shared_shapes: Arc<MapShapeTable>,
 ) {
     let signal = &signals[index];
     // Interpreter construction verifies and prepares the complete bytecode program,
     // attaches a GC mutator, allocates runtime metadata and initializes JIT state.
     // Keep that cost lazy so an N-core pool only constructs VMs for workers that
     // actually receive jobs.
-    let mut vm = None;
+    //
+    // Task scheduler: a job runs in one VM of `idle`. A job blocked on a
+    // VmAdaptativeMutex keeps its VM (its frames live there) in `parked` while
+    // this OS thread continues with other work; the releasing thread pushes the
+    // task token onto `ready` and signals this worker, which resumes the task
+    // on this same thread before taking new jobs. Several VMs on one thread are
+    // GC-safe: a rendezvous parks all same-thread mutators together.
+    let mut idle: Vec<Interpreter<'_>> = Vec::new();
+    let mut parked: FastMap<u64, ParkedTask<'_>> = FastMap::default();
+    let ready: Arc<parking_lot::Mutex<std::collections::VecDeque<u64>>> = Arc::default();
+    let mut next_token = 0u64;
 
     while !shutdown.load(AtomicOrdering::Acquire) {
-        let Some(job) = take_job(index, &local, &affinity_queues, &stealers) else {
-            signal.busy.store(false, AtomicOrdering::Release);
-            let mut guard = signal.lock.lock();
-            if shutdown.load(AtomicOrdering::Acquire) {
-                break;
+        let resumable = ready.lock().pop_front();
+        let step = if let Some(token) = resumable {
+            let Some(task) = parked.remove(&token) else { continue };
+            signal.busy.store(true, AtomicOrdering::Release);
+            resume_task(task)
+        } else {
+            let Some(job) = take_job(index, &local, &affinity_queues, &stealers) else {
+                signal.busy.store(false, AtomicOrdering::Release);
+                // Check-and-wait under `signal.lock`, which every producer
+                // (submit, lock wakers) takes before notifying. The lock is only
+                // ever taken inside the native section: holding it across the
+                // safepoint that enters native would deadlock a collection
+                // against a Running producer blocked on this mutex.
+                let wait = || {
+                    let mut guard = signal.lock.lock();
+                    if !shutdown.load(AtomicOrdering::Acquire)
+                        && local.is_empty()
+                        && affinity_queues.iter().all(|queue| queue.is_empty())
+                        && ready.lock().is_empty()
+                    {
+                        signal.cv.wait(&mut guard);
+                    }
+                };
+                // An idle worker must not block another worker's collection.
+                // Entering native marks every VM of this thread (idle and
+                // parked) native; their persistent roots are published.
+                let peer = idle.first_mut().or_else(|| parked.values_mut().next().map(|task| &mut task.vm));
+                if let Some(vm) = peer {
+                    unsafe { vm.heap.mutator.with_native(wait); }
+                } else {
+                    wait();
+                }
+                continue;
+            };
+
+            signal.busy.store(true, AtomicOrdering::Release);
+            if job.cancelled.load(AtomicOrdering::Acquire) {
+                signal.busy.store(false, AtomicOrdering::Release);
+                continue;
             }
-            if local.is_empty() && affinity_queues.iter().all(|queue| queue.is_empty()) {
-                signal.cv.wait(&mut guard);
+            let vm = match idle.pop() {
+                Some(vm) => Ok(vm),
+                None => build_worker_vm(
+                    program.as_ref(),
+                    manifest.as_ref(),
+                    jit_options.clone(),
+                    shared_jit_profile.clone(),
+                    shared_jit_repository.clone(),
+                    shared_memo.clone(),
+                    shared_shapes.clone(),
+                    index as u32,
+                ),
+            };
+            match vm {
+                Ok(vm) => start_job(vm, job),
+                Err(message) => JobStep::Finished { job, result: Err(message), vm: None },
             }
-            continue;
         };
 
-        signal.busy.store(true, AtomicOrdering::Release);
-        if job.cancelled.load(AtomicOrdering::Acquire) {
-            signal.busy.store(false, AtomicOrdering::Release);
-            continue;
+        match step {
+            JobStep::Parked(task) => {
+                let token = next_token;
+                next_token = next_token.wrapping_add(1);
+                let wake_ready = ready.clone();
+                let wake_signal = signal.clone();
+                let waker: LockWaker = Box::new(move || {
+                    wake_ready.lock().push_back(token);
+                    let _guard = wake_signal.lock.lock();
+                    wake_signal.cv.notify_one();
+                });
+                if task.vm.park_blocked_task(waker).is_err() {
+                    // Released between the spin and the registration: retry now.
+                    ready.lock().push_back(token);
+                }
+                parked.insert(token, task);
+            }
+            JobStep::Finished { job, result, vm } => {
+                // A VM that failed or suspended unexpectedly may retain stack
+                // state; drop it. Concurrent workers suppress per-VM final full
+                // collections, and the replacement keeps the shared memo domain.
+                if let Some(vm) = vm {
+                    idle.push(vm);
+                }
+                signal.busy.store(false, AtomicOrdering::Release);
+                if job.cancelled.load(AtomicOrdering::Acquire) {
+                    continue;
+                }
+                let _ = completion_tx.send(ConcurrentCompletion { id: job.id, result });
+                let _ = wake_tx.send(());
+            }
         }
-
-        if vm.is_none() {
-            vm = Some(build_worker_vm(
-                program.as_ref(),
-                manifest.as_ref(),
-                jit_options.clone(),
-                shared_jit_profile.clone(),
-                shared_jit_repository.clone(),
-                shared_memo.clone(),
-                index as u32,
-            ));
-        }
-
-        let (result, reset_vm) = match vm.as_mut().expect("worker VM must be initialized") {
-            Ok(vm) => execute_job(vm, &job),
-            Err(message) => (Err(message.clone()), true),
-        };
-        if reset_vm {
-            // Drop the failed VM before constructing its replacement. Concurrent
-            // workers suppress per-VM final full collections; the process-wide
-            // collector will reclaim their unreachable objects normally. The
-            // replacement keeps the shared memo domain, so only private L1 state is lost.
-            vm = Some(build_worker_vm(
-                program.as_ref(),
-                manifest.as_ref(),
-                jit_options.clone(),
-                shared_jit_profile.clone(),
-                shared_jit_repository.clone(),
-                shared_memo.clone(),
-                index as u32,
-            ));
-        }
-        signal.busy.store(false, AtomicOrdering::Release);
-        if job.cancelled.load(AtomicOrdering::Acquire) {
-            continue;
-        }
-        let _ = completion_tx.send(ConcurrentCompletion { id: job.id, result });
-        let _ = wake_tx.send(());
     }
+}
+
+/// A job blocked on a VmAdaptativeMutex. Its frames live in `vm`, so it resumes
+/// on the worker thread that owns that VM.
+struct ParkedTask<'a> {
+    vm: Interpreter<'a>,
+    job: ConcurrentJob,
+    roots: Vec<u32>,
+}
+
+enum JobStep<'a> {
+    Finished {
+        job: ConcurrentJob,
+        result: Result<ConcurrentValue, String>,
+        /// `Some` when the VM is clean and can run the next job.
+        vm: Option<Interpreter<'a>>,
+    },
+    Parked(ParkedTask<'a>),
+}
+
+fn start_job<'a>(mut vm: Interpreter<'a>, job: ConcurrentJob) -> JobStep<'a> {
+    let (args, mut roots) = match vm.materialize_concurrent_arguments(&job.args) {
+        Ok(values) => values,
+        Err(error) => return JobStep::Finished { job, result: Err(error.message), vm: Some(vm) },
+    };
+    for (module, slot, snapshot) in &job.shared_globals {
+        match vm.materialize_concurrent_value(snapshot) {
+            Ok(value) => vm.modules[*module].variables[*slot] = value,
+            Err(error) => {
+                for root in roots { vm.release_root(root); }
+                return JobStep::Finished { job, result: Err(error.message), vm: None };
+            }
+        }
+    }
+    let (captures, capture_roots) = match vm.materialize_concurrent_arguments(&job.captures) {
+        Ok(values) => values,
+        Err(error) => {
+            for root in roots { vm.release_root(root); }
+            return JobStep::Finished { job, result: Err(error.message), vm: None };
+        }
+    };
+    roots.extend(capture_roots);
+    let execution = vm.run_function_with_captures(job.function, &args, &captures);
+    finish_step(vm, job, roots, execution)
+}
+
+fn resume_task(task: ParkedTask<'_>) -> JobStep<'_> {
+    let ParkedTask { mut vm, job, roots } = task;
+    let execution = vm.resume_blocked_task();
+    finish_step(vm, job, roots, execution)
+}
+
+fn finish_step<'a>(
+    mut vm: Interpreter<'a>,
+    job: ConcurrentJob,
+    roots: Vec<u32>,
+    execution: Result<ExecutionResult, RuntimeError>,
+) -> JobStep<'a> {
+    if matches!(execution, Ok(ExecutionResult::Suspended(_))) && vm.blocked_on_shared_lock().is_some() {
+        // Argument/capture roots stay registered while the task is parked.
+        return JobStep::Parked(ParkedTask { vm, job, roots });
+    }
+    for root in roots {
+        vm.release_root(root);
+    }
+    let value = match execution {
+        Ok(ExecutionResult::Returned(value)) => value,
+        Ok(ExecutionResult::Suspended(_)) => {
+            return JobStep::Finished {
+                job,
+                result: Err("concurrent worker suspended without a runnable Promise/event".to_owned()),
+                vm: None,
+            };
+        }
+        Err(error) => return JobStep::Finished { job, result: Err(error.message), vm: None },
+    };
+    let result = vm.snapshot_concurrent_value(value).map_err(|error| error.message);
+    JobStep::Finished { job, result, vm: Some(vm) }
 }
 
 fn take_job(
@@ -447,10 +592,13 @@ fn build_worker_vm<'a>(
     shared_jit_profile: Arc<SharedJitProfile>,
     shared_jit_repository: Arc<SharedJitRepository>,
     shared_memo: Option<Arc<SharedMemoTables>>,
+    shared_shapes: Arc<MapShapeTable>,
     worker_id: u32,
 ) -> Result<Interpreter<'a>, String> {
     let host = Box::new(BuiltinHost::new(manifest.clone()));
-    let mut vm = Interpreter::with_host(program, host)
+    // One hidden-class table per program: objects shaped by any VM can be read
+    // by every other VM that reaches them through a shared collection.
+    let mut vm = Interpreter::with_host_and_shapes(program, host, Some(shared_shapes))
         .map_err(|error| format!("failed to initialize concurrent VM: {}", error.message))?;
     install_vm_builtins(&mut vm, manifest);
     vm.set_jit_options(jit_options);
@@ -465,41 +613,6 @@ fn build_worker_vm<'a>(
     // the premise that every VM in the domain dispatches builtins identically.
     vm.set_shared_memo(shared_memo);
     Ok(vm)
-}
-
-/// Execute one job in a worker-owned VM. The boolean indicates whether the VM
-/// must be rebuilt before accepting another job (failed/suspended execution can
-/// retain stack state, whereas a normal return leaves the main fiber idle).
-fn execute_job(
-    vm: &mut Interpreter<'_>,
-    job: &ConcurrentJob,
-) -> (Result<ConcurrentValue, String>, bool) {
-    let (args, argument_roots) = match vm.materialize_concurrent_arguments(&job.args) {
-        Ok(values) => values,
-        Err(error) => return (Err(error.message), false),
-    };
-
-    let execution = vm.run_function(job.function, &args);
-    for root in argument_roots {
-        vm.release_root(root);
-    }
-    let execution = match execution {
-        Ok(execution) => execution,
-        Err(error) => return (Err(error.message), true),
-    };
-    let value = match execution {
-        ExecutionResult::Returned(value) => value,
-        ExecutionResult::Suspended(_) => {
-            return (
-                Err("concurrent worker suspended without a runnable Promise/event".to_owned()),
-                true,
-            );
-        }
-    };
-    match vm.snapshot_concurrent_value(value) {
-        Ok(value) => (Ok(value), false),
-        Err(error) => (Err(error.message), false),
-    }
 }
 
 #[cfg(test)]

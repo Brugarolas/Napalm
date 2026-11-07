@@ -1,0 +1,182 @@
+// shared_concurrent.napalm
+//
+// Correctness test + benchmark for `shared` collections and VmAdaptativeMutex.
+//
+// Run: cargo run --release -- scripts\shared_concurrent.napalm
+//
+// What it exercises:
+//
+//   * `const shared m = new Map()` is promoted to a ConcurrentMap (Papaya).
+//     Its own operations are lock-free, so disjoint inserts from several
+//     parallel tasks should scale.
+//   * Objects stored in a shared Map become shared values: every bytecode
+//     operation on them (push, property write...) runs under that object's
+//     VmAdaptativeMutex. Contended writers to ONE object serialize, but no
+//     update performed by a single operation is ever lost.
+//   * Hidden-class shapes are program-wide: objects built by workers are
+//     readable by the main thread and vice versa.
+//
+// The checks throw on failure (the script doubles as a Rust test). Timings
+// are only printed (System.clock is in seconds; results are shown in ms).
+// For benchmarking, raise ITEMS_PER_TASK / WORK_PER_ITEM.
+
+const TASK_COUNT: Number = 4;
+const ITEMS_PER_TASK: Number = 2_000;
+const WORK_PER_ITEM: Number = 600;
+const PUSHES_PER_TASK: Number = 2_000;
+
+let checks = 0;
+function check(actual, expected, label) {
+    if (actual !== expected) {
+        throw `${label}: expected ${expected}, got ${actual}`;
+    }
+    checks++;
+}
+
+// Dependent arithmetic so each item costs real CPU time.
+function work(seed: Number, iterations: Number): Number {
+    let state: Number = seed;
+    let accumulator: Number = 0;
+    for (let i: Number = 0; i < iterations; i = i + 1) {
+        state = (state * 48271 + 1) % 2147483647;
+        accumulator = accumulator + (state % 1009);
+    }
+    return accumulator;
+}
+
+// ------------------------------------------------------------
+// Shared state
+// ------------------------------------------------------------
+
+const shared results = new Map<number, number>();
+const shared registry = new Map();
+const shared seen = new Set<number>();
+
+check(typeof results, "ConcurrentMap<Number, Number>", "shared Map is promoted");
+check(typeof seen, "ConcurrentSet<Number>", "shared Set is promoted");
+
+// Created by the main thread, read by every worker (shared shapes).
+registry.set("config", {offset: 7, scale: 3});
+registry.set("log", []);
+
+// Disjoint keys: exercises the lock-free Papaya table.
+concurrent function fill(task: Number, count: Number, cost: Number): Number {
+    const config = registry.get("config");
+    let checksum: Number = 0;
+    for (let i: Number = 0; i < count; i = i + 1) {
+        const key = task * 1_000_000 + i;
+        const value = work(key + config.offset, cost) * config.scale;
+        results.set(key, value);
+        seen.add(key);
+        checksum = checksum + value;
+    }
+    // Worker-built shaped object, read later by the main thread.
+    // (`items`, not `count`: objects still expose the builtin `count` getter.)
+    registry.set(`summary-${task}`, {task: task, items: count, checksum: checksum});
+    return checksum;
+}
+
+// One shared List and one shared object: every task contends for the same
+// VmAdaptativeMutex. Each push is a single operation, so none can be lost.
+concurrent function contend(task: Number, count: Number): Number {
+    const log = registry.get("log");
+    for (let i: Number = 0; i < count; i = i + 1) {
+        log.push(task);
+    }
+    return count;
+}
+
+function sequentialFill(seedBase: Number, count: Number, cost: Number): Number {
+    const local = new Map<number, number>();
+    let checksum: Number = 0;
+    for (let i: Number = 0; i < count; i = i + 1) {
+        const key = seedBase + i;
+        const value = work(key + 7, cost) * 3;
+        local.set(key, value);
+        checksum = checksum + value;
+    }
+    check(local.size, count, "sequential map size");
+    return checksum;
+}
+
+async function runBenchmark() {
+    System.print("========================================");
+    System.print("Napalm shared collections benchmark");
+    System.print("========================================");
+    System.print(`Tasks: ${TASK_COUNT}, items/task: ${ITEMS_PER_TASK}, work/item: ${WORK_PER_ITEM}`);
+
+    System.print("Warming up...");
+    work(17, 50_000);
+
+    // --------------------------------------------------------
+    // Phase 1: parallel inserts into a shared ConcurrentMap
+    // --------------------------------------------------------
+    const parallelStart = System.clock;
+    const fills = [];
+    for (let t = 0; t < TASK_COUNT; t++) fills.push(launch fill(t, ITEMS_PER_TASK, WORK_PER_ITEM));
+    const checksums = await Promise.all(fills);
+    const parallelMs = (System.clock - parallelStart) * 1000;
+
+    check(results.size, TASK_COUNT * ITEMS_PER_TASK, "every parallel insert is visible");
+    check(seen.size, TASK_COUNT * ITEMS_PER_TASK, "every parallel Set insert is visible");
+    let parallelChecksum = 0;
+    for (let t = 0; t < TASK_COUNT; t++) {
+        const summary = registry.get(`summary-${t}`);
+        check(summary.task, t, "worker-built object is readable");
+        check(summary.items, ITEMS_PER_TASK, "worker-built object fields");
+        check(summary.checksum, checksums[t], "worker checksum matches its summary");
+        parallelChecksum += checksums[t];
+    }
+    check(results.get(1_000_000 * (TASK_COUNT - 1) + 5), work(1_000_000 * (TASK_COUNT - 1) + 5 + 7, WORK_PER_ITEM) * 3,
+        "stored values are correct");
+
+    // --------------------------------------------------------
+    // Phase 2: the same work sequentially on the main thread
+    // --------------------------------------------------------
+    const sequentialStart = System.clock;
+    let sequentialChecksum = 0;
+    for (let t = 0; t < TASK_COUNT; t++) {
+        // Different seeds: avoid automatic memoization turning this into cache hits.
+        sequentialChecksum += sequentialFill(50_000_000 + t * 1_000_000, ITEMS_PER_TASK, WORK_PER_ITEM);
+    }
+    const sequentialMs = (System.clock - sequentialStart) * 1000;
+
+    // --------------------------------------------------------
+    // Phase 3: contended per-object VmAdaptativeMutex
+    // --------------------------------------------------------
+    const contendedStart = System.clock;
+    const pushes = [];
+    for (let t = 0; t < TASK_COUNT; t++) pushes.push(launch contend(t, PUSHES_PER_TASK));
+    const pushed = await Promise.all(pushes);
+    const contendedMs = (System.clock - contendedStart) * 1000;
+
+    const log = registry.get("log");
+    check(log.length, TASK_COUNT * PUSHES_PER_TASK, "no contended push is lost");
+    const perTask = [];
+    for (let t = 0; t < TASK_COUNT; t++) perTask.push(0);
+    for (const task of log) perTask[task] = perTask[task] + 1;
+    for (let t = 0; t < TASK_COUNT; t++) {
+        check(perTask[t], PUSHES_PER_TASK, "every task's pushes arrived");
+        check(pushed[t], PUSHES_PER_TASK, "task result");
+    }
+
+    // --------------------------------------------------------
+    // Results
+    // --------------------------------------------------------
+    const speedup = sequentialMs / parallelMs;
+    System.print("");
+    System.print("========================================");
+    System.print("RESULTS");
+    System.print("========================================");
+    System.print(`Parallel shared-map fill (ms):   ${parallelMs}`);
+    System.print(`Sequential local-map fill (ms):  ${sequentialMs}`);
+    System.print(`Speedup: ${speedup} (ideal ${TASK_COUNT})`);
+    System.print(`Parallel efficiency (%): ${(speedup / TASK_COUNT) * 100}`);
+    System.print(`Contended pushes: ${TASK_COUNT * PUSHES_PER_TASK} in ${contendedMs} ms`);
+    System.print(`Checksums: parallel ${parallelChecksum}, sequential ${sequentialChecksum}`);
+    System.print(`Shared collections: ${checks} checks passed`);
+    System.print("========================================");
+}
+
+await runBenchmark();
+const result = "shared-concurrent-ok";

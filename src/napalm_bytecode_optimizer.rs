@@ -8,10 +8,8 @@
 //! ranges, precise stack maps, source ranges, OSR/deopt resume PCs and inlined
 //! resume PCs in *other* functions are relocated together.
 //!
-//! Superinstructions requiring new interpreter handlers are intentionally not
-//! emitted here: the baseline interpreter must support an opcode before it is
-//! safe to make it executable. `superinstruction_candidates` supplies a
-//! descriptor-driven catalog for the next runtime integration phase.
+//! Specialized super-instructions are selected by the bytecode compiler
+//! (`CompileOptions::emit_specialized_bytecode`), not by this pass pipeline.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -838,173 +836,31 @@ impl BytecodeOptimization for CompactBytecode {
     }
 }
 
-/// Runtime-facing fusion opportunities. These are **not** opcodes and do not
-/// change execution until matching native interpreter handlers are implemented.
-/// Kept separate from the safe default pipeline to prevent silently emitting
-/// an instruction that an older interpreter would reject.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SuperinstructionCandidate {
-    LoadI8IntegerArithmetic,
-    LoadI8IntegerComparison,
-    LoadI8Return,
-    LoadLiteralReturn,
-    MoveReturn,
-    AllocListAndAppend,
-    AllocMapAndInsert,
-    AllocInstanceAndInitializeField,
-    AllocInstanceAndInitializeProperty,
-    LoadFieldAndCall,
-    LoadPropertyAndCall,
-    GuardThenFieldLoad,
-    GuardThenPropertyLoad,
-    MapLookupOrInsert,
-    ArrayMap,
-    ArrayForEach,
-    ArrayFilter,
-    ArrayReduce,
-    CreateClassWithSuperclass,
-    CreateClassWithMethods,
-    RegisterInterfaceContract,
-    RegisterTypeContract,
-    BindClassInterface,
-    BindClassType,
-    AllocateStructuralObject,
-    CreateObjectWithProperties,
-    ImportAndReadVariable,
-    DirectCallAndReturn,
-    ClosureCallAndReturn,
-    ConcurrentLaunchAndAwait,
-}
-
-pub const fn superinstruction_candidates() -> &'static [SuperinstructionCandidate] {
-    use SuperinstructionCandidate::*;
-    &[
-        LoadI8IntegerArithmetic, LoadI8IntegerComparison, LoadI8Return,
-        LoadLiteralReturn, MoveReturn, AllocListAndAppend, AllocMapAndInsert,
-        AllocInstanceAndInitializeField, AllocInstanceAndInitializeProperty,
-        LoadFieldAndCall, LoadPropertyAndCall, GuardThenFieldLoad,
-        GuardThenPropertyLoad, MapLookupOrInsert, ArrayMap, ArrayForEach,
-        ArrayFilter, ArrayReduce, CreateClassWithSuperclass,
-        CreateClassWithMethods, RegisterInterfaceContract, RegisterTypeContract,
-        BindClassInterface, BindClassType, AllocateStructuralObject,
-        CreateObjectWithProperties, ImportAndReadVariable, DirectCallAndReturn,
-        ClosureCallAndReturn, ConcurrentLaunchAndAwait,
-    ]
-}
-
-/// An actionable fusion site. A hit is **not** proof that it can be lowered
-/// without changing GC maps, exception behavior, or runtime side effects.
-/// `has_external_entry` must be false before a multi-instruction rewrite.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SuperinstructionSite {
-    pub function: FuncId,
-    pub start_pc: BytecodePc,
-    pub end_pc: BytecodePc,
-    pub candidate: SuperinstructionCandidate,
-    pub has_external_entry: bool,
-    pub crosses_gc_boundary: bool,
-}
-
-/// Finds candidate sites after bytecode emission. The planner is useful for
-/// coverage/profiling and for selecting which native handlers to implement.
-/// It never modifies an executable bytecode stream.
-pub fn find_superinstruction_sites(program: &BytecodeProgram) -> Result<Vec<SuperinstructionSite>, OptimizationError> {
-    use SuperinstructionCandidate::*;
-    let mut sites = Vec::new();
-    for fi in 0..program.functions.len() {
-        let f = &program.functions[fi];
-        let chunk = &f.chunk;
-        let insts = decode(&chunk.code, "superinstruction planner")?;
-        let boundaries = entries(program, fi)?;
-        for pair in insts.windows(2) {
-            let (first, second) = (pair[0],pair[1]);
-            let d = first.first.a();
-            let kind = match (first.op,second.op) {
-                (Opcode::LoadI8, Opcode::IAdd|Opcode::ISub|Opcode::IMul|
-                    Opcode::IDivS|Opcode::IRemS|Opcode::IBitAnd|Opcode::IBitOr|
-                    Opcode::IBitXor|Opcode::IShl|Opcode::IShrU|Opcode::ISar)
-                    if second.first.b() == d || second.first.c() == d => Some(LoadI8IntegerArithmetic),
-                (Opcode::LoadI8, Opcode::ICmpEq|Opcode::ICmpNe|Opcode::ICmpLt|
-                    Opcode::ICmpLe|Opcode::ICmpGt|Opcode::ICmpGe)
-                    if second.first.b() == d || second.first.c() == d => Some(LoadI8IntegerComparison),
-                (Opcode::LoadI8,Opcode::Return) if second.first.a() == d => Some(LoadI8Return),
-                (Opcode::LoadNull|Opcode::LoadTrue|Opcode::LoadFalse,Opcode::Return)
-                    if second.first.a()==d => Some(LoadLiteralReturn),
-                (Opcode::Move,Opcode::Return) if second.first.a()==d => Some(MoveReturn),
-                (Opcode::AllocList,Opcode::ListAppend) if second.first.a()==d => Some(AllocListAndAppend),
-                (Opcode::AllocMap,Opcode::MapSet) if second.first.a()==d => Some(AllocMapAndInsert),
-                (Opcode::AllocInstance,Opcode::StoreProperty) if second.first.a()==d => Some(AllocInstanceAndInitializeProperty),
-                (Opcode::AllocInstance,Opcode::StoreField) if second.first.a()==d => Some(AllocInstanceAndInitializeField),
-                (Opcode::LoadField,Opcode::CallClosure) if second.first.b()==d => Some(LoadFieldAndCall),
-                (Opcode::LoadProperty,Opcode::CallClosure) if second.first.b()==d => Some(LoadPropertyAndCall),
-                (Opcode::GuardType|Opcode::GuardClass,Opcode::LoadProperty)
-                    if second.first.b()==d => Some(GuardThenPropertyLoad),
-                (Opcode::GuardType|Opcode::GuardClass,Opcode::LoadField)
-                    if second.first.b()==d => Some(GuardThenFieldLoad),
-                (Opcode::CreateClass,Opcode::BindMethod) if second.first.a()==d => Some(CreateClassWithMethods),
-                (Opcode::ImportModule,Opcode::ImportVariable) if second.first.b()==d => Some(ImportAndReadVariable),
-                (Opcode::CallDirect,Opcode::Return) if second.first.a()==d => Some(DirectCallAndReturn),
-                (Opcode::CallClosure,Opcode::Return) if second.first.a()==d => Some(ClosureCallAndReturn),
-                (Opcode::Launch,Opcode::Await) if second.first.b()==d => Some(ConcurrentLaunchAndAwait),
-                _ => None,
-            };
-            if let Some(candidate)=kind {
-                sites.push(SuperinstructionSite {
-                    function:f.id,
-                    start_pc:BytecodePc(first.pc as u32),
-                    end_pc:BytecodePc((second.pc+second.len) as u32),
-                    candidate,
-                    has_external_entry:boundaries.contains(&second.pc),
-                    crosses_gc_boundary:first.op.may_gc()||second.op.may_gc(),
-                });
-            }
-        }
-        for i in &insts {
-            if i.op==Opcode::CreateClass && i.first.c()==1 {
-                sites.push(SuperinstructionSite {
-                    function:f.id,
-                    start_pc:BytecodePc(i.pc as u32),
-                    end_pc:BytecodePc((i.pc+i.len) as u32),
-                    candidate:CreateClassWithSuperclass,
-                    has_external_entry:false,
-                    crosses_gc_boundary:i.op.may_gc(),
-                });
-            }
-            let method = match i.op {
-                Opcode::Invoke | Opcode::InvokeSuper => chunk.inline_caches.get(chunk.code[i.pc+1].0 as usize).map(|cache|cache.method),
-                Opcode::InvokeSpread => Some(crate::napalm_ir::MethodSymbol(chunk.code[i.pc+1].0)),
-                _ => None,
-            };
-            if let Some(method) = method {
-                if let Some(signature) = program.metadata.method(method) {
-                    let candidate = match program.metadata.string(signature.name) {
-                        Some("map") => Some(ArrayMap),
-                        Some("forEach") => Some(ArrayForEach),
-                        Some("filter") => Some(ArrayFilter),
-                        Some("reduce") => Some(ArrayReduce),
-                        _ => None,
-                    };
-                    if let Some(candidate)=candidate {
-                        sites.push(SuperinstructionSite {
-                            function:f.id,
-                            start_pc:BytecodePc(i.pc as u32),
-                            end_pc:BytecodePc((i.pc+i.len) as u32),
-                            candidate,
-                            has_external_entry:false,
-                            crosses_gc_boundary:true,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(sites)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::napalm_bytecode::Assembler;
+
+    fn stub_function(code: Vec<Word>) -> BytecodeProgram {
+        use crate::napalm_bytecode::{BytecodeFunction, BytecodeChunk, FrameLayout, RegisterKind};
+        use crate::napalm_ir::{ModuleId, StringId, FunctionKind, MemoizationKind, Type};
+        let mut program = BytecodeProgram::new();
+        let mut chunk = BytecodeChunk::default();
+        chunk.code = code;
+        program.push_function(BytecodeFunction {
+            id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
+            is_async: false, is_concurrent: false, memoization: MemoizationKind::None,
+            field_owner: None, name: StringId(0), arity: 0, result_type: Type::Top,
+            capture_count: 0,
+            frame: FrameLayout {
+                general_register_count: 8, parameters: Vec::new(), captures: Vec::new(),
+                return_kind: RegisterKind::Value,
+            },
+            chunk,
+        }).unwrap();
+        program
+    }
 
     #[test]
     fn small_constant_folding_only_uses_representable_results() {

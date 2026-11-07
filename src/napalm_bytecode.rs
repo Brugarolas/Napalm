@@ -1083,6 +1083,40 @@ define_opcodes! {
     // Isolated parallel call. A=result Promise, B=concurrent closure, C=argc;
     // x0 is reserved for transport flags, followed by packed argument GPRs.
     Launch = 134,
+
+    // Specialized opcodes. The VM and tracing JIT must opt in before emission.
+    DefineClass = 135,
+    DefineInterface = 136,
+    DefineType = 137,
+    DefineDerivedClass = 138,
+    DefineClassWithImplements = 139,
+    DefineDerivedClassWithImplements = 140,
+    ImplementInterfaceOrType = 141,
+    // A=result, B=Map/Set, C=key; x0=value GPR. Runtime implementation pending
+    // (lands with the master merge); never emitted by the compiler yet.
+    MapLookupOrInsert = 142,
+    DefineArrayWithGenerics = 143,
+    NewClassInstance = 144,
+    NewInterfaceOrTypeObject = 145,
+    NewObjectShape = 146,
+    NewObjectEmpty = 147,
+    NewObjectWithProperties = 148,
+    GetFieldShape = 149,
+    SetFieldShape = 150,
+    GetFieldClass = 151,
+    SetFieldClass = 152,
+    InvokeMethodDirect = 153,
+}
+
+impl Opcode {
+    pub const fn is_specialized(self) -> bool {
+        (self as u8) >= Opcode::DefineClass as u8
+            && (self as u8) <= Opcode::InvokeMethodDirect as u8
+    }
+
+    pub const fn has_specialization_descriptor(self) -> bool {
+        self.is_specialized() && !matches!(self, Opcode::NewObjectEmpty | Opcode::MapLookupOrInsert)
+    }
 }
 
 impl Opcode {
@@ -1092,11 +1126,19 @@ impl Opcode {
         use Opcode::*;
         match self {
             Invoke | InvokeSuper | CallDirect | CallClosure | Launch | CallPrimitive | CallForeign
-            | MakeClosure => None,
+            | MakeClosure | NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
+            | InvokeMethodDirect => None,
 
-            LoadProperty | StoreProperty | StorePropertyIfPresent => Some(3),
+            LoadProperty | StoreProperty | StorePropertyIfPresent
+            | GetFieldShape | SetFieldShape => Some(3),
 
             BindInterface
+            | DefineClass | DefineInterface | DefineType | DefineDerivedClass
+            | DefineClassWithImplements | DefineDerivedClassWithImplements
+            | ImplementInterfaceOrType | DefineArrayWithGenerics
+            | NewObjectShape
+            | GetFieldClass | SetFieldClass
+            | MapLookupOrInsert
             | LoadI32
             | LoadConst
             | Jump
@@ -1173,6 +1215,7 @@ impl Opcode {
                 | ListInsert
                 | AllocMap
                 | MapSet
+                | MapLookupOrInsert
                 | StoreProperty
                 | StorePropertyIfPresent
                 | StringConcat
@@ -1187,6 +1230,13 @@ impl Opcode {
                 | FiberSuspend
                 | Await
                 | Catch
+                | DefineClass | DefineDerivedClass
+                | DefineClassWithImplements | DefineDerivedClassWithImplements
+                | ImplementInterfaceOrType | DefineArrayWithGenerics
+                | NewClassInstance | NewInterfaceOrTypeObject | NewObjectShape | NewObjectEmpty
+                | NewObjectWithProperties | SetFieldShape
+                | InvokeMethodDirect
+                | MapLookupOrInsert
         )
     }
 }
@@ -1213,6 +1263,8 @@ pub fn instruction_word_len(first: Word) -> Result<usize, DecodeError> {
         CallClosure | Launch => 2 + packed_register_word_count(first.c() as usize),
         CallPrimitive | CallForeign => 2 + packed_register_word_count(first.c() as usize),
         MakeClosure => 2 + packed_register_word_count(first.bx() as usize),
+        NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
+        | InvokeMethodDirect => 2 + packed_register_word_count(first.c() as usize),
         _ => unreachable!("fixed-size opcode reached variable-size decoder"),
     };
     Ok(len)
@@ -1253,6 +1305,87 @@ pub fn unpack_registers(words: &[Word], count: usize) -> Result<Vec<Reg>, Decode
 // =============================================================================
 // Constant pools and side tables
 // =============================================================================
+
+/// Compiled method binding consumed atomically by a Define*Class opcode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpecializedMethodTarget {
+    Function(FuncId),
+    Foreign(ForeignFnId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecializedMethod {
+    pub symbol: MethodSymbol,
+    pub target: SpecializedMethodTarget,
+    pub is_static: bool,
+}
+
+/// Typed runtime specialization payload. Indices are local to a BytecodeChunk.
+/// Runtime handlers MUST validate dynamic shapes/method identities and fall back
+/// to the original semantics on a failed speculation. No speculative assumption
+/// may silently change observable getter, callback or exception ordering.
+#[derive(Clone, Debug)]
+pub enum SpecializedDescriptor {
+    Class {
+        class: ClassId,
+        methods: Vec<SpecializedMethod>,
+        implements: Vec<Type>,
+    },
+    Contract { name: Option<StringId>, contract: Type },
+    ArrayType { element: Type, with_capacity: bool },
+    Instance { class: ClassId, constructor: Option<FuncId> },
+    ObjectShape { layout: StructuralLayoutId, contract: Option<Type> },
+    ObjectProperties { names: Vec<StringId> },
+    FieldShape { layout: StructuralLayoutId, slot: PropertySlotId },
+    /// A field of the function's own class at a known class-local offset.
+    /// `nullable`: the field contract admits null, so a read needs no
+    /// uninitialized-field trap. `unchecked_store`: the stored value's static
+    /// type already satisfies the (non-generic) field contract, so a write needs
+    /// no runtime contract check (Napalm types are enforced guarantees).
+    FieldClass { class: ClassId, local_slot: u32, nullable: bool, unchecked_store: bool },
+    DirectMethod {
+        owner: ClassId,
+        symbol: MethodSymbol,
+        target: FuncId,
+        /// The runtime must validate method identity before a direct call.
+        fallback_cache: IcSlot,
+    },
+}
+
+/// Prepared-op Y bits of GetFieldClass/SetFieldClass (see `FieldClass`).
+pub const FIELD_CLASS_NULLABLE: u32 = 1 << 0;
+pub const FIELD_CLASS_UNCHECKED_STORE: u32 = 1 << 1;
+
+impl SpecializedDescriptor {
+    /// Y operand bits for a prepared GetFieldClass/SetFieldClass.
+    pub fn field_class_flags(&self) -> u32 {
+        match self {
+            Self::FieldClass { nullable, unchecked_store, .. } => {
+                (if *nullable { FIELD_CLASS_NULLABLE } else { 0 })
+                    | (if *unchecked_store { FIELD_CLASS_UNCHECKED_STORE } else { 0 })
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn matches_opcode(&self, opcode: Opcode) -> bool {
+        use Opcode::*;
+        match opcode {
+            DefineClass | DefineDerivedClass | DefineClassWithImplements
+            | DefineDerivedClassWithImplements => matches!(self, Self::Class { .. }),
+            DefineInterface | DefineType | ImplementInterfaceOrType =>
+                matches!(self, Self::Contract { .. }),
+            DefineArrayWithGenerics => matches!(self, Self::ArrayType { .. }),
+            NewClassInstance => matches!(self, Self::Instance { .. }),
+            NewInterfaceOrTypeObject | NewObjectShape => matches!(self, Self::ObjectShape { .. }),
+            NewObjectWithProperties => matches!(self, Self::ObjectProperties { .. }),
+            GetFieldShape | SetFieldShape => matches!(self, Self::FieldShape { .. }),
+            GetFieldClass | SetFieldClass => matches!(self, Self::FieldClass { .. }),
+            InvokeMethodDirect => matches!(self, Self::DirectMethod { .. }),
+            _ => false,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct InlineCacheDescriptor {
@@ -1499,6 +1632,7 @@ pub struct BytecodeChunk {
     pub code: Vec<Word>,
     pub constants: Vec<Constant>,
     pub inline_caches: Vec<InlineCacheDescriptor>,
+    pub specializations: Vec<SpecializedDescriptor>,
     pub type_guards: Vec<TypeGuardDescriptor>,
     pub class_guards: Vec<ClassGuardDescriptor>,
     pub switch_tables: Vec<SwitchTable>,
@@ -1527,6 +1661,12 @@ impl BytecodeChunk {
     pub fn push_inline_cache(&mut self, descriptor: InlineCacheDescriptor) -> IcSlot {
         let id = IcSlot(self.inline_caches.len() as u32);
         self.inline_caches.push(descriptor);
+        id
+    }
+
+    pub fn push_specialization(&mut self, descriptor: SpecializedDescriptor) -> u32 {
+        let id = self.specializations.len() as u32;
+        self.specializations.push(descriptor);
         id
     }
 
@@ -1809,7 +1949,9 @@ impl<'a> DecodedInstruction<'a> {
             | Opcode::CallClosure
             | Opcode::Launch
             | Opcode::CallPrimitive
-            | Opcode::CallForeign => Some(self.first.c() as usize),
+            | Opcode::CallForeign
+            | Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
+            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect => Some(self.first.c() as usize),
             _ => None,
         }
     }
@@ -1943,6 +2085,7 @@ pub enum AssembleError {
     BranchOutOfRange { from: usize, to: usize },
     InvalidCallArity(usize),
     TooManyClosureCaptures(usize),
+    InvalidSpecialization(String),
 }
 
 impl fmt::Display for AssembleError {
@@ -1955,6 +2098,7 @@ impl fmt::Display for AssembleError {
             Self::InvalidCallArity(arity) => {
                 write!(f, "invalid call argument count {arity}")
             }
+            Self::InvalidSpecialization(message) => write!(f, "{message}"),
             Self::TooManyClosureCaptures(count) => {
                 write!(f, "closure has {count} captures; bytecode limit is 65535")
             }
@@ -2219,6 +2363,90 @@ impl Assembler {
         self.chunk.code.push(Word(function.0));
         self.chunk.code.extend(pack_registers(captures));
         Ok(pc)
+    }
+
+    /// Emits a descriptor-backed specialized opcode. This API is intentionally
+    /// usable for all specialization families, including those not yet lowered
+    /// from HIR. Callers must provide a precise safepoint for GC-capable ops.
+    pub fn emit_specialized(
+        &mut self,
+        opcode: Opcode,
+        a: Reg,
+        b: Reg,
+        args: &[Reg],
+        descriptor: SpecializedDescriptor,
+    ) -> Result<BytecodePc, AssembleError> {
+        if !descriptor.matches_opcode(opcode) {
+            return Err(AssembleError::InvalidSpecialization(format!(
+                "{} received an incompatible specialization descriptor", opcode.name()
+            )));
+        }
+        if matches!(opcode, Opcode::GetFieldShape | Opcode::SetFieldShape) {
+            return Err(AssembleError::InvalidSpecialization(
+                "use emit_specialized_shape for three-word field operations".into(),
+            ));
+        }
+        let variable = matches!(opcode,
+            Opcode::NewClassInstance | Opcode::NewInterfaceOrTypeObject
+            | Opcode::NewObjectWithProperties | Opcode::InvokeMethodDirect);
+        if args.len() > MAX_NAPALM_ARITY || (!variable && !args.is_empty()) {
+            return Err(AssembleError::InvalidSpecialization(
+                "invalid argument count for specialized opcode".into(),
+            ));
+        }
+        let c = if matches!(opcode, Opcode::DefineDerivedClass
+            | Opcode::DefineDerivedClassWithImplements) {
+            1
+        } else if variable {
+            args.len() as u8
+        } else {
+            0
+        };
+        let id = self.chunk.push_specialization(descriptor);
+        let pc = self.emit_x32(opcode, a.0, b.0, c, id);
+        if variable {
+            self.chunk.code.extend(pack_registers(args));
+        }
+        Ok(pc)
+    }
+
+    /// Atomic lookup-or-insert with explicit default value. A normal
+    /// `MapGet` followed by `MapSet` must not be converted to this opcode:
+    /// the unconditional store has different semantics on an existing key.
+    /// Same encoding as master: A=result, B=map, C=key, x0=value GPR.
+    pub fn emit_map_lookup_or_insert(
+        &mut self,
+        destination: Reg,
+        map: Reg,
+        key: Reg,
+        default_value: Reg,
+    ) -> Result<BytecodePc, AssembleError> {
+        Ok(self.emit_x32(
+            Opcode::MapLookupOrInsert,
+            destination.0, map.0, key.0, default_value.0 as u32,
+        ))
+    }
+
+    /// Field shape operations retain A/B/C and a second extension word holding
+    /// the logical slot. The handler must guard the actual runtime shape, and
+    /// use the original object/key path when the guard does not match.
+    pub fn emit_specialized_shape(
+        &mut self,
+        opcode: Opcode,
+        a: Reg,
+        b: Reg,
+        c: Reg,
+        layout: StructuralLayoutId,
+        slot: PropertySlotId,
+    ) -> Result<BytecodePc, AssembleError> {
+        if !matches!(opcode, Opcode::GetFieldShape | Opcode::SetFieldShape) {
+            return Err(AssembleError::InvalidSpecialization(
+                "expected GetFieldShape or SetFieldShape".into(),
+            ));
+        }
+        let id = self.chunk.push_specialization(
+            SpecializedDescriptor::FieldShape { layout, slot });
+        Ok(self.emit_x32_y32(opcode, a.0, b.0, c.0, id, slot.0 as u32))
     }
 
     pub fn add_safepoint(
@@ -2515,6 +2743,12 @@ impl BytecodeVerifier {
 
         let mut module_ids = HashSet::default();
         for module in &program.metadata.modules {
+            let mut shared = HashSet::default();
+            for slot in &module.shared_slots {
+                if slot.0 >= module.source_variable_count() || !shared.insert(*slot) {
+                    return Err(VerificationError::function("invalid or duplicate shared module slot"));
+                }
+            }
             if !module_ids.insert(module.id) {
                 return Err(VerificationError::function(format!(
                     "duplicate module metadata {:?}",
@@ -2645,6 +2879,186 @@ impl BytecodeVerifier {
         Ok(())
     }
 
+    /// Verify typed descriptors against the entire program, not just local indices.
+    fn verify_specialized_instruction(
+        program: &BytecodeProgram,
+        function: &BytecodeFunction,
+        inst: DecodedInstruction<'_>,
+    ) -> Result<(), VerificationError> {
+        use Opcode::*;
+        let op = inst.opcode;
+        if !op.has_specialization_descriptor() {
+            return Ok(());
+        }
+        let descriptor = function.chunk.specializations
+            .get(inst.extension(0).unwrap() as usize)
+            .ok_or_else(|| VerificationError::at(inst.pc, "missing specialization descriptor"))?;
+        if !descriptor.matches_opcode(op) {
+            return Err(VerificationError::at(inst.pc, "opcode/descriptor kind mismatch"));
+        }
+        let fail = |message: &str| VerificationError::at(inst.pc, message);
+        match descriptor {
+            SpecializedDescriptor::Class { class, methods, implements } => {
+                let info = program.metadata.class(*class)
+                    .ok_or_else(|| fail("specialized class is not in runtime metadata"))?;
+                let derived = matches!(op, DefineDerivedClass | DefineDerivedClassWithImplements);
+                let implementing = matches!(op, DefineClassWithImplements | DefineDerivedClassWithImplements);
+                // A superclass can be dynamically resolved even when ClassInfo
+                // has no static superclass ID. In that case operand C/B carries
+                // the runtime source of truth, not this metadata field.
+                if !derived && info.superclass.is_some() {
+                    return Err(fail("known derived class compiled without superclass"));
+                }
+                if derived != (inst.first.c() != 0) {
+                    return Err(fail("derived class opcode disagrees with superclass flag"));
+                }
+                if implementing != !implements.is_empty() {
+                    return Err(fail("class implements opcode and descriptor disagree"));
+                }
+                for contract in implements {
+                    Self::verify_type(program, contract)?;
+                }
+                for method in methods {
+                    let signature = program.metadata.method(method.symbol)
+                        .ok_or_else(|| fail("specialized class has unknown method symbol"))?;
+                    match &method.target {
+                        SpecializedMethodTarget::Function(target) => {
+                            let f = program.function(*target).ok_or_else(|| fail("class method target is absent"))?;
+                            if signature.arity != f.arity {
+                                return Err(fail("class method arity differs from method signature"));
+                            }
+                        }
+                        SpecializedMethodTarget::Foreign(target) => {
+                            let foreign = program.metadata.foreign_function(*target)
+                                .ok_or_else(|| fail("class foreign method target is absent"))?;
+                            if foreign.signature != method.symbol || foreign.is_static != method.is_static {
+                                return Err(fail("class foreign method signature/flags mismatch"));
+                            }
+                        }
+                    }
+                }
+            }
+            SpecializedDescriptor::Contract { name, contract } => {
+                if let Some(name) = name {
+                    if program.metadata.string(*name).is_none() {
+                        return Err(fail("named type/interface has unknown string id"));
+                    }
+                } else if matches!(op, DefineInterface | DefineType) {
+                    return Err(fail("declaration requires an interned contract name"));
+                }
+                Self::verify_type(program, contract)?;
+                if matches!(op, DefineInterface | DefineType)
+                    && !program.metadata.contract_names.iter().any(|(registered_name, registered_type)| {
+                        Some(*registered_name) == *name && registered_type == contract
+                    })
+                {
+                    return Err(fail("named declaration does not match canonical contract metadata"));
+                }
+                if op == DefineInterface && !matches!(contract, Type::Interface(_)) {
+                    return Err(fail("interface declaration requires an interface contract"));
+                }
+                if op == ImplementInterfaceOrType
+                    && !matches!(contract, Type::Interface(_) | Type::Record(_))
+                {
+                    return Err(fail("ImplementInterfaceOrType requires a structural contract"));
+                }
+            }
+            SpecializedDescriptor::ArrayType { element, with_capacity } => {
+                Self::verify_type(program, element)?;
+                if !with_capacity && inst.first.b() != 0 {
+                    return Err(fail("typed array without capacity has unexpected B register"));
+                }
+            },
+            SpecializedDescriptor::Instance { class, constructor } => {
+                let meta = program.metadata.class(*class)
+                    .ok_or_else(|| fail("unknown instance class"))?;
+                if meta.is_foreign {
+                    return Err(fail("NewClassInstance cannot allocate a foreign class"));
+                }
+                if constructor.is_none() && inst.first.c() != 0 {
+                    return Err(fail("instance without constructor has unexpected arguments"));
+                }
+                if let Some(constructor) = constructor {
+                    let ctor = program.function(*constructor)
+                        .ok_or_else(|| fail("unknown class constructor"))?;
+                    if ctor.kind != FunctionKind::Constructor || ctor.is_async || ctor.is_concurrent
+                        || ctor.field_owner != Some(*class)
+                        || ctor.arity as usize != inst.first.c() as usize {
+                        return Err(fail("constructor target/argument count does not match"));
+                    }
+                }
+            }
+            SpecializedDescriptor::ObjectShape { layout, contract } => {
+                let shape = program.metadata.structural_layout(*layout)
+                    .ok_or_else(|| fail("unknown object structural layout"))?;
+                if op == NewInterfaceOrTypeObject && inst.first.c() as usize != shape.properties.len() {
+                    return Err(fail("structural initializer count disagrees with layout"));
+                }
+                if let Some(contract) = contract {
+                    Self::verify_type(program, contract)?;
+                    if contract != &shape.contract {
+                        return Err(fail("object contract disagrees with structural layout"));
+                    }
+                }
+                if op == NewInterfaceOrTypeObject
+                    && !matches!(contract, Some(Type::Interface(_) | Type::Record(_)))
+                {
+                    return Err(fail("NewInterfaceOrTypeObject requires an interface or closed record"));
+                }
+            }
+            SpecializedDescriptor::ObjectProperties { names } => {
+                if names.len() != inst.first.c() as usize {
+                    return Err(fail("object property initializers do not match descriptor"));
+                }
+                for name in names {
+                    if program.metadata.string(*name).is_none() {
+                        return Err(fail("unknown property name in object initializer"));
+                    }
+                }
+            }
+            SpecializedDescriptor::FieldShape { layout, slot } => {
+                let shape = program.metadata.structural_layout(*layout)
+                    .ok_or_else(|| fail("unknown field shape"))?;
+                if shape.property(*slot).is_none() {
+                    return Err(fail("field shape slot is out of bounds"));
+                }
+            }
+            SpecializedDescriptor::FieldClass { class, local_slot, nullable, unchecked_store } => {
+                let owner = program.metadata.class(*class)
+                    .ok_or_else(|| fail("unknown field class"))?;
+                if *local_slot >= owner.own_instance_field_count as u32 {
+                    return Err(fail("class-local field slot is out of bounds"));
+                }
+                let field_type = owner.own_instance_field_types.get(*local_slot as usize);
+                if *nullable && !field_type.is_some_and(|ty| ty.accepts(&Type::Null)) {
+                    return Err(fail("nullable field read on a non-nullable field contract"));
+                }
+                if *unchecked_store
+                    // Same reading as the runtime: an absent entry is non-generic.
+                    && owner.own_generic_fields.get(*local_slot as usize).copied().unwrap_or(false)
+                {
+                    return Err(fail("unchecked store to a generic field"));
+                }
+                if (*nullable && op != GetFieldClass) || (*unchecked_store && op != SetFieldClass) {
+                    return Err(fail("field flag does not apply to this opcode"));
+                }
+            }
+            SpecializedDescriptor::DirectMethod { owner, symbol, target, fallback_cache } => {
+                if program.metadata.class(*owner).is_none() || program.function(*target).is_none() {
+                    return Err(fail("unknown direct method owner or target"));
+                }
+                let signature = program.metadata.method(*symbol)
+                    .ok_or_else(|| fail("unknown direct method signature"))?;
+                let ic = function.chunk.inline_caches.get(fallback_cache.0 as usize)
+                    .ok_or_else(|| fail("missing direct method fallback IC"))?;
+                if ic.method != *symbol || ic.home_class.is_some() || signature.arity != inst.first.c() {
+                    return Err(fail("direct method call/cache signature mismatch"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verify individual functions plus cross-function direct-call and closure
     /// invariants that cannot be checked from one chunk in isolation.
     pub fn verify_program(program: &BytecodeProgram) -> Result<(), VerificationError> {
@@ -2668,6 +3082,12 @@ impl BytecodeVerifier {
                 return Err(VerificationError::function(format!(
                     "function {:?} references unknown name {:?}",
                     function.id, function.name
+                )));
+            }
+            if function.kind == FunctionKind::Constructor && function.memoization.enabled() {
+                return Err(VerificationError::function(format!(
+                    "constructor {:?} cannot be memoized",
+                    function.id
                 )));
             }
             if let Some(owner) = function.field_owner {
@@ -2781,6 +3201,7 @@ impl BytecodeVerifier {
                     message: error.message,
                 })?;
 
+                Self::verify_specialized_instruction(program, function, inst)?;
                 match inst.opcode {
                     Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent => {
                         let layout_id = StructuralLayoutId(inst.extension(0).unwrap());
@@ -3375,6 +3796,15 @@ impl BytecodeVerifier {
             ));
         }
 
+        if inst.opcode.has_specialization_descriptor() {
+            let id = inst.extension(0).unwrap() as usize;
+            let descriptor = chunk.specializations.get(id)
+                .ok_or_else(|| VerificationError::at(inst.pc, "specialization descriptor index out of bounds"))?;
+            if !descriptor.matches_opcode(inst.opcode) {
+                return Err(VerificationError::at(inst.pc, "opcode/descriptor mismatch"));
+            }
+        }
+
         match inst.opcode {
             Nop | Trap | Safepoint | OsrPoint | Breakpoint => {}
 
@@ -3734,6 +4164,80 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, c)?;
             }
 
+            MapLookupOrInsert => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                Self::verify_reg(function, inst.pc, c)?;
+                let value = inst.extension(0).unwrap();
+                if value > u8::MAX as u32 {
+                    return Err(VerificationError::at(inst.pc, "invalid MapLookupOrInsert value register"));
+                }
+                Self::verify_reg(function, inst.pc, Reg(value as u8))?;
+            }
+
+            // Descriptor-backed specializations all use x0=chunk.specializations[id].
+            DefineClass | DefineInterface | DefineType | DefineClassWithImplements
+            | NewObjectShape => {
+                Self::verify_reg(function, inst.pc, a)?;
+                if inst.first.b() != 0 || inst.first.c() != 0 {
+                    return Err(VerificationError::at(inst.pc, "reserved B/C must be zero"));
+                }
+            }
+            DefineDerivedClass | DefineDerivedClassWithImplements
+            | DefineArrayWithGenerics | GetFieldClass | SetFieldClass => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.first.c() != 0 && !matches!(inst.opcode, DefineDerivedClass | DefineDerivedClassWithImplements) {
+                    return Err(VerificationError::at(inst.pc, "reserved C must be zero"));
+                }
+                if matches!(inst.opcode, DefineDerivedClass | DefineDerivedClassWithImplements) && inst.first.c() != 1 {
+                    return Err(VerificationError::at(inst.pc, "derived class requires a superclass"));
+                }
+            }
+            GetFieldShape | SetFieldShape => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                Self::verify_reg(function, inst.pc, c)?;
+                if inst.extension(1).unwrap() > u16::MAX as u32 {
+                    return Err(VerificationError::at(inst.pc, "shape property slot cannot exceed u16"));
+                }
+                let specialization = &chunk.specializations[inst.extension(0).unwrap() as usize];
+                if let SpecializedDescriptor::FieldShape { slot, .. } = specialization {
+                    if inst.extension(1).unwrap() != slot.0 as u32 {
+                        return Err(VerificationError::at(inst.pc, "shape access fallback slot differs"));
+                    }
+                }
+            }
+            ImplementInterfaceOrType => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.first.c() != 0 {
+                    return Err(VerificationError::at(inst.pc, "reserved C must be zero"));
+                }
+            }
+            NewClassInstance | InvokeMethodDirect => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if inst.first.c() as usize > MAX_NAPALM_ARITY {
+                    return Err(VerificationError::at(inst.pc, "specialized call exceeds max arity"));
+                }
+                for r in inst.call_arguments().map_err(|e| VerificationError {
+                    pc: e.pc, message: e.message,
+                })? { Self::verify_reg(function, inst.pc, r)?; }
+            }
+            NewInterfaceOrTypeObject | NewObjectWithProperties => {
+                Self::verify_reg(function, inst.pc, a)?;
+                if inst.first.b() != 0 { return Err(VerificationError::at(inst.pc, "reserved B must be zero")); }
+                for r in inst.call_arguments().map_err(|e| VerificationError {
+                    pc: e.pc, message: e.message,
+                })? { Self::verify_reg(function, inst.pc, r)?; }
+            }
+            NewObjectEmpty => {
+                Self::verify_reg(function, inst.pc, a)?;
+                if inst.first.b() != 0 || inst.first.c() != 0 {
+                    return Err(VerificationError::at(inst.pc, "NewObjectEmpty reserved B/C must be zero"));
+                }
+            }
             Catch => Self::verify_reg(function, inst.pc, a)?,
             Await => {
                 Self::verify_reg(function, inst.pc, a)?;
@@ -3862,7 +4366,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         AllocList | AllocMap => [General, None, None],
         AllocListCap | ListLen | MapLen | StringLen => [General, General, None],
         ListGet | ListRemoveAt | MapGet | LoadProperty | MapRemove | StringCodePointAt => [General, General, General],
-        ListSet | ListInsert | MapSet | StoreProperty | StorePropertyIfPresent => [General, General, General],
+        ListSet | ListInsert | MapSet | MapLookupOrInsert | StoreProperty | StorePropertyIfPresent => [General, General, General],
         ListAppend => [General, General, None],
         StringConcat | StringSlice | MakeRange => [General, General, General],
         INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => [General, General, None],
@@ -3870,6 +4374,14 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         | IShrU | ISar | FAdd | FSub | FMul | FDiv | FRem | ICmpEq | ICmpNe
         | ICmpLt | ICmpLe | ICmpGt | ICmpGe | FCmpEq | FCmpNe | FCmpLt
         | FCmpLe | FCmpGt | FCmpGe | RefEq => [General, General, General],
+        DefineClass | DefineInterface | DefineType | DefineClassWithImplements
+        | NewObjectShape | NewObjectEmpty | NewInterfaceOrTypeObject | NewObjectWithProperties =>
+            [General, None, SmallImmediate],
+        DefineDerivedClass | DefineDerivedClassWithImplements => [General, General, Flag],
+        GetFieldShape | SetFieldShape => [General, General, General],
+        DefineArrayWithGenerics | GetFieldClass | SetFieldClass => [General, General, None],
+        ImplementInterfaceOrType => [General, General, None],
+        NewClassInstance | InvokeMethodDirect => [General, General, SmallImmediate],
         Await => [General, General, None],
         Catch => [General, None, None],
         MakeFiber => [General, General, None],
@@ -3885,6 +4397,17 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
 pub const fn extension_description(opcode: Opcode) -> &'static str {
     use Opcode::*;
     match opcode {
+        DefineClass | DefineInterface | DefineType | DefineDerivedClass
+        | DefineClassWithImplements | DefineDerivedClassWithImplements
+        | ImplementInterfaceOrType | DefineArrayWithGenerics
+        | NewObjectShape | GetFieldClass | SetFieldClass =>
+            "x0=SpecializedDescriptor index",
+        MapLookupOrInsert => "x0=value GPR",
+        GetFieldShape | SetFieldShape =>
+            "x0=SpecializedDescriptor index, x1=original PropertySlotId for slow path",
+        NewClassInstance | NewInterfaceOrTypeObject | NewObjectWithProperties
+        | InvokeMethodDirect =>
+            "x0=SpecializedDescriptor index, then C packed register operands",
         InvokeSpread => "x0=MethodSymbol (runtime arity), x1=home ClassId or u32::MAX",
         LoadI32 => "x0=i32 bits",
         LoadConst => "x0=ConstIndex",
@@ -3994,6 +4517,93 @@ mod tests {
     }
 
     #[test]
+    fn specialized_opcode_ids_are_stable_and_decodable() {
+        for id in 135u8..=153u8 {
+            let opcode = Opcode::from_u8(id).expect("specialized opcode must decode");
+            assert!(opcode.is_specialized());
+            assert_eq!(opcode as u8, id);
+        }
+        assert!(!Opcode::Launch.is_specialized());
+        assert_eq!(Opcode::from_u8(153), Some(Opcode::InvokeMethodDirect));
+        assert_eq!(Opcode::from_u8(154), None);
+    }
+
+    #[test]
+    fn specialized_calls_retain_packed_arguments_and_descriptor() {
+        let mut assembler = Assembler::new();
+        let descriptor = SpecializedDescriptor::DirectMethod {
+            owner: ClassId(1),
+            symbol: MethodSymbol(2),
+            target: FuncId(3),
+            fallback_cache: IcSlot(7),
+        };
+        assembler.emit_specialized(
+            Opcode::InvokeMethodDirect, R1, R2,
+            &[R3, R4, R5, R6, R7], descriptor,
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let instruction = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(instruction.opcode, Opcode::InvokeMethodDirect);
+        assert_eq!(instruction.len_words(), 4);
+        assert_eq!(instruction.call_arguments().unwrap(), [R3, R4, R5, R6, R7]);
+        assert_eq!(instruction.extension(0), Some(0));
+    }
+
+    #[test]
+    fn shape_field_access_retains_key_and_slot() {
+        let mut assembler = Assembler::new();
+        assembler.emit_specialized_shape(
+            Opcode::GetFieldShape, R2, R3, R4,
+            StructuralLayoutId(12), PropertySlotId(19),
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let instruction = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(instruction.len_words(), 3);
+        assert_eq!((instruction.first.a(), instruction.first.b(), instruction.first.c()), (2,3,4));
+        assert_eq!(instruction.extension(0), Some(0));
+        assert_eq!(instruction.extension(1), Some(19));
+    }
+
+    #[test]
+    fn derived_class_specialization_sets_superclass_flag() {
+        let mut assembler = Assembler::new();
+        assembler.emit_specialized(
+            Opcode::DefineDerivedClass, R1, R2, &[],
+            SpecializedDescriptor::Class {
+                class: ClassId(3), methods: Vec::new(), implements: Vec::new(),
+            },
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let instruction = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(instruction.len_words(), 2);
+        assert_eq!(instruction.first.c(), 1);
+    }
+
+    #[test]
+    fn assembler_rejects_mismatched_specialization_descriptors() {
+        let mut assembler = Assembler::new();
+        let result = assembler.emit_specialized(
+            Opcode::DefineClass, R1, R0, &[],
+            SpecializedDescriptor::ArrayType { element: Type::Num, with_capacity: false },
+        );
+        assert!(matches!(result, Err(AssembleError::InvalidSpecialization(_))));
+        assert!(assembler.chunk.code.is_empty());
+    }
+
+    #[test]
+    fn get_or_insert_requires_explicit_default_register() {
+        let mut assembler = Assembler::new();
+        assembler.emit_map_lookup_or_insert(R4, R1, R2, R3).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let instruction = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(instruction.opcode, Opcode::MapLookupOrInsert);
+        assert_eq!(instruction.len_words(), 2);
+        assert_eq!((instruction.first.a(), instruction.first.b(), instruction.first.c()), (4,1,2));
+        assert_eq!(instruction.extension(0), Some(R3.0 as u32));
+        assert!(chunk.specializations.is_empty());
+    }
+
+    #[test]
     fn variable_call_length_is_decodable() {
         let mut assembler = Assembler::new();
         let cache = assembler.chunk.push_inline_cache(InlineCacheDescriptor {
@@ -4009,6 +4619,33 @@ mod tests {
         assert_eq!(decoded.opcode, Opcode::Invoke);
         assert_eq!(decoded.len_words(), 4); // header + IC + two packed words
         assert_eq!(decoded.call_arguments().unwrap(), vec![R2, R3, R4, R5, R6]);
+    }
+
+    #[test]
+    fn structural_contract_unification_retains_stable_opcode_ids() {
+        assert_eq!(Opcode::from_u8(141), Some(Opcode::ImplementInterfaceOrType));
+        assert_eq!(Opcode::from_u8(142), Some(Opcode::MapLookupOrInsert));
+        assert_eq!(Opcode::from_u8(145), Some(Opcode::NewInterfaceOrTypeObject));
+        assert!(Opcode::ImplementInterfaceOrType.may_gc());
+        assert!(Opcode::NewObjectWithProperties.may_gc());
+    }
+
+    #[test]
+    fn structural_object_factory_packs_four_initializer_registers() {
+        let mut assembler = Assembler::new();
+        assembler.emit_specialized(
+            Opcode::NewObjectWithProperties, R6, R0,
+            &[R1, R2, R3, R4],
+            SpecializedDescriptor::ObjectProperties {
+                names: vec![StringId(1), StringId(2), StringId(3), StringId(4)],
+            },
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let inst = Decoder::new(&chunk.code).next().unwrap().unwrap();
+        assert_eq!(inst.opcode, Opcode::NewObjectWithProperties);
+        assert_eq!(inst.first.c(), 4);
+        assert_eq!(inst.call_arguments().unwrap(), vec![R1, R2, R3, R4]);
+        assert_eq!(inst.len_words(), 3);
     }
 
     #[test]

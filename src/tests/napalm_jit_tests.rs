@@ -15,6 +15,9 @@ impl Host for TestHost {
 /// encoding (and usually a dedicated setup) before they can join the matrix.
 fn has_fixture_encoding(opcode: Opcode) -> bool {
     use Opcode::*;
+    // Specialized opcodes need a chunk descriptor plus runtime metadata; they are
+    // covered differentially by the source-level specialized-bytecode tests.
+    if opcode.is_specialized() { return false; }
     matches!(
         opcode,
         Invoke | InvokeSuper | CallDirect | MakeClosure | CallClosure | CallPrimitive | CallForeign
@@ -66,7 +69,7 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     }
     let mut program = BytecodeProgram::new();
     program.metadata.strings = vec!["main".into(), "héllo".into(), "method".into()];
-    program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 2, exports: vec![], builtin_bindings: vec![], worker_function_bindings: vec![], hidden_variable_count: 0 });
+    program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 2, exports: vec![], builtin_bindings: vec![], worker_function_bindings: vec![], shared_slots: vec![], hidden_variable_count: 0 });
     program.metadata.methods.push(MethodSignature { name: StringId(2), kind: MethodKind::Method, arity: 0 });
     for id in 0..2 {
         program.metadata.classes.push(ClassInfo { id: ClassId(id), module: ModuleId(0), name: StringId(0), superclass: (id == 1).then_some(ClassId(0)), own_instance_field_count: 1, static_field_count: 1, is_foreign: opcode == AllocForeign, own_instance_field_types: vec![Type::Top], own_instance_field_names: vec![], implements: vec![], own_generic_fields: vec![], static_field_types: vec![Type::Top] });
@@ -105,7 +108,7 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
         },
         GuardBounds => { regs[0] = i32_word(0); },
         GuardClass | LoadField | StoreField | IsInstance | Invoke | InvokeSuper => {
-            let obj = vm.heap.alloc(HeapObject::Instance { class_slot: 0, fields: vec![Value::TRUE].into_boxed_slice() }).word();
+            let obj = vm.heap.alloc(HeapObject::Instance(InstanceObject::from_values(0, &[Value::TRUE]))).word();
             regs[1] = obj;
             if opcode == StoreField { regs[0] = obj; regs[1] = Value::FALSE.word(); }
             if opcode == IsInstance { regs[2] = vm.classes[0].class_value.word(); }
@@ -211,7 +214,7 @@ fn state(vm: &mut Interpreter<'_>) -> String {
                 }).collect();
                 format!("Closure({function_index}, {captures:?}, {reference_indices:?})")
             }
-            Some(HeapObject::Instance { class_slot, fields }) => format!("Instance({class_slot}, {:?})", values(fields)),
+            Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) => format!("Instance({class_slot}, {:?})", values(fields)),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("Fiber({fiber})"),
             object => format!("{object:?}"),
         }
@@ -381,7 +384,7 @@ fn native_inlining_groups_observed_classes_with_the_same_target_only() {
     let mut receivers = Vec::new();
     for slot in 0..5 {
         vm.classes[slot].instance_methods[0] = Some(CallTarget::Bytecode(1));
-        let value = vm.heap.alloc(HeapObject::Instance { class_slot: slot as u32, fields: Box::new([]) });
+        let value = vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(slot as u32, 0)));
         vm.add_root(value);
         receivers.push(value);
         if slot < 4 {
@@ -536,9 +539,7 @@ fn native_class_guards_cover_class_sets_deopt_and_moving_gc() {
 
         let mut values = Vec::new();
         for slot in 0..2 {
-            values.push((vm.heap.alloc(HeapObject::Instance {
-                class_slot: slot, fields: vec![Value::TRUE].into_boxed_slice(),
-            }), slot == 0 || mode != 0));
+            values.push((vm.heap.alloc(HeapObject::Instance(InstanceObject::from_values(slot, &[Value::TRUE]))), slot == 0 || mode != 0));
             values.push((vm.classes[slot as usize].class_value, slot == 0 || mode != 0));
             values.push((vm.heap.alloc(HeapObject::Foreign { class_slot: slot, bytes: vec![] }), slot == 0 || mode != 0));
         }

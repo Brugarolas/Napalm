@@ -71,11 +71,18 @@ pub(super) struct WholeFunctionJit {
     function_context: FunctionBuilderContext,
     runtime_op: cranelift::module::FuncId,
     direct_call: cranelift::module::FuncId,
+    direct_method: cranelift::module::FuncId,
+    profiled_method: cranelift::module::FuncId,
     small_map_literal: cranelift::module::FuncId,
     native_self_call: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
     profiled_small_map: cranelift::module::FuncId,
     profiled_small_map_commit: cranelift::module::FuncId,
+    specialized_factory: cranelift::module::FuncId,
+    bind_factory_contract: cranelift::module::FuncId,
+    reserved_typed_array: cranelift::module::FuncId,
+    class_factory_probe: cranelift::module::FuncId,
+    class_factory_commit: cranelift::module::FuncId,
     slots: Vec<FunctionSlot>,
     threshold: u32,
     active_depth: u32,
@@ -98,6 +105,8 @@ impl WholeFunctionJit {
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
         builder.symbol("napalm_wfjit_runtime_op", napalm_wfjit_runtime_op as *const u8);
         builder.symbol("napalm_wfjit_direct_call", napalm_wfjit_direct_call as *const u8);
+        builder.symbol("napalm_wfjit_direct_method", napalm_wfjit_direct_method as *const u8);
+        builder.symbol("napalm_wfjit_profiled_method", napalm_wfjit_profiled_method as *const u8);
         builder.symbol("napalm_wfjit_small_map_literal", napalm_wfjit_small_map_literal as *const u8);
         builder.symbol("napalm_wfjit_native_self_call", napalm_wfjit_native_self_call as *const u8);
         builder.symbol(
@@ -112,6 +121,20 @@ impl WholeFunctionJit {
             "napalm_wfjit_profiled_small_map_commit",
             napalm_wfjit_profiled_small_map_commit as *const u8,
         );
+        builder.symbol(
+            "napalm_wfjit_specialized_factory",
+            napalm_wfjit_specialized_factory as *const u8,
+        );
+        builder.symbol(
+            "napalm_wfjit_bind_factory_contract",
+            napalm_wfjit_bind_factory_contract as *const u8,
+        );
+        builder.symbol(
+            "napalm_wfjit_commit_reserved_typed_array",
+            napalm_wfjit_commit_reserved_typed_array as *const u8,
+        );
+        builder.symbol("napalm_wfjit_class_factory_probe", napalm_wfjit_class_factory_probe as *const u8);
+        builder.symbol("napalm_wfjit_class_factory_commit", napalm_wfjit_class_factory_commit as *const u8);
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("Napalm whole-function JIT requires a 64-bit host".to_owned());
@@ -128,6 +151,17 @@ impl WholeFunctionJit {
         let direct_id = module
             .declare_function("napalm_wfjit_direct_call", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function direct-call helper: {e}"))?;
+        let direct_method_id = module
+            .declare_function("napalm_wfjit_direct_method", Linkage::Import, &helper_sig)
+            .map_err(|e| format!("cannot declare whole-function direct method helper: {e}"))?;
+        let mut profiled_method_sig = module.make_signature();
+        profiled_method_sig.params.push(AbiParam::new(pointer)); // vm
+        profiled_method_sig.params.push(AbiParam::new(types::I32)); // op index
+        profiled_method_sig.params.push(AbiParam::new(types::I32)); // prepared target
+        profiled_method_sig.returns.push(AbiParam::new(pointer));
+        let profiled_method_id = module
+            .declare_function("napalm_wfjit_profiled_method", Linkage::Import, &profiled_method_sig)
+            .map_err(|e| format!("cannot declare whole-function profiled method helper: {e}"))?;
         let small_map_id = module
             .declare_function("napalm_wfjit_small_map_literal", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function small-map helper: {e}"))?;
@@ -151,6 +185,28 @@ impl WholeFunctionJit {
                 &native_call_sig,
             )
             .map_err(|e| format!("cannot declare register-based small-map helper: {e}"))?;
+
+        let specialized_factory_id = module
+            .declare_function(
+                "napalm_wfjit_specialized_factory",
+                Linkage::Import,
+                &native_call_sig,
+            )
+            .map_err(|e| format!("cannot declare native specialized factory: {e}"))?;
+
+        let mut bind_contract_sig = module.make_signature();
+        bind_contract_sig.params.push(AbiParam::new(pointer));
+        bind_contract_sig.params.push(AbiParam::new(types::I32));
+        bind_contract_sig.params.push(AbiParam::new(types::I32));
+        bind_contract_sig.params.push(AbiParam::new(types::I64));
+        bind_contract_sig.returns.push(AbiParam::new(types::I64));
+        let bind_factory_contract_id = module
+            .declare_function(
+                "napalm_wfjit_bind_factory_contract",
+                Linkage::Import,
+                &bind_contract_sig,
+            )
+            .map_err(|e| format!("cannot declare specialized contract binder: {e}"))?;
 
         let mut profiled_map_sig = module.make_signature();
         profiled_map_sig.params.push(AbiParam::new(pointer)); // vm
@@ -179,6 +235,41 @@ impl WholeFunctionJit {
             )
             .map_err(|e| format!("cannot declare profiled small-map commit helper: {e}"))?;
 
+        let mut typed_array_commit_sig = module.make_signature();
+        typed_array_commit_sig.params.push(AbiParam::new(pointer)); // interpreter
+        typed_array_commit_sig.params.push(AbiParam::new(types::I32)); // function
+        typed_array_commit_sig.params.push(AbiParam::new(types::I32)); // op
+        typed_array_commit_sig.params.push(AbiParam::new(types::I64)); // reserved object address
+        typed_array_commit_sig.returns.push(AbiParam::new(types::I64));
+        let reserved_typed_array_id = module
+            .declare_function(
+                "napalm_wfjit_commit_reserved_typed_array",
+                Linkage::Import,
+                &typed_array_commit_sig,
+            )
+            .map_err(|e| format!("cannot declare typed array Immix commit helper: {e}"))?;
+
+        let mut probe_sig = module.make_signature();
+        probe_sig.params.extend([
+            AbiParam::new(pointer), AbiParam::new(types::I32),
+            AbiParam::new(types::I32), AbiParam::new(pointer),
+        ]);
+        probe_sig.returns.push(AbiParam::new(types::I32));
+        let class_factory_probe_id = module
+            .declare_function("napalm_wfjit_class_factory_probe", Linkage::Import, &probe_sig)
+            .map_err(|e| format!("cannot declare native class probe: {e}"))?;
+
+        let mut commit_sig = module.make_signature();
+        commit_sig.params.extend([
+            AbiParam::new(pointer), AbiParam::new(types::I32),
+            AbiParam::new(types::I32), AbiParam::new(types::I64),
+            AbiParam::new(pointer),
+        ]);
+        commit_sig.returns.push(AbiParam::new(pointer));
+        let class_factory_commit_id = module
+            .declare_function("napalm_wfjit_class_factory_commit", Linkage::Import, &commit_sig)
+            .map_err(|e| format!("cannot declare native class commit: {e}"))?;
+
         let context = module.make_context();
         let function_context = FunctionBuilderContext::new();
         let result = Self {
@@ -187,11 +278,18 @@ impl WholeFunctionJit {
             function_context,
             runtime_op: runtime_id,
             direct_call: direct_id,
+            direct_method: direct_method_id,
+            profiled_method: profiled_method_id,
             small_map_literal: small_map_id,
             native_self_call: native_self_call_id,
             small_map_literal_regs: small_map_regs_id,
             profiled_small_map: profiled_small_map_id,
             profiled_small_map_commit: profiled_small_map_commit_id,
+            specialized_factory: specialized_factory_id,
+            bind_factory_contract: bind_factory_contract_id,
+            reserved_typed_array: reserved_typed_array_id,
+            class_factory_probe: class_factory_probe_id,
+            class_factory_commit: class_factory_commit_id,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
             // Direct-call tiering runs before the callee's entry hook. Matching
             // its threshold avoids compiling an entry trace just before a whole
@@ -237,6 +335,11 @@ impl WholeFunctionJit {
         expected_method_epoch: u64,
         identity_sites: &[Option<NativeIdentitySite>],
         small_map_fast_alloc: Option<GcFastAllocationInfo>,
+        native_direct_method_class_slots: &crate::napalm_collections::HashMap<ClassId, u32>,
+        native_direct_method_targets: &crate::napalm_collections::HashMap<(ReceiverClass, MethodSymbol), CallTarget>,
+        native_plain_store_classes: &crate::napalm_collections::HashMap<usize, u64>,
+        native_shape_read_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
+        native_shape_write_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
         if function.memoization.enabled()
@@ -263,7 +366,9 @@ impl WholeFunctionJit {
             let unsupported_invoke = opcode == Opcode::Invoke
                 && native_numeric_quick(function, index).is_none()
                 && native_map_property_pic(function, index).is_none()
-                && identity_sites[index].is_none();
+                && identity_sites[index].is_none()
+                // Runtime-profiled InvokeMethodDirect (promoted by the VM).
+                && profiled_direct_invoke_site(function, index).is_none();
             // A recursive descent can become hot before it has returned even
             // once, leaving the unwind path unprofiled. Retry after more calls
             // instead of permanently rejecting a function on its first visit.
@@ -309,7 +414,11 @@ impl WholeFunctionJit {
         // collect. Failed nested guards unwind before entering a runtime helper.
         let recursive_needs_roots = !native_recursive_safe || reachable.iter().enumerate().any(|(i, &live)| {
             live && bytecode.chunk.code[function.raw_pcs[i] as usize].opcode()
-                == Some(Opcode::AllocMap)
+                .is_some_and(|opcode| matches!(opcode,
+                    Opcode::AllocMap | Opcode::NewObjectEmpty
+                    | Opcode::NewObjectShape | Opcode::NewObjectWithProperties
+                    | Opcode::NewInterfaceOrTypeObject | Opcode::DefineArrayWithGenerics
+                ))
         });
         if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
             eprintln!(
@@ -321,11 +430,18 @@ impl WholeFunctionJit {
         }
         let runtime_module_id = self.runtime_op;
         let direct_module_id = self.direct_call;
+        let direct_method_module_id = self.direct_method;
+        let profiled_method_module_id = self.profiled_method;
         let small_map_module_id = self.small_map_literal;
         let native_self_module_id = self.native_self_call;
         let small_map_regs_module_id = self.small_map_literal_regs;
         let profiled_small_map_module_id = self.profiled_small_map;
         let profiled_small_map_commit_module_id = self.profiled_small_map_commit;
+        let specialized_factory_module_id = self.specialized_factory;
+        let bind_factory_contract_module_id = self.bind_factory_contract;
+        let reserved_typed_array_module_id = self.reserved_typed_array;
+        let class_factory_probe_module_id = self.class_factory_probe;
+        let class_factory_commit_module_id = self.class_factory_commit;
 
         {
             let target_config = self.module.target_config();
@@ -349,6 +465,8 @@ impl WholeFunctionJit {
 
             let runtime_ref = self.module.declare_func_in_func(runtime_module_id, b.func);
             let direct_ref = self.module.declare_func_in_func(direct_module_id, b.func);
+            let direct_method_ref = self.module.declare_func_in_func(direct_method_module_id, b.func);
+            let profiled_method_ref = self.module.declare_func_in_func(profiled_method_module_id, b.func);
             let _small_map_ref = self.module.declare_func_in_func(small_map_module_id, b.func);
             let _native_self_ref = self.module.declare_func_in_func(native_self_module_id, b.func);
             let self_ref = self.module.declare_func_in_func(func_id, b.func);
@@ -358,6 +476,16 @@ impl WholeFunctionJit {
                 self.module.declare_func_in_func(profiled_small_map_module_id, b.func);
             let profiled_small_map_commit_ref =
                 self.module.declare_func_in_func(profiled_small_map_commit_module_id, b.func);
+            let specialized_factory_ref =
+                self.module.declare_func_in_func(specialized_factory_module_id, b.func);
+            let bind_factory_contract_ref =
+                self.module.declare_func_in_func(bind_factory_contract_module_id, b.func);
+            let reserved_typed_array_ref =
+                self.module.declare_func_in_func(reserved_typed_array_module_id, b.func);
+            let class_factory_probe_ref =
+                self.module.declare_func_in_func(class_factory_probe_module_id, b.func);
+            let class_factory_commit_ref =
+                self.module.declare_func_in_func(class_factory_commit_module_id, b.func);
 
             // Expand one recursion level for small replay-safe bodies. Child
             // registers and leaf branches become visible to the optimizer.
@@ -548,49 +676,141 @@ impl WholeFunctionJit {
                         store_tagged_bool(&mut b, regs, op.a, cond);
                         next!();
                     }
+                    Opcode::SetFieldClass => {
+                        regs = if let Some(&class_key) = native_plain_store_classes.get(&index) {
+                            emit_native_class_field_store(
+                                &mut b, runtime_ref, vm, regs, index as u32,
+                                &prepared_op, class_key, abort,
+                            )
+                        } else {
+                            call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
+                        };
+                        next!();
+                    }
+                    Opcode::GetFieldShape => {
+                        regs = if let Some(pic) = native_shape_read_pics.get(&index) {
+                            emit_map_property_fast_path(
+                                &mut b, runtime_ref, vm, regs, index as u32,
+                                op.a, op.b, pic, expected_method_epoch, abort,
+                            )
+                        } else {
+                            call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
+                        };
+                        next!();
+                    }
+                    Opcode::SetFieldShape => {
+                        regs = if let Some(pic) = native_shape_write_pics.get(&index) {
+                            emit_native_shape_property_store(
+                                &mut b, runtime_ref, vm, regs, index as u32,
+                                &prepared_op, pic, abort,
+                            )
+                        } else {
+                            call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
+                        };
+                        next!();
+                    }
+                    Opcode::GetFieldClass => {
+                        regs = emit_native_class_field_load(
+                            &mut b, runtime_ref, vm, regs, index as u32,
+                            &prepared_op, abort,
+                        );
+                        next!();
+                    }
                     Opcode::AllocMap
                         if prepared_op.c > 0
                             && prepared_op.c <= 4
                             && prepared_op.next > index as u32 + 1 =>
                     {
                         let value = if native_recursive_safe {
-                            if let Some(site) = native_profiled_small_map_site(function, index) {
+                            if let Some(site) = native_profiled_small_map_site(function, bytecode, index) {
                                 emit_profiled_small_map_alloc(
-                                    &mut b,
-                                    profiled_small_map_ref,
-                                    profiled_small_map_commit_ref,
-                                    vm,
-                                    regs,
-                                    function,
-                                    index,
-                                    &site,
-                                    small_map_fast_alloc,
-                                    abort,
+                                    &mut b, profiled_small_map_ref, profiled_small_map_commit_ref,
+                                    bind_factory_contract_ref, vm, regs, function,
+                                    function_index, index, &site, small_map_fast_alloc, abort,
                                 )
                             } else {
-                                call_native_value_helper(
-                                    &mut b,
-                                    small_map_regs_ref,
-                                    vm,
-                                    function_index,
-                                    index as u32,
-                                    regs,
-                                    abort,
-                                )
+                                call_native_value_helper(&mut b, small_map_regs_ref, vm,
+                                    function_index, index as u32, regs, abort)
                             }
                         } else {
-                            call_native_value_helper(
-                                &mut b,
-                                small_map_regs_ref,
-                                vm,
-                                function_index,
-                                index as u32,
-                                regs,
-                                abort,
-                            )
+                            call_native_value_helper(&mut b, small_map_regs_ref, vm,
+                                function_index, index as u32, regs, abort)
                         };
                         store_reg(&mut b, regs, op.a, value);
                         let target = prepared_op.next as usize;
+                        if target >= blocks.len() { b.ins().jump(abort, &[]); }
+                        else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    Opcode::NewObjectEmpty | Opcode::NewObjectShape
+                    | Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject => {
+                        // Specialized bytecodes must not make an otherwise
+                        // compilable function fall back to the interpreter.
+                        let value = if native_recursive_safe {
+                            if let Some(site) = native_profiled_small_map_site(function, bytecode, index) {
+                                emit_profiled_small_map_alloc(
+                                    &mut b, profiled_small_map_ref, profiled_small_map_commit_ref,
+                                    bind_factory_contract_ref, vm, regs, function,
+                                    function_index, index, &site, small_map_fast_alloc, abort,
+                                )
+                            } else {
+                                call_native_value_helper(&mut b, specialized_factory_ref, vm,
+                                    function_index, index as u32, regs, abort)
+                            }
+                        } else {
+                            call_native_value_helper(&mut b, specialized_factory_ref, vm,
+                                function_index, index as u32, regs, abort)
+                        };
+                        store_reg(&mut b, regs, op.a, value);
+                        let target = op.next as usize;
+                        if target >= blocks.len() { b.ins().jump(abort, &[]); }
+                        else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    Opcode::NewClassInstance => {
+                        // The constructor can replace the frame register bank.
+                        // Carry the refreshed base through the successor edge.
+                        regs = emit_native_class_instance_alloc(
+                            &mut b, runtime_ref, class_factory_probe_ref,
+                            class_factory_commit_ref, vm, regs,
+                            function, function_index, index, small_map_fast_alloc, abort,
+                        );
+                        let target = op.next as usize;
+                        if target >= blocks.len() { b.ins().jump(abort, &[]); }
+                        else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    Opcode::DefineArrayWithGenerics => {
+                        let value = emit_native_typed_array_alloc(
+                            &mut b, specialized_factory_ref, reserved_typed_array_ref,
+                            vm, regs, function, bytecode, function_index, index,
+                            small_map_fast_alloc, abort,
+                        );
+                        store_reg(&mut b, regs, op.a, value);
+                        let target = op.next as usize;
+                        if target >= blocks.len() { b.ins().jump(abort, &[]); }
+                        else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    Opcode::InvokeMethodDirect => {
+                        let fast_target = bytecode.chunk.specializations.get(prepared_op.x as usize)
+                            .and_then(|descriptor| match descriptor {
+                                crate::napalm_bytecode::SpecializedDescriptor::DirectMethod {
+                                    owner, symbol, ..
+                                } => Some((*owner, *symbol)),
+                                _ => None,
+                            });
+                        let class_key = fast_target.and_then(|(owner, symbol)| {
+                            let class_slot = native_direct_method_class_slots.get(&owner).copied()?;
+                            let key = ReceiverClass(CLASS_KIND_INSTANCE | class_slot as u64);
+                            (native_direct_method_targets.get(&(key, symbol)) == Some(&CallTarget::Bytecode(prepared_op.y)))
+                                .then_some(key.0)
+                        });
+                        regs = if let Some(class_key) = class_key {
+                            emit_native_direct_method_call(
+                                &mut b, runtime_ref, direct_method_ref, vm, regs,
+                                index as u32, op.b, class_key, expected_method_epoch, None, abort,
+                            )
+                        } else {
+                            call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
+                        };
+                        let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
                     }
@@ -638,6 +858,19 @@ impl WholeFunctionJit {
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    // Runtime-profiled InvokeMethodDirect: native class+epoch
+                    // guard, then the direct bytecode call; a miss replays the
+                    // generic Invoke through the runtime helper.
+                    Opcode::Invoke if native_map_property_pic(function, index).is_none()
+                        && profiled_direct_invoke_site(function, index).is_some() =>
+                    {
+                        let (class, target) = profiled_direct_invoke_site(function, index).unwrap();
+                        regs = emit_native_direct_method_call(
+                            &mut b, runtime_ref, profiled_method_ref, vm, regs,
+                            index as u32, op.b, class.0, expected_method_epoch, Some(target), abort,
+                        );
+                        next!();
                     }
                     Opcode::Invoke if native_map_property_pic(function, index).is_some() => {
                         let pic = native_map_property_pic(function, index).unwrap();
@@ -1099,6 +1332,407 @@ fn emit_map_property_fast_path(
 }
 
 
+/// Inline a shape-guarded write only for an existing, mutable and untyped
+/// physical slot. All other cases replay the original typed-map setter, which
+/// owns contract validation, reference write barriers and dictionary growth.
+fn emit_native_shape_property_store(
+    b: &mut FunctionBuilder<'_>,
+    runtime_ref: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    index: u32,
+    op: &PreparedOp,
+    pic: &NativeMapPropertyPic,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let fallback = b.create_block();
+    let map_tag_ok = b.create_block();
+    let live_ok = b.create_block();
+    let map_kind_ok = b.create_block();
+    let done = b.create_block();
+    b.append_block_param(done, types::I64);
+
+    let reactive = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
+        offset_of!(Interpreter<'static>, reactive_enabled) as i32);
+    let no_reactivity = b.ins().icmp_imm(IntCC::Equal, reactive, 0);
+    let value = load_reg(b, regs, op.c);
+    let val_tag = b.ins().band_imm(value, TAG_HEAP_MASK as i64);
+    let reference = b.ins().icmp_imm(IntCC::Equal, val_tag, TAG_HEAP as i64);
+    let immediate = b.ins().bxor_imm(reference, 1);
+    let fast = b.ins().band(no_reactivity, immediate);
+    b.ins().brif(fast, map_tag_ok, &[], fallback, &[]);
+
+    b.switch_to_block(map_tag_ok);
+    let map = load_reg(b, regs, op.a);
+    let map_tag = b.ins().band_imm(map, TAG_HEAP_MASK as i64);
+    let is_heap = b.ins().icmp_imm(IntCC::Equal, map_tag, TAG_HEAP as i64);
+    let entry_block = b.create_block();
+    b.ins().brif(is_heap, entry_block, &[], fallback, &[]);
+    b.seal_block(map_tag_ok);
+
+    b.switch_to_block(entry_block);
+    let handle = b.ins().ireduce(types::I32, map);
+    let handle = b.ins().uextend(types::I64, handle);
+    let chunk_index = b.ins().ushr_imm_u(handle, TRACE_HEAP_CHUNK_BITS as i64);
+    let slot_index = b.ins().band_imm(handle, TRACE_HEAP_CHUNK_MASK as i64);
+    let chunks = b.ins().iconst(types::I64, handles().jit_chunks() as usize as i64);
+    let chunk_offset = b.ins().ishl_imm(chunk_index, 3);
+    let chunk_slot = b.ins().iadd(chunks, chunk_offset);
+    let chunk = b.ins().load(types::I64, MemFlagsData::trusted(), chunk_slot, 0);
+    let entry_offset = b.ins().imul_imm(slot_index, std::mem::size_of::<TraceHeapEntry>() as i64);
+    let entry = b.ins().iadd(chunk, entry_offset);
+    let address = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, address) as i32);
+    let live = b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+    b.ins().brif(live, live_ok, &[], fallback, &[]);
+    b.seal_block(entry_block);
+
+    b.switch_to_block(live_ok);
+    // Other persistent contracts (for example a generic Map<K,V>) may impose
+    // additional checks not represented by the shape's slot contract.
+    // They must always use the authoritative VM write path.
+    let has_contract = b.ins().load(types::I32, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, has_contract) as i32);
+    let contract_free = b.ins().icmp_imm(IntCC::Equal, has_contract, 0);
+    let contract_ok = b.create_block();
+    b.ins().brif(contract_free, contract_ok, &[], fallback, &[]);
+    b.seal_block(live_ok);
+    b.switch_to_block(contract_ok);
+    let kind = b.ins().load(types::I32, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, kind) as i32);
+    let object_kind = b.ins().band_imm(kind, TRACE_HEAP_KIND_MASK as i64);
+    let is_map = b.ins().icmp_imm(IntCC::Equal, object_kind, TraceHeapKind::Map as i64);
+    b.ins().brif(is_map, map_kind_ok, &[], fallback, &[]);
+    b.seal_block(contract_ok);
+
+    b.switch_to_block(map_kind_ok);
+    let shape = b.ins().ushr_imm_u(kind, TRACE_HEAP_METADATA_SHIFT as i64);
+    let encoded = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, data) as i32);
+    let relative_bit = b.ins().band_imm(encoded, TRACE_HEAP_DATA_RELATIVE_MASK as i64);
+    let relative = b.ins().icmp_imm(IntCC::NotEqual, relative_bit, 0);
+    let relative_ok = b.create_block();
+    b.ins().brif(relative, relative_ok, &[], fallback, &[]);
+    b.seal_block(map_kind_ok);
+
+    b.switch_to_block(relative_ok);
+    let offset = b.ins().band_imm(encoded, !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64);
+    let data = b.ins().iadd(address, offset);
+    let mut check_block = relative_ok;
+    for (i, cached) in pic.entries.iter().enumerate() {
+        if i != 0 { b.switch_to_block(check_block); }
+        let hit = b.create_block();
+        let miss = if i + 1 == pic.entries.len() { fallback } else { b.create_block() };
+        let matches = b.ins().icmp_imm(IntCC::Equal, shape, cached.shape as i64);
+        b.ins().brif(matches, hit, &[], miss, &[]);
+        b.seal_block(check_block);
+        b.switch_to_block(hit);
+        b.ins().store(MemFlagsData::trusted(), value, data,
+            cached.slot as i32 * std::mem::size_of::<RegisterWord>() as i32);
+        b.ins().jump(done, &[BlockArg::Value(regs)]);
+        b.seal_block(hit);
+        check_block = miss;
+    }
+    b.switch_to_block(fallback);
+    let fallback_regs = call_runtime_helper(b, runtime_ref, vm, regs, index, abort);
+    b.ins().jump(done, &[BlockArg::Value(fallback_regs)]);
+    b.seal_block(fallback);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    b.block_params(done)[0]
+}
+
+/// Instance field-array base from a handle sidecar: inline fields publish a
+/// tagged owner-relative offset (they move with the GC object), boxed fields
+/// an absolute pointer (bit 0 clear). Branch-free decode against the live
+/// owner `address` already loaded from the same entry.
+fn emit_instance_field_base(
+    b: &mut FunctionBuilder<'_>,
+    entry: cranelift::prelude::Value,
+    address: cranelift::prelude::Value,
+) -> cranelift::prelude::Value {
+    let encoded = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, data) as i32);
+    let relative = b.ins().band_imm(encoded, TRACE_HEAP_DATA_RELATIVE_MASK as i64);
+    let owner_mask = b.ins().ineg(relative);
+    let base = b.ins().band(address, owner_mask);
+    let offset = b.ins().band_imm(encoded, !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64);
+    b.ins().iadd(base, offset)
+}
+
+/// Direct fixed-slot write for non-reference values in untyped class fields.
+/// A reference store must run the MMTk post-barrier, so it is intentionally
+/// handled by the exact baseline path. Guard failure never commits the store.
+fn emit_native_class_field_store(
+    b: &mut FunctionBuilder<'_>,
+    runtime_ref: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    index: u32,
+    op: &PreparedOp,
+    class_key: u64,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let fallback = b.create_block();
+    let tag_ok = b.create_block();
+    let live_ok = b.create_block();
+    let kind_ok = b.create_block();
+    let class_ok = b.create_block();
+    let store_ok = b.create_block();
+    let done = b.create_block();
+    b.append_block_param(done, types::I64);
+
+    let reactive = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
+        offset_of!(Interpreter<'static>, reactive_enabled) as i32);
+    let no_reactivity = b.ins().icmp_imm(IntCC::Equal, reactive, 0);
+    let value = load_reg(b, regs, op.b);
+    let value_tag = b.ins().band_imm(value, TAG_HEAP_MASK as i64);
+    let is_reference = b.ins().icmp_imm(IntCC::Equal, value_tag, TAG_HEAP as i64);
+    let is_immediate = b.ins().bxor_imm(is_reference, 1);
+    let fast = b.ins().band(no_reactivity, is_immediate);
+    b.ins().brif(fast, tag_ok, &[], fallback, &[]);
+
+    b.switch_to_block(tag_ok);
+    let receiver = load_reg(b, regs, op.a);
+    let tag = b.ins().band_imm(receiver, TAG_HEAP_MASK as i64);
+    let valid_tag = b.ins().icmp_imm(IntCC::Equal, tag, TAG_HEAP as i64);
+    let entry_block = b.create_block();
+    b.ins().brif(valid_tag, entry_block, &[], fallback, &[]);
+    b.seal_block(tag_ok);
+
+    b.switch_to_block(entry_block);
+    let handle = b.ins().ireduce(types::I32, receiver);
+    let handle = b.ins().uextend(types::I64, handle);
+    let chunk_index = b.ins().ushr_imm_u(handle, TRACE_HEAP_CHUNK_BITS as i64);
+    let entry_index = b.ins().band_imm(handle, TRACE_HEAP_CHUNK_MASK as i64);
+    let chunks = b.ins().iconst(types::I64, handles().jit_chunks() as usize as i64);
+    let chunk_offset = b.ins().ishl_imm(chunk_index, 3);
+    let chunk_ptr_slot = b.ins().iadd(chunks, chunk_offset);
+    let chunk = b.ins().load(types::I64, MemFlagsData::trusted(), chunk_ptr_slot, 0);
+    let offset = b.ins().imul_imm(entry_index, std::mem::size_of::<TraceHeapEntry>() as i64);
+    let entry = b.ins().iadd(chunk, offset);
+    let address = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, address) as i32);
+    let live = b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+    b.ins().brif(live, live_ok, &[], fallback, &[]);
+    b.seal_block(entry_block);
+
+    b.switch_to_block(live_ok);
+    let kind = b.ins().load(types::I32, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, kind) as i32);
+    let kind = b.ins().band_imm(kind, TRACE_HEAP_KIND_MASK as i64);
+    let is_instance = b.ins().icmp_imm(IntCC::Equal, kind, TraceHeapKind::Instance as i64);
+    b.ins().brif(is_instance, kind_ok, &[], fallback, &[]);
+    b.seal_block(live_ok);
+
+    b.switch_to_block(kind_ok);
+    let class = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, receiver_class) as i32);
+    let matches = b.ins().icmp_imm(IntCC::Equal, class, class_key as i64);
+    b.ins().brif(matches, class_ok, &[], fallback, &[]);
+    b.seal_block(kind_ok);
+
+    b.switch_to_block(class_ok);
+    let len = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, len) as i32);
+    let in_bounds = b.ins().icmp_imm(IntCC::UnsignedGreaterThan, len, op.x as i64);
+    b.ins().brif(in_bounds, store_ok, &[], fallback, &[]);
+    b.seal_block(class_ok);
+
+    b.switch_to_block(store_ok);
+    let data = emit_instance_field_base(b, entry, address);
+    b.ins().store(MemFlagsData::trusted(), value, data,
+        op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
+    b.ins().jump(done, &[BlockArg::Value(regs)]);
+    b.seal_block(store_ok);
+
+    b.switch_to_block(fallback);
+    let next_regs = call_runtime_helper(b, runtime_ref, vm, regs, index, abort);
+    b.ins().jump(done, &[BlockArg::Value(next_regs)]);
+    b.seal_block(fallback);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    b.block_params(done)[0]
+}
+
+/// Guard method identity in native code, then enter the known bytecode
+/// function without the dynamic Invoke lookup. The helper retains Napalm's
+/// complete call ABI (memo, errors, async and native callee promotion).
+fn emit_native_direct_method_call(
+    b: &mut FunctionBuilder<'_>,
+    runtime_ref: cranelift::codegen::ir::FuncRef,
+    direct_method_ref: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    index: u32,
+    receiver: u8,
+    receiver_class: u64,
+    epoch: u64,
+    // Some(target): runtime-profiled site; the helper takes the target as a
+    // compile-time argument instead of reading it from the prepared op.
+    profiled_target: Option<u32>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let fallback = b.create_block();
+    let tag_ok = b.create_block();
+    let live_ok = b.create_block();
+    let class_ok = b.create_block();
+    let done = b.create_block();
+    b.append_block_param(done, types::I64);
+
+    let actual_epoch = b.ins().load(types::I64, MemFlagsData::trusted(), vm,
+        offset_of!(Interpreter<'static>, method_epoch) as i32);
+    let epoch_match = b.ins().icmp_imm(IntCC::Equal, actual_epoch, epoch as i64);
+    b.ins().brif(epoch_match, tag_ok, &[], fallback, &[]);
+
+    b.switch_to_block(tag_ok);
+    let tagged = load_reg(b, regs, receiver);
+    let masked = b.ins().band_imm(tagged, TAG_HEAP_MASK as i64);
+    let valid_tag = b.ins().icmp_imm(IntCC::Equal, masked, TAG_HEAP as i64);
+    let entry_block = b.create_block();
+    b.ins().brif(valid_tag, entry_block, &[], fallback, &[]);
+    b.seal_block(tag_ok);
+
+    b.switch_to_block(entry_block);
+    let handle = b.ins().ireduce(types::I32, tagged);
+    let handle = b.ins().uextend(types::I64, handle);
+    let chunk_index = b.ins().ushr_imm_u(handle, TRACE_HEAP_CHUNK_BITS as i64);
+    let entry_index = b.ins().band_imm(handle, TRACE_HEAP_CHUNK_MASK as i64);
+    let chunks = b.ins().iconst(types::I64, handles().jit_chunks() as usize as i64);
+    let chunk_offset = b.ins().ishl_imm(chunk_index, 3);
+    let chunk_ptr_slot = b.ins().iadd(chunks, chunk_offset);
+    let chunk = b.ins().load(types::I64, MemFlagsData::trusted(), chunk_ptr_slot, 0);
+    let offset = b.ins().imul_imm(entry_index, std::mem::size_of::<TraceHeapEntry>() as i64);
+    let entry = b.ins().iadd(chunk, offset);
+    let address = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, address) as i32);
+    let live = b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+    b.ins().brif(live, live_ok, &[], fallback, &[]);
+    b.seal_block(entry_block);
+
+    b.switch_to_block(live_ok);
+    let class = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, receiver_class) as i32);
+    let class_match = b.ins().icmp_imm(IntCC::Equal, class, receiver_class as i64);
+    b.ins().brif(class_match, class_ok, &[], fallback, &[]);
+    b.seal_block(live_ok);
+
+    b.switch_to_block(class_ok);
+    let current_regs = call_runtime_helper_with(b, direct_method_ref, vm, regs, index, profiled_target, abort);
+    b.ins().jump(done, &[BlockArg::Value(current_regs)]);
+    b.seal_block(class_ok);
+
+    b.switch_to_block(fallback);
+    let current_regs = call_runtime_helper(b, runtime_ref, vm, regs, index, abort);
+    b.ins().jump(done, &[BlockArg::Value(current_regs)]);
+    b.seal_block(fallback);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    b.block_params(done)[0]
+}
+
+/// Load a known-offset class field without entering the interpreter.
+/// No GC safepoint occurs between reading the published sidecar pointer and
+/// loading the field. Reactive tracking and uninitialized fields replay the
+/// baseline handler, which owns their exact observable behavior.
+fn emit_native_class_field_load(
+    b: &mut FunctionBuilder<'_>,
+    runtime_ref: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    index: u32,
+    op: &PreparedOp,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let fallback = b.create_block();
+    let tag_ok = b.create_block();
+    let live_ok = b.create_block();
+    let kind_ok = b.create_block();
+    let bounds_ok = b.create_block();
+    let done = b.create_block();
+    b.append_block_param(done, b.func.dfg.value_type(regs));
+
+    let tracking = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
+        offset_of!(Interpreter<'static>, reactive_tracking_active) as i32);
+    let skip = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
+        offset_of!(Interpreter<'static>, reactive_skip_next_field_track) as i32);
+    let skip_or_track = b.ins().bor(tracking, skip);
+    let allow = b.ins().icmp_imm(IntCC::Equal, skip_or_track, 0);
+    b.ins().brif(allow, tag_ok, &[], fallback, &[]);
+
+    b.switch_to_block(tag_ok);
+    let receiver = load_reg(b, regs, op.b);
+    let tagged_mask = b.ins().band_imm(receiver, TAG_HEAP_MASK as i64);
+    let valid_tag = b.ins().icmp_imm(IntCC::Equal, tagged_mask, TAG_HEAP as i64);
+    let entry_block = b.create_block();
+    b.ins().brif(valid_tag, entry_block, &[], fallback, &[]);
+    b.seal_block(tag_ok);
+
+    b.switch_to_block(entry_block);
+    let handle32 = b.ins().ireduce(types::I32, receiver);
+    let handle = b.ins().uextend(types::I64, handle32);
+    let chunk_index = b.ins().ushr_imm_u(handle, TRACE_HEAP_CHUNK_BITS as i64);
+    let entry_index = b.ins().band_imm(handle, TRACE_HEAP_CHUNK_MASK as i64);
+    let chunks = b.ins().iconst(types::I64, handles().jit_chunks() as usize as i64);
+    let chunk_offset = b.ins().ishl_imm(chunk_index, 3);
+    let chunk_ptr_slot = b.ins().iadd(chunks, chunk_offset);
+    let chunk = b.ins().load(types::I64, MemFlagsData::trusted(), chunk_ptr_slot, 0);
+    let stride = std::mem::size_of::<TraceHeapEntry>() as i64;
+    let entry_offset = b.ins().imul_imm(entry_index, stride);
+    let entry = b.ins().iadd(chunk, entry_offset);
+    let address = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, address) as i32);
+    let live = b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+    b.ins().brif(live, live_ok, &[], fallback, &[]);
+    b.seal_block(entry_block);
+
+    b.switch_to_block(live_ok);
+    let kind = b.ins().load(types::I32, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, kind) as i32);
+    let kind = b.ins().band_imm(kind, TRACE_HEAP_KIND_MASK as i64);
+    let is_instance = b.ins().icmp_imm(IntCC::Equal, kind, TraceHeapKind::Instance as i64);
+    b.ins().brif(is_instance, kind_ok, &[], fallback, &[]);
+    b.seal_block(live_ok);
+
+    b.switch_to_block(kind_ok);
+    let len = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, len) as i32);
+    let valid_slot = b.ins().icmp_imm(IntCC::UnsignedGreaterThan, len, op.x as i64);
+    b.ins().brif(valid_slot, bounds_ok, &[], fallback, &[]);
+    b.seal_block(kind_ok);
+
+    b.switch_to_block(bounds_ok);
+    let data = emit_instance_field_base(b, entry, address);
+    let value = b.ins().load(types::I64, MemFlagsData::trusted(), data,
+        op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
+    let result_ok = b.create_block();
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_NULLABLE != 0 {
+        // Proven nullable field: null is an ordinary result, no runtime trap.
+        b.ins().jump(result_ok, &[]);
+    } else {
+        let initialized = b.ins().icmp_imm(IntCC::NotEqual, value, TAG_NULL as i64);
+        b.ins().brif(initialized, result_ok, &[], fallback, &[]);
+    }
+    b.seal_block(bounds_ok);
+
+    b.switch_to_block(result_ok);
+    store_reg(b, regs, op.a, value);
+    b.ins().jump(done, &[BlockArg::Value(regs)]);
+    b.seal_block(result_ok);
+
+    b.switch_to_block(fallback);
+    let next_regs = call_runtime_helper(b, runtime_ref, vm, regs, index, abort);
+    b.ins().jump(done, &[BlockArg::Value(next_regs)]);
+    b.seal_block(fallback);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    b.block_params(done)[0]
+}
+
 /// Whether a compiled function may recurse through the lightweight native ABI.
 ///
 /// A bailout from a nested native call replays the outermost self-call in the
@@ -1212,11 +1846,14 @@ fn native_recursive_body_safe(
             | Opcode::FCmpGe
             | Opcode::RefEq => true,
             Opcode::CallDirect => prepared.x == function_index,
+            Opcode::GetFieldClass => true,
             Opcode::Invoke => {
                 native_numeric_quick(function, index).is_some()
                     || native_map_property_pic(function, index).is_some()
                     || identity_sites[index].is_some()
             }
+            Opcode::NewObjectEmpty | Opcode::NewObjectWithProperties
+            | Opcode::NewObjectShape | Opcode::NewInterfaceOrTypeObject => true,
             Opcode::AllocMap => {
                 prepared.c > 0
                     && prepared.c <= 4
@@ -1366,6 +2003,20 @@ fn call_runtime_helper(
     op: u32,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
+    call_runtime_helper_with(b, helper, vm, current_regs, op, None, abort)
+}
+
+/// `call_runtime_helper` for helpers taking one extra compile-time u32
+/// (e.g. the profiled direct-call target).
+fn call_runtime_helper_with(
+    b: &mut FunctionBuilder<'_>,
+    helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    current_regs: cranelift::prelude::Value,
+    op: u32,
+    extra: Option<u32>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
     // The legacy runtime helpers execute against Interpreter::hot_registers.
     // A native shadow-frame callee has a different register base, so crossing
     // such a helper would silently operate on its outer interpreter frame.
@@ -1384,7 +2035,13 @@ fn call_runtime_helper(
     b.seal_block(runtime);
 
     let op = b.ins().iconst(types::I32, op as i64);
-    let call = b.ins().call(helper, &[vm, op]);
+    let call = match extra {
+        Some(extra) => {
+            let extra = b.ins().iconst(types::I32, extra as i64);
+            b.ins().call(helper, &[vm, op, extra])
+        }
+        None => b.ins().call(helper, &[vm, op]),
+    };
     let regs = b.inst_results(call)[0];
     let failed = b.ins().icmp_imm(IntCC::Equal, regs, 0);
     let ok = b.create_block();
@@ -1522,44 +2179,72 @@ struct NativeProfiledSmallMapSite {
     value_regs: [u8; SMALL_MAP_INLINE_FIELDS],
     key_words: [u64; SMALL_MAP_INLINE_FIELDS],
     slots: [u16; SMALL_MAP_INLINE_FIELDS],
+    /// Legacy AllocMap+MapSet needs dynamic string-key guards.
+    guard_keys: bool,
+    /// ObjectShape and NewObjectEmpty create only null-initialized slots.
+    null_fields: bool,
+    /// A structural contract must be installed before the new object escapes.
+    bind_contract: bool,
 }
 
 fn native_profiled_small_map_site(
     function: &PreparedFunction,
+    bytecode: &BytecodeFunction,
     index: usize,
 ) -> Option<NativeProfiledSmallMapSite> {
     let op = *function.ops.get(index)?;
-    let field_count = op.c as usize;
-    if field_count == 0 || field_count > SMALL_MAP_INLINE_FIELDS {
-        return None;
-    }
     if function.gc_map_by_op.get(index).copied()? == NO_INDEX {
         return None;
     }
+    let opcode = bytecode.chunk.code.get(*function.raw_pcs.get(index)? as usize)?.opcode()?;
+    let make = |shape: u32, field_count: u8, value_count: u8, slots: [u16; SMALL_MAP_INLINE_FIELDS],
+                guard_keys: bool, null_fields: bool, bind_contract: bool| {
+        NativeProfiledSmallMapSite {
+            shape, field_count, value_count, slots, guard_keys, null_fields, bind_contract,
+            key_regs: [0; SMALL_MAP_INLINE_FIELDS],
+            value_regs: [0; SMALL_MAP_INLINE_FIELDS],
+            key_words: [0; SMALL_MAP_INLINE_FIELDS],
+        }
+    };
+    if opcode == Opcode::NewObjectEmpty {
+        return Some(make(0, 0, 0, [0; SMALL_MAP_INLINE_FIELDS], false, true, false));
+    }
     let site = function.small_map_literal_sites.get(op.cache as usize)?;
-    if !site.initialized
-        || site.disabled
-        || !site.stable_program_keys
-        || site.field_count as usize != field_count
+    if !site.initialized || site.disabled || !site.stable_program_keys
         || site.value_count as usize > SMALL_MAP_INLINE_FIELDS
+        || site.field_count as usize > SMALL_MAP_INLINE_FIELDS
     {
         return None;
     }
-
-    let mut result = NativeProfiledSmallMapSite {
-        shape: site.shape,
-        value_count: site.value_count,
-        field_count: site.field_count,
-        key_regs: [0; SMALL_MAP_INLINE_FIELDS],
-        value_regs: [0; SMALL_MAP_INLINE_FIELDS],
-        key_words: [0; SMALL_MAP_INLINE_FIELDS],
-        slots: site.slots,
+    let (field_count, guard_keys, null_fields, bind_contract) = match opcode {
+        Opcode::AllocMap if op.c > 0 && op.c <= 4 => (op.c, true, false, false),
+        Opcode::NewObjectWithProperties if op.c > 0 && op.c <= 4 =>
+            (op.c, false, false, false),
+        Opcode::NewInterfaceOrTypeObject if op.c > 0 && op.c <= 4 =>
+            (op.c, false, false, true),
+        Opcode::NewObjectShape => (site.field_count, false, true, true),
+        _ => return None,
     };
-    let offset = op.args_offset as usize;
-    for i in 0..field_count {
-        result.key_regs[i] = function.call_args.get(offset + i * 2)?.0;
-        result.value_regs[i] = function.call_args.get(offset + i * 2 + 1)?.0;
-        result.key_words[i] = Value::from_heap(site.key_handles[i]).raw_bits();
+    if site.field_count != field_count {
+        return None;
+    }
+    let needs_contract = bind_contract && matches!(
+        bytecode.chunk.specializations.get(op.x as usize),
+        Some(crate::napalm_bytecode::SpecializedDescriptor::ObjectShape {
+            contract: Some(_), ..
+        })
+    );
+    let mut result = make(site.shape, field_count, site.value_count,
+        site.slots, guard_keys, null_fields, needs_contract);
+    for i in 0..field_count as usize {
+        if guard_keys {
+            let offset = op.args_offset as usize;
+            result.key_regs[i] = function.call_args.get(offset + i * 2)?.0;
+            result.value_regs[i] = function.call_args.get(offset + i * 2 + 1)?.0;
+            result.key_words[i] = Value::from_heap(site.key_handles[i]).raw_bits();
+        } else if !null_fields {
+            result.value_regs[i] = unsafe { wfjit_call_source_reg(function, &op, i) }?;
+        }
         if result.slots[i] as usize >= site.value_count as usize {
             return None;
         }
@@ -1617,13 +2302,188 @@ fn emit_native_root_map_update(
     b.seal_block(ready);
 }
 
-fn emit_profiled_small_map_alloc(
+/// Native zero-capacity List<T> allocation. No managed external buffer is
+/// needed, so the generated function can reserve a fixed Immix object in its
+/// TLAB, then publish it through a non-safepoint GC helper. Dynamic capacities
+/// that are not zero retain the ordinary specialized allocation helper.
+/// Native fast allocation of a zero-field class instance. The probe validates
+/// the current class layout and constructor before any raw Immix reservation;
+/// the commit publishes the instance before changing frames. Unsupported layouts
+/// and exhausted TLABs take the existing authoritative call-to-return path.
+fn emit_native_class_instance_alloc(
+    b: &mut FunctionBuilder<'_>,
+    slow_helper: cranelift::codegen::ir::FuncRef,
+    probe_helper: cranelift::codegen::ir::FuncRef,
+    commit_helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    function: &PreparedFunction,
+    function_index: u32,
+    index: usize,
+    fast: Option<GcFastAllocationInfo>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let Some(fast) = fast.filter(|info| info.alignment.is_power_of_two() && info.bytes > 0) else {
+        return call_runtime_helper(b, slow_helper, vm, regs, index as u32, abort);
+    };
+    if function.gc_map_by_op[index] == NO_INDEX {
+        return call_runtime_helper(b, slow_helper, vm, regs, index as u32, abort);
+    }
+    emit_native_root_map_update(b, vm, regs, function.gc_map_by_op[index], index as u32);
+    let flags = MemFlagsData::trusted();
+    let func = b.ins().iconst(types::I32, function_index as i64);
+    let op_idx = b.ins().iconst(types::I32, index as i64);
+    let checked = b.ins().call(probe_helper, &[vm, func, op_idx, regs]);
+    let allowed = b.inst_results(checked)[0];
+    let allowed = b.ins().icmp_imm(IntCC::NotEqual, allowed, 0);
+    let fast_block = b.create_block();
+    let slow_block = b.create_block();
+    let commit_block = b.create_block();
+    let done_block = b.create_block();
+    b.append_block_param(commit_block, types::I64);
+    b.append_block_param(done_block, types::I64);
+    b.ins().brif(allowed, fast_block, &[], slow_block, &[]);
+
+    b.switch_to_block(fast_block);
+    let cursor_ptr = b.ins().iconst(types::I64, fast.cursor as usize as i64);
+    let limit_ptr = b.ins().iconst(types::I64, fast.limit as usize as i64);
+    let cursor = b.ins().load(types::I64, flags, cursor_ptr, 0);
+    let limit = b.ins().load(types::I64, flags, limit_ptr, 0);
+    let biased = b.ins().iadd_imm(cursor, (fast.alignment - 1) as i64);
+    let no_align_overflow = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, biased, cursor);
+    let mask = b.ins().iconst(types::I64, -(fast.alignment as i64));
+    let aligned = b.ins().band(biased, mask);
+    let end = b.ins().iadd_imm(aligned, fast.bytes as i64);
+    let no_end_overflow = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, end, aligned);
+    let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, limit);
+    let valid = b.ins().band(fits, no_align_overflow);
+    let valid = b.ins().band(valid, no_end_overflow);
+    b.ins().brif(valid, commit_block, &[BlockArg::Value(aligned)], slow_block, &[]);
+
+    b.switch_to_block(commit_block);
+    let address = b.block_params(commit_block)[0];
+    let next = b.ins().iadd_imm(address, fast.bytes as i64);
+    b.ins().store(flags, next, cursor_ptr, 0);
+    let call = b.ins().call(commit_helper, &[vm, func, op_idx, address, regs]);
+    let refreshed = b.inst_results(call)[0];
+    b.ins().jump(done_block, &[BlockArg::Value(refreshed)]);
+
+    b.switch_to_block(slow_block);
+    let next_regs = call_runtime_helper(b, slow_helper, vm, regs, index as u32, abort);
+    b.ins().jump(done_block, &[BlockArg::Value(next_regs)]);
+
+    b.seal_block(fast_block);
+    b.seal_block(slow_block);
+    b.seal_block(commit_block);
+    b.seal_block(done_block);
+    b.switch_to_block(done_block);
+    let result = b.block_params(done_block)[0];
+    let failed = b.ins().icmp_imm(IntCC::Equal, result, 0);
+    let ok = b.create_block();
+    b.ins().brif(failed, abort, &[], ok, &[]);
+    b.seal_block(ok);
+    b.switch_to_block(ok);
+    result
+}
+
+fn emit_native_typed_array_alloc(
     b: &mut FunctionBuilder<'_>,
     slow_helper: cranelift::codegen::ir::FuncRef,
     commit_helper: cranelift::codegen::ir::FuncRef,
     vm: cranelift::prelude::Value,
     regs: cranelift::prelude::Value,
     function: &PreparedFunction,
+    bytecode: &BytecodeFunction,
+    function_index: u32,
+    index: usize,
+    fast: Option<GcFastAllocationInfo>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
+    let Some(fast) = fast else {
+        return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort);
+    };
+    let op = function.ops[index];
+    let with_capacity = match bytecode.chunk.specializations.get(op.x as usize) {
+        Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { with_capacity, .. }) => *with_capacity,
+        _ => return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort),
+    };
+    if !fast.alignment.is_power_of_two() || fast.bytes == 0 {
+        return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort);
+    }
+
+    emit_native_root_map_update(b, vm, regs, function.gc_map_by_op[index], index as u32);
+    let flags = MemFlagsData::trusted();
+    let try_fast = b.create_block();
+    let slow = b.create_block();
+    let commit = b.create_block();
+    let done = b.create_block();
+    b.append_block_param(commit, types::I64);
+    b.append_block_param(done, types::I64);
+    if with_capacity {
+        let capacity = load_reg(b, regs, op.b);
+        let empty = b.ins().icmp_imm(IntCC::Equal, capacity, 0);
+        b.ins().brif(empty, try_fast, &[], slow, &[]);
+    } else {
+        b.ins().jump(try_fast, &[]);
+    }
+
+    b.switch_to_block(try_fast);
+    let cursor_ptr = b.ins().iconst(types::I64, fast.cursor as usize as i64);
+    let limit_ptr = b.ins().iconst(types::I64, fast.limit as usize as i64);
+    let cursor = b.ins().load(types::I64, flags, cursor_ptr, 0);
+    let limit = b.ins().load(types::I64, flags, limit_ptr, 0);
+    let biased = b.ins().iadd_imm(cursor, (fast.alignment - 1) as i64);
+    let mask = b.ins().iconst(types::I64, -(fast.alignment as i64));
+    let aligned = b.ins().band(biased, mask);
+    let end = b.ins().iadd_imm(aligned, fast.bytes as i64);
+    let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, limit);
+    let no_overflow = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, end, aligned);
+    let alignment_ok = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, biased, cursor);
+    let valid = b.ins().band(fits, no_overflow);
+    let valid = b.ins().band(valid, alignment_ok);
+    b.ins().brif(valid, commit, &[BlockArg::Value(aligned)], slow, &[]);
+
+    b.switch_to_block(commit);
+    let address = b.block_params(commit)[0];
+    let end = b.ins().iadd_imm(address, fast.bytes as i64);
+    b.ins().store(flags, end, cursor_ptr, 0);
+    let func = b.ins().iconst(types::I32, function_index as i64);
+    let op_index = b.ins().iconst(types::I32, index as i64);
+    let call = b.ins().call(commit_helper, &[vm, func, op_index, address]);
+    let result = b.inst_results(call)[0];
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.switch_to_block(slow);
+    let func = b.ins().iconst(types::I32, function_index as i64);
+    let op_index = b.ins().iconst(types::I32, index as i64);
+    let call = b.ins().call(slow_helper, &[vm, func, op_index, regs]);
+    let result = b.inst_results(call)[0];
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.seal_block(try_fast);
+    b.seal_block(commit);
+    b.seal_block(slow);
+    b.seal_block(done);
+    b.switch_to_block(done);
+    let value = b.block_params(done)[0];
+    let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
+    let success = b.create_block();
+    b.append_block_param(success, types::I64);
+    b.ins().brif(failed, abort, &[], success, &[BlockArg::Value(value)]);
+    b.seal_block(success);
+    b.switch_to_block(success);
+    b.block_params(success)[0]
+}
+
+fn emit_profiled_small_map_alloc(
+    b: &mut FunctionBuilder<'_>,
+    slow_helper: cranelift::codegen::ir::FuncRef,
+    commit_helper: cranelift::codegen::ir::FuncRef,
+    bind_contract_helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    regs: cranelift::prelude::Value,
+    function: &PreparedFunction,
+    function_index: u32,
     index: usize,
     site: &NativeProfiledSmallMapSite,
     fast_alloc: Option<GcFastAllocationInfo>,
@@ -1634,6 +2494,7 @@ fn emit_profiled_small_map_alloc(
     // Program-string handles cannot be recycled. Guard their exact tagged words
     // so a polymorphic/dynamic-key fused site safely bails to the baseline path.
     for i in 0..field_count {
+        if !site.guard_keys { break; }
         let actual = load_reg(b, regs, site.key_regs[i]);
         let expected = b.ins().iconst(types::I64, site.key_words[i] as i64);
         let matches = b.ins().icmp(IntCC::Equal, actual, expected);
@@ -1669,8 +2530,12 @@ fn emit_profiled_small_map_alloc(
     for slot in 0..SMALL_MAP_INLINE_FIELDS {
         // Duplicate literal keys retain their last value without duplicate
         // runtime stores. All initializer expressions have already executed.
-        let value = (0..field_count).rfind(|&i| site.slots[i] as usize == slot)
-            .map_or(null, |i| load_reg(b, regs, site.value_regs[i]));
+        let value = if site.null_fields {
+            null
+        } else {
+            (0..field_count).rfind(|&i| site.slots[i] as usize == slot)
+                .map_or(null, |i| load_reg(b, regs, site.value_regs[i]))
+        };
         b.ins().store(flags, value, values,
             (offset_of!(InlineMapValues, values) + slot * 8) as i32);
     }
@@ -1706,6 +2571,10 @@ fn emit_profiled_small_map_alloc(
         let fits = b
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, new_cursor, limit);
+        let without_end_overflow = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, new_cursor, aligned);
+        let without_alignment_overflow = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, biased, cursor);
+        let fits = b.ins().band(fits, without_end_overflow);
+        let fits = b.ins().band(fits, without_alignment_overflow);
         b.ins().brif(
             fits,
             commit_block,
@@ -1743,6 +2612,18 @@ fn emit_profiled_small_map_alloc(
             .ins()
             .call(slow_helper, &[vm, shape, values]);
         b.inst_results(call)[0]
+    };
+
+    let value = if site.bind_contract {
+        // The complete object is published by the map helper before contract
+        // validation. On failure the helper returns BAILOUT; baseline replays
+        // the allocation and reports the original structural-type error.
+        let function = b.ins().iconst(types::I32, function_index as i64);
+        let op = b.ins().iconst(types::I32, index as i64);
+        let call = b.ins().call(bind_contract_helper, &[vm, function, op, value]);
+        b.inst_results(call)[0]
+    } else {
+        value
     };
 
     let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
@@ -1796,6 +2677,73 @@ pub(super) unsafe fn try_direct_call(
     }
 
     if unsafe { (*jit_ptr).note_call(target) } {
+        let native_direct_method_class_slots: crate::napalm_collections::HashMap<ClassId, u32> =
+            vm.prepared.class_by_id.iter().map(|(id, slot)| (*id, *slot)).collect();
+        let mut native_direct_method_targets = crate::napalm_collections::HashMap::default();
+        for (&owner, &class_slot) in &native_direct_method_class_slots {
+            let class = ReceiverClass(CLASS_KIND_INSTANCE | class_slot as u64);
+            for (symbol, method) in vm.classes[class_slot as usize].instance_methods.iter().enumerate() {
+                if let Some(target) = method {
+                    native_direct_method_targets.insert((class, MethodSymbol(symbol as u32)), *target);
+                }
+            }
+        }
+        let mut native_plain_store_classes = crate::napalm_collections::HashMap::default();
+        let prepared_for_target = &vm.prepared.functions[target as usize];
+        let bytecode_for_target = &vm.program.functions[target as usize];
+        for (index, op) in prepared_for_target.ops.iter().enumerate() {
+            let bytecode_opcode = bytecode_for_target.chunk.code[prepared_for_target.raw_pcs[index] as usize]
+                .opcode();
+            if bytecode_opcode != Some(Opcode::SetFieldClass) { continue; }
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { class, unchecked_store, .. }) =
+                bytecode_for_target.chunk.specializations.get(
+                    prepared_for_target.original_ops[index].x as usize)
+            else { continue; };
+            let Some(&class_slot) = vm.prepared.class_by_id.get(class) else { continue; };
+            let Some(info) = vm.classes.get(class_slot as usize) else { continue; };
+            // Untyped field, or a store the compiler proved satisfies the field.
+            if !*unchecked_store
+                && (info.instance_field_types.get(op.x as usize) != Some(&Type::Top)
+                    || info.generic_fields.get(op.x as usize) != Some(&false))
+            { continue; }
+            native_plain_store_classes.insert(index, CLASS_KIND_INSTANCE | class_slot as u64);
+        }
+        // A fixed structural layout and PIC shape identify the physical slot.
+        // Shape descriptors are immutable after publication. Stores are only
+        // inlined when the shape also proves a writable untyped field.
+        let mut native_shape_read_pics = crate::napalm_collections::HashMap::default();
+        let mut native_shape_write_pics = crate::napalm_collections::HashMap::default();
+        for (index, op) in prepared_for_target.ops.iter().enumerate() {
+            let opcode = bytecode_for_target.chunk.code
+                [prepared_for_target.raw_pcs[index] as usize].opcode();
+            if !matches!(opcode, Some(Opcode::GetFieldShape | Opcode::SetFieldShape)) {
+                continue;
+            }
+            let Some(cache) = prepared_for_target.map_inline_caches.get(op.cache as usize) else {
+                continue;
+            };
+            if cache.len == 0 || cache.megamorphic { continue; }
+            let mut entries = smallvec::SmallVec::<[MapIcEntry; 4]>::new();
+            for &entry in &cache.entries[..cache.len as usize] {
+                if opcode == Some(Opcode::SetFieldShape) {
+                    let Some(shape) = vm.heap.map_shapes.get_shape(entry.shape) else {
+                        continue;
+                    };
+                    let Some(contract) = shape.slots.get(entry.slot as usize) else { continue; };
+                    if contract.readonly || contract.write_runtime_checked
+                        || contract.write_type.is_some()
+                    { continue; }
+                }
+                entries.push(entry);
+            }
+            if entries.is_empty() { continue; }
+            let site = NativeMapPropertyPic { entries };
+            match opcode {
+                Some(Opcode::GetFieldShape) => { native_shape_read_pics.insert(index, site); }
+                Some(Opcode::SetFieldShape) => { native_shape_write_pics.insert(index, site); }
+                _ => {}
+            }
+        }
         let small_map_fast_alloc = vm.heap.inline_map_fast_allocation_info();
         let identity_sites = native_identity_sites(vm, target);
         let prepared = vm.prepared.functions.as_ptr().add(target as usize);
@@ -1810,6 +2758,11 @@ pub(super) unsafe fn try_direct_call(
                 vm.method_epoch,
                 &identity_sites,
                 small_map_fast_alloc,
+                &native_direct_method_class_slots,
+                &native_direct_method_targets,
+                &native_plain_store_classes,
+                &native_shape_read_pics,
+                &native_shape_write_pics,
             )
         } {
             unsafe { (*jit_ptr).reject(target); }
@@ -1998,7 +2951,7 @@ unsafe extern "C" fn napalm_wfjit_profiled_small_map_commit(
     // The generated caller initializes the complete repr(C), fixed-capacity
     // value array using a compile-time validated allocation-site layout.
     let values = unsafe { source_values.read() };
-    debug_assert!(values.len() > 0 && values.len() <= SMALL_MAP_INLINE_FIELDS);
+    debug_assert!(values.len() <= SMALL_MAP_INLINE_FIELDS);
 
     unsafe {
         vm.heap
@@ -2020,7 +2973,7 @@ unsafe extern "C" fn napalm_wfjit_profiled_small_map(
     }
 
     let values = unsafe { source_values.read() };
-    debug_assert!(values.len() > 0 && values.len() <= SMALL_MAP_INLINE_FIELDS);
+    debug_assert!(values.len() <= SMALL_MAP_INLINE_FIELDS);
 
     vm.heap.alloc_inline_map(shape, values).raw_bits()
 }
@@ -2065,6 +3018,215 @@ unsafe extern "C" fn napalm_wfjit_small_map_literal_regs(
         _ => return WFJIT_BAILOUT,
     };
 
+    result.map_or(WFJIT_BAILOUT, Value::raw_bits)
+}
+
+/// Install the structural contract after a fast native TLAB map allocation.
+/// Contract checks may reject a runtime value; the native caller bails out and
+/// executes the authoritative baseline error path without exposing the object.
+unsafe extern "C" fn napalm_wfjit_bind_factory_contract(
+    vm: *mut c_void,
+    function_index: u32,
+    op_index: u32,
+    raw: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || raw == WFJIT_BAILOUT {
+        return WFJIT_BAILOUT;
+    }
+    let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(op) = function.ops.get(op_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let descriptor = vm.program.functions.get(function_index as usize)
+        .and_then(|function| function.chunk.specializations.get(op.x as usize));
+    let Some(crate::napalm_bytecode::SpecializedDescriptor::ObjectShape {
+        contract: Some(contract), ..
+    }) = descriptor else {
+        return WFJIT_BAILOUT;
+    };
+    if vm.heap.bind_contract(unsafe { Value::from_raw_bits_unchecked(raw) }, contract).is_err() {
+        return WFJIT_BAILOUT;
+    }
+    raw
+}
+
+/// Publish a zero-capacity typed array in the Immix range reserved by
+/// generated WFJIT code. This cannot trigger a managed GC collection.
+unsafe extern "C" fn napalm_wfjit_commit_reserved_typed_array(
+    vm: *mut c_void,
+    function_index: u32,
+    op_index: u32,
+    reserved: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if reserved == 0 || vm.run_state != RunState::Running {
+        return WFJIT_BAILOUT;
+    }
+    let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(&op) = function.ops.get(op_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { element, .. }) = vm
+        .program.functions.get(function_index as usize)
+        .and_then(|f| f.chunk.specializations.get(op.x as usize))
+    else { return WFJIT_BAILOUT; };
+    let contract = Type::List(Some(Box::new(element.clone())));
+    let value = unsafe {
+        vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::List(Vec::new()))
+    };
+    if vm.heap.bind_contract(value, &contract).is_err() {
+        return WFJIT_BAILOUT;
+    }
+    value.raw_bits()
+}
+
+/// Directly execute a prepared specialized factory without redispatching its
+/// bytecode handler. The native frame is registered with the precise GC map
+/// before the heap allocation or any persistent contract installation.
+/// The native class path is legal only for a finalized, zero-field, non-foreign
+/// layout. Other instances require externally allocated field storage and must
+/// use the ordinary GC-safe runtime allocation path.
+unsafe extern "C" fn napalm_wfjit_class_factory_probe(
+    vm: *mut c_void, function_index: u32, op_index: u32,
+    registers: *mut RegisterWord,
+) -> u32 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || registers != vm.hot_registers {
+        return 0;
+    }
+    let Some(prepared) = vm.prepared.functions.get(function_index as usize) else {
+        return 0;
+    };
+    let Some(&op) = prepared.ops.get(op_index as usize) else { return 0; };
+    let Some(&raw) = prepared.raw_pcs.get(op_index as usize) else { return 0; };
+    if vm.program.functions.get(function_index as usize)
+        .and_then(|function| function.chunk.code.get(raw as usize))
+        .and_then(|word| word.opcode()) != Some(Opcode::NewClassInstance)
+    { return 0; }
+    if !unsafe { wfjit_set_native_root_map(vm, function_index, op_index, registers) } {
+        return 0;
+    }
+    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX). Any
+    // finalized layout qualifies: the field array is unmanaged Box storage and
+    // its allocation in the commit never reaches a GC safepoint.
+    let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
+    u32::from(!layout.is_foreign && layout.layout_finalized)
+}
+
+/// Publish a TLAB-reserved class object and complete its constructor without
+/// keeping the caller's possibly relocated register pointer across the call.
+unsafe extern "C" fn napalm_wfjit_class_factory_commit(
+    vm: *mut c_void, function_index: u32, op_index: u32,
+    reserved: u64, registers: *mut RegisterWord,
+) -> *mut RegisterWord {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    // The generated function called the probe immediately before reserving the
+    // TLAB range. Rechecking it after the bump would introduce a failure path
+    // with an uninitialized object in already-reserved GC space.
+    debug_assert_ne!(reserved, 0);
+    debug_assert_eq!(registers, vm.hot_registers);
+    let caller_fiber = vm.current_fiber;
+    let caller_depth = vm.fiber(caller_fiber).frames.len();
+    let caller_function = vm.hot_function_index;
+    let Some(&op) = vm.prepared.functions[function_index as usize].ops.get(op_index as usize) else {
+        return std::ptr::null_mut();
+    };
+    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+    let args = unsafe { gather_specialized_values(vm, &op) };
+    vm.mark_gc_point(&op);
+    let count = vm.classes[op.y as usize].total_instance_field_count as usize;
+    let instance = unsafe { vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::Instance(InstanceObject::nulls(op.y, count))) };
+    unsafe { vm.set_reg(op.a, instance.word()) };
+    if op.cache != NO_INDEX {
+        let callee = op.cache;
+        let caller_pc = vm.raw_pc_for_op(&op);
+        unsafe { vm.advance(&op) };
+        vm.flush_hot_pc();
+        let mut explicit = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+        for (index, value) in args[..op.c as usize].iter().enumerate() {
+            explicit[index] = value.word();
+        }
+        if let Err(error) = vm.push_frame(callee, Some(instance.word()),
+            &explicit[..op.c as usize], None, None)
+        {
+            vm.fail_at_raw_pc(caller_pc, error.message);
+            return std::ptr::null_mut();
+        }
+        vm.current_frame_mut().caller_pc = caller_pc;
+        while vm.run_state == RunState::Running
+            && vm.current_fiber == caller_fiber
+            && vm.fiber(caller_fiber).frames.len() > caller_depth
+        {
+            let pc = vm.hot_pc as usize;
+            let handler = unsafe { *vm.hot_handlers.add(pc) };
+            let prepared = unsafe { vm.hot_ops.add(pc) };
+            unsafe { handler(vm, prepared) };
+        }
+    } else {
+        unsafe { vm.advance(&op) };
+    }
+    if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
+        && vm.fiber(caller_fiber).frames.len() == caller_depth
+        && vm.hot_function_index == caller_function && vm.hot_pc == op.next
+    {
+        vm.hot_registers
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+unsafe extern "C" fn napalm_wfjit_specialized_factory(
+    vm: *mut c_void,
+    function_index: u32,
+    op_index: u32,
+    registers: *mut RegisterWord,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || registers.is_null()
+        || !unsafe { wfjit_set_native_root_map(vm, function_index, op_index, registers) }
+    {
+        return WFJIT_BAILOUT;
+    }
+    let Some(function) = vm.prepared.functions.get(function_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(&op) = function.ops.get(op_index as usize) else {
+        return WFJIT_BAILOUT;
+    };
+    let Some(opcode) = vm.program.functions.get(function_index as usize)
+        .and_then(|f| f.chunk.code.get(function.raw_pcs[op_index as usize] as usize))
+        .and_then(|word| word.opcode()) else {
+        return WFJIT_BAILOUT;
+    };
+    // Native-recursive shadow frames use a separate GPR bank. The object
+    // factory reads the normal VM registers, so require the top-level frame.
+    if registers != vm.hot_registers { return WFJIT_BAILOUT; }
+    let result = match opcode {
+        Opcode::NewObjectEmpty | Opcode::NewObjectShape
+        | Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject =>
+            allocate_specialized_object(vm, &op, opcode),
+        Opcode::DefineArrayWithGenerics => {
+            let descriptor = vm.program.functions[function_index as usize]
+                .chunk.specializations.get(op.x as usize);
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType {
+                element, with_capacity,
+            }) = descriptor else { return WFJIT_BAILOUT; };
+            let capacity = if *with_capacity {
+                let count = word_i32(unsafe { *registers.add(op.b as usize) });
+                if count < 0 { return WFJIT_BAILOUT; }
+                count as usize
+            } else { 0 };
+            let contract = Type::List(Some(Box::new(element.clone())));
+            let result = vm.heap.alloc(HeapObject::List(Vec::with_capacity(capacity)));
+            vm.heap.bind_contract(result, &contract).map(|()| result)
+        },
+        _ => return WFJIT_BAILOUT,
+    };
     result.map_or(WFJIT_BAILOUT, Value::raw_bits)
 }
 
@@ -2305,6 +3467,117 @@ unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) ->
     }
 }
 
+/// Bytecode InvokeMethodDirect: the prepared op carries the target in Y.
+unsafe extern "C" fn napalm_wfjit_direct_method(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
+    let target = {
+        let vm = unsafe { &*(vm as *const Interpreter<'static>) };
+        if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
+        unsafe { vm.current_prepared().ops.get_unchecked(op_index as usize).y }
+    };
+    unsafe { wfjit_direct_method_call(vm, op_index, target) }
+}
+
+/// Runtime-profiled InvokeMethodDirect (a promoted Invoke): the target was the
+/// profile's at compile time; native code already guarded class and epoch.
+unsafe extern "C" fn napalm_wfjit_profiled_method(vm: *mut c_void, op_index: u32, target: u32) -> *mut RegisterWord {
+    unsafe { wfjit_direct_method_call(vm, op_index, target) }
+}
+
+unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) -> *mut RegisterWord {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
+    let caller_fiber = vm.current_fiber;
+    let caller_depth = vm.fiber(caller_fiber).frames.len();
+    let caller_function = vm.hot_function_index;
+    let op = unsafe { *vm.current_prepared().ops.get_unchecked(op_index as usize) };
+    let mut words = [RegisterWord(0); 17];
+    let count = if op.c <= 4 {
+        // Small-call register IDs are packed directly in PreparedOp::args_offset.
+        // Treating args_offset as a side-table offset here corrupts recursive
+        // arguments (for example createTree(d)). Reuse the interpreter ABI.
+        let mut small = [RegisterWord(0); 4];
+        let count = unsafe { vm.gather_call_words_small(&op, &mut small) };
+        words[..count].copy_from_slice(&small[..count]);
+        count
+    } else {
+        unsafe { vm.gather_call_words_large(&op, &mut words) }
+    };
+    let receiver = unsafe { vm.reg(op.b) };
+    unsafe { vm.set_pc(op_index); }
+
+    // The native caller already verified the method epoch and receiver class.
+    // Always use the ordinary call entry. This is the memoization firewall: if a
+    // future native caller reaches an auto-memoized target, probe/miss bookkeeping
+    // and return caching still happen exactly once in the existing runtime path.
+    vm.enter_bytecode_call(&op, target, Some(receiver), &words[..count], None);
+    if vm.run_state != RunState::Running { return std::ptr::null_mut(); }
+    if vm.current_fiber != caller_fiber { return std::ptr::null_mut(); }
+    if vm.fiber(caller_fiber).frames.len() == caller_depth {
+        return vm.hot_registers;
+    }
+
+    let native = vm.whole_function_jit.as_ref().and_then(|jit| {
+        (!vm.prepared.functions[target as usize].memoization.enabled()
+            && jit.active_depth < MAX_NATIVE_CALL_DEPTH)
+            .then(|| jit.entry(target))
+            .flatten()
+    });
+    if let Some(entry) = native {
+        if let Some(jit) = vm.whole_function_jit.as_mut() {
+            jit.stats.native_direct_calls = jit.stats.native_direct_calls.saturating_add(1);
+            jit.stats.native_entries = jit.stats.native_entries.saturating_add(1);
+            jit.active_depth = jit.active_depth.saturating_add(1);
+        }
+        let result = unsafe { entry(vm as *mut _ as *mut c_void, vm.hot_registers) };
+        if let Some(jit) = vm.whole_function_jit.as_mut() {
+            jit.active_depth = jit.active_depth.saturating_sub(1);
+        }
+        if result == WFJIT_BAILOUT {
+            // Finish this callee in baseline so the native caller can resume with
+            // the same direct-call ABI and a freshly relocated register base.
+            while vm.run_state == RunState::Running
+                && vm.current_fiber == caller_fiber
+                && vm.fiber(caller_fiber).frames.len() > caller_depth
+            {
+                let pc = vm.hot_pc as usize;
+                let handler = unsafe { *vm.hot_handlers.add(pc) };
+                let prepared_op = unsafe { vm.hot_ops.add(pc) };
+                unsafe { handler(vm, prepared_op); }
+            }
+        } else if vm.run_state == RunState::Running
+            && vm.current_fiber == caller_fiber
+            && vm.fiber(caller_fiber).frames.len() == caller_depth + 1
+            && vm.hot_function_index == target
+        {
+            vm.return_from_frame(RegisterWord(result), None);
+        }
+    } else {
+        if let Some(jit) = vm.whole_function_jit.as_mut() {
+            jit.stats.baseline_direct_calls = jit.stats.baseline_direct_calls.saturating_add(1);
+        }
+        while vm.run_state == RunState::Running
+            && vm.current_fiber == caller_fiber
+            && vm.fiber(caller_fiber).frames.len() > caller_depth
+        {
+            let pc = vm.hot_pc as usize;
+            let handler = unsafe { *vm.hot_handlers.add(pc) };
+            let prepared_op = unsafe { vm.hot_ops.add(pc) };
+            unsafe { handler(vm, prepared_op); }
+        }
+    }
+
+    if vm.run_state == RunState::Running
+        && vm.current_fiber == caller_fiber
+        && vm.fiber(caller_fiber).frames.len() == caller_depth
+        && vm.hot_function_index == caller_function
+    {
+        vm.hot_registers
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+
 unsafe extern "C" fn napalm_wfjit_small_map_literal(
     vm: *mut c_void,
     op_index: u32,
@@ -2348,6 +3621,24 @@ unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> 
     let opcode = vm.program.functions[caller_function as usize].chunk.code[raw_pc as usize]
         .opcode().unwrap();
 
+    // Constructors may grow the VM's register stack while the native caller
+    // is suspended. Run the constructor to completion and return the *current*
+    // GPR base so the caller never retains a dangling register-bank pointer.
+    // The tracing tier has a separate inline Immix reservation for zero-field
+    // instances; WFJIT currently uses the safe class-constructor slow path.
+    if opcode == Opcode::NewClassInstance {
+        let expected_next = vm.current_prepared().ops[op_index as usize].next;
+        let result = vm.trace_execute_call_to_return();
+        return match result {
+            Ok(step) if step.running && !step.frame_changed
+                && vm.current_fiber == caller_fiber
+                && vm.fiber(caller_fiber).frames.len() == caller_depth
+                && vm.hot_function_index == caller_function
+                && vm.hot_pc == expected_next => vm.hot_registers,
+            _ => std::ptr::null_mut(),
+        };
+    }
+
     if opcode == Opcode::Invoke {
         let prepared = vm.current_prepared();
         let op = unsafe { *prepared.ops.get_unchecked(op_index as usize) };
@@ -2368,12 +3659,15 @@ unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> 
         let prepared_op = unsafe { *vm.current_prepared().ops.get_unchecked(op_index as usize) };
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
             | Opcode::LoadField | Opcode::StoreField | Opcode::MakeClosure | Opcode::CreateClass
+            | Opcode::GetFieldShape | Opcode::SetFieldShape
+            | Opcode::GetFieldClass | Opcode::SetFieldClass | Opcode::InvokeMethodDirect
             | Opcode::AllocInstance | Opcode::AllocForeign) {
             op.x = prepared_op.x;
             op.y = prepared_op.y;
         }
         if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty
-            | Opcode::StoreProperty | Opcode::StorePropertyIfPresent) {
+            | Opcode::StoreProperty | Opcode::StorePropertyIfPresent
+            | Opcode::GetFieldShape | Opcode::SetFieldShape | Opcode::InvokeMethodDirect) {
             op.cache = prepared_op.cache;
         }
 

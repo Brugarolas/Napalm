@@ -133,6 +133,13 @@ fn native_decorators_executable_example() {
 }
 
 #[test]
+fn shared_concurrent_executable_example() {
+    // Shared Map/Set promotion, lock-free Papaya inserts, per-object
+    // VmAdaptativeMutex contention and cross-worker shapes (doubles as benchmark).
+    run_napalm(include_str!("..\\..\\scripts\\shared_concurrent.napalm"), "shared-concurrent-ok");
+}
+
+#[test]
 fn native_decorators_cache_null_errors_and_full_argument_keys() {
     run_napalm(r#"
         let calls = 0;
@@ -1138,8 +1145,10 @@ fn napalm_interfaces_ir_retains_contract_and_typed_reads() {
     assert!(!lowered.has_errors(), "{:?}", lowered.diagnostics);
     let mut program = compile_program(&mut hir).unwrap();
     use crate::napalm_bytecode::{Decoder, Opcode};
+    // Generic or specialized (super-instruction) structural binding.
+    let is_bind = |opcode: Opcode| matches!(opcode, Opcode::BindInterface | Opcode::ImplementInterfaceOrType);
     assert!(program.functions.iter().any(|f| Decoder::new(&f.chunk.code)
-        .any(|op| op.unwrap().opcode == Opcode::BindInterface)));
+        .any(|op| is_bind(op.unwrap().opcode))));
     assert!(hir.functions.iter().any(|f| f.nodes.iter().any(|node| {
         // Typed reads are a MapGet or, with a known structural layout, a
         // fixed-slot LoadProperty; either way the result is typed Num.
@@ -1148,9 +1157,9 @@ fn napalm_interfaces_ir_retains_contract_and_typed_reads() {
     })));
     // A corrupted descriptor must fail verification before VM preparation.
     let function = program.functions.iter_mut().find(|f| Decoder::new(&f.chunk.code)
-        .any(|op| op.unwrap().opcode == Opcode::BindInterface)).unwrap();
+        .any(|op| is_bind(op.unwrap().opcode))).unwrap();
     let pc = Decoder::new(&function.chunk.code).find_map(|op| {
-        let op = op.unwrap(); (op.opcode == Opcode::BindInterface).then_some(op.pc)
+        let op = op.unwrap(); is_bind(op.opcode).then_some(op.pc)
     }).unwrap();
     function.chunk.code[pc.word_index() + 1].0 = u32::MAX;
     assert!(crate::napalm_bytecode::BytecodeVerifier::verify_program(&program).is_err());
