@@ -219,6 +219,41 @@ fn napalm_whole_function_literal_slots_preserve_duplicates_and_dynamic_keys() {
 }
 
 #[test]
+fn napalm_profiled_invoke_promotes_to_direct_method_and_compiles_natively() {
+    // `shape` is untyped, so WIR cannot devirtualize `shape.area()`. The VM's
+    // call-site profile promotes the monomorphic site to InvokeMethodDirect and
+    // the whole-function JIT compiles `measure` (it used to reject it). A later
+    // receiver of another class must fall back to the generic Invoke.
+    let (program, entry, manifest) = whole_function_program(r#"
+        class Square { side: number; constructor(s: number) { this.side = s; } area(): number { return this.side * this.side; } }
+        class Circle { r: number; constructor(r: number) { this.r = r; } area(): number { return 3 * this.r * this.r; } }
+        function measure(shape) { return shape.area() + 1; }
+        const square = new Square(3);
+        let sum = 0;
+        for (let i = 0; i < 400; i++) sum += measure(square);
+        sum += measure(new Circle(2));
+        for (let i = 0; i < 10; i++) sum += measure(square);
+        const result = sum;
+    "#);
+    for native in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        // Isolate the whole-function tier: no loop traces may inline `measure`.
+        vm.set_jit_options(native.then(|| TracingJitOptions {
+            hot_loop_threshold: u32::MAX,
+            hot_entry_threshold: 64,
+            ..Default::default()
+        }));
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 410.0 * 10.0 + 13.0);
+        if native {
+            let stats = vm.whole_function_jit_stats().unwrap();
+            assert!(stats.compiled_functions >= 1, "{stats:?}");
+            assert!(stats.native_entries > 0, "{stats:?}");
+        }
+    }
+}
+
+#[test]
 fn napalm_whole_function_small_maps_enable_tlab_allocation() {
     let mut heap = Heap::default();
     let info = heap.inline_map_fast_allocation_info()

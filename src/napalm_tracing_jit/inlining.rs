@@ -46,12 +46,22 @@ struct InlineEffects {
     /// Identity bases whose exact class (hence field layout and field types)
     /// is guarded inside this inlined region.
     class_guarded: Vec<TraceValueId>,
+    /// Objects allocated by the trace itself (NewClassInstance): identity base
+    /// and exact receiver class. They have no recording-time word, so field
+    /// types/genericity come from the class instead of an observed object.
+    fresh: Vec<(TraceValueId, u64)>,
     /// Interpreter instructions the recording run executes for this call tree.
     steps: usize,
     frames: usize,
     devirtualized: usize,
     /// Functions of the caller and every active inlined frame (no recursion).
     active: Vec<FuncId>,
+}
+
+impl InlineEffects {
+    fn fresh_class(&self, base: TraceValueId) -> Option<u64> {
+        self.fresh.iter().find(|(known, _)| *known == base).map(|(_, class)| *class)
+    }
 }
 
 /// One abstract inlined frame.
@@ -134,20 +144,33 @@ impl TraceRecorder<'_> {
         let target = runtime
             .trace_invoke_closure_target(op.location.function, op.x, closure_word)
             .ok_or(RecordingAbort::UnsupportedCall)?;
-        self.inline_call_impl(runtime, program, op, builder, Some((target, closure_word)))
+        self.inline_call_impl(runtime, program, op, builder, Some((target, closure_word)), None)
     }
 
     pub(super) fn inline_call<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
-        self.inline_call_impl(runtime, program, op, builder, None)
+        self.inline_call_impl(runtime, program, op, builder, None, None)
+    }
+
+    /// Inline a constructor (`op` is a synthetic CallDirect whose first
+    /// argument register holds an instance the trace just allocated, of exact
+    /// receiver class `class`). The instance needs no class guard and its field
+    /// contracts come from the class.
+    pub(super) fn inline_constructor_call<R: TraceRuntime>(
+        &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        class: u64,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        self.inline_call_impl(runtime, program, op, builder, None, Some(class))
     }
 
     fn inline_call_impl<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
         closure: Option<(FuncId, RegisterWord)>,
+        fresh_receiver: Option<u64>,
     ) -> Result<ExpectedStep, RecordingAbort> {
         // Reactive dependency tracking is intentionally implemented in the baseline
         // field handlers. Bounded replayable inlining would otherwise turn a
@@ -198,9 +221,18 @@ impl TraceRecorder<'_> {
         let receiver = receiver_reg
             .map(|reg| self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged))
             .transpose()?;
-        let receiver_word = receiver_reg
-            .map(|reg| runtime.trace_read_slot(FrameSlot::General(reg)).map_err(|_| RecordingAbort::UnsupportedCall))
-            .transpose()?;
+        // A trace-allocated receiver has no meaningful recording-time word: the
+        // register still holds whatever preceded the allocation.
+        let receiver_word = if fresh_receiver.is_some() {
+            None
+        } else {
+            receiver_reg
+                .map(|reg| runtime.trace_read_slot(FrameSlot::General(reg)).map_err(|_| RecordingAbort::UnsupportedCall))
+                .transpose()?
+        };
+        if fresh_receiver.is_some() && (receiver.is_none() || class.is_some() || closure.is_some()) {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
 
         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
         builder.emit0(TraceInst::GuardMethodEpoch { expected: runtime.trace_method_epoch(), exit });
@@ -211,11 +243,18 @@ impl TraceRecorder<'_> {
             cells: Vec::new(),
             cell_words: Vec::new(),
             class_guarded: Vec::new(),
+            fresh: Vec::new(),
             steps: 0,
             frames: 0,
             devirtualized: class.is_some() as usize,
             active: vec![op.location.function, target],
         };
+        if let (Some(fresh_class), Some(value)) = (fresh_receiver, receiver) {
+            // Exact class by construction: no guard needed.
+            let base = identity_base(builder, value);
+            fx.class_guarded.push(base);
+            fx.fresh.push((base, fresh_class));
+        }
         let receiver = match (&class, receiver) {
             (Some(classes), Some(value)) => {
                 let guarded = builder.emit1(
@@ -416,7 +455,7 @@ impl TraceRecorder<'_> {
                 None
             };
             let word = match inst.opcode {
-                Move | BindInterface => frame.words[inst.b as usize],
+                Move | BindInterface | ImplementInterfaceOrType => frame.words[inst.b as usize],
                 MoveFromArg => frame.arg_words.get(inst.b as usize).copied().flatten(),
                 MoveFromSpecial if inst.b == 0 => frame.receiver_word,
                 // Module variable arrays are fixed for the interpreter's lifetime
@@ -476,6 +515,25 @@ impl TraceRecorder<'_> {
                     let value = scalar(&frame, builder, inst.b, TraceRep::Tagged)?;
                     self.guard_store_value(builder, value, &descriptor.expected, fx.replay_pc)
                         .ok_or(RecordingAbort::UnsupportedCall)?
+                }
+                // Structural bind in its specialized encoding: a no-op only when
+                // the operand already carries exactly that contract (anything
+                // else would install persistent state inside the inlined body).
+                ImplementInterfaceOrType => {
+                    let Some(crate::napalm_bytecode::SpecializedDescriptor::Contract { contract, .. }) =
+                        callee.chunk.specializations.get(inst.x as usize)
+                    else { return Err(RecordingAbort::UnsupportedCall); };
+                    let value = scalar(&frame, builder, inst.b, TraceRep::Tagged)?;
+                    if builder.proven_type(value) != Some(contract) {
+                        if jit_events_enabled() {
+                            eprintln!(
+                                "[napalm-jit] inline {target:?} stops at ImplementInterfaceOrType {contract:?} (operand proven {:?})",
+                                builder.proven_type(value)
+                            );
+                        }
+                        return Err(RecordingAbort::UnsupportedCall);
+                    }
+                    value
                 }
                 LoadNull => builder.constant(TraceConstant::Null),
                 LoadFalse | LoadTrue => builder.constant(TraceConstant::Bool(inst.opcode == LoadTrue)),
@@ -566,14 +624,27 @@ impl TraceRecorder<'_> {
                         return Err(RecordingAbort::UnsupportedCall);
                     }
                     let slot = runtime.trace_field_slot(inst.location, inst.x);
+                    let fresh = fx.fresh_class(identity_base(builder, object));
+                    // SetFieldClass whose value statically satisfies the field.
+                    let proven = inst.y & crate::napalm_bytecode::FIELD_CLASS_UNCHECKED_STORE != 0;
                     // Generic-parameter fields are checked against per-instance
                     // arguments by the baseline handler; keep the call.
-                    if object_word.is_some_and(|word| runtime.trace_field_is_generic(word, slot)) {
+                    let generic = !proven && match (object_word, fresh) {
+                        (Some(word), _) => runtime.trace_field_is_generic(word, slot),
+                        (None, Some(class)) => runtime.trace_class_field_is_generic(class, slot),
+                        (None, None) => false,
+                    };
+                    if generic {
                         return Err(RecordingAbort::UnsupportedCall);
                     }
-                    let expected = object_word
-                        .and_then(|word| runtime.trace_field_type(word, slot))
-                        .unwrap_or(Type::Top);
+                    let expected = match (object_word, fresh) {
+                        _ if proven => Type::Top,
+                        (Some(word), _) => runtime.trace_field_type(word, slot).unwrap_or(Type::Top),
+                        // A fresh instance's field contract must be known exactly.
+                        (None, Some(class)) => runtime.trace_class_field_type(class, slot)
+                            .ok_or(RecordingAbort::UnsupportedCall)?,
+                        (None, None) => Type::Top,
+                    };
                     let value = scalar(&frame, builder, inst.b, TraceRep::Tagged)?;
                     let value = if matches!(expected, Type::Top) {
                         value
@@ -620,11 +691,26 @@ impl TraceRecorder<'_> {
                     }
                     match own {
                         Some(index) => fx.stores[index].value,
+                        // A trace-allocated instance with no buffered write to
+                        // this slot still holds its initial null. The baseline
+                        // traps on a null read of a non-nullable field: keep the
+                        // call then, otherwise the read folds to null.
+                        None if fx.fresh_class(base).is_some() => {
+                            let class = fx.fresh_class(base).unwrap();
+                            let field_type = runtime.trace_class_field_type(class, slot)
+                                .ok_or(RecordingAbort::UnsupportedCall)?;
+                            if !field_type.accepts(&Type::Null) {
+                                return Err(RecordingAbort::UnsupportedCall);
+                            }
+                            builder.constant(TraceConstant::Null)
+                        }
                         None => {
                             // Field types are only known for exactly class-guarded objects.
                             let field_type = if fx.class_guarded.contains(&base) {
                                 frame.words[inst.b as usize]
                                     .and_then(|word| runtime.trace_field_type(word, slot))
+                                    .or_else(|| fx.fresh_class(base)
+                                        .and_then(|class| runtime.trace_class_field_type(class, slot)))
                                     .unwrap_or(Type::Top)
                             } else {
                                 Type::Top

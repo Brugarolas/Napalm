@@ -2324,6 +2324,28 @@ impl ObjectFusionPlan {
     }
 }
 
+/// Field contracts whose runtime check also *installs* persistent state on the
+/// stored value (structural objects, typed collections, generic instances):
+/// a static proof alone cannot skip them.
+fn field_requires_runtime_contract(ty: &Type) -> bool {
+    use crate::napalm_ir::BuiltinId;
+    match ty {
+        Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _)
+        | Type::Set(Some(_)) | Type::GenericInstance { .. } => true,
+        Type::Builtin(BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, Some(_)) => true,
+        Type::Union(types) => types.iter().any(field_requires_runtime_contract),
+        _ => false,
+    }
+}
+
+fn mentions_nominal_type(ty: &Type) -> bool {
+    match ty {
+        Type::Instance(_) | Type::Class(_) => true,
+        Type::Union(types) => types.iter().any(mentions_nominal_type),
+        _ => false,
+    }
+}
+
 /// `DefineArrayWithGenerics` installs a *persistent* element contract at
 /// allocation. That is only equivalent to the generic bytecode when the list
 /// was going to receive exactly that contract anyway: an `AllocList` whose
@@ -3021,6 +3043,40 @@ enum CallTransfer<'a> {
 }
 
 impl FunctionEmitter<'_> {
+    /// Known-class field access: the function's own class, an own field at a
+    /// known class-local offset, and what the static types prove about it
+    /// (`stored` is the written value for SetFieldClass). Slots outside the
+    /// class's own range (accessors inlined from another class) keep the
+    /// generic LoadField/StoreField encoding.
+    fn field_class_descriptor(&self, slot: u16, stored: Option<ValueId>) -> Option<SpecializedDescriptor> {
+        if !self.options.emit_specialized_bytecode { return None; }
+        let class = self.function.field_owner?;
+        let info = self.program.class(class)?;
+        let local = slot as usize;
+        if local >= info.own_instance_field_count as usize { return None; }
+        let field_type = info.own_instance_field_types.get(local).cloned().unwrap_or(Type::Top);
+        let (nullable, unchecked_store) = match stored {
+            None => (field_type.accepts(&Type::Null), false),
+            Some(value) => {
+                let generic = info.own_generic_fields.get(local).copied().unwrap_or(false);
+                let value_type = &self.function.value(value)?.ty;
+                // Heap contracts are installed (not merely checked) by the store.
+                // Nominal (class) contracts are exact at runtime: require the
+                // identical static type rather than static subtyping.
+                let proven = matches!(field_type, Type::Top)
+                    || (!field_requires_runtime_contract(&field_type)
+                        && !matches!(value_type, Type::Top | Type::Bottom)
+                        && !value_type.is_internal_representation()
+                        && field_type.accepts(value_type)
+                        && (!mentions_nominal_type(&field_type) || field_type == *value_type));
+                (false, !generic && proven)
+            }
+        };
+        Some(SpecializedDescriptor::FieldClass {
+            class, local_slot: slot as u32, nullable, unchecked_store,
+        })
+    }
+
     fn specialize_method_call(
         &self,
         receiver: ValueId,
@@ -3556,11 +3612,11 @@ impl FunctionEmitter<'_> {
                 class.0,
             ),
             LoadField { object, slot } => {
-                if let (true, Some(class)) = (self.options.emit_specialized_bytecode, self.function.field_owner) {
+                if let Some(descriptor) = self.field_class_descriptor(slot.0, None) {
                     self.stats.specialized_opcodes += 1;
                     self.assembler.emit_specialized(
                         Opcode::GetFieldClass, self.result_reg(node)?, self.reg(*object)?, &[],
-                        SpecializedDescriptor::FieldClass { class, local_slot: slot.0 as u32 },
+                        descriptor,
                     ).map_err(|error| self.assemble_error(error))?
                 } else {
                     self.assembler.emit_x32(
@@ -3570,11 +3626,11 @@ impl FunctionEmitter<'_> {
                 }
             },
             StoreField { object, slot, value } => {
-                if let (true, Some(class)) = (self.options.emit_specialized_bytecode, self.function.field_owner) {
+                if let Some(descriptor) = self.field_class_descriptor(slot.0, Some(*value)) {
                     self.stats.specialized_opcodes += 1;
                     self.assembler.emit_specialized(
                         Opcode::SetFieldClass, self.reg(*object)?, self.reg(*value)?, &[],
-                        SpecializedDescriptor::FieldClass { class, local_slot: slot.0 as u32 },
+                        descriptor,
                     ).map_err(|error| self.assemble_error(error))?
                 } else {
                     self.assembler.emit_x32(

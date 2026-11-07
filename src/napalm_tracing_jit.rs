@@ -763,6 +763,18 @@ pub trait TraceRuntime {
     /// stores stay runtime calls instead of native fast paths.
     fn trace_field_is_generic(&self, _object: RegisterWord, _slot: u32) -> bool { false }
 
+    /// Receiver class of instances of `class` once its layout is finalized.
+    /// Used for objects the trace allocates itself (NewClassInstance), whose
+    /// exact class is known without observing a recording-time word.
+    fn trace_instance_class(&self, _class: ClassId) -> Option<u64> { None }
+
+    /// Class-based counterparts of `trace_field_type`/`trace_field_is_generic`
+    /// for freshly allocated instances (`class` as returned by
+    /// `trace_instance_class`). Conservative defaults: unknown type and
+    /// "generic" (both make the inliner keep the call).
+    fn trace_class_field_type(&self, _class: u64, _slot: u32) -> Option<Type> { None }
+    fn trace_class_field_is_generic(&self, _class: u64, _slot: u32) -> bool { true }
+
     /// Stable address of the module-global slot referenced by this bytecode.
     /// Module variable arrays are fixed-size for the lifetime of an interpreter.
     fn trace_module_slot_address(&self, _location: TraceLocation) -> Option<usize> { None }
@@ -1379,6 +1391,7 @@ fn decode_at(
             | Opcode::CallPrimitive
             | Opcode::CallForeign
             | Opcode::InvokeMethodDirect
+            | Opcode::NewClassInstance
     ) {
         let count = first.c() as usize;
         args.reserve(count);
@@ -1402,15 +1415,17 @@ fn decode_at(
     // specialized handler (same semantics).
     let (opcode, x, y) = match opcode {
         Opcode::GetFieldClass | Opcode::SetFieldClass => {
-            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { local_slot, .. }) =
+            let Some(descriptor @ crate::napalm_bytecode::SpecializedDescriptor::FieldClass { local_slot, .. }) =
                 function.chunk.specializations.get(x as usize)
             else {
                 return Err(TracingJitError::Decode { location, message: "invalid FieldClass descriptor".to_owned() });
             };
             // trace_field_slot() resolves the relocated absolute slot from the
             // prepared op at this PC; the class-local slot is only its fallback.
+            // Y keeps the compile-time FIELD_CLASS_* facts (a real LoadField /
+            // StoreField decodes Y = 0: nothing proven).
             let canonical = if opcode == Opcode::GetFieldClass { Opcode::LoadField } else { Opcode::StoreField };
-            (canonical, *local_slot, 0)
+            (canonical, *local_slot, descriptor.field_class_flags())
         }
         Opcode::GetFieldShape | Opcode::SetFieldShape => {
             let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldShape { layout, slot }) =
@@ -1986,6 +2001,80 @@ impl<'a> TraceRecorder<'a> {
             builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
         }
         Ok(ExpectedStep::Runtime { terminal: false })
+    }
+
+    /// NewClassInstance as *allocation + inlined constructor*. The descriptor
+    /// fixes the exact class, hence its complete (relocated) field layout and
+    /// field contracts. The allocation is one native-factory runtime leaf that
+    /// leaves the VM at this PC with A = the null-initialized instance; the
+    /// constructor body is then inlined against that fresh instance, its field
+    /// initializers becoming stores at known slots (no class guard, no lookup).
+    /// Every inlined guard replays this PC, which re-executes the complete
+    /// allocate-and-construct opcode in the VM (the unpublished trace instance
+    /// is simply dropped). `Ok(None)` restores the builder: the caller emits the
+    /// authoritative allocate-and-construct RuntimeCall instead.
+    fn record_new_class_instance<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        function: &BytecodeFunction,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<Option<ExpectedStep>, RecordingAbort> {
+        let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) =
+            function.chunk.specializations.get(op.x as usize)
+        else { return Ok(None); };
+        let Some(class_key) = runtime.trace_instance_class(*class) else { return Ok(None); };
+        // The destination is written by the allocation, before the constructor
+        // reads its arguments: an aliased argument register cannot be split.
+        if op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.location.pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.args.len() != op.c as usize
+            || op.args.contains(&Reg(op.a))
+        {
+            return Ok(None);
+        }
+        let used = builder.trace().nodes.iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+            .count();
+        if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
+            return Ok(None);
+        }
+
+        let Some(constructor) = *constructor else {
+            // No constructor: the factory leaf completes the opcode.
+            builder.runtime_gc_leaf(op.location, BytecodePc(op.next_pc.0 | TRACE_RUNTIME_MODE_OBJECT_FACTORY));
+            builder.reload_slot_after_runtime(FrameSlot::General(Reg(op.a)), TraceType::Any, TraceRep::Tagged);
+            return Ok(Some(ExpectedStep::Runtime { terminal: false }));
+        };
+
+        let checkpoint = builder.clone();
+        // Allocate-only: continuation == this PC (the VM does not advance).
+        builder.runtime_gc_leaf(op.location, BytecodePc(op.location.pc.0 | TRACE_RUNTIME_MODE_OBJECT_FACTORY));
+        let instance = builder.reload_slot_after_runtime(
+            FrameSlot::General(Reg(op.a)), TraceType::Any, TraceRep::Tagged);
+
+        let mut call = op.clone();
+        call.opcode = Opcode::CallDirect;
+        call.x = constructor.0;
+        call.args = std::iter::once(Reg(op.a)).chain(op.args.iter().copied()).collect();
+        call.c = call.args.len() as u8;
+        match self.inline_constructor_call(runtime, program, &call, builder, class_key) {
+            Ok(step @ ExpectedStep::Inlined { .. }) => {
+                // The constructor's return value is discarded: A keeps the instance.
+                self.write_gpr(builder, op.a, instance);
+                Ok(Some(step))
+            }
+            Ok(_)
+            | Err(RecordingAbort::UnsupportedCall
+                | RecordingAbort::UnsupportedOpcode(_)
+                | RecordingAbort::UnsupportedConstant
+                | RecordingAbort::RepresentationConflict) => {
+                *builder = checkpoint;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Same synchronization contract as runtime_gc_leaf, but the compiled trace
@@ -4721,10 +4810,16 @@ impl<'a> TraceRecorder<'a> {
                     .trace_read_slot(FrameSlot::General(Reg(op.a)))
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
                 let slot = runtime.trace_field_slot(op.location, op.x);
-                if runtime.trace_field_is_generic(object_word, slot) {
+                // SetFieldClass whose value statically satisfies the field.
+                let proven = op.y & crate::napalm_bytecode::FIELD_CLASS_UNCHECKED_STORE != 0;
+                if !proven && runtime.trace_field_is_generic(object_word, slot) {
                     return self.runtime_leaf(op, builder, &[]);
                 }
-                let expected = runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top);
+                let expected = if proven {
+                    Type::Top
+                } else {
+                    runtime.trace_field_type(object_word, slot).unwrap_or(Type::Top)
+                };
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let value = if matches!(expected, Type::Top) {
@@ -5796,9 +5891,25 @@ impl<'a> TraceRecorder<'a> {
             // opcodes allocate complete, GC-rooted objects before publication;
             // the trace keeps its unrelated SSA values across one GC boundary.
             // LLVM uses the same TraceInst::Runtime GC-leaf ABI as Cranelift.
-            ImplementInterfaceOrType => self.runtime_gc_leaf(
-                op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
+            ImplementInterfaceOrType => {
+                let Some(crate::napalm_bytecode::SpecializedDescriptor::Contract { contract, .. }) =
+                    function.chunk.specializations.get(op.x as usize)
+                else { return Err(RecordingAbort::UnsupportedOpcode(op.opcode)); };
+                // Rebinding an already installed identical contract is a no-op
+                // at runtime (same rule as structural BindInterface above).
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                if builder.proven_type(source) == Some(contract) {
+                    self.write_gpr(builder, op.a, source);
+                    return Ok(ExpectedStep::Exact(next));
+                }
+                let step = self.runtime_gc_leaf(
+                    op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                )?;
+                if let Some(result) = builder.slot_value(FrameSlot::General(Reg(op.a))) {
+                    builder.set_proven_type(result, contract.clone());
+                }
+                Ok(step)
+            }
             DefineArrayWithGenerics => self.runtime_gc_specialized(
                 op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
@@ -5814,6 +5925,9 @@ impl<'a> TraceRecorder<'a> {
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
             ),
             NewClassInstance => {
+                if let Some(step) = self.record_new_class_instance(runtime, program, function, op, builder)? {
+                    return Ok(step);
+                }
                 // The constructor may grow the interpreter register stack.
                 // RuntimeCall is the only safe trace boundary; its native mode
                 // first attempts an inline Immix reservation and then executes

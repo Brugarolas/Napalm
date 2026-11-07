@@ -113,6 +113,39 @@ fn napalm_typed_list_length_and_subscript_trace_natively_with_baseline_edge_case
 }
 
 #[test]
+fn new_class_instance_is_devirtualized_and_fused_at_the_call_site() {
+    // `new P(..)` reads the class from a module binding (typed `Top`). The
+    // exact class is still provable, so the factory call is resolved, the
+    // trivial factory inlined, and the caller's loop holds a NewClassInstance
+    // (allocation + constructor with a known layout); `p.sum()` is then a
+    // direct call on the exactly typed instance.
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        class P {
+            x: number; y: number;
+            constructor(x: number, y: number) { this.x = x; this.y = y; }
+            sum(): number { return this.x + this.y; }
+        }
+        function run(n: number): number {
+            let s = 0;
+            for (let i = 0; i < n; i++) { const p = new P(i, 1); s = s + p.sum(); }
+            return s;
+        }
+        const result = run(3000);
+    "#);
+    let run = program.functions.iter()
+        .find(|function| crate::napalm_bytecode::Decoder::new(&function.chunk.code)
+            .any(|inst| inst.unwrap().opcode == Opcode::NewClassInstance)
+            && function.kind != crate::napalm_ir::FunctionKind::StaticMethod)
+        .expect("a caller with an inlined NewClassInstance");
+    let opcodes: Vec<Opcode> = crate::napalm_bytecode::Decoder::new(&run.chunk.code)
+        .map(|inst| inst.unwrap().opcode).collect();
+    assert!(opcodes.contains(&Opcode::CallDirect), "{opcodes:?}");
+    assert_eq!(opcodes.iter().filter(|op| **op == Opcode::Invoke).count(), 3, "{opcodes:?}");
+    let expected: f64 = (0..3000).map(|i| i as f64 + 1.0).sum();
+    assert_eq!(static_type_results(&program, entry, &manifest), [expected; 2]);
+}
+
+#[test]
 fn inferred_list_literal_type_never_becomes_a_runtime_contract() {
     // DefineArrayWithGenerics must only replace an explicit List<T> binding.
     // The inferred type of `[1]` is not a contract: an `any` variable stays

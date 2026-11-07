@@ -72,6 +72,7 @@ pub(super) struct WholeFunctionJit {
     runtime_op: cranelift::module::FuncId,
     direct_call: cranelift::module::FuncId,
     direct_method: cranelift::module::FuncId,
+    profiled_method: cranelift::module::FuncId,
     small_map_literal: cranelift::module::FuncId,
     native_self_call: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
@@ -105,6 +106,7 @@ impl WholeFunctionJit {
         builder.symbol("napalm_wfjit_runtime_op", napalm_wfjit_runtime_op as *const u8);
         builder.symbol("napalm_wfjit_direct_call", napalm_wfjit_direct_call as *const u8);
         builder.symbol("napalm_wfjit_direct_method", napalm_wfjit_direct_method as *const u8);
+        builder.symbol("napalm_wfjit_profiled_method", napalm_wfjit_profiled_method as *const u8);
         builder.symbol("napalm_wfjit_small_map_literal", napalm_wfjit_small_map_literal as *const u8);
         builder.symbol("napalm_wfjit_native_self_call", napalm_wfjit_native_self_call as *const u8);
         builder.symbol(
@@ -152,6 +154,14 @@ impl WholeFunctionJit {
         let direct_method_id = module
             .declare_function("napalm_wfjit_direct_method", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function direct method helper: {e}"))?;
+        let mut profiled_method_sig = module.make_signature();
+        profiled_method_sig.params.push(AbiParam::new(pointer)); // vm
+        profiled_method_sig.params.push(AbiParam::new(types::I32)); // op index
+        profiled_method_sig.params.push(AbiParam::new(types::I32)); // prepared target
+        profiled_method_sig.returns.push(AbiParam::new(pointer));
+        let profiled_method_id = module
+            .declare_function("napalm_wfjit_profiled_method", Linkage::Import, &profiled_method_sig)
+            .map_err(|e| format!("cannot declare whole-function profiled method helper: {e}"))?;
         let small_map_id = module
             .declare_function("napalm_wfjit_small_map_literal", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function small-map helper: {e}"))?;
@@ -269,6 +279,7 @@ impl WholeFunctionJit {
             runtime_op: runtime_id,
             direct_call: direct_id,
             direct_method: direct_method_id,
+            profiled_method: profiled_method_id,
             small_map_literal: small_map_id,
             native_self_call: native_self_call_id,
             small_map_literal_regs: small_map_regs_id,
@@ -355,7 +366,9 @@ impl WholeFunctionJit {
             let unsupported_invoke = opcode == Opcode::Invoke
                 && native_numeric_quick(function, index).is_none()
                 && native_map_property_pic(function, index).is_none()
-                && identity_sites[index].is_none();
+                && identity_sites[index].is_none()
+                // Runtime-profiled InvokeMethodDirect (promoted by the VM).
+                && profiled_direct_invoke_site(function, index).is_none();
             // A recursive descent can become hot before it has returned even
             // once, leaving the unwind path unprofiled. Retry after more calls
             // instead of permanently rejecting a function on its first visit.
@@ -418,6 +431,7 @@ impl WholeFunctionJit {
         let runtime_module_id = self.runtime_op;
         let direct_module_id = self.direct_call;
         let direct_method_module_id = self.direct_method;
+        let profiled_method_module_id = self.profiled_method;
         let small_map_module_id = self.small_map_literal;
         let native_self_module_id = self.native_self_call;
         let small_map_regs_module_id = self.small_map_literal_regs;
@@ -452,6 +466,7 @@ impl WholeFunctionJit {
             let runtime_ref = self.module.declare_func_in_func(runtime_module_id, b.func);
             let direct_ref = self.module.declare_func_in_func(direct_module_id, b.func);
             let direct_method_ref = self.module.declare_func_in_func(direct_method_module_id, b.func);
+            let profiled_method_ref = self.module.declare_func_in_func(profiled_method_module_id, b.func);
             let _small_map_ref = self.module.declare_func_in_func(small_map_module_id, b.func);
             let _native_self_ref = self.module.declare_func_in_func(native_self_module_id, b.func);
             let self_ref = self.module.declare_func_in_func(func_id, b.func);
@@ -790,7 +805,7 @@ impl WholeFunctionJit {
                         regs = if let Some(class_key) = class_key {
                             emit_native_direct_method_call(
                                 &mut b, runtime_ref, direct_method_ref, vm, regs,
-                                index as u32, op.b, class_key, expected_method_epoch, abort,
+                                index as u32, op.b, class_key, expected_method_epoch, None, abort,
                             )
                         } else {
                             call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
@@ -843,6 +858,19 @@ impl WholeFunctionJit {
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
                         else { b.ins().jump(blocks[target], &[BlockArg::Value(vm), BlockArg::Value(regs)]); }
+                    }
+                    // Runtime-profiled InvokeMethodDirect: native class+epoch
+                    // guard, then the direct bytecode call; a miss replays the
+                    // generic Invoke through the runtime helper.
+                    Opcode::Invoke if native_map_property_pic(function, index).is_none()
+                        && profiled_direct_invoke_site(function, index).is_some() =>
+                    {
+                        let (class, target) = profiled_direct_invoke_site(function, index).unwrap();
+                        regs = emit_native_direct_method_call(
+                            &mut b, runtime_ref, profiled_method_ref, vm, regs,
+                            index as u32, op.b, class.0, expected_method_epoch, Some(target), abort,
+                        );
+                        next!();
                     }
                     Opcode::Invoke if native_map_property_pic(function, index).is_some() => {
                         let pic = native_map_property_pic(function, index).unwrap();
@@ -1525,6 +1553,9 @@ fn emit_native_direct_method_call(
     receiver: u8,
     receiver_class: u64,
     epoch: u64,
+    // Some(target): runtime-profiled site; the helper takes the target as a
+    // compile-time argument instead of reading it from the prepared op.
+    profiled_target: Option<u32>,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
@@ -1572,7 +1603,7 @@ fn emit_native_direct_method_call(
     b.seal_block(live_ok);
 
     b.switch_to_block(class_ok);
-    let current_regs = call_runtime_helper(b, direct_method_ref, vm, regs, index, abort);
+    let current_regs = call_runtime_helper_with(b, direct_method_ref, vm, regs, index, profiled_target, abort);
     b.ins().jump(done, &[BlockArg::Value(current_regs)]);
     b.seal_block(class_ok);
 
@@ -1661,9 +1692,14 @@ fn emit_native_class_field_load(
         offset_of!(TraceHeapEntry, data) as i32);
     let value = b.ins().load(types::I64, MemFlagsData::trusted(), data,
         op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
-    let initialized = b.ins().icmp_imm(IntCC::NotEqual, value, TAG_NULL as i64);
     let result_ok = b.create_block();
-    b.ins().brif(initialized, result_ok, &[], fallback, &[]);
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_NULLABLE != 0 {
+        // Proven nullable field: null is an ordinary result, no runtime trap.
+        b.ins().jump(result_ok, &[]);
+    } else {
+        let initialized = b.ins().icmp_imm(IntCC::NotEqual, value, TAG_NULL as i64);
+        b.ins().brif(initialized, result_ok, &[], fallback, &[]);
+    }
     b.seal_block(bounds_ok);
 
     b.switch_to_block(result_ok);
@@ -1951,6 +1987,20 @@ fn call_runtime_helper(
     op: u32,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
+    call_runtime_helper_with(b, helper, vm, current_regs, op, None, abort)
+}
+
+/// `call_runtime_helper` for helpers taking one extra compile-time u32
+/// (e.g. the profiled direct-call target).
+fn call_runtime_helper_with(
+    b: &mut FunctionBuilder<'_>,
+    helper: cranelift::codegen::ir::FuncRef,
+    vm: cranelift::prelude::Value,
+    current_regs: cranelift::prelude::Value,
+    op: u32,
+    extra: Option<u32>,
+    abort: cranelift::prelude::Block,
+) -> cranelift::prelude::Value {
     // The legacy runtime helpers execute against Interpreter::hot_registers.
     // A native shadow-frame callee has a different register base, so crossing
     // such a helper would silently operate on its outer interpreter frame.
@@ -1969,7 +2019,13 @@ fn call_runtime_helper(
     b.seal_block(runtime);
 
     let op = b.ins().iconst(types::I32, op as i64);
-    let call = b.ins().call(helper, &[vm, op]);
+    let call = match extra {
+        Some(extra) => {
+            let extra = b.ins().iconst(types::I32, extra as i64);
+            b.ins().call(helper, &[vm, op, extra])
+        }
+        None => b.ins().call(helper, &[vm, op]),
+    };
     let regs = b.inst_results(call)[0];
     let failed = b.ins().icmp_imm(IntCC::Equal, regs, 0);
     let ok = b.create_block();
@@ -2623,14 +2679,16 @@ pub(super) unsafe fn try_direct_call(
             let bytecode_opcode = bytecode_for_target.chunk.code[prepared_for_target.raw_pcs[index] as usize]
                 .opcode();
             if bytecode_opcode != Some(Opcode::SetFieldClass) { continue; }
-            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { class, .. }) =
+            let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { class, unchecked_store, .. }) =
                 bytecode_for_target.chunk.specializations.get(
                     prepared_for_target.original_ops[index].x as usize)
             else { continue; };
             let Some(&class_slot) = vm.prepared.class_by_id.get(class) else { continue; };
             let Some(info) = vm.classes.get(class_slot as usize) else { continue; };
-            if info.instance_field_types.get(op.x as usize) != Some(&Type::Top)
-                || info.generic_fields.get(op.x as usize) != Some(&false)
+            // Untyped field, or a store the compiler proved satisfies the field.
+            if !*unchecked_store
+                && (info.instance_field_types.get(op.x as usize) != Some(&Type::Top)
+                    || info.generic_fields.get(op.x as usize) != Some(&false))
             { continue; }
             native_plain_store_classes.insert(index, CLASS_KIND_INSTANCE | class_slot as u64);
         }
@@ -3037,10 +3095,11 @@ unsafe extern "C" fn napalm_wfjit_class_factory_probe(
     if !unsafe { wfjit_set_native_root_map(vm, function_index, op_index, registers) } {
         return 0;
     }
-    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+    // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX). Any
+    // finalized layout qualifies: the field array is unmanaged Box storage and
+    // its allocation in the commit never reaches a GC safepoint.
     let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
-    u32::from(!layout.is_foreign && layout.layout_finalized
-        && layout.total_instance_field_count == 0)
+    u32::from(!layout.is_foreign && layout.layout_finalized)
 }
 
 /// Publish a TLAB-reserved class object and complete its constructor without
@@ -3064,9 +3123,10 @@ unsafe extern "C" fn napalm_wfjit_class_factory_commit(
     // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
     let args = unsafe { gather_specialized_values(vm, &op) };
     vm.mark_gc_point(&op);
+    let count = vm.classes[op.y as usize].total_instance_field_count as usize;
     let instance = unsafe { vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::Instance {
         class_slot: op.y,
-        fields: Box::new([]),
+        fields: vec![Value::NULL; count].into_boxed_slice(),
     }) };
     unsafe { vm.set_reg(op.a, instance.word()) };
     if op.cache != NO_INDEX {
@@ -3394,7 +3454,23 @@ unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) ->
     }
 }
 
+/// Bytecode InvokeMethodDirect: the prepared op carries the target in Y.
 unsafe extern "C" fn napalm_wfjit_direct_method(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
+    let target = {
+        let vm = unsafe { &*(vm as *const Interpreter<'static>) };
+        if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
+        unsafe { vm.current_prepared().ops.get_unchecked(op_index as usize).y }
+    };
+    unsafe { wfjit_direct_method_call(vm, op_index, target) }
+}
+
+/// Runtime-profiled InvokeMethodDirect (a promoted Invoke): the target was the
+/// profile's at compile time; native code already guarded class and epoch.
+unsafe extern "C" fn napalm_wfjit_profiled_method(vm: *mut c_void, op_index: u32, target: u32) -> *mut RegisterWord {
+    unsafe { wfjit_direct_method_call(vm, op_index, target) }
+}
+
+unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) -> *mut RegisterWord {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
     let caller_fiber = vm.current_fiber;
@@ -3413,7 +3489,6 @@ unsafe extern "C" fn napalm_wfjit_direct_method(vm: *mut c_void, op_index: u32) 
     } else {
         unsafe { vm.gather_call_words_large(&op, &mut words) }
     };
-    let target = op.y;
     let receiver = unsafe { vm.reg(op.b) };
     unsafe { vm.set_pc(op_index); }
 

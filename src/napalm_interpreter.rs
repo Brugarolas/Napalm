@@ -5508,6 +5508,11 @@ struct PreparedFunction {
     /// entries here. PreparedOp::cache stores the dense cache index so x/y remain
     /// available for structural layout and logical-slot metadata.
     map_inline_caches: Vec<MapInlineCacheState>,
+    /// Parallel to map_inline_caches: GetFieldShape on a *class instance* that
+    /// satisfies the structural layout. Class field layouts are immutable and
+    /// the property name is fixed by (layout, logical slot), so the receiver
+    /// class alone determines the absolute field offset.
+    structural_instance_caches: Vec<StructuralInstanceCache>,
     /// Predecoded frame-entry destinations. u16::MAX means the corresponding
     /// source value was dead after bytecode allocation and needs no GPR copy.
     entry_this_dst: u16,
@@ -5826,13 +5831,17 @@ impl PreparedProgram {
                     })?;
                 }
                 Opcode::GetFieldClass | Opcode::SetFieldClass => {
-                    let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { class, local_slot }) =
-                        function.chunk.specializations.get(temp.x as usize)
+                    let Some(descriptor @ crate::napalm_bytecode::SpecializedDescriptor::FieldClass {
+                        class, local_slot, ..
+                    }) = function.chunk.specializations.get(temp.x as usize)
                     else { return Err(RuntimeError::new("invalid specialized class field descriptor")); };
                     if function.field_owner != Some(*class) {
                         return Err(RuntimeError::new("specialized field owner differs from the function owner"));
                     }
+                    // X = class-local slot (relocated to absolute at class link);
+                    // Y = FIELD_CLASS_* facts proven at compile time.
                     op.x = *local_slot;
+                    op.y = descriptor.field_class_flags();
                 }
                 Opcode::GetFieldShape | Opcode::SetFieldShape => {
                     let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldShape { layout, slot }) =
@@ -6113,6 +6122,7 @@ impl PreparedProgram {
             small_map_literal_sites,
             quickened_invoke_ops: Vec::new(),
             map_inline_caches: vec![MapInlineCacheState::default(); map_inline_cache_count],
+            structural_instance_caches: vec![StructuralInstanceCache::EMPTY; map_inline_cache_count],
             entry_this_dst,
             entry_arg_dsts,
             needs_argument_bank,
@@ -6789,6 +6799,18 @@ struct MapIcEntry {
     _padding: u16,
 }
 
+/// Monomorphic (receiver class slot -> absolute field) cache of one structural
+/// property op. `class_slot == u32::MAX` is empty.
+#[derive(Clone, Copy, Debug)]
+struct StructuralInstanceCache {
+    class_slot: u32,
+    field: u32,
+}
+
+impl StructuralInstanceCache {
+    const EMPTY: Self = Self { class_slot: u32::MAX, field: 0 };
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MapInlineCacheState {
     entries: [MapIcEntry; 4],
@@ -6952,13 +6974,22 @@ impl Default for MapPropertyQuickState {
 struct QuickInvokeSite {
     class: ReceiverClass,
     target: CallTarget,
+    /// Runtime call-site profile: consecutive monomorphic hits on `class`
+    /// since the site was quickened. Any miss disables the site (and resets
+    /// it); a method-epoch change resets it as well.
+    hits: u32,
 }
 
 impl Default for QuickInvokeSite {
     fn default() -> Self {
-        Self { class: ReceiverClass(0), target: CallTarget::Bytecode(0) }
+        Self { class: ReceiverClass(0), target: CallTarget::Bytecode(0), hits: 0 }
     }
 }
+
+/// Monomorphic hits after which a bytecode-target Invoke site is promoted to
+/// the profiled `InvokeMethodDirect` form (class guard + direct call). The
+/// whole-function JIT compiles promoted sites as native direct calls.
+const INVOKE_DIRECT_PROMOTION_HITS: u32 = 32;
 
 struct RuntimeClass {
     id: ClassId,
@@ -13937,7 +13968,7 @@ impl Interpreter<'_> {
         if index >= function.handlers.len() || index >= function.ops.len() { return; }
         if function.ops[index].flags != 0 { return; }
 
-        function.quick_invokes[index] = QuickInvokeSite { class, target };
+        function.quick_invokes[index] = QuickInvokeSite { class, target, hits: 0 };
         let handler = if let Some((key_hash, key_string)) = map_property_key.filter(|_| function.ops[index].c == 0) {
             let property = &mut function.quick_map_properties[index];
             property.key_hash = key_hash;
@@ -13966,6 +13997,29 @@ impl Interpreter<'_> {
         unsafe {
             let quick_invokes = &(*self.hot_function).quick_invokes;
             *quick_invokes.get_unchecked(index)
+        }
+    }
+
+    /// Record one monomorphic hit of the current bytecode-target Invoke site and
+    /// promote it to the profiled InvokeMethodDirect handler once it is stable.
+    #[inline(always)]
+    fn note_monomorphic_bytecode_hit(&mut self) {
+        let function_index = self.hot_function_index as usize;
+        let index = self.hot_pc as usize;
+        let function = unsafe { self.prepared.functions.get_unchecked_mut(function_index) };
+        let site = unsafe { function.quick_invokes.get_unchecked_mut(index) };
+        site.hits = site.hits.saturating_add(1);
+        if unlikely(site.hits >= INVOKE_DIRECT_PROMOTION_HITS) {
+            let handler: Handler = match function.ops[index].c {
+                0 => h_invoke_direct_profiled_small::<0>,
+                1 => h_invoke_direct_profiled_small::<1>,
+                2 => h_invoke_direct_profiled_small::<2>,
+                3 => h_invoke_direct_profiled_small::<3>,
+                4 => h_invoke_direct_profiled_small::<4>,
+                _ => h_invoke_direct_profiled,
+            };
+            // Stays in quickened_invoke_ops: an epoch change demotes it again.
+            function.set_handler(index, handler);
         }
     }
 
@@ -16620,6 +16674,29 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
         || same_handler(handler, h_invoke_mono_bytecode_small::<2> as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<3> as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<4> as Handler)
+        || is_profiled_direct_invoke_handler(handler)
+}
+
+fn is_profiled_direct_invoke_handler(handler: Handler) -> bool {
+    same_handler(handler, h_invoke_direct_profiled as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<0> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<1> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<2> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<3> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<4> as Handler)
+}
+
+/// The runtime-profiled InvokeMethodDirect at `index`, if the VM promoted that
+/// Invoke site: (expected exact receiver class, prepared bytecode target).
+pub(super) fn profiled_direct_invoke_site(function: &PreparedFunction, index: usize) -> Option<(ReceiverClass, u32)> {
+    let handler = function.jit_entry_handlers.get(index).copied().flatten()
+        .or_else(|| function.handlers.get(index).copied())?;
+    if !is_profiled_direct_invoke_handler(handler) { return None; }
+    let site = function.quick_invokes.get(index)?;
+    match site.target {
+        CallTarget::Bytecode(target) if site.class.0 != 0 => Some((site.class, target)),
+        _ => None,
+    }
 }
 
 // =============================================================================
@@ -17270,6 +17347,7 @@ unsafe fn h_invoke_mono_bytecode_small<const N: usize>(vm:&mut Interpreter, ptr:
         h_invoke_mono(vm,ptr);
         return;
     };
+    vm.note_monomorphic_bytecode_hit();
     let args=vm.gather_call_words_const::<N>(&op);
     vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
 }
@@ -17289,6 +17367,54 @@ unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
         h_invoke_mono(vm,ptr);
         return;
     };
+    vm.note_monomorphic_bytecode_hit();
+    h_invoke_bytecode_target(vm,&op,function,receiver);
+}
+
+/// Profiled InvokeMethodDirect: an Invoke site promoted by the VM after
+/// INVOKE_DIRECT_PROMOTION_HITS consecutive monomorphic hits. Same guard as the
+/// monomorphic handler (exact receiver class; any miss falls back to the
+/// generic IC and disables the site) but no profiling work on the hot path.
+/// The whole-function JIT lowers these sites to native guarded direct calls.
+unsafe fn h_invoke_direct_profiled_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=*ptr;
+    let receiver=vm.reg(op.b);
+    let site=vm.current_quick_invoke();
+    if unlikely(!vm.receiver_matches_class(Value::from_word(receiver),site.class)) {
+        vm.disable_current_monomorphic_invoke();
+        h_invoke(vm,ptr);
+        return;
+    }
+    let CallTarget::Bytecode(function)=site.target else {
+        cold_path();
+        h_invoke_mono(vm,ptr);
+        return;
+    };
+    let args=vm.gather_call_words_const::<N>(&op);
+    vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
+}
+
+unsafe fn h_invoke_direct_profiled(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=*ptr;
+    let receiver=vm.reg(op.b);
+    let site=vm.current_quick_invoke();
+    if unlikely(!vm.receiver_matches_class(Value::from_word(receiver),site.class)) {
+        vm.disable_current_monomorphic_invoke();
+        h_invoke(vm,ptr);
+        return;
+    }
+    let CallTarget::Bytecode(function)=site.target else {
+        cold_path();
+        h_invoke_mono(vm,ptr);
+        return;
+    };
+    h_invoke_bytecode_target(vm,&op,function,receiver);
+}
+
+/// Shared tail of the large-arity monomorphic/profiled bytecode handlers.
+#[inline(always)]
+unsafe fn h_invoke_bytecode_target(vm:&mut Interpreter, op:&PreparedOp, function:u32, receiver:RegisterWord){
+    let op=*op;
 
     // The receiver/argument registers must be read before push_frame can resize
     // the current fiber register stack and invalidate the hot GPR base.
@@ -17898,6 +18024,22 @@ unsafe fn h_new_object_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
 /// Allocates the instance once and calls its statically known constructor.
 /// The constructor's return value is discarded: the destination remains the
 /// allocated receiver, including when a constructor returns an explicit value.
+/// The allocation half of NewClassInstance (no constructor). The caller owns
+/// the GC point/poll. Prepared Y is the dense class slot.
+fn allocate_class_instance_shell(vm: &mut Interpreter<'_>, op: &PreparedOp) -> Result<Value, RuntimeError> {
+    let Some(layout) = vm.classes.get(op.y as usize) else {
+        return Err(RuntimeError::new("NewClassInstance class slot out of range"));
+    };
+    if !layout.layout_finalized {
+        return Err(RuntimeError::new("NewClassInstance requires a finalized class layout"));
+    }
+    let count = layout.total_instance_field_count as usize;
+    Ok(vm.heap.alloc(HeapObject::Instance {
+        class_slot: op.y,
+        fields: vec![Value::NULL; count].into_boxed_slice(),
+    }))
+}
+
 unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let op = unsafe { &*ptr };
     // Preparation resolved Y = class slot and CACHE = constructor index.
@@ -17984,8 +18126,62 @@ unsafe fn h_alloc_foreign(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*p
 // Known-layout field bytecodes use the same write barriers, reactive tracking,
 // nullability checks and polymorphic inline caches as their baseline equivalents.
 // The prepare pass turns descriptor IDs into physical layout/field operands.
-#[inline(always)]
+/// Structural property read with a statically known layout (X) and logical
+/// slot (Y). One object lookup decides the representation:
+/// - shaped Map: the per-op PIC, then the shape's family membership (both give
+///   the physical slot without hashing the key);
+/// - class instance satisfying the layout: a per-op class -> field offset cache
+///   replaces the field-name search;
+/// anything else (dictionary maps, misses, nulls needing a trap) takes the
+/// authoritative LoadProperty path.
 unsafe fn h_get_field_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let object = Value::from_word(unsafe { vm.reg(op.b) });
+    let function = vm.current_function_index();
+    let prepared = unsafe { vm.prepared.functions.get_unchecked_mut(function) };
+    let map_cache = unsafe { &mut *prepared.map_inline_caches.as_mut_ptr().add(op.cache as usize) };
+    let instance_cache = unsafe { &mut *prepared.structural_instance_caches.as_mut_ptr().add(op.cache as usize) };
+    let hit = match vm.heap.get(object) {
+        Some(HeapObject::Map(map)) => map.shaped().and_then(|(shape, values)| {
+            if let Some(slot) = map_cache.probe_property(shape) {
+                return Some(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            match vm.heap.map_shapes.family_slot_layout(
+                shape, StructuralLayoutId(op.x), PropertySlotId(op.y as u16),
+            )? {
+                Some(slot) => {
+                    map_cache.insert(shape, slot);
+                    Some(unsafe { *values.get_unchecked(slot as usize) })
+                }
+                // Optional declared property absent from this family member.
+                None => Some(Value::NULL),
+            }
+        }),
+        Some(HeapObject::Instance { class_slot, fields }) => {
+            let class_slot = *class_slot;
+            if instance_cache.class_slot == class_slot {
+                // A null may be an uninitialized non-nullable field: let the
+                // generic path decide (it traps or returns null).
+                fields.get(instance_cache.field as usize).copied().filter(|value| !value.is_null())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(value) = hit {
+        if !(vm.reactive_tracking_active || vm.reactive_skip_next_field_track) {
+            unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) }
+            return;
+        }
+    }
+    // Learn the instance offset once (immutable class layout, constant key).
+    let key = Value::from_word(unsafe { vm.reg(op.c) });
+    if let Some(Some((class_slot, field))) = vm.instance_property_slot(object, key) {
+        let prepared = unsafe { vm.prepared.functions.get_unchecked_mut(function) };
+        prepared.structural_instance_caches[op.cache as usize] =
+            StructuralInstanceCache { class_slot, field: field as u32 };
+    }
     unsafe { h_load_property(vm, ptr) }
 }
 
@@ -17994,14 +18190,55 @@ unsafe fn h_set_field_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
     unsafe { h_store_property(vm, ptr) }
 }
 
-#[inline(always)]
+/// Known-class field read at a relocated absolute offset (X). Y carries the
+/// compile-time facts: a nullable field needs no uninitialized-field trap.
 unsafe fn h_get_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
-    unsafe { h_load_field(vm, ptr) }
+    let op = unsafe { &*ptr };
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_NULLABLE == 0 {
+        // Non-nullable: identical to LoadField, including the null trap.
+        return unsafe { h_load_field(vm, ptr) };
+    }
+    let obj = Value::from_word(unsafe { vm.reg(op.b) });
+    let value = match vm.heap.get(obj) {
+        Some(HeapObject::Instance { fields, .. }) => {
+            debug_assert!((op.x as usize) < fields.len(), "verified GetFieldClass slot is out of range");
+            unsafe { *fields.get_unchecked(op.x as usize) }
+        }
+        _ => { vm.fail_at(op, "LoadField object is not an instance"); return; }
+    };
+    if unlikely(vm.reactive_skip_next_field_track) {
+        vm.reactive_skip_next_field_track = false;
+    } else if unlikely(vm.reactive_tracking_active) {
+        vm.reactive_track_field(obj, ReactiveSourceKind::InstanceField, op.x, value);
+    }
+    unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) }
 }
 
-#[inline(always)]
+/// Known-class field write. With FIELD_CLASS_UNCHECKED_STORE the value's
+/// static type already satisfies the field contract: no runtime type check, no
+/// field-type clone, no generic check and a single object lookup (plus the
+/// remembered-set barrier for references).
 unsafe fn h_set_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
-    unsafe { h_store_field(vm, ptr) }
+    let op = unsafe { &*ptr };
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_UNCHECKED_STORE == 0 {
+        return unsafe { h_store_field(vm, ptr) };
+    }
+    let obj = Value::from_word(unsafe { vm.reg(op.a) });
+    let value = Value::from_word(unsafe { vm.reg(op.b) });
+    // Barrier immediately before the mutation, as in StoreField.
+    vm.heap.remember_if_reference(obj, value);
+    let old = match vm.heap.get_mut(obj) {
+        Some(HeapObject::Instance { fields, .. }) => {
+            debug_assert!((op.x as usize) < fields.len(), "verified SetFieldClass slot is out of range");
+            let slot = unsafe { fields.get_unchecked_mut(op.x as usize) };
+            std::mem::replace(slot, value)
+        }
+        _ => { vm.fail_at(op, "StoreField object is not an instance"); return; }
+    };
+    if unlikely(vm.reactive_enabled) && old.raw_bits() != value.raw_bits() {
+        vm.reactive_trigger(obj, ReactiveSourceKind::InstanceField, op.x);
+    }
+    unsafe { vm.advance(op) }
 }
 
 /// The optimistic method target is valid only while lookup resolves to the
@@ -19327,6 +19564,26 @@ impl TraceRuntime for Interpreter<'_> {
             .map_or(local_slot, |op| op.x)
     }
 
+    fn trace_instance_class(&self, class: ClassId) -> Option<u64> {
+        let slot = *self.prepared.class_by_id.get(&class)?;
+        let layout = self.classes.get(slot as usize)?;
+        (layout.layout_finalized && !layout.is_foreign).then_some(CLASS_KIND_INSTANCE | slot as u64)
+    }
+
+    fn trace_class_field_type(&self, class: u64, slot: u32) -> Option<Type> {
+        if class & !0x00ff_ffff_ffff_ffff != CLASS_KIND_INSTANCE { return None; }
+        let class_slot = (class & 0x00ff_ffff_ffff_ffff) as usize;
+        self.classes.get(class_slot)?.instance_field_types.get(slot as usize).cloned()
+    }
+
+    fn trace_class_field_is_generic(&self, class: u64, slot: u32) -> bool {
+        if class & !0x00ff_ffff_ffff_ffff != CLASS_KIND_INSTANCE { return true; }
+        let class_slot = (class & 0x00ff_ffff_ffff_ffff) as usize;
+        self.classes.get(class_slot)
+            .and_then(|info| info.generic_fields.get(slot as usize).copied())
+            .unwrap_or(true)
+    }
+
     fn trace_field_type(&self, object: RegisterWord, slot: u32) -> Option<Type> {
         let value = Value::from_word(object);
         let class_slot = match self.heap.get(value)? {
@@ -20190,6 +20447,16 @@ impl Interpreter<'_> {
                 };
                 result.map(|value| unsafe { self.set_reg(op.a, value.word()) })
             }
+            // Allocate-only half of NewClassInstance: the trace inlines the
+            // constructor itself, so the VM stays at this PC (continuation ==
+            // location) with A holding the fresh, null-initialized instance.
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY
+                if opcode == Opcode::NewClassInstance =>
+            {
+                allocate_class_instance_shell(self, &op).map(|value| unsafe {
+                    self.set_reg(op.a, value.word())
+                })
+            }
             _ => return Err(RuntimeError::new("specialized collection mode/opcode mismatch")),
         };
 
@@ -20273,9 +20540,10 @@ unsafe extern "C" fn trace_native_factory_probe(
         }
         Opcode::NewClassInstance => {
             // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+            // Any finalized layout: the field array is unmanaged (Box) storage
+            // whose allocation never reaches a GC safepoint.
             let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
             !layout.is_foreign && layout.layout_finalized
-                && layout.total_instance_field_count == 0
         }
         _ => false,
     };
@@ -20356,15 +20624,30 @@ unsafe extern "C" fn trace_native_factory_commit(
                 vm.heap.bind_contract(value, &contract)?;
                 value
             }
-            Opcode::NewClassInstance => unsafe {
-                vm.heap.alloc_reserved_managed(address, HeapObject::Instance {
-                    class_slot: op.y, fields: Box::new([]),
-                })
-            },
+            Opcode::NewClassInstance => {
+                // Unmanaged field storage: no GC safepoint before publication.
+                let count = vm.classes[op.y as usize].total_instance_field_count as usize;
+                unsafe {
+                    vm.heap.alloc_reserved_managed(address, HeapObject::Instance {
+                        class_slot: op.y, fields: vec![Value::NULL; count].into_boxed_slice(),
+                    })
+                }
+            }
             _ => return Err(RuntimeError::new("unsupported native factory kind")),
         };
         unsafe { vm.set_reg(op.a, object.word()) };
-        if opcode == Opcode::NewClassInstance {
+        // OBJECT_FACTORY on NewClassInstance is the allocate-only half used when
+        // the trace inlines the constructor: stay at this PC (continuation).
+        let shell_only = opcode == Opcode::NewClassInstance
+            && next & crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK
+                == crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY;
+        if shell_only {
+            // With an inlined constructor the continuation is this same PC.
+            // Without a constructor the allocation completes the opcode.
+            if continuation.pc.0 != pc {
+                unsafe { vm.advance(&op) };
+            }
+        } else if opcode == Opcode::NewClassInstance {
             let args = constructor_args.expect("validated constructor arguments");
             if op.cache != NO_INDEX {
                 let callee = op.cache;
@@ -21204,8 +21487,9 @@ class Box {
   }
 }
 class Runner {
-  static run() {
-    const box = new Box(1);
+  // An untyped parameter keeps an ordinary Invoke: with a statically known
+  // receiver class the call would be devirtualized to CallDirect.
+  static run(box) {
     let result = 0;
     let i = 0;
     try {
@@ -21219,7 +21503,7 @@ class Runner {
     return result;
   }
 }
-var result = Runner.run();
+var result = Runner.run(new Box(1));
 "#;
         let (program, entry, manifest) = compile_typescript_module(source);
         for native in [false, true] {

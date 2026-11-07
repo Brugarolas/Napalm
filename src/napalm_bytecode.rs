@@ -1336,7 +1336,12 @@ pub enum SpecializedDescriptor {
     ObjectShape { layout: StructuralLayoutId, contract: Option<Type> },
     ObjectProperties { names: Vec<StringId> },
     FieldShape { layout: StructuralLayoutId, slot: PropertySlotId },
-    FieldClass { class: ClassId, local_slot: u32 },
+    /// A field of the function's own class at a known class-local offset.
+    /// `nullable`: the field contract admits null, so a read needs no
+    /// uninitialized-field trap. `unchecked_store`: the stored value's static
+    /// type already satisfies the (non-generic) field contract, so a write needs
+    /// no runtime contract check (Napalm types are enforced guarantees).
+    FieldClass { class: ClassId, local_slot: u32, nullable: bool, unchecked_store: bool },
     DirectMethod {
         owner: ClassId,
         symbol: MethodSymbol,
@@ -1346,7 +1351,22 @@ pub enum SpecializedDescriptor {
     },
 }
 
+/// Prepared-op Y bits of GetFieldClass/SetFieldClass (see `FieldClass`).
+pub const FIELD_CLASS_NULLABLE: u32 = 1 << 0;
+pub const FIELD_CLASS_UNCHECKED_STORE: u32 = 1 << 1;
+
 impl SpecializedDescriptor {
+    /// Y operand bits for a prepared GetFieldClass/SetFieldClass.
+    pub fn field_class_flags(&self) -> u32 {
+        match self {
+            Self::FieldClass { nullable, unchecked_store, .. } => {
+                (if *nullable { FIELD_CLASS_NULLABLE } else { 0 })
+                    | (if *unchecked_store { FIELD_CLASS_UNCHECKED_STORE } else { 0 })
+            }
+            _ => 0,
+        }
+    }
+
     pub fn matches_opcode(&self, opcode: Opcode) -> bool {
         use Opcode::*;
         match opcode {
@@ -2996,11 +3016,24 @@ impl BytecodeVerifier {
                     return Err(fail("field shape slot is out of bounds"));
                 }
             }
-            SpecializedDescriptor::FieldClass { class, local_slot } => {
+            SpecializedDescriptor::FieldClass { class, local_slot, nullable, unchecked_store } => {
                 let owner = program.metadata.class(*class)
                     .ok_or_else(|| fail("unknown field class"))?;
                 if *local_slot >= owner.own_instance_field_count as u32 {
                     return Err(fail("class-local field slot is out of bounds"));
+                }
+                let field_type = owner.own_instance_field_types.get(*local_slot as usize);
+                if *nullable && !field_type.is_some_and(|ty| ty.accepts(&Type::Null)) {
+                    return Err(fail("nullable field read on a non-nullable field contract"));
+                }
+                if *unchecked_store
+                    // Same reading as the runtime: an absent entry is non-generic.
+                    && owner.own_generic_fields.get(*local_slot as usize).copied().unwrap_or(false)
+                {
+                    return Err(fail("unchecked store to a generic field"));
+                }
+                if (*nullable && op != GetFieldClass) || (*unchecked_store && op != SetFieldClass) {
+                    return Err(fail("field flag does not apply to this opcode"));
                 }
             }
             SpecializedDescriptor::DirectMethod { owner, symbol, target, fallback_cache } => {
