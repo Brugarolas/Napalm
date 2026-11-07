@@ -1443,6 +1443,24 @@ fn emit_native_shape_property_store(
     b.block_params(done)[0]
 }
 
+/// Instance field-array base from a handle sidecar: inline fields publish a
+/// tagged owner-relative offset (they move with the GC object), boxed fields
+/// an absolute pointer (bit 0 clear). Branch-free decode against the live
+/// owner `address` already loaded from the same entry.
+fn emit_instance_field_base(
+    b: &mut FunctionBuilder<'_>,
+    entry: cranelift::prelude::Value,
+    address: cranelift::prelude::Value,
+) -> cranelift::prelude::Value {
+    let encoded = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
+        offset_of!(TraceHeapEntry, data) as i32);
+    let relative = b.ins().band_imm(encoded, TRACE_HEAP_DATA_RELATIVE_MASK as i64);
+    let owner_mask = b.ins().ineg(relative);
+    let base = b.ins().band(address, owner_mask);
+    let offset = b.ins().band_imm(encoded, !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64);
+    b.ins().iadd(base, offset)
+}
+
 /// Direct fixed-slot write for non-reference values in untyped class fields.
 /// A reference store must run the MMTk post-barrier, so it is intentionally
 /// handled by the exact baseline path. Guard failure never commits the store.
@@ -1523,8 +1541,7 @@ fn emit_native_class_field_store(
     b.seal_block(class_ok);
 
     b.switch_to_block(store_ok);
-    let data = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
-        offset_of!(TraceHeapEntry, data) as i32);
+    let data = emit_instance_field_base(b, entry, address);
     b.ins().store(MemFlagsData::trusted(), value, data,
         op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
     b.ins().jump(done, &[BlockArg::Value(regs)]);
@@ -1688,8 +1705,7 @@ fn emit_native_class_field_load(
     b.seal_block(kind_ok);
 
     b.switch_to_block(bounds_ok);
-    let data = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
-        offset_of!(TraceHeapEntry, data) as i32);
+    let data = emit_instance_field_base(b, entry, address);
     let value = b.ins().load(types::I64, MemFlagsData::trusted(), data,
         op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
     let result_ok = b.create_block();
@@ -3124,10 +3140,7 @@ unsafe extern "C" fn napalm_wfjit_class_factory_commit(
     let args = unsafe { gather_specialized_values(vm, &op) };
     vm.mark_gc_point(&op);
     let count = vm.classes[op.y as usize].total_instance_field_count as usize;
-    let instance = unsafe { vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::Instance {
-        class_slot: op.y,
-        fields: vec![Value::NULL; count].into_boxed_slice(),
-    }) };
+    let instance = unsafe { vm.heap.alloc_reserved_managed(reserved as usize, HeapObject::Instance(InstanceObject::nulls(op.y, count))) };
     unsafe { vm.set_reg(op.a, instance.word()) };
     if op.cache != NO_INDEX {
         let callee = op.cache;

@@ -9258,6 +9258,19 @@ impl CraneliftLoweringState<'_, '_> {
         self.builder.ins().iadd(owner_address, offset)
     }
 
+    /// Resolve an Instance field-array pointer. Inline fields (<= 4) live in
+    /// the moving GC object and publish a tagged owner-relative offset; boxed
+    /// fields publish their stable absolute pointer (bit 0 clear). Branch-free:
+    /// `data = (encoded & !1) + (owner & -(encoded & 1))`.
+    fn heap_entry_instance_data(&mut self, entry: Value, owner_address: Value) -> Value {
+        let encoded = self.heap_entry_data(entry);
+        let relative = self.builder.ins().band_imm(encoded, TRACE_HEAP_DATA_RELATIVE_MASK as i64);
+        let owner_mask = self.builder.ins().ineg(relative);
+        let base = self.builder.ins().band(owner_address, owner_mask);
+        let offset = self.builder.ins().band_imm(encoded, !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64);
+        self.builder.ins().iadd(base, offset)
+    }
+
     fn heap_entry_len(&mut self, entry: Value) -> Value {
         if let Some(&value) = self.heap_len.get(&entry) {
             return value;
@@ -10492,14 +10505,14 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapLoadField { object, slot, exit } => {
-                let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
+                let (entry, owner_address) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
                 let location = ForwardedHeapLocation::Field { entry, slot: *slot };
                 let result = if let Some(value) = self.forwarded_heap_load(location) {
                     value
                 } else {
-                    let data = self.heap_entry_data(entry);
+                    let data = self.heap_entry_instance_data(entry, owner_address);
                     let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.heap_element_address(data, index);
                     let value = self.builder.ins().load(
@@ -10520,7 +10533,7 @@ impl CraneliftLoweringState<'_, '_> {
                     self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
-                let data = self.heap_entry_data(entry);
+                let data = self.heap_entry_instance_data(entry, owner_address);
                 let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;

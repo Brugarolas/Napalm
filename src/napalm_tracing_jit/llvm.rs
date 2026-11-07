@@ -2270,6 +2270,21 @@ impl LlvmLowering<'_> {
         self.gep8_dyn(owner, &offset)
     }
 
+    /// Instance field-array pointer: inline fields (in the moving owner) are a
+    /// tagged owner-relative offset, boxed fields an absolute pointer. Keep
+    /// owner-based provenance for the inline case (GEP off the owner) and
+    /// select between the two.
+    fn heap_entry_instance_data(&mut self, entry: &V, owner: &V) -> V {
+        let encoded = self.heap_entry_data(entry);
+        let encoded = self.word(&encoded);
+        let relative = self.bin("and", &encoded, &V::i64(TRACE_HEAP_DATA_RELATIVE_MASK as i64));
+        let is_relative = self.icmp("ne", &relative, &V::i64(0));
+        let offset = self.bin("and", &encoded, &V::i64(!(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64));
+        let inline = self.gep8_dyn(owner, &offset);
+        let boxed = self.as_ptr(&offset);
+        self.select(&is_relative, &inline, &boxed)
+    }
+
     fn heap_entry_len(&mut self, entry: &V) -> V {
         if let Some(value) = self.heap_len.get(entry) {
             return value.clone();
@@ -3315,7 +3330,7 @@ impl LlvmLowering<'_> {
             }
 
             HeapLoadField { object, slot, exit } => {
-                let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
+                let (entry, owner) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(&entry);
                 self.guard_constant_index(&len, *slot, *exit)?;
                 self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), false, *exit)?;
@@ -3323,7 +3338,7 @@ impl LlvmLowering<'_> {
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
                 } else {
-                    let data = self.heap_entry_data(&entry);
+                    let data = self.heap_entry_instance_data(&entry, &owner);
                     let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
                     let tag = self.slot_tbaa(*slot, false);
@@ -3340,7 +3355,7 @@ impl LlvmLowering<'_> {
                 let (entry, owner) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(&entry);
                 self.guard_constant_index(&len, *slot, *exit)?;
-                let data = self.heap_entry_data(&entry);
+                let data = self.heap_entry_instance_data(&entry, &owner);
                 let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
                 self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), true, *exit)?;

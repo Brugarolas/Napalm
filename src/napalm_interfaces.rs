@@ -98,7 +98,7 @@ impl Heap {
             Type::Range => matches!(self.get(value), Some(HeapObject::Range { .. })),
             Type::Fiber => matches!(self.get(value), Some(HeapObject::FiberObject { .. })),
             Type::Instance(classes) => match self.get(value) {
-                Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => {
+                Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => {
                     classes.is_unknown() || self.contract_class_ids.get(*class_slot as usize)
                         .is_some_and(|id| classes.contains(*id))
                 }
@@ -136,7 +136,7 @@ impl Heap {
                 true
             }
             Type::GenericInstance { class, fields, .. } => {
-                let Some(HeapObject::Instance { class_slot, fields: values }) = self.get(value) else {
+                let Some(HeapObject::Instance(values @ InstanceObject { class_slot, .. })) = self.get(value) else {
                     return Err(mismatch(path, expected));
                 };
                 if self.contract_class_ids.get(*class_slot as usize) != Some(class) {
@@ -156,7 +156,7 @@ impl Heap {
             Type::Interface(fields) | Type::Record(fields) => {
                 let map = match self.get(value) {
                     Some(HeapObject::Map(map)) => map,
-                    Some(HeapObject::Instance { class_slot, .. })
+                    Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
                     | Some(HeapObject::Foreign { class_slot, .. })
                         if self.class_implements_contract(*class_slot, expected) =>
                     {

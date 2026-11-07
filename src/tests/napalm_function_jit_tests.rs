@@ -254,6 +254,83 @@ fn napalm_profiled_invoke_promotes_to_direct_method_and_compiles_natively() {
 }
 
 #[test]
+fn inline_instance_fields_do_not_grow_managed_objects() {
+    // Up to INSTANCE_INLINE_FIELDS fields live inside the managed object; the
+    // fixed managed payload (every object pays it) must not grow for that.
+    assert_eq!(std::mem::size_of::<HeapObject>(), std::mem::size_of::<NapalmMap>());
+    assert_eq!(std::mem::size_of::<HeapObject>(), 48);
+    assert!(InstanceObject::nulls(0, INSTANCE_INLINE_FIELDS).is_inline());
+    assert!(!InstanceObject::nulls(0, INSTANCE_INLINE_FIELDS + 1).is_inline());
+    assert_eq!(InstanceObject::nulls(0, 3).len(), 3);
+    assert_eq!(InstanceObject::nulls(0, 7).len(), 7);
+}
+
+#[test]
+fn inline_and_boxed_instance_fields_survive_moving_gc_in_native_code() {
+    let (program, entry, manifest) = whole_function_program(r#"
+        class Small { a: number; b: number; constructor(a: number, b: number) { this.a = a; this.b = b; } }
+        class Wide {
+            a: number; b: number; c: number; d: number; e: number; f: number;
+            constructor(x: number) { this.a = x; this.b = x + 1; this.c = x + 2; this.d = x + 3; this.e = x + 4; this.f = x + 5; }
+        }
+        function run(n: number): number {
+            const keep = [];
+            let sum = 0;
+            for (let i = 0; i < n; i++) {
+                const s = new Small(i, 2);
+                const w = new Wide(i);
+                if (i % 50 == 0) { keep.push(s); keep.push(w); System.gc(); }
+                s.b = s.b + w.f;
+                sum = sum + s.a + s.b + w.a + w.f;
+            }
+            for (let j = 0; j < keep.length; j++) {
+                const o = keep[j];
+                sum = sum + o.a + o.b;
+            }
+            return sum;
+        }
+        const result = run(2000);
+    "#);
+    let mut expected = 0.0f64;
+    let mut kept = 0.0f64;
+    for i in 0..2000 {
+        let i = i as f64;
+        let b = 2.0 + i + 5.0;
+        expected += i + b + i + (i + 5.0);
+        if (i as i64) % 50 == 0 { kept += (i + b) + (i + (i + 1.0)); }
+    }
+    for native in [false, true] {
+        let mut vm = source_vm(&program, &manifest);
+        if !native { vm.set_jit_options(None); }
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), expected + kept, "native={native}");
+        assert!(vm.gc_statistics().collections > 0);
+    }
+}
+
+#[test]
+fn inline_instance_sidecar_uses_gc_relative_field_storage() {
+    for count in [2usize, 9] {
+        let entry = HandleEntry::new(FREE_HANDLE_NONE);
+        let managed = ManagedObject {
+            handle: 0,
+            object: HeapObject::Instance(InstanceObject::nulls(3, count)),
+        };
+        let base = (&managed as *const ManagedObject) as usize;
+        HandleTable::refresh_entry(&entry, base, &managed.object);
+        let encoded = entry.data.load(Ordering::Relaxed);
+        let fields = match &managed.object { HeapObject::Instance(fields) => fields.as_ptr() as usize, _ => unreachable!() };
+        let relative = encoded & crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK != 0;
+        assert_eq!(relative, count <= INSTANCE_INLINE_FIELDS, "count {count}");
+        // The branch-free JIT decode resolves both representations.
+        let mask = crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK;
+        let decoded = (encoded & !mask) + (base & (encoded & mask).wrapping_neg());
+        assert_eq!(decoded, fields, "count {count}");
+        assert_eq!(entry.len.load(Ordering::Relaxed), count);
+    }
+}
+
+#[test]
 fn napalm_whole_function_small_maps_enable_tlab_allocation() {
     let mut heap = Heap::default();
     let info = heap.inline_map_fast_allocation_info()

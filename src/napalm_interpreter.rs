@@ -2216,6 +2216,109 @@ struct NapalmHeaders {
     response: Value,
 }
 
+/// Fields stored inside the managed object itself (no separate malloc).
+/// Four values fit in the existing fixed-size managed payload; larger classes
+/// keep an unmanaged Box. `HeapObject` must not grow because of this.
+const INSTANCE_INLINE_FIELDS: usize = 4;
+
+#[repr(C)]
+union InstanceStorage {
+    inline: [Value; INSTANCE_INLINE_FIELDS],
+    boxed: std::mem::ManuallyDrop<Box<[Value]>>,
+}
+
+/// A class instance: class slot plus its fixed field layout. Dereferences to
+/// the field slice, so field code reads `fields[slot]` regardless of storage.
+/// Inline storage moves with the managed object; its handle sidecar therefore
+/// publishes an owner-relative data offset (like inline Maps), while boxed
+/// storage publishes the stable absolute pointer.
+#[repr(C)]
+struct InstanceObject {
+    pub(crate) class_slot: u32,
+    len: u32,
+    storage: InstanceStorage,
+}
+
+impl InstanceObject {
+    /// A null-initialized instance of `count` fields.
+    #[inline]
+    fn nulls(class_slot: u32, count: usize) -> Self {
+        let storage = if count <= INSTANCE_INLINE_FIELDS {
+            InstanceStorage { inline: [Value::NULL; INSTANCE_INLINE_FIELDS] }
+        } else {
+            InstanceStorage { boxed: std::mem::ManuallyDrop::new(vec![Value::NULL; count].into_boxed_slice()) }
+        };
+        Self { class_slot, len: count as u32, storage }
+    }
+
+    #[cfg(test)]
+    fn from_values(class_slot: u32, values: &[Value]) -> Self {
+        let mut instance = Self::nulls(class_slot, values.len());
+        instance.copy_from_slice(values);
+        instance
+    }
+
+    #[inline(always)]
+    fn is_inline(&self) -> bool { self.len as usize <= INSTANCE_INLINE_FIELDS }
+
+    #[inline(always)]
+    fn fields(&self) -> &[Value] {
+        unsafe {
+            if self.is_inline() {
+                self.storage.inline.get_unchecked(..self.len as usize)
+            } else {
+                &self.storage.boxed
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn fields_mut(&mut self) -> &mut [Value] {
+        unsafe {
+            if self.is_inline() {
+                let len = self.len as usize;
+                self.storage.inline.get_unchecked_mut(..len)
+            } else {
+                &mut self.storage.boxed
+            }
+        }
+    }
+
+    /// Bytes of unmanaged storage owned by this instance (0 when inline).
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        if self.is_inline() { 0 } else { self.len as usize * std::mem::size_of::<Value>() }
+    }
+}
+
+impl std::ops::Deref for InstanceObject {
+    type Target = [Value];
+    #[inline(always)]
+    fn deref(&self) -> &[Value] { self.fields() }
+}
+
+impl std::ops::DerefMut for InstanceObject {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Value] { self.fields_mut() }
+}
+
+impl Drop for InstanceObject {
+    fn drop(&mut self) {
+        if !self.is_inline() {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.storage.boxed) };
+        }
+    }
+}
+
+impl std::fmt::Debug for InstanceObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("class_slot", &self.class_slot)
+            .field("fields", &self.fields())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum HeapObject {
     Random { state: u64 },
@@ -2246,10 +2349,7 @@ enum HeapObject {
     BuiltinClass {
         builtin: BuiltinId,
     },
-    Instance {
-        class_slot: u32,
-        fields: Box<[Value]>,
-    },
+    Instance(InstanceObject),
     Foreign {
         class_slot: u32,
         bytes: Vec<u8>,
@@ -2716,9 +2816,16 @@ impl HandleTable {
                 1,
                 0,
             ),
-            HeapObject::Instance { fields, .. } => (
+            // Inline fields move with their owner: publish a tagged
+            // owner-relative offset (like inline Maps). Boxed fields keep the
+            // stable absolute pointer (bit 0 clear: Values are 8-aligned).
+            HeapObject::Instance(fields) => (
                 TraceHeapKind::Instance,
-                fields.as_ptr() as usize,
+                if fields.is_inline() {
+                    encode_inline_heap_data(object_address, fields.as_ptr() as usize)
+                } else {
+                    fields.as_ptr() as usize
+                },
                 fields.len(),
                 0,
             ),
@@ -3009,7 +3116,7 @@ unsafe fn trace_closure(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 
 unsafe fn trace_instance(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
-    if let HeapObject::Instance { fields, .. } = &managed.object {
+    if let HeapObject::Instance(fields) = &managed.object {
         visit_values_prefetched(fields, visitor);
     }
 }
@@ -3248,7 +3355,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::Closure { .. } => &GC_CLOSURE,
         HeapObject::ClassObject { .. } => &GC_CLASS,
         HeapObject::BuiltinClass { .. } => &GC_BUILTIN_CLASS,
-        HeapObject::Instance { .. } => &GC_INSTANCE,
+        HeapObject::Instance(_) => &GC_INSTANCE,
         HeapObject::Foreign { .. } => &GC_FOREIGN,
         HeapObject::FfiLibrary { .. } => &GC_FFI_LIBRARY,
         HeapObject::FfiFunction { .. } => &GC_FFI_FUNCTION,
@@ -3298,7 +3405,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
             // therefore does not grow with each closure instance.
             captures.len() * std::mem::size_of::<RegisterWord>()
         },
-        HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
+        HeapObject::Instance(fields) => fields.external_bytes(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
         HeapObject::Response(response) => {
             std::mem::size_of::<NapalmResponse>()
@@ -3511,7 +3618,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 }
             }
         }
-        HeapObject::Instance { fields, .. } => {
+        HeapObject::Instance(fields) => {
             for &value in fields.iter() { push_value_handle(value, roots); }
         }
         HeapObject::Promise { state } => {
@@ -5153,7 +5260,7 @@ impl HostContext<'_> {
             Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
             Some(HeapObject::ClassObject { class_slot }) => format!("<class#{class_slot}>"),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => format!("<instance class#{class_slot}>"),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
             Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
             Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
@@ -6620,7 +6727,7 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_STATIC | *class_slot as u64),
         HeapObject::BuiltinClass { builtin } =>
             ReceiverClass(CLASS_KIND_CORE_STATIC | builtin.index() as u64),
-        HeapObject::Instance { class_slot, .. } =>
+        HeapObject::Instance(InstanceObject { class_slot, .. }) =>
             ReceiverClass(CLASS_KIND_INSTANCE | *class_slot as u64),
         HeapObject::Foreign { class_slot, .. } =>
             ReceiverClass(CLASS_KIND_FOREIGN | *class_slot as u64),
@@ -11484,7 +11591,7 @@ impl<'p> Interpreter<'p> {
             | Some(HeapObject::FfiPointer { .. }) => {
                 return Err(RuntimeError::new("native/foreign objects cannot cross a concurrent boundary"));
             }
-            Some(HeapObject::Instance { .. }) | Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => {
+            Some(HeapObject::Instance(_)) | Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => {
                 return Err(RuntimeError::new("class instances/objects cannot cross a concurrent boundary yet"));
             }
             Some(HeapObject::Cell(_)) => {
@@ -14521,7 +14628,7 @@ impl Interpreter<'_> {
 
     fn instance_properties(&self, value: Value) -> Result<Vec<(Value, Value)>, RuntimeError> {
         let (class_slot, fields) = match self.heap.get(value) {
-            Some(HeapObject::Instance { class_slot, fields }) => (*class_slot, fields),
+            Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) => (*class_slot, fields),
             Some(HeapObject::Foreign { .. }) => return Ok(Vec::new()),
             _ => return Err(RuntimeError::new("receiver is not a class instance")),
         };
@@ -14534,7 +14641,7 @@ impl Interpreter<'_> {
     fn default_to_string_text(&mut self, value: Value) -> String {
         let named_class = match self.heap.get(value) {
             Some(HeapObject::ClassObject { class_slot }) => Some((true, *class_slot)),
-            Some(HeapObject::Instance { class_slot, .. })
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
             | Some(HeapObject::Foreign { class_slot, .. }) => Some((false, *class_slot)),
             _ => None,
         };
@@ -15735,7 +15842,7 @@ impl Interpreter<'_> {
                     _ => None,
                 };
                 let actual = match self.heap.get(arg(0)) {
-                    Some(HeapObject::Instance { class_slot, .. })
+                    Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
                     | Some(HeapObject::Foreign { class_slot, .. })
                     | Some(HeapObject::ClassObject { class_slot }) => Some(*class_slot),
                     _ => None,
@@ -15946,7 +16053,7 @@ impl Interpreter<'_> {
     fn class_set_matches(&self, value: Value, set: &ClassSet, want_class_object: bool) -> bool {
         let slot = match self.heap.get(value) {
             Some(HeapObject::ClassObject { class_slot }) if want_class_object => *class_slot,
-            Some(HeapObject::Instance { class_slot, .. }) if !want_class_object => *class_slot,
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) if !want_class_object => *class_slot,
             Some(HeapObject::Foreign { class_slot, .. }) if !want_class_object => *class_slot,
             _ => return false,
         };
@@ -16050,7 +16157,7 @@ impl Interpreter<'_> {
     /// objects are checked structurally.
     fn value_implements(&self, value: Value, contract: &Type, allow_class_object: bool) -> bool {
         let class_slot = match self.heap.get(value) {
-            Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => *class_slot,
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => *class_slot,
             Some(HeapObject::ClassObject { class_slot }) if allow_class_object => *class_slot,
             Some(HeapObject::Map(_)) => return self.heap.structurally_matches(value, contract),
             _ => return false,
@@ -16125,7 +16232,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Cell(_)) => "Cell".to_owned(),
             Some(HeapObject::Closure { .. }) => "Function".to_owned(),
             Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => "Class".to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => {
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => {
                 format!("Instance of {}", self.instance_class_display(value, *class_slot))
             }
             Some(HeapObject::FfiLibrary { .. }) => "FfiLibrary".to_owned(),
@@ -16241,7 +16348,7 @@ impl Interpreter<'_> {
     /// instructions; interfaces and types only describe data, so every such
     /// property is an instance field addressed by its public name.
     fn instance_property_slot(&self, object: Value, key: Value) -> Option<Option<(u32, usize)>> {
-        let Some(HeapObject::Instance { class_slot, .. }) = self.heap.get(object) else {
+        let Some(HeapObject::Instance(InstanceObject { class_slot, .. })) = self.heap.get(object) else {
             return None;
         };
         let class_slot = *class_slot;
@@ -16264,7 +16371,7 @@ impl Interpreter<'_> {
         let Some((class_slot, slot)) = slot else {
             return Some(Ok(Value::NULL));
         };
-        let Some(HeapObject::Instance { fields, .. }) = self.heap.get(object) else {
+        let Some(HeapObject::Instance(fields)) = self.heap.get(object) else {
             return Some(Ok(Value::NULL));
         };
         let value = fields.get(slot).copied().unwrap_or(Value::NULL);
@@ -16308,7 +16415,7 @@ impl Interpreter<'_> {
             }
         }
         self.heap.remember_if_reference(object, value);
-        if let Some(HeapObject::Instance { fields, .. }) = self.heap.get_mut(object) {
+        if let Some(HeapObject::Instance(fields)) = self.heap.get_mut(object) {
             if let Some(field) = fields.get_mut(slot) {
                 *field = value;
             }
@@ -17185,7 +17292,7 @@ unsafe fn h_guard_type(vm:&mut Interpreter, ptr:*const PreparedOp){
 }
 unsafe fn h_guard_class(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr; let f=vm.current_function_index(); let desc:&ClassGuardDescriptor=vm.program.functions.get_unchecked(f).chunk.class_guards.get_unchecked(op.x as usize); let value=Value::from_word(vm.reg(op.b));
-    let ok=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},_=>false};
+    let ok=match vm.heap.get(value){Some(HeapObject::Instance(InstanceObject { class_slot, .. }))|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},_=>false};
     if likely(ok){vm.set_reg(op.a,value.word());vm.advance(op)}else{vm.deopt(op,op.y)}
 }
 unsafe fn h_guard_bounds(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let i=word_i32(vm.reg(op.a));let n=word_i32(vm.reg(op.b));if likely(i>=0&&i<n){vm.advance(op)}else{vm.deopt(op,op.x)}}
@@ -18034,10 +18141,7 @@ fn allocate_class_instance_shell(vm: &mut Interpreter<'_>, op: &PreparedOp) -> R
         return Err(RuntimeError::new("NewClassInstance requires a finalized class layout"));
     }
     let count = layout.total_instance_field_count as usize;
-    Ok(vm.heap.alloc(HeapObject::Instance {
-        class_slot: op.y,
-        fields: vec![Value::NULL; count].into_boxed_slice(),
-    }))
+    Ok(vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(op.y, count))))
 }
 
 unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
@@ -18055,10 +18159,7 @@ unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let args = unsafe { gather_specialized_values(vm, op) };
     vm.mark_gc_point(op);
     vm.maybe_collect();
-    let instance = vm.heap.alloc(HeapObject::Instance {
-        class_slot: slot,
-        fields: vec![Value::NULL; count].into_boxed_slice(),
-    });
+    let instance = vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(slot, count)));
     unsafe { vm.set_reg(op.a, instance.word()); }
     if op.cache != NO_INDEX {
         let caller_pc = vm.raw_pc_for_op(op);
@@ -18115,10 +18216,7 @@ unsafe fn h_alloc_instance(vm:&mut Interpreter, ptr:*const PreparedOp){
         return;
     }
     let count=class.total_instance_field_count as usize;
-    let value=vm.heap.alloc(HeapObject::Instance{
-        class_slot:op.x,
-        fields:vec![Value::NULL;count].into_boxed_slice()
-    });
+    let value=vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(op.x, count)));
     vm.set_reg(op.a,value.word());
     vm.advance(op)
 }
@@ -18157,7 +18255,7 @@ unsafe fn h_get_field_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
                 None => Some(Value::NULL),
             }
         }),
-        Some(HeapObject::Instance { class_slot, fields }) => {
+        Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) => {
             let class_slot = *class_slot;
             if instance_cache.class_slot == class_slot {
                 // A null may be an uninitialized non-nullable field: let the
@@ -18200,7 +18298,7 @@ unsafe fn h_get_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
     }
     let obj = Value::from_word(unsafe { vm.reg(op.b) });
     let value = match vm.heap.get(obj) {
-        Some(HeapObject::Instance { fields, .. }) => {
+        Some(HeapObject::Instance(fields)) => {
             debug_assert!((op.x as usize) < fields.len(), "verified GetFieldClass slot is out of range");
             unsafe { *fields.get_unchecked(op.x as usize) }
         }
@@ -18228,7 +18326,7 @@ unsafe fn h_set_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
     // Barrier immediately before the mutation, as in StoreField.
     vm.heap.remember_if_reference(obj, value);
     let old = match vm.heap.get_mut(obj) {
-        Some(HeapObject::Instance { fields, .. }) => {
+        Some(HeapObject::Instance(fields)) => {
             debug_assert!((op.x as usize) < fields.len(), "verified SetFieldClass slot is out of range");
             let slot = unsafe { fields.get_unchecked_mut(op.x as usize) };
             std::mem::replace(slot, value)
@@ -18273,7 +18371,7 @@ unsafe fn h_load_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
     let (class_slot,value)={
-        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+        let Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
         (*class_slot,*fields.get_unchecked(slot))
     };
@@ -18299,7 +18397,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
     let (class_slot,value)={
-        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+        let Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
         (*class_slot,*fields.get_unchecked(slot))
     };
@@ -18324,7 +18422,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
     let (class_slot,index,old)=match vm.heap.get(obj){
-        Some(HeapObject::Instance{class_slot,fields})=>{
+        Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=>{
             let index=op.x as usize;
             debug_assert!(index < fields.len(), "verified StoreField slot is out of range");
             (*class_slot,index,*fields.get_unchecked(index))
@@ -18337,7 +18435,7 @@ unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
         if let Err(error)=vm.check_generic_field_store(obj,class_slot,index,value){vm.fail_at(op,error.message);return;}
     }
     vm.heap.remember_if_reference(obj, value);
-    let Some(HeapObject::Instance{fields,..})=vm.heap.get_mut(obj) else {std::hint::unreachable_unchecked()};
+    let Some(HeapObject::Instance(fields))=vm.heap.get_mut(obj) else {std::hint::unreachable_unchecked()};
     *fields.get_unchecked_mut(index)=value;
     if unlikely(vm.reactive_enabled) && old.raw_bits()!=value.raw_bits(){vm.reactive_trigger(obj,ReactiveSourceKind::InstanceField,op.x);}
     vm.advance(op)
@@ -18391,7 +18489,7 @@ unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     if unlikely(vm.reactive_enabled) && old.raw_bits()!=value.raw_bits(){vm.reactive_trigger(class,ReactiveSourceKind::StaticField,op.x);}
     vm.advance(op)
 }
-unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
+unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance(InstanceObject { class_slot, .. }))|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
 
 unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
@@ -19105,7 +19203,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
             Some(HeapObject::ClassObject { class_slot }) => self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("<class>").to_owned(),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
             Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
@@ -19587,7 +19685,7 @@ impl TraceRuntime for Interpreter<'_> {
     fn trace_field_type(&self, object: RegisterWord, slot: u32) -> Option<Type> {
         let value = Value::from_word(object);
         let class_slot = match self.heap.get(value)? {
-            HeapObject::Instance { class_slot, .. } => *class_slot,
+            HeapObject::Instance(InstanceObject { class_slot, .. }) => *class_slot,
             _ => return None,
         };
         self.classes
@@ -19599,7 +19697,7 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_field_is_generic(&self, object: RegisterWord, slot: u32) -> bool {
         match self.heap.get(Value::from_word(object)) {
-            Some(HeapObject::Instance { class_slot, .. }) => self
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => self
                 .classes
                 .get(*class_slot as usize)
                 .and_then(|class| class.generic_fields.get(slot as usize))
@@ -19921,7 +20019,7 @@ impl TraceRuntime for Interpreter<'_> {
             HeapObject::List(_) => Some(TraceHeapObjectKind::List),
             HeapObject::Map(_) => Some(TraceHeapObjectKind::Map),
             HeapObject::Cell(_) => Some(TraceHeapObjectKind::Cell),
-            HeapObject::Instance { .. } => Some(TraceHeapObjectKind::Instance),
+            HeapObject::Instance(_) => Some(TraceHeapObjectKind::Instance),
             HeapObject::Promise { .. } => Some(TraceHeapObjectKind::Promise),
             HeapObject::Range { .. } => Some(TraceHeapObjectKind::Range),
             HeapObject::Closure { .. } => Some(TraceHeapObjectKind::Closure),
@@ -20628,9 +20726,7 @@ unsafe extern "C" fn trace_native_factory_commit(
                 // Unmanaged field storage: no GC safepoint before publication.
                 let count = vm.classes[op.y as usize].total_instance_field_count as usize;
                 unsafe {
-                    vm.heap.alloc_reserved_managed(address, HeapObject::Instance {
-                        class_slot: op.y, fields: vec![Value::NULL; count].into_boxed_slice(),
-                    })
+                    vm.heap.alloc_reserved_managed(address, HeapObject::Instance(InstanceObject::nulls(op.y, count)))
                 }
             }
             _ => return Err(RuntimeError::new("unsupported native factory kind")),
