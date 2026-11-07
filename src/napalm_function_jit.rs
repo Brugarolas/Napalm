@@ -3621,6 +3621,14 @@ unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> 
     let opcode = vm.program.functions[caller_function as usize].chunk.code[raw_pc as usize]
         .opcode().unwrap();
 
+    // Shared collections must execute through the locking interpreter quantum.
+    // Bail out at this PC before the conditional insertion has any effect.
+    if opcode == Opcode::MapLookupOrInsert && vm.heap.shared_mode
+        && unsafe { vm.current_op_touches_shared() }
+    {
+        return std::ptr::null_mut();
+    }
+
     // Constructors may grow the VM's register stack while the native caller
     // is suspended. Run the constructor to completion and return the *current*
     // GPR base so the caller never retains a dangling register-bank pointer.

@@ -1199,6 +1199,7 @@ scores.delete("Lin");
 | `new Map()` | Empty Map; does not accept an initial iterable. |
 | `get(key)`, `[key]` | Value or null if absent. |
 | `set(key, value)` | Inserts/updates and returns the Map. |
+| `set_if_not_exists(key, value)` | Returns the existing value (including null), or inserts and returns `value`. |
 | `[key] = value` | Writes an entry. |
 | `has(key)`, `containsKey(key)`, `key in map` | Whether the key exists, even if its value is null. |
 | `delete(key)`, `delete map.key`, `delete map[key]` | Bool indicating whether it existed. |
@@ -1270,6 +1271,7 @@ System.print(names.delete("Ada")); // true
 | --- | --- |
 | `new Set()` | Empty Set; does not accept an initial iterable. |
 | `add(value)` | Inserts if absent; returns the Set. |
+| `set_if_not_exists(value)` | Returns the stored equal element, or inserts and returns `value`. |
 | `has(value)` | Bool. |
 | `delete(value)` | Bool indicating whether it was present. |
 | `clear()` | Empties and returns null. |
@@ -1282,6 +1284,11 @@ To get an independent list, use `[...set]` or `[...set.values()]`.
 There is no `new Set(list)`; add elements in a loop.
 
 ### 10.5 Generic Collections
+
+`set_if_not_exists` also works on `ConcurrentMap` and `ConcurrentSet`, where
+conditional insertion is atomic across workers. Arguments are evaluated before
+the lookup; insertion contracts are checked only when no entry exists. Existing
+entries are never overwritten by this operation.
 
 `new Map<K, V>()`, `new Set<T>()`, and equivalent annotations install
 persistent contracts. These include nested contents, unions, and structural

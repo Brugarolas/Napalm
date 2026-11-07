@@ -3745,7 +3745,9 @@ impl<'a> TraceRecorder<'a> {
         let next = TraceLocation::new(op.location.function, op.next_pc);
 
         match op.opcode {
-            MapLookupOrInsert => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
+            MapLookupOrInsert => self.runtime_gc_leaf(
+                op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
             Nop | OsrPoint => Ok(ExpectedStep::Exact(next)),
 
             Move => {

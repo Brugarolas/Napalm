@@ -1092,8 +1092,8 @@ define_opcodes! {
     DefineClassWithImplements = 139,
     DefineDerivedClassWithImplements = 140,
     ImplementInterfaceOrType = 141,
-    // A=result, B=Map/Set, C=key; x0=value GPR. Runtime implementation pending
-    // (lands with the master merge); never emitted by the compiler yet.
+    // A=result, B=Map/Set, C=key; x0=value GPR. Returns the existing value,
+    // or atomically inserts and returns the default. Sets use C as the value.
     MapLookupOrInsert = 142,
     DefineArrayWithGenerics = 143,
     NewClassInstance = 144,
@@ -1236,7 +1236,6 @@ impl Opcode {
                 | NewClassInstance | NewInterfaceOrTypeObject | NewObjectShape | NewObjectEmpty
                 | NewObjectWithProperties | SetFieldShape
                 | InvokeMethodDirect
-                | MapLookupOrInsert
         )
     }
 }

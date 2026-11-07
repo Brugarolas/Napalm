@@ -1602,6 +1602,41 @@ impl MapDictionary {
     fn concurrent_clear(&self) { match self {
         Self::ConcurrentMap(m) => m.pin().clear(), Self::ConcurrentSet(s) => s.pin().clear(), _ => unreachable!(),
     } }
+    fn concurrent_lookup_or_insert(&self, key: MapKey, value: Value) -> (Value, bool) {
+        match self {
+            Self::ConcurrentMap(map) => match map.pin().try_insert(key, value) {
+                Ok(inserted) => (*inserted, true),
+                Err(occupied) => (*occupied.current, false),
+            },
+            Self::ConcurrentSet(set) => {
+                let pin = set.pin();
+                loop {
+                    if let Some(existing) = pin.get(&key) { return (existing.1, false); }
+                    if pin.insert(SetEntry(key.clone(), value)) { return (value, true); }
+                    // Another writer won. Retry: a concurrent delete may
+                    // already have removed its element. Never replace it.
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn lookup_or_insert(&mut self, key: MapKey, value: Value) -> (Value, bool) {
+        let before = self.len();
+        let result = match self {
+            Self::Map(map) => *map.entry(key).or_insert(value),
+            Self::Set(set) => set.get_or_insert(SetEntry(key, value)).1,
+            Self::Object { indices, entries } => {
+                let index = *indices.entry(key.clone()).or_insert_with(|| {
+                    let index = entries.len();
+                    entries.push((key, value));
+                    index
+                });
+                entries[index].1
+            }
+            _ => unreachable!("concurrent insertion requires a shared borrow"),
+        };
+        (result, self.len() != before)
+    }
     fn is_map_origin(&self) -> bool { !matches!(self, Self::Object { .. }) }
     fn len(&self) -> usize { match self {
         Self::Object { entries, .. } => entries.len(), Self::Map(m) => m.len(), Self::Set(s) => s.len(),
@@ -4484,6 +4519,50 @@ impl Heap {
             }
         }
         result
+    }
+
+    /// Conditional insertion preserves present nulls and the canonical Set
+    /// element. Contracts are checked only on the insertion path.
+    fn map_lookup_or_insert(
+        &mut self, receiver: Value, key_value: Value, mut value: Value,
+    ) -> Result<Value, RuntimeError> {
+        let map_value = match self.get(receiver) {
+            Some(HeapObject::Map(_)) => receiver,
+            Some(HeapObject::Set { map }) => { value = key_value; *map }
+            _ => return Err(RuntimeError::new("MapLookupOrInsert receiver is not a Map or Set")),
+        };
+        let key = self.map_key(key_value)?;
+        let contracted = self.has_contract(map_value);
+        let shaped = matches!(self.get(map_value),
+            Some(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Shaped { .. } })));
+        if contracted || shaped {
+            let Some(HeapObject::Map(map)) = self.get(map_value) else { unreachable!() };
+            if let Some(existing) = map.get(&self.map_shapes, &key) {
+                return Ok(existing);
+            }
+            if contracted { self.check_map_write(map_value, Some(&key), Some(value))?; }
+        }
+        self.remember_if_reference(map_value, key_value);
+        self.remember_if_reference(map_value, value);
+        let (result, inserted) = if self.concurrent_table(map_value).is_some() {
+            // Publish the graph before another worker can observe the entry.
+            self.mark_shared_deep(key_value);
+            self.mark_shared_deep(value);
+            self.concurrent_table(map_value).unwrap().concurrent_lookup_or_insert(key, value)
+        } else if shaped {
+            (value, self.map_set_encoded(map_value, key, value, None)?)
+        } else {
+            let Some(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(table) })) = self.get_mut(map_value)
+                else { unreachable!() };
+            table.lookup_or_insert(key, value)
+        };
+        if inserted {
+            if let Some(bytes) = self.map_external_bytes(map_value) {
+                self.set_external_bytes(map_value, bytes);
+            }
+            self.refresh_jit_view(map_value);
+        }
+        Ok(result)
     }
 
     /// Insert/update a map entry. The boolean reports a structural mutation
@@ -17295,7 +17374,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_define_class_specialized, // DefineClassWithImplements
     h_define_class_specialized, // DefineDerivedClassWithImplements
     h_implement_structural_contract, // ImplementInterfaceOrType
-    h_map_lookup_or_insert_pending, // MapLookupOrInsert
+    h_map_lookup_or_insert, // MapLookupOrInsert
     h_define_typed_array, // DefineArrayWithGenerics
     h_new_class_instance, // NewClassInstance
     h_new_interface_or_type_object, // NewInterfaceOrTypeObject
@@ -19108,6 +19187,21 @@ unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
         Err(error)=>vm.fail_at(op,error.message),
     }
 }
+/// Shared by baseline dispatch and both native runtime-call ABIs. Read the
+/// fourth operand after the safepoint, including when A aliases that register.
+unsafe fn h_map_lookup_or_insert(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    let receiver = Value::from_word(unsafe { vm.reg(op.b) });
+    let key = Value::from_word(unsafe { vm.reg(op.c) });
+    let value = Value::from_word(unsafe { vm.reg(op.x as u8) });
+    match vm.heap.map_lookup_or_insert(receiver, key, value) {
+        Ok(value) => unsafe { vm.set_reg(op.a, value.word()); vm.advance(op); },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
 unsafe fn h_load_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let op = unsafe { &*ptr };
     let map = Value::from_word(unsafe { vm.reg(op.b) });
@@ -25600,9 +25694,4 @@ let result = 1;
         assert_eq!(source_result(&optimized_vm), 99.0);
     }
 
-}
-
-// Deliberately reserved for the future interpreter/JIT implementation.
-unsafe fn h_map_lookup_or_insert_pending(vm: &mut Interpreter, ptr: *const PreparedOp) {
-    vm.fail_at(&*ptr, "MapLookupOrInsert execution is not implemented yet");
 }
