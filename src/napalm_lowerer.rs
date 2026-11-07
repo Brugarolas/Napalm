@@ -1764,6 +1764,27 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 self.program.contract_names.push((id, ty));
             }
         }
+
+        // Preserve declaration kind separately from the resolved structural
+        // type. The latter is not sufficient to distinguish a type alias of an
+        // interface from an actual interface declaration.
+        let module = self.module_id.expect("module id is assigned before contract planning");
+        for (name, kind) in self.ast.interfaces.iter().map(|decl| (
+            &decl.name.value,
+            ir::ContractDeclarationKind::Interface,
+        )).chain(self.ast.type_aliases.iter().map(|decl| (
+            &decl.name.value,
+            ir::ContractDeclarationKind::Type,
+        ))) {
+            let Some(contract) = self.interface_types.get(name).cloned() else { continue; };
+            let name_id = self.program.intern_string(name);
+            self.program.contract_declarations.push(ir::ContractDeclaration {
+                module,
+                name: name_id,
+                contract,
+                kind,
+            });
+        }
     }
 
     /// Contracts of concrete generic class uses (`Holder<number>`): the fields
@@ -3837,6 +3858,28 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Type::Class(ClassSet::singleton(plan.id)),
         );
 
+        // Bind methods before publishing the class into a module slot. The
+        // bytecode compiler may now emit a single atomic Define*Class opcode
+        // with the complete statically known method table. Publication happens
+        // only after the class has been fully initialized.
+        for method in &plan.methods {
+            if let Some(function) = method.function {
+                self.builder.emit0(Inst::BindMethod {
+                    class: class_value,
+                    method: method.symbol,
+                    function,
+                    is_static: method.bind_static,
+                });
+            } else if let Some(foreign) = method.foreign {
+                self.builder.emit0(Inst::BindForeignMethod {
+                    class: class_value,
+                    method: method.symbol,
+                    foreign,
+                    is_static: method.bind_static,
+                });
+            }
+        }
+
         self.builder.emit0(Inst::StoreModuleVar {
             module: self.context.module,
             slot: plan.class_slot,
@@ -3861,23 +3904,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.bind_initial(binding, class_value);
         }
 
-        for method in &plan.methods {
-            if let Some(function) = method.function {
-                self.builder.emit0(Inst::BindMethod {
-                    class: class_value,
-                    method: method.symbol,
-                    function,
-                    is_static: method.bind_static,
-                });
-            } else if let Some(foreign) = method.foreign {
-                self.builder.emit0(Inst::BindForeignMethod {
-                    class: class_value,
-                    method: method.symbol,
-                    foreign,
-                    is_static: method.bind_static,
-                });
-            }
-        }
+
     }
 
     fn lower_import(&mut self, import: &ImportDecl, module_level: bool) {
@@ -5044,6 +5071,41 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             Type::Interface(fields) | Type::Record(fields) => fields.clone(),
             _ => return self.lower_map(entries),
         };
+        // Pure, statically valid structural literals may defer property
+        // installation until all constant values have been evaluated. There
+        // can be no observable intermediate object or failing field check.
+        // This forms a contiguous AllocMap + StoreProperty + BindInterface
+        // sequence that the bytecode compiler can replace with one shape
+        // factory. It MUST stay StoreProperty (not MapSet): WIR escape analysis
+        // scalar-replaces structural objects only through layout-slot stores.
+        let can_fuse_literal = fields.len() == entries.len()
+            && fields.iter().zip(entries).all(|(field, entry)| {
+                if field.optional || field.readonly || entry.spread { return false; }
+                let key_matches = matches!(&entry.key.kind,
+                    ExprKind::String(bytes) if bytes.as_slice() == field.name.as_bytes());
+                let value_matches = matches!(
+                    (&field.ty, &entry.value.kind),
+                    (Type::Num, ExprKind::Number(_))
+                        | (Type::Bool, ExprKind::Bool(_))
+                        | (Type::Null, ExprKind::Null)
+                        | (Type::String, ExprKind::String(_))
+                );
+                key_matches && value_matches
+            });
+        if can_fuse_literal {
+            let mut initialized = Vec::with_capacity(entries.len());
+            for (index, (field, entry)) in fields.iter().zip(entries).enumerate() {
+                let value = self.lower_expr(&entry.value);
+                let key = self.builder.const_string(&field.name);
+                initialized.push((key, value, ir::PropertySlotId(index as u16)));
+            }
+            let map = self.builder.emit1(Inst::AllocMap, Type::Map);
+            for (key, value, slot) in initialized {
+                self.builder.emit0(Inst::StoreProperty { object: map, key, value, layout, slot });
+            }
+            return map;
+        }
+
         let map = self.builder.emit1(Inst::AllocMap, Type::Map);
         for entry in entries {
             if entry.spread {

@@ -15,6 +15,12 @@ use crate::napalm_ir_optimizer::{
     repair_effect_chain, FunctionOptimization, Optimize, ProgramOptimization,
 };
 
+#[path = "napalm_ir/deforestation.rs"]
+mod deforestation;
+pub use deforestation::{Deforestation, DeforestationStats};
+#[path = "napalm_ir/loop_fusion.rs"]
+mod loop_fusion;
+pub use loop_fusion::{LoopFusion, LoopFusionStats};
 #[path = "napalm_ir/typed_object_specialization.rs"]
 mod typed_object_specialization;
 pub use typed_object_specialization::TypedObjectSpecialization;
@@ -330,7 +336,12 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
         allocating.extend(additional);
     }
     for function in &mut program.functions {
-        let next = if pure.contains(&function.id) {
+        // A constructor initializes a fresh `this` on every call: caching it
+        // would hand out a shared instance. Constructors are never memoized
+        // (NewClassInstance also relies on this and pushes the frame directly).
+        let next = if function.kind == crate::napalm_ir::FunctionKind::Constructor {
+            MemoizationKind::None
+        } else if pure.contains(&function.id) {
             match (recursive.contains(&function.id), allocating.contains(&function.id)) {
                 (true, true) => MemoizationKind::RecursiveShared,
                 // Allocating purity is useful for proving recursive producers,
@@ -597,6 +608,8 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         let mut dce = DeadCodeElimination::default();
         let mut cfg = ControlFlowCleanup::default();
         let mut sroa = ScalarReplacement::default();
+        let mut deforestation = Deforestation::default();
+        let mut loop_fusion = LoopFusion::default();
 
         // ---------------------------------------------------------------------
         // Phase 1: cheap local fixed point.
@@ -636,6 +649,12 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
                 changed_any |= dce.optimize_function(function);
             }
         }
+
+        // Fuse canonical, effect-free counted reductions and remove single-use
+        // List staging buffers before escape analysis materializes any of them.
+        // Both passes are deliberately conservative about exceptions and aliasing.
+        changed_any |= loop_fusion.optimize_function(function);
+        changed_any |= deforestation.optimize_function(function);
 
         // ---------------------------------------------------------------------
         // Phase 2: first PEA/SROA pass.
@@ -683,6 +702,11 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
 
             // Thread/simplify CFG after data-flow simplification.
             round |= cfg.optimize_function(function);
+
+            // Local simplifications may expose a new append/spread staging buffer
+            // or a new pair of adjacent canonical induction loops.
+            round |= loop_fusion.optimize_function(function);
+            round |= deforestation.optimize_function(function);
 
             // Re-run PEA/SROA because all previous passes may have converted an
             // escaping allocation into a non-escaping or partially escaping one.

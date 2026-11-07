@@ -2379,6 +2379,109 @@ struct NapalmHeaders {
     response: Value,
 }
 
+/// Fields stored inside the managed object itself (no separate malloc).
+/// Four values fit in the existing fixed-size managed payload; larger classes
+/// keep an unmanaged Box. `HeapObject` must not grow because of this.
+const INSTANCE_INLINE_FIELDS: usize = 4;
+
+#[repr(C)]
+union InstanceStorage {
+    inline: [Value; INSTANCE_INLINE_FIELDS],
+    boxed: std::mem::ManuallyDrop<Box<[Value]>>,
+}
+
+/// A class instance: class slot plus its fixed field layout. Dereferences to
+/// the field slice, so field code reads `fields[slot]` regardless of storage.
+/// Inline storage moves with the managed object; its handle sidecar therefore
+/// publishes an owner-relative data offset (like inline Maps), while boxed
+/// storage publishes the stable absolute pointer.
+#[repr(C)]
+struct InstanceObject {
+    pub(crate) class_slot: u32,
+    len: u32,
+    storage: InstanceStorage,
+}
+
+impl InstanceObject {
+    /// A null-initialized instance of `count` fields.
+    #[inline]
+    fn nulls(class_slot: u32, count: usize) -> Self {
+        let storage = if count <= INSTANCE_INLINE_FIELDS {
+            InstanceStorage { inline: [Value::NULL; INSTANCE_INLINE_FIELDS] }
+        } else {
+            InstanceStorage { boxed: std::mem::ManuallyDrop::new(vec![Value::NULL; count].into_boxed_slice()) }
+        };
+        Self { class_slot, len: count as u32, storage }
+    }
+
+    #[cfg(test)]
+    fn from_values(class_slot: u32, values: &[Value]) -> Self {
+        let mut instance = Self::nulls(class_slot, values.len());
+        instance.copy_from_slice(values);
+        instance
+    }
+
+    #[inline(always)]
+    fn is_inline(&self) -> bool { self.len as usize <= INSTANCE_INLINE_FIELDS }
+
+    #[inline(always)]
+    fn fields(&self) -> &[Value] {
+        unsafe {
+            if self.is_inline() {
+                self.storage.inline.get_unchecked(..self.len as usize)
+            } else {
+                &self.storage.boxed
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn fields_mut(&mut self) -> &mut [Value] {
+        unsafe {
+            if self.is_inline() {
+                let len = self.len as usize;
+                self.storage.inline.get_unchecked_mut(..len)
+            } else {
+                &mut self.storage.boxed
+            }
+        }
+    }
+
+    /// Bytes of unmanaged storage owned by this instance (0 when inline).
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        if self.is_inline() { 0 } else { self.len as usize * std::mem::size_of::<Value>() }
+    }
+}
+
+impl std::ops::Deref for InstanceObject {
+    type Target = [Value];
+    #[inline(always)]
+    fn deref(&self) -> &[Value] { self.fields() }
+}
+
+impl std::ops::DerefMut for InstanceObject {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Value] { self.fields_mut() }
+}
+
+impl Drop for InstanceObject {
+    fn drop(&mut self) {
+        if !self.is_inline() {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.storage.boxed) };
+        }
+    }
+}
+
+impl std::fmt::Debug for InstanceObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("class_slot", &self.class_slot)
+            .field("fields", &self.fields())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum HeapObject {
     Random { state: u64 },
@@ -2409,10 +2512,7 @@ enum HeapObject {
     BuiltinClass {
         builtin: BuiltinId,
     },
-    Instance {
-        class_slot: u32,
-        fields: Box<[Value]>,
-    },
+    Instance(InstanceObject),
     Foreign {
         class_slot: u32,
         bytes: Vec<u8>,
@@ -2879,9 +2979,16 @@ impl HandleTable {
                 1,
                 0,
             ),
-            HeapObject::Instance { fields, .. } => (
+            // Inline fields move with their owner: publish a tagged
+            // owner-relative offset (like inline Maps). Boxed fields keep the
+            // stable absolute pointer (bit 0 clear: Values are 8-aligned).
+            HeapObject::Instance(fields) => (
                 TraceHeapKind::Instance,
-                fields.as_ptr() as usize,
+                if fields.is_inline() {
+                    encode_inline_heap_data(object_address, fields.as_ptr() as usize)
+                } else {
+                    fields.as_ptr() as usize
+                },
                 fields.len(),
                 0,
             ),
@@ -3177,7 +3284,7 @@ unsafe fn trace_closure(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 
 unsafe fn trace_instance(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
-    if let HeapObject::Instance { fields, .. } = &managed.object {
+    if let HeapObject::Instance(fields) = &managed.object {
         visit_values_prefetched(fields, visitor);
     }
 }
@@ -3416,7 +3523,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::Closure { .. } => &GC_CLOSURE,
         HeapObject::ClassObject { .. } => &GC_CLASS,
         HeapObject::BuiltinClass { .. } => &GC_BUILTIN_CLASS,
-        HeapObject::Instance { .. } => &GC_INSTANCE,
+        HeapObject::Instance(_) => &GC_INSTANCE,
         HeapObject::Foreign { .. } => &GC_FOREIGN,
         HeapObject::FfiLibrary { .. } => &GC_FFI_LIBRARY,
         HeapObject::FfiFunction { .. } => &GC_FFI_FUNCTION,
@@ -3466,7 +3573,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
             // therefore does not grow with each closure instance.
             captures.len() * std::mem::size_of::<RegisterWord>()
         },
-        HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
+        HeapObject::Instance(fields) => fields.external_bytes(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
         HeapObject::Response(response) => {
             std::mem::size_of::<NapalmResponse>()
@@ -3679,7 +3786,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 }
             }
         }
-        HeapObject::Instance { fields, .. } => {
+        HeapObject::Instance(fields) => {
             for &value in fields.iter() { push_value_handle(value, roots); }
         }
         HeapObject::Promise { state } => {
@@ -3943,6 +4050,37 @@ impl Heap {
             >(&GC_MAP, address)
         };
         self.initialize_inline_map_object(object, handle, shape, values)
+    }
+
+    /// Commit a non-Map managed object into a TLAB range reserved by native code.
+    /// The caller must prevalidate the object and ensure its construction cannot
+    /// safepoint. Unlike the ordinary allocation path this never polls the GC.
+    ///
+    /// # Safety
+    /// `address` must be a reservation from this mutator's fixed-size allocation
+    /// TLAB, with the exact size and alignment of ManagedObject.
+    unsafe fn alloc_reserved_managed(&mut self, address: usize, object: HeapObject) -> Value {
+        let descriptor = descriptor_for(&object);
+        let external = external_bytes_for(&object);
+        let handle = self.allocate_handle_fast();
+        let gc_object = unsafe {
+            self.mutator.finish_fast_fixed_uninitialized::<
+                { std::mem::size_of::<ManagedObject>() },
+            >(descriptor, address)
+        };
+        unsafe {
+            gc_object.payload().cast::<ManagedObject>().write(ManagedObject {
+                handle, object,
+            });
+        }
+        self.handle_table.publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
+        if external != 0 {
+            unsafe { self.mutator.set_external_bytes(gc_object, external) };
+        }
+        let value = Value::from_heap(handle);
+        #[cfg(test)]
+        self.allocations.push(value);
+        value
     }
 
     #[inline]
@@ -5358,7 +5496,7 @@ impl HostContext<'_> {
             Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
             Some(HeapObject::ClassObject { class_slot }) => format!("<class#{class_slot}>"),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => format!("<instance class#{class_slot}>"),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
             Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
             Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
@@ -5716,6 +5854,11 @@ struct PreparedFunction {
     /// entries here. PreparedOp::cache stores the dense cache index so x/y remain
     /// available for structural layout and logical-slot metadata.
     map_inline_caches: Vec<MapInlineCacheState>,
+    /// Parallel to map_inline_caches: GetFieldShape on a *class instance* that
+    /// satisfies the structural layout. Class field layouts are immutable and
+    /// the property name is fixed by (layout, logical slot), so the receiver
+    /// class alone determines the absolute field offset.
+    structural_instance_caches: Vec<StructuralInstanceCache>,
     /// Predecoded frame-entry destinations. u16::MAX means the corresponding
     /// source value was dead after bytecode allocation and needs no GPR copy.
     entry_this_dst: u16,
@@ -5897,6 +6040,10 @@ impl PreparedProgram {
                     | Opcode::Launch
                     | Opcode::CallPrimitive
                     | Opcode::CallForeign
+                    | Opcode::InvokeMethodDirect
+                    | Opcode::NewClassInstance
+                    | Opcode::NewInterfaceOrTypeObject
+                    | Opcode::NewObjectWithProperties
             );
             let args_offset = if is_call {
                 let count = first.c() as usize;
@@ -6003,6 +6150,20 @@ impl PreparedProgram {
                         RuntimeError::new(format!("unknown function {:?}", function))
                     })?;
                 }
+                Opcode::DefineClass | Opcode::DefineDerivedClass
+                | Opcode::DefineClassWithImplements | Opcode::DefineDerivedClassWithImplements => {
+                    let descriptor_id = temp.x;
+                    let class = match function.chunk.specializations.get(descriptor_id as usize) {
+                        Some(crate::napalm_bytecode::SpecializedDescriptor::Class { class, .. }) => *class,
+                        _ => return Err(RuntimeError::new("invalid specialized class descriptor")),
+                    };
+                    op.x = *class_by_id.get(&class).ok_or_else(|| {
+                        RuntimeError::new(format!("unknown class {:?}", class))
+                    })?;
+                    // The prepared opcode stores the dense runtime class slot in X
+                    // and the function-local immutable descriptor index in Y.
+                    op.y = descriptor_id;
+                }
                 Opcode::CreateClass | Opcode::AllocInstance | Opcode::AllocForeign => {
                     let class = ClassId(temp.x);
                     op.x = *class_by_id.get(&class).ok_or_else(|| {
@@ -6014,6 +6175,55 @@ impl PreparedProgram {
                     op.x = *module_by_id.get(&module).ok_or_else(|| {
                         RuntimeError::new(format!("unknown module {:?}", module))
                     })?;
+                }
+                Opcode::GetFieldClass | Opcode::SetFieldClass => {
+                    let Some(descriptor @ crate::napalm_bytecode::SpecializedDescriptor::FieldClass {
+                        class, local_slot, ..
+                    }) = function.chunk.specializations.get(temp.x as usize)
+                    else { return Err(RuntimeError::new("invalid specialized class field descriptor")); };
+                    if function.field_owner != Some(*class) {
+                        return Err(RuntimeError::new("specialized field owner differs from the function owner"));
+                    }
+                    // X = class-local slot (relocated to absolute at class link);
+                    // Y = FIELD_CLASS_* facts proven at compile time.
+                    op.x = *local_slot;
+                    op.y = descriptor.field_class_flags();
+                }
+                Opcode::GetFieldShape | Opcode::SetFieldShape => {
+                    let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldShape { layout, slot }) =
+                        function.chunk.specializations.get(temp.x as usize)
+                    else { return Err(RuntimeError::new("invalid specialized shape field descriptor")); };
+                    if temp.y != slot.0 as u32 {
+                        return Err(RuntimeError::new("shape property slot disagrees with the descriptor"));
+                    }
+                    op.x = layout.0;
+                    op.y = slot.0 as u32;
+                    op.cache = map_inline_cache_count as u32;
+                    map_inline_cache_count += 1;
+                }
+                Opcode::NewClassInstance => {
+                    // X keeps the descriptor index (JIT tiers read it at compile
+                    // time). Resolve the hot-path identities once: Y = dense class
+                    // slot, CACHE = prepared constructor index or NO_INDEX.
+                    let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { class, constructor }) =
+                        function.chunk.specializations.get(temp.x as usize)
+                    else { return Err(RuntimeError::new("invalid NewClassInstance descriptor")); };
+                    op.y = *class_by_id.get(class).ok_or_else(||
+                        RuntimeError::new(format!("unknown class {:?}", class)))?;
+                    op.cache = match constructor {
+                        Some(id) => *function_by_id.get(id).ok_or_else(||
+                            RuntimeError::new("unknown class constructor"))?,
+                        None => NO_INDEX,
+                    };
+                }
+                Opcode::InvokeMethodDirect => {
+                    let Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod {
+                        target, fallback_cache, ..
+                    }) = function.chunk.specializations.get(temp.x as usize)
+                    else { return Err(RuntimeError::new("invalid direct method descriptor")); };
+                    op.y = *function_by_id.get(target).ok_or_else(||
+                        RuntimeError::new("unknown direct method function"))?;
+                    op.cache = fallback_cache.0;
                 }
                 Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent => {
                     op.cache = map_inline_cache_count as u32;
@@ -6086,17 +6296,40 @@ impl PreparedProgram {
                 _ => {},
             }
         }
+        // Every constant-key object factory with 1..=4 properties gets a
+        // monomorphic shape-allocation site. Runtime values vary, but the
+        // interned key identities and their physical slots are immutable.
+        let mut small_map_literal_sites = Vec::new();
+        for (index, temp) in temps.iter().enumerate() {
+            let shape_fields = if temp.opcode == Opcode::NewObjectShape {
+                // Its property count comes from RuntimeMetadata, not the opcode C field.
+                // Assign the cache slot optimistically; the allocator uses it only
+                // when the resolved layout has at most four properties.
+                1
+            } else {
+                temp.c as usize
+            };
+            if matches!(temp.opcode,
+                Opcode::NewInterfaceOrTypeObject | Opcode::NewObjectWithProperties | Opcode::NewObjectShape)
+                && (1..=SMALL_MAP_INLINE_FIELDS).contains(&shape_fields)
+            {
+                ops[index].cache = small_map_literal_sites.len() as u32;
+                let mut site = SmallMapAllocationSite::default();
+                site.stable_program_keys = true;
+                small_map_literal_sites.push(site);
+            }
+        }
         let original_ops = ops.clone();
         let field_access_ops: Vec<u32> = temps
             .iter()
             .enumerate()
             .filter_map(|(index, temp)| {
-                matches!(temp.opcode, Opcode::LoadField | Opcode::StoreField)
+                matches!(temp.opcode, Opcode::LoadField | Opcode::StoreField
+                    | Opcode::GetFieldClass | Opcode::SetFieldClass)
                     .then_some(index as u32)
             })
             .collect();
 
-        let mut small_map_literal_sites = Vec::new();
         install_superinstructions(
             &temps,
             &mut handlers,
@@ -6237,6 +6470,7 @@ impl PreparedProgram {
             small_map_literal_sites,
             quickened_invoke_ops: Vec::new(),
             map_inline_caches: vec![MapInlineCacheState::default(); map_inline_cache_count],
+            structural_instance_caches: vec![StructuralInstanceCache::EMPTY; map_inline_cache_count],
             entry_this_dst,
             entry_arg_dsts,
             needs_argument_bank,
@@ -6734,7 +6968,7 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_STATIC | *class_slot as u64),
         HeapObject::BuiltinClass { builtin } =>
             ReceiverClass(CLASS_KIND_CORE_STATIC | builtin.index() as u64),
-        HeapObject::Instance { class_slot, .. } =>
+        HeapObject::Instance(InstanceObject { class_slot, .. }) =>
             ReceiverClass(CLASS_KIND_INSTANCE | *class_slot as u64),
         HeapObject::Foreign { class_slot, .. } =>
             ReceiverClass(CLASS_KIND_FOREIGN | *class_slot as u64),
@@ -6913,6 +7147,18 @@ struct MapIcEntry {
     _padding: u16,
 }
 
+/// Monomorphic (receiver class slot -> absolute field) cache of one structural
+/// property op. `class_slot == u32::MAX` is empty.
+#[derive(Clone, Copy, Debug)]
+struct StructuralInstanceCache {
+    class_slot: u32,
+    field: u32,
+}
+
+impl StructuralInstanceCache {
+    const EMPTY: Self = Self { class_slot: u32::MAX, field: 0 };
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MapInlineCacheState {
     entries: [MapIcEntry; 4],
@@ -7076,13 +7322,22 @@ impl Default for MapPropertyQuickState {
 struct QuickInvokeSite {
     class: ReceiverClass,
     target: CallTarget,
+    /// Runtime call-site profile: consecutive monomorphic hits on `class`
+    /// since the site was quickened. Any miss disables the site (and resets
+    /// it); a method-epoch change resets it as well.
+    hits: u32,
 }
 
 impl Default for QuickInvokeSite {
     fn default() -> Self {
-        Self { class: ReceiverClass(0), target: CallTarget::Bytecode(0) }
+        Self { class: ReceiverClass(0), target: CallTarget::Bytecode(0), hits: 0 }
     }
 }
+
+/// Monomorphic hits after which a bytecode-target Invoke site is promoted to
+/// the profiled `InvokeMethodDirect` form (class guard + direct call). The
+/// whole-function JIT compiles promoted sites as native direct calls.
+const INVOKE_DIRECT_PROMOTION_HITS: u32 = 32;
 
 struct RuntimeClass {
     id: ClassId,
@@ -11642,7 +11897,7 @@ impl<'p> Interpreter<'p> {
             | Some(HeapObject::FfiPointer { .. }) => {
                 return Err(RuntimeError::new("native/foreign objects cannot cross a concurrent boundary"));
             }
-            Some(HeapObject::Instance { .. }) | Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => {
+            Some(HeapObject::Instance(_)) | Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => {
                 return Err(RuntimeError::new("class instances/objects cannot cross a concurrent boundary yet"));
             }
             Some(HeapObject::Cell(_)) => {
@@ -14146,7 +14401,7 @@ impl Interpreter<'_> {
         if index >= function.handlers.len() || index >= function.ops.len() { return; }
         if function.ops[index].flags != 0 { return; }
 
-        function.quick_invokes[index] = QuickInvokeSite { class, target };
+        function.quick_invokes[index] = QuickInvokeSite { class, target, hits: 0 };
         let handler = if let Some((key_hash, key_string)) = map_property_key.filter(|_| function.ops[index].c == 0) {
             let property = &mut function.quick_map_properties[index];
             property.key_hash = key_hash;
@@ -14175,6 +14430,29 @@ impl Interpreter<'_> {
         unsafe {
             let quick_invokes = &(*self.hot_function).quick_invokes;
             *quick_invokes.get_unchecked(index)
+        }
+    }
+
+    /// Record one monomorphic hit of the current bytecode-target Invoke site and
+    /// promote it to the profiled InvokeMethodDirect handler once it is stable.
+    #[inline(always)]
+    fn note_monomorphic_bytecode_hit(&mut self) {
+        let function_index = self.hot_function_index as usize;
+        let index = self.hot_pc as usize;
+        let function = unsafe { self.prepared.functions.get_unchecked_mut(function_index) };
+        let site = unsafe { function.quick_invokes.get_unchecked_mut(index) };
+        site.hits = site.hits.saturating_add(1);
+        if unlikely(site.hits >= INVOKE_DIRECT_PROMOTION_HITS) {
+            let handler: Handler = match function.ops[index].c {
+                0 => h_invoke_direct_profiled_small::<0>,
+                1 => h_invoke_direct_profiled_small::<1>,
+                2 => h_invoke_direct_profiled_small::<2>,
+                3 => h_invoke_direct_profiled_small::<3>,
+                4 => h_invoke_direct_profiled_small::<4>,
+                _ => h_invoke_direct_profiled,
+            };
+            // Stays in quickened_invoke_ops: an epoch change demotes it again.
+            function.set_handler(index, handler);
         }
     }
 
@@ -14676,7 +14954,7 @@ impl Interpreter<'_> {
 
     fn instance_properties(&self, value: Value) -> Result<Vec<(Value, Value)>, RuntimeError> {
         let (class_slot, fields) = match self.heap.get(value) {
-            Some(HeapObject::Instance { class_slot, fields }) => (*class_slot, fields),
+            Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) => (*class_slot, fields),
             Some(HeapObject::Foreign { .. }) => return Ok(Vec::new()),
             _ => return Err(RuntimeError::new("receiver is not a class instance")),
         };
@@ -14689,7 +14967,7 @@ impl Interpreter<'_> {
     fn default_to_string_text(&mut self, value: Value) -> String {
         let named_class = match self.heap.get(value) {
             Some(HeapObject::ClassObject { class_slot }) => Some((true, *class_slot)),
-            Some(HeapObject::Instance { class_slot, .. })
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
             | Some(HeapObject::Foreign { class_slot, .. }) => Some((false, *class_slot)),
             _ => None,
         };
@@ -15890,7 +16168,7 @@ impl Interpreter<'_> {
                     _ => None,
                 };
                 let actual = match self.heap.get(arg(0)) {
-                    Some(HeapObject::Instance { class_slot, .. })
+                    Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
                     | Some(HeapObject::Foreign { class_slot, .. })
                     | Some(HeapObject::ClassObject { class_slot }) => Some(*class_slot),
                     _ => None,
@@ -16108,7 +16386,7 @@ impl Interpreter<'_> {
     fn class_set_matches(&self, value: Value, set: &ClassSet, want_class_object: bool) -> bool {
         let slot = match self.heap.get(value) {
             Some(HeapObject::ClassObject { class_slot }) if want_class_object => *class_slot,
-            Some(HeapObject::Instance { class_slot, .. }) if !want_class_object => *class_slot,
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) if !want_class_object => *class_slot,
             Some(HeapObject::Foreign { class_slot, .. }) if !want_class_object => *class_slot,
             _ => return false,
         };
@@ -16212,7 +16490,7 @@ impl Interpreter<'_> {
     /// objects are checked structurally.
     fn value_implements(&self, value: Value, contract: &Type, allow_class_object: bool) -> bool {
         let class_slot = match self.heap.get(value) {
-            Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => *class_slot,
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => *class_slot,
             Some(HeapObject::ClassObject { class_slot }) if allow_class_object => *class_slot,
             Some(HeapObject::Map(_)) => return self.heap.structurally_matches(value, contract),
             _ => return false,
@@ -16294,7 +16572,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Cell(_)) => "Cell".to_owned(),
             Some(HeapObject::Closure { .. }) => "Function".to_owned(),
             Some(HeapObject::ClassObject { .. }) | Some(HeapObject::BuiltinClass { .. }) => "Class".to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) | Some(HeapObject::Foreign { class_slot, .. }) => {
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => {
                 format!("Instance of {}", self.instance_class_display(value, *class_slot))
             }
             Some(HeapObject::FfiLibrary { .. }) => "FfiLibrary".to_owned(),
@@ -16410,7 +16688,7 @@ impl Interpreter<'_> {
     /// instructions; interfaces and types only describe data, so every such
     /// property is an instance field addressed by its public name.
     fn instance_property_slot(&self, object: Value, key: Value) -> Option<Option<(u32, usize)>> {
-        let Some(HeapObject::Instance { class_slot, .. }) = self.heap.get(object) else {
+        let Some(HeapObject::Instance(InstanceObject { class_slot, .. })) = self.heap.get(object) else {
             return None;
         };
         let class_slot = *class_slot;
@@ -16433,7 +16711,7 @@ impl Interpreter<'_> {
         let Some((class_slot, slot)) = slot else {
             return Some(Ok(Value::NULL));
         };
-        let Some(HeapObject::Instance { fields, .. }) = self.heap.get(object) else {
+        let Some(HeapObject::Instance(fields)) = self.heap.get(object) else {
             return Some(Ok(Value::NULL));
         };
         let value = fields.get(slot).copied().unwrap_or(Value::NULL);
@@ -16477,7 +16755,7 @@ impl Interpreter<'_> {
             }
         }
         self.heap.remember_if_reference(object, value);
-        if let Some(HeapObject::Instance { fields, .. }) = self.heap.get_mut(object) {
+        if let Some(HeapObject::Instance(fields)) = self.heap.get_mut(object) {
             if let Some(field) = fields.get_mut(slot) {
                 *field = value;
             }
@@ -16843,13 +17121,36 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
         || same_handler(handler, h_invoke_mono_bytecode_small::<2> as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<3> as Handler)
         || same_handler(handler, h_invoke_mono_bytecode_small::<4> as Handler)
+        || is_profiled_direct_invoke_handler(handler)
+}
+
+fn is_profiled_direct_invoke_handler(handler: Handler) -> bool {
+    same_handler(handler, h_invoke_direct_profiled as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<0> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<1> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<2> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<3> as Handler)
+        || same_handler(handler, h_invoke_direct_profiled_small::<4> as Handler)
+}
+
+/// The runtime-profiled InvokeMethodDirect at `index`, if the VM promoted that
+/// Invoke site: (expected exact receiver class, prepared bytecode target).
+pub(super) fn profiled_direct_invoke_site(function: &PreparedFunction, index: usize) -> Option<(ReceiverClass, u32)> {
+    let handler = function.jit_entry_handlers.get(index).copied().flatten()
+        .or_else(|| function.handlers.get(index).copied())?;
+    if !is_profiled_direct_invoke_handler(handler) { return None; }
+    let site = function.quick_invokes.get(index)?;
+    match site.target {
+        CallTarget::Bytecode(target) if site.class.0 != 0 => Some((site.class, target)),
+        _ => None,
+    }
 }
 
 // =============================================================================
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 136;
+const OPCODE_COUNT: usize = Opcode::InvokeMethodDirect as usize + 1;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -16987,7 +17288,25 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_store_property,
     h_store_property_if_present,
     h_launch, // Launch
-    h_map_lookup_or_insert_pending,
+    h_define_class_specialized, // DefineClass
+    h_define_contract_specialized, // DefineInterface
+    h_define_contract_specialized, // DefineType
+    h_define_class_specialized, // DefineDerivedClass
+    h_define_class_specialized, // DefineClassWithImplements
+    h_define_class_specialized, // DefineDerivedClassWithImplements
+    h_implement_structural_contract, // ImplementInterfaceOrType
+    h_map_lookup_or_insert_pending, // MapLookupOrInsert
+    h_define_typed_array, // DefineArrayWithGenerics
+    h_new_class_instance, // NewClassInstance
+    h_new_interface_or_type_object, // NewInterfaceOrTypeObject
+    h_new_object_shape, // NewObjectShape
+    h_new_object_empty, // NewObjectEmpty
+    h_new_object_with_properties, // NewObjectWithProperties
+    h_get_field_shape, // GetFieldShape
+    h_set_field_shape, // SetFieldShape
+    h_get_field_class, // GetFieldClass
+    h_set_field_class, // SetFieldClass
+    h_invoke_method_direct, // InvokeMethodDirect
 ];
 
 #[inline(always)]
@@ -17313,7 +17632,7 @@ unsafe fn h_guard_type(vm:&mut Interpreter, ptr:*const PreparedOp){
 }
 unsafe fn h_guard_class(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr; let f=vm.current_function_index(); let desc:&ClassGuardDescriptor=vm.program.functions.get_unchecked(f).chunk.class_guards.get_unchecked(op.x as usize); let value=Value::from_word(vm.reg(op.b));
-    let ok=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},_=>false};
+    let ok=match vm.heap.get(value){Some(HeapObject::Instance(InstanceObject { class_slot, .. }))|Some(HeapObject::Foreign{class_slot,..})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},Some(HeapObject::ClassObject{class_slot})=>{if desc.expected.is_unknown(){true}else{desc.expected.contains(vm.classes.get_unchecked(*class_slot as usize).id)}},_=>false};
     if likely(ok){vm.set_reg(op.a,value.word());vm.advance(op)}else{vm.deopt(op,op.y)}
 }
 unsafe fn h_guard_bounds(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let i=word_i32(vm.reg(op.a));let n=word_i32(vm.reg(op.b));if likely(i>=0&&i<n){vm.advance(op)}else{vm.deopt(op,op.x)}}
@@ -17475,6 +17794,7 @@ unsafe fn h_invoke_mono_bytecode_small<const N: usize>(vm:&mut Interpreter, ptr:
         h_invoke_mono(vm,ptr);
         return;
     };
+    vm.note_monomorphic_bytecode_hit();
     let args=vm.gather_call_words_const::<N>(&op);
     vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
 }
@@ -17494,6 +17814,54 @@ unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
         h_invoke_mono(vm,ptr);
         return;
     };
+    vm.note_monomorphic_bytecode_hit();
+    h_invoke_bytecode_target(vm,&op,function,receiver);
+}
+
+/// Profiled InvokeMethodDirect: an Invoke site promoted by the VM after
+/// INVOKE_DIRECT_PROMOTION_HITS consecutive monomorphic hits. Same guard as the
+/// monomorphic handler (exact receiver class; any miss falls back to the
+/// generic IC and disables the site) but no profiling work on the hot path.
+/// The whole-function JIT lowers these sites to native guarded direct calls.
+unsafe fn h_invoke_direct_profiled_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=*ptr;
+    let receiver=vm.reg(op.b);
+    let site=vm.current_quick_invoke();
+    if unlikely(!vm.receiver_matches_class(Value::from_word(receiver),site.class)) {
+        vm.disable_current_monomorphic_invoke();
+        h_invoke(vm,ptr);
+        return;
+    }
+    let CallTarget::Bytecode(function)=site.target else {
+        cold_path();
+        h_invoke_mono(vm,ptr);
+        return;
+    };
+    let args=vm.gather_call_words_const::<N>(&op);
+    vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
+}
+
+unsafe fn h_invoke_direct_profiled(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=*ptr;
+    let receiver=vm.reg(op.b);
+    let site=vm.current_quick_invoke();
+    if unlikely(!vm.receiver_matches_class(Value::from_word(receiver),site.class)) {
+        vm.disable_current_monomorphic_invoke();
+        h_invoke(vm,ptr);
+        return;
+    }
+    let CallTarget::Bytecode(function)=site.target else {
+        cold_path();
+        h_invoke_mono(vm,ptr);
+        return;
+    };
+    h_invoke_bytecode_target(vm,&op,function,receiver);
+}
+
+/// Shared tail of the large-arity monomorphic/profiled bytecode handlers.
+#[inline(always)]
+unsafe fn h_invoke_bytecode_target(vm:&mut Interpreter, op:&PreparedOp, function:u32, receiver:RegisterWord){
+    let op=*op;
 
     // The receiver/argument registers must be read before push_frame can resize
     // the current fiber register stack and invalidate the hot GPR base.
@@ -17736,6 +18104,427 @@ unsafe fn h_call_foreign(vm:&mut Interpreter, ptr:*const PreparedOp){
     }
 }
 
+/// Execute a complete class definition in a single token-threaded dispatch.
+/// The compiler only emits this opcode when its absorbed BindMethod operations
+/// have no separately observable control-flow or deoptimization entry points.
+unsafe fn h_define_class_specialized(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    use crate::napalm_bytecode::{SpecializedDescriptor, SpecializedMethodTarget};
+
+    let op = unsafe { &*ptr };
+    // Preserve the precise reference map before resolving the dynamic superclass.
+    vm.mark_gc_point(op);
+    let function_index = vm.current_function_index();
+    // The BytecodeProgram outlives the VM. Borrowing its immutable descriptor
+    // separately avoids heap allocations while linking runtime class metadata.
+    let program = vm.program;
+    let (class_id, methods, implements) = match program.functions[function_index]
+        .chunk.specializations.get(op.y as usize)
+    {
+        Some(SpecializedDescriptor::Class { class, methods, implements }) =>
+            (*class, methods, implements),
+        _ => {
+            vm.fail_at(op, "DefineClass references an invalid class descriptor");
+            return;
+        }
+    };
+
+    let slot = op.x as usize;
+    let Some(runtime_class) = vm.classes.get(slot) else {
+        vm.fail_at(op, "DefineClass class slot out of range");
+        return;
+    };
+    if runtime_class.id != class_id || runtime_class.own_implements.as_slice() != implements.as_slice() {
+        vm.fail_at(op, "DefineClass descriptor disagrees with runtime class metadata");
+        return;
+    }
+
+    let superclass = if op.c == 1 {
+        let super_value = Value::from_word(vm.reg(op.b));
+        match vm.heap.get(super_value) {
+            Some(HeapObject::ClassObject { class_slot }) => Some(*class_slot),
+            _ => {
+                vm.fail_at(op, "DefineDerivedClass superclass is not a class");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(error) = vm.link_class_layout(op.x, superclass) {
+        vm.fail_at(op, error.message);
+        return;
+    }
+
+    // Bind after inheritance copy-down, exactly as CreateClass followed by
+    // BindMethod/BindForeignMethod. Only one invalidation is required because
+    // no executable instruction can observe an intermediate method table.
+    let method_count = vm.classes[slot].instance_methods.len();
+    let has_bindings = !methods.is_empty();
+    for method in methods {
+        let index = method.symbol.0 as usize;
+        if index >= method_count {
+            vm.fail_at(op, "DefineClass method symbol out of range");
+            return;
+        }
+        let target = match &method.target {
+            SpecializedMethodTarget::Function(function) => {
+                let Some(function_index) = vm.prepared.function_by_id.get(function).copied() else {
+                    vm.fail_at(op, "DefineClass method function does not exist");
+                    return;
+                };
+                CallTarget::Bytecode(function_index)
+            }
+            SpecializedMethodTarget::Foreign(foreign) => CallTarget::Foreign(*foreign),
+        };
+        let table = if method.is_static {
+            &mut vm.classes[slot].static_methods
+        } else {
+            &mut vm.classes[slot].instance_methods
+        };
+        table[index] = Some(target);
+    }
+    if has_bindings {
+        vm.invalidate_method_traces();
+    }
+    let value = vm.classes[slot].class_value;
+    vm.set_reg(op.a, value.word());
+    vm.advance(op);
+}
+
+/// Interface and type aliases are canonicalized into RuntimeMetadata before
+/// bytecode execution. This instruction verifies the named declaration; it must
+/// never create another contract identity or replace the existing canonical one.
+unsafe fn h_define_contract_specialized(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    use crate::napalm_bytecode::SpecializedDescriptor;
+
+    let op = unsafe { &*ptr };
+    let function_index = vm.current_function_index();
+    let descriptor = vm.program.functions[function_index]
+        .chunk.specializations.get(op.x as usize);
+    let Some(SpecializedDescriptor::Contract { name: Some(name), contract }) = descriptor else {
+        vm.fail_at(op, "DefineInterface/DefineType needs a named contract");
+        return;
+    };
+    let named_and_canonical = vm.program.metadata.contract_names.iter()
+        .any(|(declared_name, declared_type)| declared_name == name && declared_type == contract);
+    if !named_and_canonical {
+        vm.fail_at(op, "contract declaration is absent from canonical runtime metadata");
+        return;
+    }
+    // This is a declaration, not the creation of a runtime object. The source
+    // language's interface/type names are compile-time entities.
+    vm.advance(op);
+}
+
+/// Unsupported specialized opcodes must fail explicitly until they have
+/// complete baseline semantics and independently verified GC roots.
+/// Install a persistent structural contract using the original transactional
+/// validator. Interface contracts remain open; Record contracts forbid additions.
+unsafe fn h_implement_structural_contract(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    use crate::napalm_bytecode::SpecializedDescriptor;
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    let descriptor = vm.program.functions[vm.current_function_index()]
+        .chunk.specializations.get(op.x as usize);
+    let Some(SpecializedDescriptor::Contract { contract, .. }) = descriptor else {
+        vm.fail_at(op, "ImplementInterfaceOrType descriptor is invalid");
+        return;
+    };
+    if !matches!(contract, Type::Interface(_) | Type::Record(_)) {
+        vm.fail_at(op, "ImplementInterfaceOrType requires a structural contract");
+        return;
+    }
+    let value = Value::from_word(unsafe { vm.reg(op.b) });
+    match vm.heap.bind_contract(value, contract) {
+        Ok(()) => unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
+/// Allocate a typed List and attach the persistent element contract. This is
+/// shared by the interpreter and the GC-safe JIT fallback, so the latter never
+/// redispatches the original handler.
+fn allocate_specialized_typed_array(
+    vm: &mut Interpreter<'_>, op: &PreparedOp,
+) -> Result<Value, RuntimeError> {
+    use crate::napalm_bytecode::SpecializedDescriptor;
+    let descriptor = vm.program.functions[vm.current_function_index()]
+        .chunk.specializations.get(op.x as usize);
+    let Some(SpecializedDescriptor::ArrayType { element, with_capacity }) = descriptor else {
+        return Err(RuntimeError::new("DefineArrayWithGenerics descriptor is invalid"));
+    };
+    let capacity = if *with_capacity {
+        let requested = unsafe { word_i32(vm.reg(op.b)) };
+        if requested < 0 {
+            return Err(RuntimeError::new("negative list capacity"));
+        }
+        requested as usize
+    } else { 0 };
+    let contract = Type::List(Some(Box::new(element.clone())));
+    let value = vm.heap.alloc(HeapObject::List(Vec::with_capacity(capacity)));
+    vm.heap.bind_contract(value, &contract)?;
+    Ok(value)
+}
+
+unsafe fn h_define_typed_array(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    match allocate_specialized_typed_array(vm, op) {
+        Ok(value) => unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
+/// Read the packed source registers before heap allocation; the values stay
+/// rooted by the original precise bytecode reference map until publication.
+unsafe fn gather_specialized_values(
+    vm: &Interpreter<'_>, op: &PreparedOp,
+) -> [Value; ARGUMENT_REGISTER_COUNT] {
+    let mut values = [Value::NULL; ARGUMENT_REGISTER_COUNT];
+    if op.c <= 4 {
+        let mut words = [RegisterWord(0); 4];
+        let count = unsafe { vm.gather_call_words_small(op, &mut words) };
+        for index in 0..count {
+            values[index] = Value::from_word(words[index]);
+        }
+    } else {
+        let mut words = [RegisterWord(0); 17];
+        let count = unsafe { vm.gather_call_words_large(op, &mut words) };
+        for index in 0..count {
+            values[index] = Value::from_word(words[index]);
+        }
+    }
+    values
+}
+
+/// Initialize an unpublished Map in source order with compile-time string keys.
+/// This can create the physical shape without MapSet interpreter dispatches,
+/// inline caches, write barriers or intermediary observable objects.
+fn allocate_named_object(
+    vm: &mut Interpreter<'_>,
+    names: &[StringId],
+    values: &[Value],
+    contract: Option<&Type>,
+    site_index: Option<usize>,
+) -> Result<Value, RuntimeError> {
+    if names.len() != values.len() {
+        return Err(RuntimeError::new("object literal property count mismatch"));
+    }
+    // A factory with constant program-string keys can reuse the monomorphic
+    // allocation site across calls. After the first run, allocation builds the
+    // Map in one GC object without MapShapeTable probes or value insertions.
+    if let Some(index) = site_index {
+        if (1..=4).contains(&names.len()) {
+            let strings = &vm.strings;
+            let get = |slot: usize| -> Result<(Value, Value), RuntimeError> {
+                let name = names[slot].0 as usize;
+                let key = *strings.get(name)
+                    .ok_or_else(|| RuntimeError::new("invalid object property string ID"))?;
+                Ok((key, values[slot]))
+            };
+            let object = match names.len() {
+                1 => vm.heap.alloc_map_from_site::<1>([get(0)?],
+                    &mut vm.prepared.functions[vm.hot_function_index as usize].small_map_literal_sites[index])?,
+                2 => vm.heap.alloc_map_from_site::<2>([get(0)?, get(1)?],
+                    &mut vm.prepared.functions[vm.hot_function_index as usize].small_map_literal_sites[index])?,
+                3 => vm.heap.alloc_map_from_site::<3>([get(0)?, get(1)?, get(2)?],
+                    &mut vm.prepared.functions[vm.hot_function_index as usize].small_map_literal_sites[index])?,
+                4 => vm.heap.alloc_map_from_site::<4>([get(0)?, get(1)?, get(2)?, get(3)?],
+                    &mut vm.prepared.functions[vm.hot_function_index as usize].small_map_literal_sites[index])?,
+                _ => unreachable!(),
+            };
+            if let Some(contract) = contract {
+                vm.heap.bind_contract(object, contract)?;
+            }
+            return Ok(object);
+        }
+    }
+    let mut map = NapalmMap::default();
+    for (&name, &value) in names.iter().zip(values) {
+        let text = vm.program.metadata.string(name)
+            .ok_or_else(|| RuntimeError::new("invalid object property name"))?;
+        let key = MapKey::String(MapStringKey::new(Arc::from(text.as_bytes())));
+        map.insert_unpublished(&mut vm.heap.map_shapes, key, value);
+    }
+    let result = vm.heap.alloc(HeapObject::Map(map));
+    if let Some(contract) = contract {
+        vm.heap.bind_contract(result, contract)?;
+    }
+    Ok(result)
+}
+
+/// Shared allocation core for baseline handlers and the Cranelift/LLVM
+/// synchronized factory path. The caller owns the GC safepoint and GC poll.
+/// This routine never advances the bytecode PC or enters another VM frame.
+fn allocate_specialized_object(
+    vm: &mut Interpreter<'_>, op: &PreparedOp, opcode: Opcode,
+) -> Result<Value, RuntimeError> {
+    use crate::napalm_bytecode::SpecializedDescriptor;
+    if opcode == Opcode::NewObjectEmpty {
+        return Ok(vm.heap.alloc(HeapObject::Map(NapalmMap::default())));
+    }
+    // `vm.program` outlives the &mut borrow of the VM: descriptors, names and
+    // contracts are borrowed, never cloned, on every path below.
+    let program = vm.program;
+    let descriptor = program.functions[vm.current_function_index()]
+        .chunk.specializations.get(op.x as usize);
+    let contract = match (opcode, descriptor) {
+        (Opcode::NewObjectWithProperties, Some(SpecializedDescriptor::ObjectProperties { .. })) => None,
+        (Opcode::NewInterfaceOrTypeObject, Some(SpecializedDescriptor::ObjectShape { contract: Some(contract), .. })) =>
+            Some(contract),
+        (Opcode::NewObjectShape, Some(SpecializedDescriptor::ObjectShape { contract, .. })) => contract.as_ref(),
+        (Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject | Opcode::NewObjectShape, _) =>
+            return Err(RuntimeError::new(format!("{} descriptor is invalid", opcode.name()))),
+        _ => return Err(RuntimeError::new("unsupported structural factory opcode")),
+    };
+
+    // Steady state. Each factory op owns its allocation site (op.cache), and
+    // its keys are compile-time program strings, so once the site has learned
+    // the shape no key handle or property name needs to be read again: place
+    // the values by slot and allocate the inline map directly. Preparation
+    // assigns a site to every NewObjectShape and to 1..=4-value factories.
+    let has_site = opcode == Opcode::NewObjectShape || (1..=SMALL_MAP_INLINE_FIELDS).contains(&(op.c as usize));
+    if has_site {
+        let site = vm.prepared.functions[vm.hot_function_index as usize]
+            .small_map_literal_sites.get(op.cache as usize).copied();
+        if let Some(site) = site {
+            let count = if opcode == Opcode::NewObjectShape { site.field_count as usize } else { op.c as usize };
+            if site.initialized && !site.disabled && site.stable_program_keys
+                && count != 0 && site.field_count as usize == count
+                && site.value_count as usize <= SMALL_MAP_INLINE_FIELDS
+                && site.slots[..count].iter().all(|&slot| slot < site.value_count as u16)
+            {
+                let mut values = InlineMapValues::new();
+                values.resize(site.value_count as usize, Value::NULL);
+                if opcode != Opcode::NewObjectShape {
+                    let sources = unsafe { gather_specialized_values(vm, op) };
+                    // In source order: a duplicated key keeps its last value.
+                    for index in 0..count {
+                        unsafe { *values.get_unchecked_mut(site.slots[index] as usize) = sources[index]; }
+                    }
+                }
+                let object = vm.heap.alloc_inline_map(site.shape, values);
+                if let Some(contract) = contract {
+                    vm.heap.bind_contract(object, contract)?;
+                }
+                return Ok(object);
+            }
+        }
+    }
+
+    match (opcode, descriptor) {
+        (Opcode::NewObjectWithProperties, Some(SpecializedDescriptor::ObjectProperties { names })) => {
+            let values = unsafe { gather_specialized_values(vm, op) };
+            allocate_named_object(vm, names, &values[..op.c as usize], None,
+                has_site.then_some(op.cache as usize))
+        }
+        (_, Some(SpecializedDescriptor::ObjectShape { layout, .. })) => {
+            let Some(layout) = program.metadata.structural_layout(*layout) else {
+                return Err(RuntimeError::new("unknown structural layout"));
+            };
+            let names: smallvec::SmallVec<[StringId; SMALL_MAP_INLINE_FIELDS]> =
+                layout.properties.iter().map(|field| field.name).collect();
+            if opcode == Opcode::NewInterfaceOrTypeObject {
+                let values = unsafe { gather_specialized_values(vm, op) };
+                allocate_named_object(vm, &names, &values[..op.c as usize], contract,
+                    has_site.then_some(op.cache as usize))
+            } else if names.len() <= SMALL_MAP_INLINE_FIELDS {
+                let null_values = [Value::NULL; SMALL_MAP_INLINE_FIELDS];
+                allocate_named_object(vm, &names, &null_values[..names.len()], contract,
+                    (!names.is_empty()).then_some(op.cache as usize))
+            } else {
+                let values = vec![Value::NULL; names.len()];
+                allocate_named_object(vm, &names, &values, contract, None)
+            }
+        }
+        _ => Err(RuntimeError::new("unsupported structural factory opcode")),
+    }
+}
+
+/// The four object factories share one optimized implementation. The match is
+/// outside the hot handler table and contains no general MapSet dispatch.
+unsafe fn h_new_object_factory(vm: &mut Interpreter, ptr: *const PreparedOp, opcode: Opcode) {
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    match allocate_specialized_object(vm, op, opcode) {
+        Ok(object) => unsafe { vm.set_reg(op.a, object.word()); vm.advance(op) },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
+unsafe fn h_new_object_empty(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    unsafe { h_new_object_factory(vm, ptr, Opcode::NewObjectEmpty) }
+}
+unsafe fn h_new_object_with_properties(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    unsafe { h_new_object_factory(vm, ptr, Opcode::NewObjectWithProperties) }
+}
+unsafe fn h_new_interface_or_type_object(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    unsafe { h_new_object_factory(vm, ptr, Opcode::NewInterfaceOrTypeObject) }
+}
+unsafe fn h_new_object_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    unsafe { h_new_object_factory(vm, ptr, Opcode::NewObjectShape) }
+}
+
+/// Allocates the instance once and calls its statically known constructor.
+/// The constructor's return value is discarded: the destination remains the
+/// allocated receiver, including when a constructor returns an explicit value.
+/// The allocation half of NewClassInstance (no constructor). The caller owns
+/// the GC point/poll. Prepared Y is the dense class slot.
+fn allocate_class_instance_shell(vm: &mut Interpreter<'_>, op: &PreparedOp) -> Result<Value, RuntimeError> {
+    let Some(layout) = vm.classes.get(op.y as usize) else {
+        return Err(RuntimeError::new("NewClassInstance class slot out of range"));
+    };
+    if !layout.layout_finalized {
+        return Err(RuntimeError::new("NewClassInstance requires a finalized class layout"));
+    }
+    let count = layout.total_instance_field_count as usize;
+    Ok(vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(op.y, count))))
+}
+
+unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    // Preparation resolved Y = class slot and CACHE = constructor index.
+    let slot = op.y;
+    debug_assert!((slot as usize) < vm.classes.len(), "prepared NewClassInstance class slot out of range");
+    let layout = unsafe { vm.classes.get_unchecked(slot as usize) };
+    if unlikely(!layout.layout_finalized) {
+        vm.fail_at(op, "NewClassInstance requires a finalized class layout");
+        return;
+    }
+    let count = layout.total_instance_field_count as usize;
+    // Read the operands before writing A: the destination may alias one.
+    let args = unsafe { gather_specialized_values(vm, op) };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    let instance = vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(slot, count)));
+    unsafe { vm.set_reg(op.a, instance.word()); }
+    if op.cache != NO_INDEX {
+        let caller_pc = vm.raw_pc_for_op(op);
+        unsafe { vm.advance(op); }
+        vm.flush_hot_pc();
+        let mut explicit = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+        for (index, value) in args[..op.c as usize].iter().enumerate() {
+            explicit[index] = value.word();
+        }
+        // No result register: the destination keeps the instance, whatever the
+        // constructor returns. Constructors are never memoized (verifier).
+        match vm.push_frame(op.cache, Some(instance.word()), &explicit[..op.c as usize], None, None) {
+            Ok(()) => vm.current_frame_mut().caller_pc = caller_pc,
+            Err(error) => vm.fail_at_raw_pc(caller_pc, error.message),
+        }
+    } else {
+        unsafe { vm.advance(op); }
+    }
+}
+
+unsafe fn h_unsupported_specialized_opcode(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    vm.fail_at(op, "specialized opcode is not implemented in the interpreter");
+}
+
 unsafe fn h_create_class(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let slot=op.x;
@@ -17767,19 +18556,162 @@ unsafe fn h_alloc_instance(vm:&mut Interpreter, ptr:*const PreparedOp){
         return;
     }
     let count=class.total_instance_field_count as usize;
-    let value=vm.heap.alloc(HeapObject::Instance{
-        class_slot:op.x,
-        fields:vec![Value::NULL;count].into_boxed_slice()
-    });
+    let value=vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(op.x, count)));
     vm.set_reg(op.a,value.word());
     vm.advance(op)
 }
 unsafe fn h_alloc_foreign(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let size=word_i32(vm.reg(op.b));if size<0{vm.fail_at(op,"negative foreign allocation size");return;}let value=vm.heap.alloc(HeapObject::Foreign{class_slot:op.x,bytes:vec![0;size as usize]});vm.set_reg(op.a,value.word());vm.advance(op)}
+// Known-layout field bytecodes use the same write barriers, reactive tracking,
+// nullability checks and polymorphic inline caches as their baseline equivalents.
+// The prepare pass turns descriptor IDs into physical layout/field operands.
+/// Structural property read with a statically known layout (X) and logical
+/// slot (Y). One object lookup decides the representation:
+/// - shaped Map: the per-op PIC, then the shape's family membership (both give
+///   the physical slot without hashing the key);
+/// - class instance satisfying the layout: a per-op class -> field offset cache
+///   replaces the field-name search;
+/// anything else (dictionary maps, misses, nulls needing a trap) takes the
+/// authoritative LoadProperty path.
+unsafe fn h_get_field_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    let object = Value::from_word(unsafe { vm.reg(op.b) });
+    let function = vm.current_function_index();
+    let prepared = unsafe { vm.prepared.functions.get_unchecked_mut(function) };
+    let map_cache = unsafe { &mut *prepared.map_inline_caches.as_mut_ptr().add(op.cache as usize) };
+    let instance_cache = unsafe { &mut *prepared.structural_instance_caches.as_mut_ptr().add(op.cache as usize) };
+    let hit = match vm.heap.get(object) {
+        Some(HeapObject::Map(map)) => map.shaped().and_then(|(shape, values)| {
+            if let Some(slot) = map_cache.probe_property(shape) {
+                return Some(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            match vm.heap.map_shapes.family_slot_layout(
+                shape, StructuralLayoutId(op.x), PropertySlotId(op.y as u16),
+            )? {
+                Some(slot) => {
+                    map_cache.insert(shape, slot);
+                    Some(unsafe { *values.get_unchecked(slot as usize) })
+                }
+                // Optional declared property absent from this family member.
+                None => Some(Value::NULL),
+            }
+        }),
+        Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) => {
+            let class_slot = *class_slot;
+            if instance_cache.class_slot == class_slot {
+                // A null may be an uninitialized non-nullable field: let the
+                // generic path decide (it traps or returns null).
+                fields.get(instance_cache.field as usize).copied().filter(|value| !value.is_null())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(value) = hit {
+        if !(vm.reactive_tracking_active || vm.reactive_skip_next_field_track) {
+            unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) }
+            return;
+        }
+    }
+    // Learn the instance offset once (immutable class layout, constant key).
+    let key = Value::from_word(unsafe { vm.reg(op.c) });
+    if let Some(Some((class_slot, field))) = vm.instance_property_slot(object, key) {
+        let prepared = unsafe { vm.prepared.functions.get_unchecked_mut(function) };
+        prepared.structural_instance_caches[op.cache as usize] =
+            StructuralInstanceCache { class_slot, field: field as u32 };
+    }
+    unsafe { h_load_property(vm, ptr) }
+}
+
+#[inline(always)]
+unsafe fn h_set_field_shape(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    unsafe { h_store_property(vm, ptr) }
+}
+
+/// Known-class field read at a relocated absolute offset (X). Y carries the
+/// compile-time facts: a nullable field needs no uninitialized-field trap.
+unsafe fn h_get_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_NULLABLE == 0 {
+        // Non-nullable: identical to LoadField, including the null trap.
+        return unsafe { h_load_field(vm, ptr) };
+    }
+    let obj = Value::from_word(unsafe { vm.reg(op.b) });
+    let value = match vm.heap.get(obj) {
+        Some(HeapObject::Instance(fields)) => {
+            debug_assert!((op.x as usize) < fields.len(), "verified GetFieldClass slot is out of range");
+            unsafe { *fields.get_unchecked(op.x as usize) }
+        }
+        _ => { vm.fail_at(op, "LoadField object is not an instance"); return; }
+    };
+    if unlikely(vm.reactive_skip_next_field_track) {
+        vm.reactive_skip_next_field_track = false;
+    } else if unlikely(vm.reactive_tracking_active) {
+        vm.reactive_track_field(obj, ReactiveSourceKind::InstanceField, op.x, value);
+    }
+    unsafe { vm.set_reg(op.a, value.word()); vm.advance(op) }
+}
+
+/// Known-class field write. With FIELD_CLASS_UNCHECKED_STORE the value's
+/// static type already satisfies the field contract: no runtime type check, no
+/// field-type clone, no generic check and a single object lookup (plus the
+/// remembered-set barrier for references).
+unsafe fn h_set_field_class(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    if op.y & crate::napalm_bytecode::FIELD_CLASS_UNCHECKED_STORE == 0 {
+        return unsafe { h_store_field(vm, ptr) };
+    }
+    let obj = Value::from_word(unsafe { vm.reg(op.a) });
+    let value = Value::from_word(unsafe { vm.reg(op.b) });
+    // Barrier immediately before the mutation, as in StoreField.
+    vm.heap.remember_if_reference(obj, value);
+    let old = match vm.heap.get_mut(obj) {
+        Some(HeapObject::Instance(fields)) => {
+            debug_assert!((op.x as usize) < fields.len(), "verified SetFieldClass slot is out of range");
+            let slot = unsafe { fields.get_unchecked_mut(op.x as usize) };
+            std::mem::replace(slot, value)
+        }
+        _ => { vm.fail_at(op, "StoreField object is not an instance"); return; }
+    };
+    if unlikely(vm.reactive_enabled) && old.raw_bits() != value.raw_bits() {
+        vm.reactive_trigger(obj, ReactiveSourceKind::InstanceField, op.x);
+    }
+    unsafe { vm.advance(op) }
+}
+
+/// The optimistic method target is valid only while lookup resolves to the
+/// descriptor's function. Inherited overrides and later method rebinding take
+/// the exact original inline-cache path, including its errors and host methods.
+unsafe fn h_invoke_method_direct(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { *ptr };
+    let receiver = unsafe { vm.reg(op.b) };
+    let receiver_value = Value::from_word(receiver);
+    let descriptor = vm.program.functions[vm.hot_function_index as usize]
+        .chunk.specializations.get(op.x as usize);
+    let Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod { symbol, .. }) = descriptor else {
+        vm.fail_at(&op, "invalid direct method descriptor");
+        return;
+    };
+    let symbol = *symbol;
+    if let Ok(class) = vm.receiver_class(receiver_value) {
+        if vm.lookup_method(class, symbol, None) == Some(CallTarget::Bytecode(op.y)) {
+            unsafe { invoke_args_and_target(vm, &op, CallTarget::Bytecode(op.y), receiver) };
+            return;
+        }
+    }
+    // Restore the original Invoke IC index rather than treating the specialized
+    // descriptor ID as an inline-cache index.
+    let mut generic = op;
+    generic.x = op.cache;
+    generic.flags = 1; // Never quicken a specialized opcode into a different handler.
+    unsafe { h_invoke(vm, &generic) };
+}
+
 unsafe fn h_load_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
     let (class_slot,value)={
-        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+        let Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
         (*class_slot,*fields.get_unchecked(slot))
     };
@@ -17805,7 +18737,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.b));
     let slot=op.x as usize;
     let (class_slot,value)={
-        let Some(HeapObject::Instance{class_slot,fields})=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
+        let Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=vm.heap.get(obj) else {vm.fail_at(op,"LoadField object is not an instance");return;};
         debug_assert!(slot < fields.len(), "verified LoadField slot is out of range");
         (*class_slot,*fields.get_unchecked(slot))
     };
@@ -17830,7 +18762,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
     let (class_slot,index,old)=match vm.heap.get(obj){
-        Some(HeapObject::Instance{class_slot,fields})=>{
+        Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. }))=>{
             let index=op.x as usize;
             debug_assert!(index < fields.len(), "verified StoreField slot is out of range");
             (*class_slot,index,*fields.get_unchecked(index))
@@ -17843,7 +18775,7 @@ unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
         if let Err(error)=vm.check_generic_field_store(obj,class_slot,index,value){vm.fail_at(op,error.message);return;}
     }
     vm.heap.remember_if_reference(obj, value);
-    let Some(HeapObject::Instance{fields,..})=vm.heap.get_mut(obj) else {std::hint::unreachable_unchecked()};
+    let Some(HeapObject::Instance(fields))=vm.heap.get_mut(obj) else {std::hint::unreachable_unchecked()};
     *fields.get_unchecked_mut(index)=value;
     if unlikely(vm.reactive_enabled) && old.raw_bits()!=value.raw_bits(){vm.reactive_trigger(obj,ReactiveSourceKind::InstanceField,op.x);}
     vm.advance(op)
@@ -17897,7 +18829,7 @@ unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     if unlikely(vm.reactive_enabled) && old.raw_bits()!=value.raw_bits(){vm.reactive_trigger(class,ReactiveSourceKind::StaticField,op.x);}
     vm.advance(op)
 }
-unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance{class_slot,..})|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
+unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance(InstanceObject { class_slot, .. }))|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
 
 unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
@@ -18611,7 +19543,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
             Some(HeapObject::ClassObject { class_slot }) => self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("<class>").to_owned(),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
-            Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
             Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
@@ -19070,10 +20002,30 @@ impl TraceRuntime for Interpreter<'_> {
             .map_or(local_slot, |op| op.x)
     }
 
+    fn trace_instance_class(&self, class: ClassId) -> Option<u64> {
+        let slot = *self.prepared.class_by_id.get(&class)?;
+        let layout = self.classes.get(slot as usize)?;
+        (layout.layout_finalized && !layout.is_foreign).then_some(CLASS_KIND_INSTANCE | slot as u64)
+    }
+
+    fn trace_class_field_type(&self, class: u64, slot: u32) -> Option<Type> {
+        if class & !0x00ff_ffff_ffff_ffff != CLASS_KIND_INSTANCE { return None; }
+        let class_slot = (class & 0x00ff_ffff_ffff_ffff) as usize;
+        self.classes.get(class_slot)?.instance_field_types.get(slot as usize).cloned()
+    }
+
+    fn trace_class_field_is_generic(&self, class: u64, slot: u32) -> bool {
+        if class & !0x00ff_ffff_ffff_ffff != CLASS_KIND_INSTANCE { return true; }
+        let class_slot = (class & 0x00ff_ffff_ffff_ffff) as usize;
+        self.classes.get(class_slot)
+            .and_then(|info| info.generic_fields.get(slot as usize).copied())
+            .unwrap_or(true)
+    }
+
     fn trace_field_type(&self, object: RegisterWord, slot: u32) -> Option<Type> {
         let value = Value::from_word(object);
         let class_slot = match self.heap.get(value)? {
-            HeapObject::Instance { class_slot, .. } => *class_slot,
+            HeapObject::Instance(InstanceObject { class_slot, .. }) => *class_slot,
             _ => return None,
         };
         self.classes
@@ -19085,7 +20037,7 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_field_is_generic(&self, object: RegisterWord, slot: u32) -> bool {
         match self.heap.get(Value::from_word(object)) {
-            Some(HeapObject::Instance { class_slot, .. }) => self
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => self
                 .classes
                 .get(*class_slot as usize)
                 .and_then(|class| class.generic_fields.get(slot as usize))
@@ -19234,6 +20186,9 @@ impl TraceRuntime for Interpreter<'_> {
         let opcode = self.program.functions[function as usize].chunk.code[raw_pc as usize].opcode().unwrap();
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
             | Opcode::LoadField | Opcode::StoreField | Opcode::CallDirect
+            | Opcode::GetFieldClass | Opcode::SetFieldClass
+            | Opcode::GetFieldShape | Opcode::SetFieldShape
+            | Opcode::InvokeMethodDirect
             | Opcode::MakeClosure | Opcode::CreateClass | Opcode::AllocInstance
             | Opcode::AllocForeign) {
             // These handlers consume preparation-time patched operands (direct
@@ -19246,7 +20201,9 @@ impl TraceRuntime for Interpreter<'_> {
                 op.cache = prepared_op.cache;
             }
         }
-        if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty | Opcode::StoreProperty | Opcode::StorePropertyIfPresent) {
+        if matches!(opcode, Opcode::MapGet | Opcode::MapSet | Opcode::LoadProperty
+            | Opcode::StoreProperty | Opcode::StorePropertyIfPresent
+            | Opcode::GetFieldShape | Opcode::SetFieldShape | Opcode::InvokeMethodDirect) {
             op.cache = self.current_prepared().ops[self.hot_pc as usize].cache;
         }
         // Runtime boundaries inside a trace still execute exactly one logical
@@ -19291,9 +20248,11 @@ impl TraceRuntime for Interpreter<'_> {
             .code[raw_pc as usize]
             .opcode()
             .ok_or_else(|| RuntimeError::new("trace call boundary has invalid opcode"))?;
-        if opcode == Opcode::CallDirect {
+        if matches!(opcode, Opcode::CallDirect | Opcode::InvokeMethodDirect) {
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
+            op.y = prepared_op.y;
+            op.cache = prepared_op.cache;
         }
 
         if !matches!(
@@ -19301,12 +20260,14 @@ impl TraceRuntime for Interpreter<'_> {
             Opcode::Invoke
                 | Opcode::InvokeSpread
                 | Opcode::InvokeSuper
+                | Opcode::InvokeMethodDirect
                 | Opcode::CallDirect
                 | Opcode::CallClosure
                 | Opcode::Launch
                 | Opcode::CallPrimitive
                 | Opcode::CallForeign
                 | Opcode::ImportModule
+                | Opcode::NewClassInstance
         ) {
             return Err(RuntimeError::new("trace call-to-return used for non-call opcode"));
         }
@@ -19365,6 +20326,9 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_activation_inputs(&mut self) -> Result<TraceActivationInputs, RuntimeError> {
+        // The same fixed-size Immix reservation protocol as the whole-function
+        // tier. Refreshed after any helper that may collect or switch the VM.
+        let fast = self.heap.inline_map_fast_allocation_info();
         self.flush_hot_pc();
         let general = self.hot_registers;
         let runtime = self as *mut Self as *mut std::ffi::c_void;
@@ -19372,7 +20336,14 @@ impl TraceRuntime for Interpreter<'_> {
         Ok(TraceActivationInputs { general, arguments: banks.arguments.as_mut_ptr(),
             returns: banks.returns.as_mut_ptr(), special: banks.special.as_mut_ptr(), runtime,
             execute: execute_trace_runtime, heap_chunks: handles().jit_chunks(),
-            heap_write_barrier: trace_heap_write_barrier })
+            heap_write_barrier: trace_heap_write_barrier,
+            factory_cursor: fast.as_ref().map_or(std::ptr::null_mut(), |info| info.cursor as *mut usize),
+            factory_limit: fast.as_ref().map_or(std::ptr::null_mut(), |info| info.limit as *mut usize),
+            factory_bytes: fast.as_ref().map_or(0, |info| info.bytes),
+            factory_alignment: fast.as_ref().map_or(0, |info| info.alignment),
+            factory_probe: trace_native_factory_probe,
+            factory_commit: trace_native_factory_commit,
+        })
     }
 
     fn trace_list_len(&self, value: RegisterWord) -> Option<usize> {
@@ -19388,7 +20359,7 @@ impl TraceRuntime for Interpreter<'_> {
             HeapObject::List(_) => Some(TraceHeapObjectKind::List),
             HeapObject::Map(_) => Some(TraceHeapObjectKind::Map),
             HeapObject::Cell(_) => Some(TraceHeapObjectKind::Cell),
-            HeapObject::Instance { .. } => Some(TraceHeapObjectKind::Instance),
+            HeapObject::Instance(_) => Some(TraceHeapObjectKind::Instance),
             HeapObject::Promise { .. } => Some(TraceHeapObjectKind::Promise),
             HeapObject::Range { .. } => Some(TraceHeapObjectKind::Range),
             HeapObject::Closure { .. } => Some(TraceHeapObjectKind::Closure),
@@ -19628,7 +20599,7 @@ impl Interpreter<'_> {
             .and_then(|function| function.chunk.code.get(raw_pc as usize))
             .and_then(|word| word.opcode())
             .ok_or_else(|| RuntimeError::new("direct trace call opcode is invalid"))?;
-        if !matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::InvokeSpread | Opcode::CallClosure) {
+        if !matches!(opcode, Opcode::Invoke | Opcode::InvokeMethodDirect | Opcode::InvokeSuper | Opcode::InvokeSpread | Opcode::CallClosure) {
             return Err(RuntimeError::new("direct trace call used outside Invoke/InvokeSuper/InvokeSpread/CallClosure"));
         }
 
@@ -19638,7 +20609,7 @@ impl Interpreter<'_> {
         if destination > u8::MAX as u32
             || destination as u8 != op.a
             || arity > ARGUMENT_REGISTER_COUNT
-            || (matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallClosure)
+            || (matches!(opcode, Opcode::Invoke | Opcode::InvokeMethodDirect | Opcode::InvokeSuper | Opcode::CallClosure)
                 && op.c as usize != arity)
         {
             return Err(RuntimeError::new("invalid direct trace call metadata"));
@@ -19799,6 +20770,7 @@ impl Interpreter<'_> {
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_INSERT
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
                 | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL
+                | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY
         );
         if requires_gc {
             self.mark_gc_point(&op);
@@ -19900,6 +20872,29 @@ impl Interpreter<'_> {
                     unsafe { self.set_reg(op.a, value.word()) };
                 })
             }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY
+                if matches!(opcode,
+                    Opcode::NewObjectEmpty | Opcode::NewObjectShape
+                    | Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject
+                    | Opcode::DefineArrayWithGenerics) =>
+            {
+                let result = if opcode == Opcode::DefineArrayWithGenerics {
+                    allocate_specialized_typed_array(self, &op)
+                } else {
+                    allocate_specialized_object(self, &op, opcode)
+                };
+                result.map(|value| unsafe { self.set_reg(op.a, value.word()) })
+            }
+            // Allocate-only half of NewClassInstance: the trace inlines the
+            // constructor itself, so the VM stays at this PC (continuation ==
+            // location) with A holding the fresh, null-initialized instance.
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY
+                if opcode == Opcode::NewClassInstance =>
+            {
+                allocate_class_instance_shell(self, &op).map(|value| unsafe {
+                    self.set_reg(op.a, value.word())
+                })
+            }
             _ => return Err(RuntimeError::new("specialized collection mode/opcode mismatch")),
         };
 
@@ -19914,6 +20909,234 @@ impl Interpreter<'_> {
             || self.fiber(self.current_fiber).frames.len() != depth
             || self.hot_function_index != function;
         Ok(TraceStep { before, after, frame_changed, running })
+    }
+}
+
+/// Fast-path eligibility for native object allocations. This must never
+/// allocate managed memory or permit work that can fail before the reserved
+/// object has been initialized and published. A zero result selects the normal
+/// GC-safe bytecode factory without reserving a raw TLAB range.
+unsafe extern "C" fn trace_native_factory_probe(
+    activation: *mut TraceActivation,
+    function: u32,
+    pc: u32,
+) -> u32 {
+    let activation = unsafe { &mut *activation };
+    if activation.factory_cursor.is_null() || activation.factory_limit.is_null()
+        || activation.factory_bytes != std::mem::size_of::<ManagedObject>()
+        || activation.factory_alignment == 0
+        || !activation.factory_alignment.is_power_of_two()
+    {
+        return 0;
+    }
+    let vm = unsafe { &*(activation.runtime as *const Interpreter<'_>) };
+    if vm.run_state != RunState::Running || vm.hot_frame.is_null() {
+        return 0;
+    }
+    // Truly side-effect free: resolve the op without moving the VM PC (the
+    // commit or the slow helper positions the VM). The commit resumes in the
+    // *current* frame, so a location in any other function never reserves.
+    if vm.current_prepared().id != FuncId(function) { return 0; }
+    let function_index = vm.hot_function_index as usize;
+    let prepared = &vm.prepared.functions[function_index];
+    let Some(&op_index) = prepared.word_to_op.get(pc as usize) else { return 0; };
+    if op_index == NO_INDEX { return 0; }
+    let Some(op) = prepared.ops.get(op_index as usize) else { return 0; };
+    let Some(opcode) = vm.program.functions.get(function_index)
+        .and_then(|f| f.chunk.code.get(pc as usize)).and_then(|word| word.opcode())
+    else { return 0; };
+
+    let suitable = match opcode {
+        Opcode::NewObjectEmpty => true,
+        Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject
+        | Opcode::NewObjectShape => {
+            let Some(site) = prepared.small_map_literal_sites.get(op.cache as usize) else {
+                return 0;
+            };
+            let source_count = if opcode == Opcode::NewObjectShape {
+                site.field_count as usize
+            } else {
+                op.c as usize
+            };
+            source_count <= SMALL_MAP_INLINE_FIELDS
+                && site.initialized && !site.disabled && site.stable_program_keys
+                && site.field_count as usize == source_count
+                && site.value_count as usize <= SMALL_MAP_INLINE_FIELDS
+                && site.slots[..source_count].iter().all(|&slot| slot < site.value_count as u16)
+        }
+        Opcode::DefineArrayWithGenerics => {
+            // Empty typed arrays have an allocation-free external representation.
+            // Nonzero external capacity uses the ordinary managed allocation path.
+            let source = vm.program.functions[vm.hot_function_index as usize]
+                .chunk.specializations.get(op.x as usize);
+            matches!(source, Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType {
+                with_capacity: false, ..
+            })) || matches!(source,
+                Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { with_capacity: true, .. })
+                if word_i32(unsafe { vm.reg(op.b) }) == 0
+            )
+        }
+        Opcode::NewClassInstance => {
+            // Prepared Y = class slot, CACHE = constructor index (or NO_INDEX).
+            // Any finalized layout: the field array is unmanaged (Box) storage
+            // whose allocation never reaches a GC safepoint.
+            let Some(layout) = vm.classes.get(op.y as usize) else { return 0; };
+            !layout.is_foreign && layout.layout_finalized
+        }
+        _ => false,
+    };
+    u32::from(suitable)
+}
+
+/// Commit the machine-code-reserved Immix object. The probe guarantees that
+/// no managed allocation is needed to create its Rust payload; callbacks here
+/// must publish the object before any possible GC safepoint or frame change.
+unsafe extern "C" fn trace_native_factory_commit(
+    activation: *mut TraceActivation,
+    function: u32,
+    pc: u32,
+    next: u32,
+    reserved: u64,
+) -> u32 {
+    let activation = unsafe { &mut *activation };
+    let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
+    let continuation = TraceLocation::new(FuncId(function), BytecodePc(next & !crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if vm.run_state != RunState::Running || reserved == 0 {
+            return Err(RuntimeError::new("native factory received an invalid reservation"));
+        }
+        vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc)))?;
+        let caller_fiber = vm.current_fiber;
+        let caller_depth = vm.fiber(caller_fiber).frames.len();
+        let caller_function = vm.hot_function_index;
+        let op = vm.current_prepared().ops[vm.hot_pc as usize];
+        let opcode = vm.program.functions[caller_function as usize].chunk.code[pc as usize]
+            .opcode().ok_or_else(|| RuntimeError::new("invalid native factory opcode"))?;
+        vm.mark_gc_point(&op);
+        // Capture constructor operands before overwriting a possibly aliased
+        // destination register. This fixed-size local never allocates or GCs.
+        let constructor_args = if opcode == Opcode::NewClassInstance {
+            Some(unsafe { gather_specialized_values(vm, &op) })
+        } else { None };
+        let address = reserved as usize;
+        let object = match opcode {
+            Opcode::NewObjectEmpty => unsafe {
+                vm.heap.alloc_inline_map_reserved(address, 0, InlineMapValues::new())
+            },
+            Opcode::NewObjectShape | Opcode::NewObjectWithProperties
+            | Opcode::NewInterfaceOrTypeObject => {
+                let site = *vm.current_prepared().small_map_literal_sites
+                    .get(op.cache as usize)
+                    .ok_or_else(|| RuntimeError::new("factory shape cache is missing"))?;
+                let mut values = InlineMapValues::new();
+                values.resize(site.value_count as usize, Value::NULL);
+                if opcode != Opcode::NewObjectShape {
+                    let source_values = unsafe { gather_specialized_values(vm, &op) };
+                    for index in 0..site.field_count as usize {
+                        let slot = site.slots[index] as usize;
+                        unsafe { *values.get_unchecked_mut(slot) = source_values[index]; }
+                    }
+                }
+                let value = unsafe { vm.heap.alloc_inline_map_reserved(address, site.shape, values) };
+                if matches!(opcode, Opcode::NewObjectShape | Opcode::NewInterfaceOrTypeObject) {
+                    let descriptor = vm.program.functions[caller_function as usize]
+                        .chunk.specializations.get(op.x as usize);
+                    if let Some(crate::napalm_bytecode::SpecializedDescriptor::ObjectShape {
+                        contract: Some(contract), ..
+                    }) = descriptor {
+                        vm.heap.bind_contract(value, contract)?;
+                    }
+                }
+                value
+            }
+            Opcode::DefineArrayWithGenerics => {
+                let descriptor = vm.program.functions[caller_function as usize]
+                    .chunk.specializations.get(op.x as usize);
+                let Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { element, .. }) = descriptor else {
+                    return Err(RuntimeError::new("invalid native generic array descriptor"));
+                };
+                let contract = Type::List(Some(Box::new(element.clone())));
+                let value = unsafe {
+                    vm.heap.alloc_reserved_managed(address, HeapObject::List(Vec::new()))
+                };
+                vm.heap.bind_contract(value, &contract)?;
+                value
+            }
+            Opcode::NewClassInstance => {
+                // Unmanaged field storage: no GC safepoint before publication.
+                let count = vm.classes[op.y as usize].total_instance_field_count as usize;
+                unsafe {
+                    vm.heap.alloc_reserved_managed(address, HeapObject::Instance(InstanceObject::nulls(op.y, count)))
+                }
+            }
+            _ => return Err(RuntimeError::new("unsupported native factory kind")),
+        };
+        unsafe { vm.set_reg(op.a, object.word()) };
+        // OBJECT_FACTORY on NewClassInstance is the allocate-only half used when
+        // the trace inlines the constructor: stay at this PC (continuation).
+        let shell_only = opcode == Opcode::NewClassInstance
+            && next & crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK
+                == crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY;
+        if shell_only {
+            // With an inlined constructor the continuation is this same PC.
+            // Without a constructor the allocation completes the opcode.
+            if continuation.pc.0 != pc {
+                unsafe { vm.advance(&op) };
+            }
+        } else if opcode == Opcode::NewClassInstance {
+            let args = constructor_args.expect("validated constructor arguments");
+            if op.cache != NO_INDEX {
+                let callee = op.cache;
+                let caller_pc = vm.raw_pc_for_op(&op);
+                unsafe { vm.advance(&op) };
+                vm.flush_hot_pc();
+                let mut explicit = [RegisterWord(0); ARGUMENT_REGISTER_COUNT];
+                for (index, value) in args[..op.c as usize].iter().enumerate() {
+                    explicit[index] = value.word();
+                }
+                vm.push_frame(callee, Some(object.word()), &explicit[..op.c as usize], None, None)?;
+                vm.current_frame_mut().caller_pc = caller_pc;
+                // Preserve normal synchronous constructor completion semantics.
+                while vm.run_state == RunState::Running
+                    && vm.current_fiber == caller_fiber
+                    && vm.fiber(caller_fiber).frames.len() > caller_depth
+                {
+                    let pc = vm.hot_pc as usize;
+                    let handler = unsafe { *vm.hot_handlers.add(pc) };
+                    let prepared = unsafe { vm.hot_ops.add(pc) };
+                    unsafe { handler(vm, prepared) };
+                }
+            } else {
+                unsafe { vm.advance(&op) };
+            }
+        } else {
+            unsafe { vm.advance(&op) };
+        }
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) if vm.run_state == RunState::Running
+            && vm.trace_current_location() == continuation => {
+            match vm.trace_activation_inputs() {
+                Ok(inputs) => {
+                    activation.general = inputs.general;
+                    activation.arguments = inputs.arguments;
+                    activation.returns = inputs.returns;
+                    activation.special = inputs.special;
+                    activation.heap_chunks = inputs.heap_chunks;
+                    activation.method_epoch = vm.method_epoch;
+                    activation.factory_cursor = inputs.factory_cursor;
+                    activation.factory_limit = inputs.factory_limit;
+                    activation.factory_bytes = inputs.factory_bytes;
+                    activation.factory_alignment = inputs.factory_alignment;
+                    0
+                }
+                Err(error) => { vm.fail(error); 1 }
+            }
+        }
+        Ok(Ok(())) => 1,
+        Ok(Err(error)) => { vm.fail(error); 1 },
+        Err(_) => { vm.fail(RuntimeError::new("panic in native factory commit")); 1 },
     }
 }
 
@@ -19944,6 +21167,9 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
             crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_DIRECT_CALL => {
                 vm.trace_execute_direct_bytecode_call(activation)
             }
+            crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY => {
+                vm.trace_execute_call_to_return()
+            }
             crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_SPREAD
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SPREAD
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_LIST_REST
@@ -19954,7 +21180,8 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_REMOVE
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_GET
             | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MAP_SET
-            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL => {
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_SMALL_MAP_LITERAL
+            | crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_OBJECT_FACTORY => {
                 vm.trace_execute_collection_fast(mode, continuation)
             }
             _ => Err(RuntimeError::new("unknown JIT runtime helper mode")),
@@ -19971,6 +21198,10 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
                         activation.special = inputs.special;
                         activation.heap_chunks = inputs.heap_chunks;
                         activation.method_epoch = vm.method_epoch;
+                        activation.factory_cursor = inputs.factory_cursor;
+                        activation.factory_limit = inputs.factory_limit;
+                        activation.factory_bytes = inputs.factory_bytes;
+                        activation.factory_alignment = inputs.factory_alignment;
                         0
                     }
                     Err(error) => { vm.fail(error); 1 }
@@ -20700,8 +21931,9 @@ class Box {
   }
 }
 class Runner {
-  static run() {
-    const box = new Box(1);
+  // An untyped parameter keeps an ordinary Invoke: with a statically known
+  // receiver class the call would be devirtualized to CallDirect.
+  static run(box) {
     let result = 0;
     let i = 0;
     try {
@@ -20715,7 +21947,7 @@ class Runner {
     return result;
   }
 }
-var result = Runner.run();
+var result = Runner.run(new Box(1));
 "#;
         let (program, entry, manifest) = compile_typescript_module(source);
         for native in [false, true] {
@@ -24156,6 +25388,216 @@ let result = 1;
             error.message.contains("must satisfy Num") || error.message.contains("Channel"),
             "unexpected runtime type error: {error:?}"
         );
+    }
+
+
+    #[test]
+    fn specialized_direct_method_preserves_packed_arguments() {
+        use crate::napalm_bytecode::{IcSlot, R0, R1, R2, R3, R4, SpecializedDescriptor};
+        let mut assembler = Assembler::new();
+        assembler.emit_specialized(
+            Opcode::InvokeMethodDirect,
+            R0,
+            R1,
+            &[R2, R3, R4],
+            SpecializedDescriptor::DirectMethod {
+                owner: ClassId(0),
+                symbol: MethodSymbol(0),
+                target: FuncId(0),
+                fallback_cache: IcSlot(0),
+            },
+        ).unwrap();
+        let chunk = assembler.finish().unwrap();
+        let program = simple_program(chunk, 8);
+        let prepared = PreparedProgram::prepare(&program).unwrap();
+        let function = &prepared.functions[0];
+        let call = function.ops[0];
+        assert_eq!(call.c, 3);
+        assert_eq!(call.args_offset, (R2.0 as u32) | ((R3.0 as u32) << 8) | ((R4.0 as u32) << 16));
+        assert_eq!(call.y, 0);
+        assert_eq!(call.cache, 0);
+    }
+
+    #[test]
+    fn specialized_shape_and_class_fields_match_generic_bytecode() {
+        use crate::napalm_bytecode::Opcode;
+        use crate::napalm_bytecodecompiler::CompileOptions;
+        use crate::napalm_pipeline::CompilationPipeline;
+
+        let source = r#"
+            interface Position { x: number; y: number; }
+            class Counter {
+                value: number = 1;
+                add(n: number) {
+                    this.value = this.value + n;
+                    return this.value;
+                }
+            }
+            let position: Position = { x: 2, y: 7 };
+            position.x = position.x + 3;
+            let counter = new Counter();
+            let first = counter.add(4);
+            let second = counter.add(5);
+            let result = position.x * 100 + first * 10 + second;
+        "#;
+        let parsed = crate::napalm_front_main::parse("field_specializations.np", source);
+        assert!(!parsed.has_errors(), "parse: {:#?}", parsed.diagnostics);
+        let build = |enabled: bool| {
+            let mut hir = Program::new();
+            let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+            let lowered = lower_module(&mut hir, "field_specializations.np", source,
+                "field_specializations", &parsed.module);
+            assert!(!lowered.has_errors(), "lowering: {:#?}", lowered.diagnostics);
+            let entry = lowered.lowered.unwrap().entry;
+            let mut options = CompileOptions::default();
+            options.emit_specialized_bytecode = enabled;
+            let program = CompilationPipeline::default()
+                .with_bytecode_options(options).compile(&mut hir).unwrap();
+            (program, entry, manifest)
+        };
+        let (baseline, baseline_entry, baseline_manifest) = build(false);
+        let (specialized, specialized_entry, specialized_manifest) = build(true);
+        let opcodes = specialized.functions.iter().flat_map(|function| {
+            crate::napalm_bytecode::Decoder::new(&function.chunk.code)
+                .map(|inst| inst.unwrap().opcode)
+        }).collect::<Vec<_>>();
+        assert!(opcodes.iter().any(|opcode| matches!(opcode,
+            Opcode::GetFieldClass | Opcode::SetFieldClass |
+            Opcode::GetFieldShape | Opcode::SetFieldShape)));
+        let mut old_vm = source_vm(&baseline, &baseline_manifest);
+        let mut new_vm = source_vm(&specialized, &specialized_manifest);
+        old_vm.set_jit_options(None);
+        new_vm.set_jit_options(None);
+        old_vm.run_module(baseline_entry).unwrap();
+        new_vm.run_module(specialized_entry).unwrap();
+        assert_eq!(source_result(&old_vm), 560.0);
+        assert_eq!(source_result(&new_vm), source_result(&old_vm));
+    }
+
+    #[test]
+    fn structural_object_factories_match_generic_bytecode() {
+        use crate::napalm_bytecode::Opcode;
+        use crate::napalm_bytecodecompiler::CompileOptions;
+        use crate::napalm_pipeline::CompilationPipeline;
+
+        let source = r#"
+            interface OpenValue { value: number; }
+            type ClosedValue = { value: number; };
+            let first = { value: 11 };
+            let second = { value: 22 };
+            let empty = {};
+            empty.extra = 5;
+            let typed: ClosedValue = { value: 7 };
+            let result = first.value + second.value + typed.value;
+        "#;
+        let parsed = crate::napalm_front_main::parse("objects.np", source);
+        assert!(!parsed.has_errors(), "parse: {:#?}", parsed.diagnostics);
+        let build = |enabled: bool| {
+            let mut hir = Program::new();
+            let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+            let lowered = lower_module(&mut hir, "objects.np", source,
+                "objects", &parsed.module);
+            assert!(!lowered.has_errors(), "lowering: {:#?}", lowered.diagnostics);
+            let entry = lowered.lowered.unwrap().entry;
+            let mut options = CompileOptions::default();
+            options.emit_specialized_bytecode = enabled;
+            let program = CompilationPipeline::default()
+                .with_bytecode_options(options).compile(&mut hir).unwrap();
+            (program, entry, manifest)
+        };
+        let (baseline, baseline_entry, baseline_manifest) = build(false);
+        let (specialized, entry, manifest) = build(true);
+        let opcodes = crate::napalm_bytecode::Decoder::new(
+            &specialized.function(entry).unwrap().chunk.code)
+            .map(|inst| inst.unwrap().opcode).collect::<Vec<_>>();
+        assert!(opcodes.contains(&Opcode::NewObjectEmpty));
+        assert!(opcodes.contains(&Opcode::NewObjectWithProperties)
+            || opcodes.contains(&Opcode::NewInterfaceOrTypeObject));
+        let mut old_vm = source_vm(&baseline, &baseline_manifest);
+        old_vm.run_module(baseline_entry).unwrap();
+        let mut new_vm = source_vm(&specialized, &manifest);
+        new_vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&old_vm), 40.0);
+        assert_eq!(source_result(&new_vm), source_result(&old_vm));
+    }
+
+    #[test]
+    fn closed_type_rejects_extra_properties_through_any_alias() {
+        use crate::napalm_bytecodecompiler::CompileOptions;
+        use crate::napalm_pipeline::CompilationPipeline;
+        let source = r#"
+            type Closed = { value: number; };
+            let subject: Closed = { value: 10 };
+            let alias: any = subject;
+            alias.extra = 20;
+            let result = 0;
+        "#;
+        let parsed = crate::napalm_front_main::parse("closed.np", source);
+        assert!(!parsed.has_errors(), "parse: {:#?}", parsed.diagnostics);
+        for specialized in [false, true] {
+            let mut hir = Program::new();
+            let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+            let lowered = lower_module(&mut hir, "closed.np", source,
+                "closed", &parsed.module);
+            assert!(!lowered.has_errors(), "lowering: {:#?}", lowered.diagnostics);
+            let entry = lowered.lowered.unwrap().entry;
+            let mut options = CompileOptions::default();
+            options.emit_specialized_bytecode = specialized;
+            let bytecode = CompilationPipeline::default()
+                .with_bytecode_options(options).compile(&mut hir).unwrap();
+            let mut vm = source_vm(&bytecode, &manifest);
+            assert!(vm.run_module(entry).is_err(), "closed type allowed a new field");
+        }
+    }
+
+    #[test]
+    fn specialized_class_and_contract_declarations_match_baseline() {
+        use crate::napalm_bytecode::Opcode;
+        use crate::napalm_bytecodecompiler::CompileOptions;
+        use crate::napalm_pipeline::CompilationPipeline;
+
+        let source = r#"
+            interface HasValue { value: number; }
+            type ValueRecord = { value: number; };
+            class Plain { }
+            class Parent { value: number = 2; }
+            class Derived extends Parent { }
+            class Implementing implements HasValue { value: number = 7; }
+            class Combined extends Parent implements ValueRecord { }
+            let result = 99;
+        "#;
+        let parsed = crate::napalm_front_main::parse("class_specializations.np", source);
+        assert!(!parsed.has_errors(), "parse: {:#?}", parsed.diagnostics);
+
+        let compile_case = |specialized: bool| {
+            let mut hir = Program::new();
+            let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+            let lowered = lower_module(&mut hir, "class_specializations.np", source,
+                "class_specializations", &parsed.module);
+            assert!(!lowered.has_errors(), "lowering: {:#?}", lowered.diagnostics);
+            let entry = lowered.lowered.unwrap().entry;
+            let mut options = CompileOptions::default();
+            options.emit_specialized_bytecode = specialized;
+            let program = CompilationPipeline::default()
+                .with_bytecode_options(options).compile(&mut hir).unwrap();
+            (program, entry, manifest)
+        };
+        let (baseline, entry, manifest) = compile_case(false);
+        let (optimized, optimized_entry, optimized_manifest) = compile_case(true);
+        let function = optimized.function(optimized_entry).unwrap();
+        let opcodes = crate::napalm_bytecode::Decoder::new(&function.chunk.code)
+            .map(|inst| inst.unwrap().opcode).collect::<Vec<_>>();
+        assert!(opcodes.contains(&Opcode::DefineInterface));
+        assert!(opcodes.contains(&Opcode::DefineType));
+        assert!(opcodes.iter().any(|op| matches!(op,
+            Opcode::DefineClass | Opcode::DefineDerivedClass
+            | Opcode::DefineClassWithImplements | Opcode::DefineDerivedClassWithImplements)));
+        let mut baseline_vm = source_vm(&baseline, &manifest);
+        let mut optimized_vm = source_vm(&optimized, &optimized_manifest);
+        baseline_vm.run_module(entry).unwrap();
+        optimized_vm.run_module(optimized_entry).unwrap();
+        assert_eq!(source_result(&baseline_vm), source_result(&optimized_vm));
+        assert_eq!(source_result(&optimized_vm), 99.0);
     }
 
 }

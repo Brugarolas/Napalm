@@ -133,7 +133,8 @@ pub(super) fn shared_operand_mask(opcode: Opcode) -> u8 {
     use crate::napalm_bytecode::{operand_roles, OperandRole};
     use Opcode::*;
     let packed = match opcode {
-        Invoke | InvokeSuper | CallPrimitive | CallClosure => OPERAND_PACKED,
+        Invoke | InvokeSuper | CallPrimitive | CallClosure | InvokeMethodDirect
+            | NewClassInstance | NewObjectWithProperties | NewInterfaceOrTypeObject => OPERAND_PACKED,
         _ => 0,
     };
     let touches_heap = packed != 0
@@ -145,6 +146,8 @@ pub(super) fn shared_operand_mask(opcode: Opcode) -> u8 {
                 | ListSpread | MapSpread | DestructureCheck | DestructureGet | DestructureRest
                 | InvokeSpread | BindInterface | StringConcat
                 | LoadProperty | StoreProperty | StorePropertyIfPresent
+                | GetFieldShape | SetFieldShape | GetFieldClass | SetFieldClass
+                | ImplementInterfaceOrType
         );
     if !touches_heap {
         return 0;

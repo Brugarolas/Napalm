@@ -240,6 +240,39 @@ fn napalm_collections_shared_objects_are_locked_per_operation() {
 }
 
 #[test]
+fn napalm_collections_specialized_field_stores_publish_shared_values() {
+    use crate::napalm_bytecode::{Decoder, Opcode};
+
+    for (target, opcode) in [("shape", Opcode::SetFieldShape), ("object", Opcode::SetFieldClass)] {
+        let source = format!(r#"
+            interface Holder {{ items: number[]; }}
+            class Box {{ items: number[] = []; }}
+            const shared roots = new Map();
+            const shape: Holder = {{items: []}};
+            const object = new Box();
+            roots.set('shape', shape);
+            roots.set('object', object);
+            concurrent function ready() {{ return 1; }}
+            const pending = launch ready();
+            await pending;
+            const replacement: number[] = [];
+            {target}.items = replacement;
+        "#);
+        let (program, entry, manifest) = compile_typescript_module(&source);
+        assert!(program.functions.iter().any(|function| {
+            Decoder::new(&function.chunk.code).any(|inst| inst.unwrap().opcode == opcode)
+        }), "fixture must exercise {opcode:?}");
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        vm.run_module(entry).unwrap();
+        // Inspect the last binding directly: reading it through another heap
+        // opcode could itself mark the list shared and hide a missed barrier.
+        assert!(vm.heap.is_shared(last_source_variable(&vm)),
+            "{opcode:?} must publish values stored into an already shared object");
+    }
+}
+
+#[test]
 fn napalm_collections_contended_shared_lock_parks_tasks() {
     // One long operation (spreading a large shared List) holds the lock for
     // longer than the 1 ms spin budget, so contending workers park their task

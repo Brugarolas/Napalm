@@ -379,7 +379,6 @@ mod tests {
         let output = CompilationPipeline::new(Optimize::new())
             .with_bytecode_options(CompileOptions {
                 eliminate_dead_code: false,
-                // Inspect unoptimized lowering of the untouched HIR.
                 optimize_bytecode: false,
                 ..CompileOptions::default()
             })

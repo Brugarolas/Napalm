@@ -2270,6 +2270,21 @@ impl LlvmLowering<'_> {
         self.gep8_dyn(owner, &offset)
     }
 
+    /// Instance field-array pointer: inline fields (in the moving owner) are a
+    /// tagged owner-relative offset, boxed fields an absolute pointer. Keep
+    /// owner-based provenance for the inline case (GEP off the owner) and
+    /// select between the two.
+    fn heap_entry_instance_data(&mut self, entry: &V, owner: &V) -> V {
+        let encoded = self.heap_entry_data(entry);
+        let encoded = self.word(&encoded);
+        let relative = self.bin("and", &encoded, &V::i64(TRACE_HEAP_DATA_RELATIVE_MASK as i64));
+        let is_relative = self.icmp("ne", &relative, &V::i64(0));
+        let offset = self.bin("and", &encoded, &V::i64(!(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64));
+        let inline = self.gep8_dyn(owner, &offset);
+        let boxed = self.as_ptr(&offset);
+        self.select(&is_relative, &inline, &boxed)
+    }
+
     fn heap_entry_len(&mut self, entry: &V) -> V {
         if let Some(value) = self.heap_len.get(entry) {
             return value.clone();
@@ -2607,6 +2622,69 @@ impl LlvmLowering<'_> {
         )
     }
 
+    /// LLVM equivalent of the Cranelift Immix fast factory path. The native
+    /// block reserves the exact fixed-size GC allocation before calling the
+    /// non-safepoint publication helper. The baseline factory remains a cold
+    /// branch for an unwarmed shape, a nonzero external buffer or a full TLAB.
+    fn native_factory_runtime(&mut self, function: u32, pc: u32, encoded_next: u32) -> V {
+        let act = Self::activation();
+        let probe = self.load_at(Ty::Ptr, &act,
+            offset_of!(TraceActivation, factory_probe) as i64, Mem::Act);
+        let allowed = self.def(Ty::I32, &format!(
+            "call i32 {}(ptr %act, i32 {}, i32 {})",
+            probe.op, function, pc,
+        ));
+        let can_allocate = self.icmp("ne", &allowed, &V::i32(0));
+        let fast = self.new_block();
+        let slow = self.new_block();
+        let commit = self.new_block();
+        let merge = self.new_block();
+        self.cond_br(&can_allocate, &fast, &slow, None);
+
+        self.begin(&fast);
+        let cursor_addr = self.load_at(Ty::Ptr, &act,
+            offset_of!(TraceActivation, factory_cursor) as i64, Mem::Act);
+        let limit_addr = self.load_at(Ty::Ptr, &act,
+            offset_of!(TraceActivation, factory_limit) as i64, Mem::Act);
+        let alignment = self.load_at(Ty::I64, &act,
+            offset_of!(TraceActivation, factory_alignment) as i64, Mem::Act);
+        let bytes = self.load_at(Ty::I64, &act,
+            offset_of!(TraceActivation, factory_bytes) as i64, Mem::Act);
+        let cursor = self.load(Ty::I64, &cursor_addr, Mem::Heap);
+        let limit = self.load(Ty::I64, &limit_addr, Mem::Heap);
+        let am1 = self.bin("sub", &alignment, &V::i64(1));
+        let biased = self.bin("add", &cursor, &am1);
+        let negative_alignment = self.bin("sub", &V::i64(0), &alignment);
+        let aligned = self.bin("and", &biased, &negative_alignment);
+        let new_cursor = self.bin("add", &aligned, &bytes);
+        let fits = self.icmp("ule", &new_cursor, &limit);
+        let no_overflow = self.icmp("uge", &new_cursor, &aligned);
+        let alignment_ok = self.icmp("uge", &biased, &cursor);
+        let ready = self.and1(&fits, &no_overflow);
+        let ready = self.and1(&ready, &alignment_ok);
+        self.cond_br(&ready, &commit, &slow, None);
+
+        self.begin(&commit);
+        self.store(&new_cursor, &cursor_addr, Mem::Heap);
+        let committer = self.load_at(Ty::Ptr, &act,
+            offset_of!(TraceActivation, factory_commit) as i64, Mem::Act);
+        let committed = self.def(Ty::I32, &format!(
+            "call i32 {}(ptr %act, i32 {}, i32 {}, i32 {}, i64 {})",
+            committer.op, function, pc, encoded_next, aligned.op,
+        ));
+        self.br(&merge);
+
+        self.begin(&slow);
+        let fallback = self.runtime_call(function, pc, encoded_next);
+        self.br(&merge);
+
+        self.begin(&merge);
+        self.def(Ty::I32, &format!(
+            "phi i32 [ {}, %{} ], [ {}, %{} ]",
+            committed.op, commit, fallback.op, slow,
+        ))
+    }
+
     fn after_runtime_status(&mut self, status: &V, terminal: bool) {
         let stop = self.new_block();
         let resume = self.new_block();
@@ -2694,17 +2772,27 @@ impl LlvmLowering<'_> {
                 } else {
                     next.0
                 };
-                let status = self.runtime_call(location.function.0, location.pc.0, encoded_next);
+                let status = if encoded_next & TRACE_RUNTIME_MODE_MASK == TRACE_RUNTIME_MODE_OBJECT_FACTORY {
+                    self.native_factory_runtime(location.function.0, location.pc.0, encoded_next)
+                } else {
+                    self.runtime_call(location.function.0, location.pc.0, encoded_next)
+                };
                 self.invalidate_heap_proofs();
                 self.after_runtime_status(&status, *terminal);
             }
 
             RuntimeCall { location, next } => {
                 self.invalidate_heap_proofs();
-                if next.0 & TRACE_RUNTIME_MODE_MASK != 0 {
+                if next.0 & TRACE_RUNTIME_MODE_MASK != 0
+                    && next.0 & TRACE_RUNTIME_MODE_MASK != TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY
+                {
                     return Err(self.error("RuntimeCall continuation PC uses reserved runtime-mode bits"));
                 }
-                let status = self.runtime_call(location.function.0, location.pc.0, next.0 | TRACE_RUNTIME_MODE_CALL);
+                let status = if next.0 & TRACE_RUNTIME_MODE_MASK == TRACE_RUNTIME_MODE_CONSTRUCTOR_FACTORY {
+                    self.native_factory_runtime(location.function.0, location.pc.0, next.0)
+                } else {
+                    self.runtime_call(location.function.0, location.pc.0, next.0 | TRACE_RUNTIME_MODE_CALL)
+                };
                 self.invalidate_heap_proofs();
                 self.after_runtime_status(&status, false);
             }
@@ -3242,7 +3330,7 @@ impl LlvmLowering<'_> {
             }
 
             HeapLoadField { object, slot, exit } => {
-                let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
+                let (entry, owner) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(&entry);
                 self.guard_constant_index(&len, *slot, *exit)?;
                 self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), false, *exit)?;
@@ -3250,7 +3338,7 @@ impl LlvmLowering<'_> {
                 let result = if let Some(value) = self.forwarded_heap_loads.get(&location) {
                     value.clone()
                 } else {
-                    let data = self.heap_entry_data(&entry);
+                    let data = self.heap_entry_instance_data(&entry, &owner);
                     let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                     let address = self.gep_words(&data, &index);
                     let tag = self.slot_tbaa(*slot, false);
@@ -3267,7 +3355,7 @@ impl LlvmLowering<'_> {
                 let (entry, owner) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(&entry);
                 self.guard_constant_index(&len, *slot, *exit)?;
-                let data = self.heap_entry_data(&entry);
+                let data = self.heap_entry_instance_data(&entry, &owner);
                 let index = self.vm_binding_word(VmBindingKind::FieldSlot, *slot as u64)?;
                 let address = self.gep_words(&data, &index);
                 self.observe_identity_access(*object, &entry, IdentityAccess::Instance(*slot), true, *exit)?;

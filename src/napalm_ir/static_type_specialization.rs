@@ -922,7 +922,10 @@ impl Planner<'_> {
             // Static calls are only devirtualized on provably exact class
             // objects: `this` inside a static method may be a subclass reached
             // through `super`.
-            Type::Class(_) => {
+            // A module binding of a class reads as `Top`, yet `trace_class` can
+            // still prove the exact class object (single CreateClass store):
+            // `new C(...)` / `C.staticMethod(...)` resolve statically too.
+            Type::Class(_) | Type::Top => {
                 let class = self.hierarchy.trace_class(self.function, receiver, 0)?;
                 self.hierarchy.static_target(class, method)
             }
@@ -1121,6 +1124,7 @@ fn inlinable_inst(kind: &Inst) -> bool {
             | Inst::LoadProperty { .. }
             | Inst::StoreProperty { .. }
             | Inst::AllocMap
+            | Inst::AllocInstance { .. }
             | Inst::MapGet { .. }
             | Inst::MapSet { .. }
             | Inst::MapLen { .. }
@@ -1197,8 +1201,26 @@ fn is_local_allocation(function: &Function, mut value: ValueId) -> bool {
     false
 }
 
+/// A synthesized `new` factory: `AllocInstance; [CallDirect ctor(inst, ..)];
+/// Return inst`. Inlining it puts the allocation and the constructor call next
+/// to each other in the caller, where the bytecode compiler fuses them into one
+/// `NewClassInstance` (known class, layout and constructor) and the JIT tiers
+/// see the exact class of the new object.
+fn is_constructor_factory(body: &InlineBody) -> bool {
+    let Some((Inst::AllocInstance { .. }, alloc_results, ..)) = body.insts.first() else { return false };
+    let [instance] = alloc_results.as_slice() else { return false };
+    if body.returned != *instance { return false; }
+    match &body.insts[1..] {
+        [] => true,
+        [(Inst::CallDirect { conv: CallConv::Napalm, args, .. }, ..)] => {
+            args.first() == Some(instance) && !args[1..].contains(instance)
+        }
+        _ => false,
+    }
+}
+
 /// Inline small straight-line `CallDirect` targets that receive an object
-/// allocated by the caller. Static types made these calls direct; inlining them
+/// allocated by the caller, and synthesized constructor factories. Static types made these calls direct; inlining them
 /// lets the ordinary escape analysis scalar-replace the object (e.g. a
 /// structural `{ x, y }` literal handed to `dist(a: Point, b: Point)`), which
 /// removes the allocation, its contract binding and every property access.
@@ -1228,7 +1250,8 @@ fn inline_allocation_calls(program: &mut Program) -> Vec<usize> {
                     if *callee == caller_id
                         || body.params.len() != args.len()
                         || caller.nodes[id.0 as usize].results.len() != 1
-                        || !args.iter().any(|arg| is_local_allocation(caller, *arg))
+                        || !(is_constructor_factory(body)
+                            || args.iter().any(|arg| is_local_allocation(caller, *arg)))
                     {
                         continue;
                     }

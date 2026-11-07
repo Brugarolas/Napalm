@@ -113,6 +113,56 @@ fn napalm_typed_list_length_and_subscript_trace_natively_with_baseline_edge_case
 }
 
 #[test]
+fn new_class_instance_is_devirtualized_and_fused_at_the_call_site() {
+    // `new P(..)` reads the class from a module binding (typed `Top`). The
+    // exact class is still provable, so the factory call is resolved, the
+    // trivial factory inlined, and the caller's loop holds a NewClassInstance
+    // (allocation + constructor with a known layout); `p.sum()` is then a
+    // direct call on the exactly typed instance.
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        class P {
+            x: number; y: number;
+            constructor(x: number, y: number) { this.x = x; this.y = y; }
+            sum(): number { return this.x + this.y; }
+        }
+        function run(n: number): number {
+            let s = 0;
+            for (let i = 0; i < n; i++) { const p = new P(i, 1); s = s + p.sum(); }
+            return s;
+        }
+        const result = run(3000);
+    "#);
+    let run = program.functions.iter()
+        .find(|function| crate::napalm_bytecode::Decoder::new(&function.chunk.code)
+            .any(|inst| inst.unwrap().opcode == Opcode::NewClassInstance)
+            && function.kind != crate::napalm_ir::FunctionKind::StaticMethod)
+        .expect("a caller with an inlined NewClassInstance");
+    let opcodes: Vec<Opcode> = crate::napalm_bytecode::Decoder::new(&run.chunk.code)
+        .map(|inst| inst.unwrap().opcode).collect();
+    assert!(opcodes.contains(&Opcode::CallDirect), "{opcodes:?}");
+    assert_eq!(opcodes.iter().filter(|op| **op == Opcode::Invoke).count(), 3, "{opcodes:?}");
+    let expected: f64 = (0..3000).map(|i| i as f64 + 1.0).sum();
+    assert_eq!(static_type_results(&program, entry, &manifest), [expected; 2]);
+}
+
+#[test]
+fn inferred_list_literal_type_never_becomes_a_runtime_contract() {
+    // DefineArrayWithGenerics must only replace an explicit List<T> binding.
+    // The inferred type of `[1]` is not a contract: an `any` variable stays
+    // untyped. (Violations of real contracts are uncatchable by design and are
+    // covered by the interface tests.)
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        const loose: any = [1];
+        loose[0] = 'a';
+        loose.push('b');
+        const declared: number[] = [];
+        declared.push(4);
+        const result = loose.length * 10 + declared[0];
+    "#);
+    assert_eq!(static_type_results(&program, entry, &manifest), [24.0; 2]);
+}
+
+#[test]
 fn napalm_structural_arguments_are_scalar_replaced_after_direct_call_inlining() {
     let (program, entry, manifest) = compile_typescript_module(r#"
         interface Point { x: number; y: number; }
@@ -137,7 +187,12 @@ fn napalm_structural_arguments_are_scalar_replaced_after_direct_call_inlining() 
     // `points` is the second source function. Its literals no longer escape
     // into a call, so neither the maps nor their property traffic remain.
     let opcodes = static_type_closure_opcodes(&program, 1);
-    for opcode in [Opcode::AllocMap, Opcode::StoreProperty, Opcode::LoadProperty, Opcode::CallDirect] {
+    // Include the specialized encodings: an object factory or shape access
+    // would mean the literal was NOT scalar-replaced.
+    for opcode in [Opcode::AllocMap, Opcode::StoreProperty, Opcode::LoadProperty, Opcode::CallDirect,
+        Opcode::NewObjectEmpty, Opcode::NewObjectShape, Opcode::NewObjectWithProperties,
+        Opcode::NewInterfaceOrTypeObject, Opcode::GetFieldShape, Opcode::SetFieldShape,
+        Opcode::MapSet, Opcode::ImplementInterfaceOrType] {
         assert!(!opcodes.contains(&opcode), "{opcode:?} in {opcodes:?}");
     }
     let expected: f64 = (0..2000)
@@ -426,8 +481,9 @@ fn napalm_static_types_inline_trivial_accessors_with_inherited_fields() {
     let absorb_ops: Vec<Opcode> = crate::napalm_bytecode::Decoder::new(&absorb.chunk.code)
         .map(|inst| inst.unwrap().opcode)
         .collect();
-    assert!(absorb_ops.contains(&Opcode::LoadField), "{absorb_ops:?}");
-    assert!(absorb_ops.contains(&Opcode::StoreField), "{absorb_ops:?}");
+    // Either the generic or the specialized (super-instruction) field encoding.
+    assert!(absorb_ops.iter().any(|op| matches!(op, Opcode::LoadField | Opcode::GetFieldClass)), "{absorb_ops:?}");
+    assert!(absorb_ops.iter().any(|op| matches!(op, Opcode::StoreField | Opcode::SetFieldClass)), "{absorb_ops:?}");
     assert!(!absorb_ops.contains(&Opcode::CallDirect), "{absorb_ops:?}");
     // Each iteration adds 2 to x; bump sees 2i+1 (+1 for `first`), absorb 2i+2.
     let expected: f64 = (0..500).map(|i| (2 * i + 2) as f64 + (2 * i + 2) as f64).sum();
