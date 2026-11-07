@@ -1927,7 +1927,7 @@ impl FunctionOptimization for FastLocalSimplify {
                             _ => true,
                         });
                     }
-                    Inst::MapRemove { .. } | Inst::MapSpread { .. } => {
+                    Inst::MapLookupOrInsert { .. } | Inst::MapRemove { .. } | Inst::MapSpread { .. } => {
                         map_values.clear();
                     }
                     Inst::StringCodePointAt { string, index } => {

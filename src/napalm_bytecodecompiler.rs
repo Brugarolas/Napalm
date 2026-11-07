@@ -2754,7 +2754,7 @@ impl<'a> FunctionEmitter<'a> {
             Await | MakeFiber | FiberCall | FiberTry | FiberTransfer
             | FiberTransferError | FiberYield | FiberSuspend => SafepointKind::FiberSwitch,
             BindMethod | BindForeignMethod | ImplementInterfaceOrType
-            | SetFieldShape | ListAppend | ListInsert | MapSet | StoreProperty
+            | SetFieldShape | ListAppend | ListInsert | MapSet | MapLookupOrInsert | StoreProperty
             | StorePropertyIfPresent => {
                 SafepointKind::RuntimeMutation
             }
@@ -3856,6 +3856,10 @@ impl FunctionEmitter<'_> {
                     )
                 }
             },
+            MapLookupOrInsert { map, key, value } => self.assembler.emit_x32(
+                Opcode::MapLookupOrInsert, self.result_reg(node)?.0,
+                self.reg(*map)?.0, self.reg(*key)?.0, self.reg(*value)?.0 as u32,
+            ),
             MapSet { map, key, value } => self.assembler.emit_abc(
                 Opcode::MapSet,
                 self.reg(*map)?.0,

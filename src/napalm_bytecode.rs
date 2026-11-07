@@ -1215,6 +1215,7 @@ impl Opcode {
                 | ListInsert
                 | AllocMap
                 | MapSet
+                | MapLookupOrInsert
                 | StoreProperty
                 | StorePropertyIfPresent
                 | StringConcat
@@ -2742,6 +2743,12 @@ impl BytecodeVerifier {
 
         let mut module_ids = HashSet::default();
         for module in &program.metadata.modules {
+            let mut shared = HashSet::default();
+            for slot in &module.shared_slots {
+                if slot.0 >= module.source_variable_count() || !shared.insert(*slot) {
+                    return Err(VerificationError::function("invalid or duplicate shared module slot"));
+                }
+            }
             if !module_ids.insert(module.id) {
                 return Err(VerificationError::function(format!(
                     "duplicate module metadata {:?}",

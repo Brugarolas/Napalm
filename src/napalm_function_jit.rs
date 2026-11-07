@@ -2726,7 +2726,7 @@ pub(super) unsafe fn try_direct_call(
             let mut entries = smallvec::SmallVec::<[MapIcEntry; 4]>::new();
             for &entry in &cache.entries[..cache.len as usize] {
                 if opcode == Some(Opcode::SetFieldShape) {
-                    let Some(shape) = vm.heap.map_shapes.shapes.get(entry.shape as usize) else {
+                    let Some(shape) = vm.heap.map_shapes.get_shape(entry.shape) else {
                         continue;
                     };
                     let Some(contract) = shape.slots.get(entry.slot as usize) else { continue; };

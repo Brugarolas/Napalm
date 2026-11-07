@@ -189,7 +189,7 @@ pub(super) unsafe fn h_list_spread(vm: &mut Interpreter, ptr: *const PreparedOp)
     }
 }
 
-fn map_entries(heap: &Heap, source: Value) -> Result<Vec<(MapKey, Value)>, RuntimeError> {
+pub(super) fn map_entries(heap: &Heap, source: Value) -> Result<Vec<(MapKey, Value)>, RuntimeError> {
     let Some(HeapObject::Map(map)) = heap.get(source) else {
         return Err(RuntimeError::new("object spread/destructuring requires a Map"));
     };
@@ -197,7 +197,7 @@ fn map_entries(heap: &Heap, source: Value) -> Result<Vec<(MapKey, Value)>, Runti
         NapalmMapStorage::Shaped { shape, values } => heap.map_shapes.keys(*shape)
             .iter().cloned().zip(values.iter().copied())
             .map(|(key, value)| (MapKey::String(key), value)).collect(),
-        NapalmMapStorage::Dictionary(entries) => entries.iter().map(|(key, &value)| (key.clone(), value)).collect(),
+        NapalmMapStorage::Dictionary(entries) => entries.iter().collect(),
     })
 }
 

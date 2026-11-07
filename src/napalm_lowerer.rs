@@ -362,6 +362,14 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         | ExprKind::Await(source) => infer_surface_type_annotation(source),
         ExprKind::Launch(_) => None,
         ExprKind::TypeOf(_) => direct(K::String),
+        ExprKind::Invoke(invoke) if invoke.name.value == "new" => {
+            let ExprKind::Name(name) = &invoke.receiver.as_ref()?.kind else { return None; };
+            match name.value.as_str() {
+                "Map" => direct(K::Map), "Set" => direct(K::Set(None)),
+                "ConcurrentMap" | "ConcurrentSet" => direct(K::BuiltinGeneric(name.value.clone(), None)),
+                _ => None,
+            }
+        }
         ExprKind::Invoke(invoke)
             if invoke.name.value == "toString" && invoke.args.is_empty() => direct(K::String),
         ExprKind::Name(_)
@@ -495,6 +503,8 @@ fn resolve_type_annotation_with(
         K::Set(element) => Type::Set(element.as_ref().map(|t| Box::new(resolve_type_annotation_with(t, classes, interfaces, env)))),
         K::BuiltinGeneric(name, element) => {
             let builtin = match name.as_str() {
+                "ConcurrentMap" => Some(BuiltinId::ConcurrentMap),
+                "ConcurrentSet" => Some(BuiltinId::ConcurrentSet),
                 "Event" => Some(BuiltinId::Event),
                 "Emitter" => Some(BuiltinId::Emitter),
                 "Channel" => Some(BuiltinId::Channel),
@@ -521,6 +531,8 @@ fn resolve_type_annotation_with(
         K::Named(name) => match name.split('<').next().unwrap_or(name).rsplit('.').next().unwrap_or(name) {
             "Range" => Type::Range,
             "Fiber" => Type::Fiber,
+            "ConcurrentMap" => Type::Builtin(BuiltinId::ConcurrentMap, None),
+            "ConcurrentSet" => Type::Builtin(BuiltinId::ConcurrentSet, None),
             "Event" => Type::Builtin(BuiltinId::Event, None),
             "Emitter" => Type::Builtin(BuiltinId::Emitter, None),
             "Channel" => Type::Builtin(BuiltinId::Channel, None),
@@ -578,7 +590,7 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::GenericInstance { .. } => true,
         Type::Builtin(
-            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
             Some(_),
         ) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
@@ -747,6 +759,7 @@ struct BindingInfo {
     declaration: Span,
     owner: FunctionNodeId,
     captured: bool,
+    shared: bool,
     mutated: bool,
     synthetic_this: bool,
     /// Explicit annotation or a conservative source-level inference hint. The
@@ -891,6 +904,7 @@ impl<'ast> Analyzer<'ast> {
             declaration: Span::empty(span.start),
             owner: self.current_function,
             captured: false,
+            shared: false,
             mutated: false,
             synthetic_this: true,
             source_type: None,
@@ -927,6 +941,7 @@ impl<'ast> Analyzer<'ast> {
             declaration: ident.span,
             owner: self.current_function,
             captured: false,
+            shared: false,
             mutated: false,
             synthetic_this: false,
             source_type,
@@ -1015,7 +1030,7 @@ impl<'ast> Analyzer<'ast> {
 
     fn visit_stmt(&mut self, stmt: &'ast Stmt, module_level: bool) {
         match &stmt.kind {
-            StmtKind::Variable { name, annotation, initializer } => {
+            StmtKind::Variable { shared, name, annotation, initializer } => {
                 if module_level && self.module_root {
                     if let Some(initializer) = initializer {
                         self.visit_expr(initializer);
@@ -1025,6 +1040,7 @@ impl<'ast> Analyzer<'ast> {
                         .clone()
                         .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
                     let binding = self.declare_typed(name, source_type);
+                    self.analysis.bindings[binding.0 as usize].shared = *shared;
                     if let Some(initializer) = initializer {
                         self.visit_expr(initializer);
                     }
@@ -1407,6 +1423,7 @@ struct StaticBindingType {
 
 #[derive(Clone, Debug)]
 struct ModuleLayout {
+    shared: HashSet<String>,
     slots: HashMap<String, ModuleSlot>,
 }
 
@@ -1480,6 +1497,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             source_file,
             module_id: None,
             module_layout: ModuleLayout {
+                shared: HashSet::default(),
                 slots: HashMap::default(),
             },
             module_binding_types: HashMap::default(),
@@ -1501,6 +1519,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .program
             .add_module(self.module_name, self.module_layout.slots.len() as u32);
         self.module_id = Some(module_id);
+        self.program.set_module_shared_slots(module_id, self.module_layout.shared.iter()
+            .filter_map(|name| self.module_layout.get(name)).collect());
         self.install_module_exports(module_id);
         let builtin_bindings = BuiltinId::ALL
             .into_iter()
@@ -1568,7 +1588,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let mut declarations: Vec<(String, Span)> = Vec::new();
         for statement in &self.ast.statements {
             match &statement.kind {
-                StmtKind::Variable { name, .. } => {
+                StmtKind::Variable { name, shared, .. } => {
+                    if *shared { self.module_layout.shared.insert(name.value.clone()); }
                     declarations.push((name.value.clone(), name.span));
                 }
                 StmtKind::Class(class) => {
@@ -1848,6 +1869,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     fn plan_module_binding_types(&mut self) {
         for statement in &self.ast.statements {
             let StmtKind::Variable {
+                shared: _,
                 name,
                 annotation,
                 initializer,
@@ -2790,19 +2812,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             builder.set_field_owner(class);
         }
 
-        // Concurrent functions execute in a separate Interpreter/heap. Capturing a
-        // lexical binding would create an implicit cross-heap edge, so require all
-        // data to cross explicitly through `launch` arguments.
-        if spec.is_concurrent && !node.captures.is_empty() {
+        // Concurrent closures capture only explicitly shared collection identities.
+        // Shared bindings travel by value; no mutable lexical cell crosses threads.
+        if spec.is_concurrent && node.captures.iter().any(|id| !analysis.binding(*id).shared) {
             let span = node.closure_span.unwrap_or_else(|| function_node_span(node));
             self.diagnostics.push(
                 Diagnostic::error(
                     "NAPALM-L041",
-                    "a concurrent function cannot capture lexical state",
+                    "a concurrent function can only capture shared Map/Set bindings",
                     span,
                 )
                 .with_primary_label(span, "pass captured values explicitly as `launch` arguments")
-                .with_note("Concurrent workers have isolated heaps and no shared mutable memory."),
+                .with_note("Only shared concurrent collections can cross the lexical capture boundary."),
             );
             return None;
         }
@@ -2811,13 +2832,15 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let mut capture_values = HashMap::default();
         for binding in &node.captures {
             let info = analysis.binding(*binding);
-            let mode = if info.mutated {
+            let mode = if info.mutated && !info.shared {
                 CaptureMode::ByCell
             } else {
                 CaptureMode::ByValue
             };
             let ty = if mode == CaptureMode::ByCell {
                 Type::Cell(Box::new(Type::Top))
+            } else if info.shared {
+                info.source_type.as_ref().map(|a| resolve_type_annotation(a, &self.top_level_classes, &self.interface_types)).unwrap_or(Type::Top)
             } else {
                 Type::Top
             };
@@ -3291,6 +3314,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn check_module_assignment(&mut self, name: &str, value: ValueId, span: Span) -> ValueId {
+        let shared_type = self.context.module_binding_types.get(name).map(|t| &t.expected)
+            .filter(|t| matches!(t, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)))
+            .cloned().unwrap_or_else(|| semantic_source_type(self.builder.value_type(value)));
+        if self.context.module_layout.shared.contains(name) && !matches!(shared_type, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)) {
+            self.error("NAPALM-L107", "shared requires a Map/Set value (stored as ConcurrentMap/ConcurrentSet)", span);
+        }
         let Some(binding_type) = self.context.module_binding_types.get(name).cloned() else {
             return value;
         };
@@ -3329,7 +3358,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn bind_initial(&mut self, binding: BindingId, value: ValueId) {
         let info = self.context.analysis.binding(binding);
-        if info.mutated
+        if info.mutated && !info.shared
             && (info.captured
                 || self.context.analysis.nodes[self.context.node_id.0].has_structured_exceptions)
         {
@@ -3709,6 +3738,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.set_source(stmt.span);
         match &stmt.kind {
             StmtKind::Variable {
+                shared,
                 name,
                 annotation,
                 initializer,
@@ -3720,7 +3750,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 };
                 let early_binding = binding.filter(|binding| {
                     let info = self.context.analysis.binding(*binding);
-                    info.captured && info.mutated
+                    info.captured && info.mutated && !info.shared
                 });
                 if let Some(binding) = early_binding {
                     let empty = self.builder.const_null();
@@ -3746,6 +3776,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         _ => self.lower_expr(expr),
                     })
                     .unwrap_or_else(|| self.builder.const_null());
+                let shared_type = explicit_expected.as_ref().filter(|t| matches!(t, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)))
+                    .cloned().unwrap_or_else(|| semantic_source_type(self.builder.value_type(value)));
+                if *shared && !matches!(shared_type, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)) {
+                    self.error("NAPALM-L107", "shared requires a `new Map()`/`new Set()` (or ConcurrentMap/ConcurrentSet) initializer", name.span);
+                }
                 let value_span = initializer.as_ref().map_or(name.span, |expr| expr.span);
 
                 if module_level {
@@ -4534,6 +4569,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             if self.context.is_concurrent
                 && !BuiltinId::ALL.iter().any(|builtin| builtin.binding_name() == name.value)
                 && !self.context.worker_function_names.contains(&name.value)
+                && !self.context.module_layout.shared.contains(&name.value)
             {
                 self.error(
                     "NAPALM-L045",
@@ -6406,6 +6442,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 return None;
             }
             match name.value.as_str() {
+                "ConcurrentMap" => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
+                "ConcurrentSet" => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
+                "Map" => Some(Type::Map),
+                "Set" => Some(Type::Set(None)),
                 "Emitter" => Some(Type::Builtin(BuiltinId::Emitter, None)),
                 "Channel" => Some(Type::Builtin(BuiltinId::Channel, None)),
                 _ => None,
@@ -6452,6 +6492,20 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
         let receiver_type = semantic_source_type(self.builder.value_type(receiver));
+        if kind == MethodKind::Method && invoke.name.value == "set_if_not_exists"
+            && matches!(receiver_type, Type::Map | Type::GenericMap(_, _) | Type::Set(_) | Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _))
+        {
+            let is_set = matches!(receiver_type, Type::Set(_) | Type::Builtin(BuiltinId::ConcurrentSet, _));
+            let arity = if is_set { 1 } else { 2 };
+            if invoke.args.len() != arity || invoke.args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+                self.error("NAPALM-L106", "invalid set_if_not_exists arguments", span);
+                return self.builder.const_null();
+            }
+            let args = self.lower_call_args(&invoke.args, span);
+            return self.builder.emit1(Inst::MapLookupOrInsert {
+                map: receiver, key: args[0], value: if is_set { args[0] } else { args[1] },
+            }, Type::Top);
+        }
         if let Some(value) = self.lower_native_endpoint_invoke(
             receiver,
             &receiver_type,
@@ -6827,6 +6881,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn write_binding(&mut self, binding: BindingId, value: ValueId, span: Span) {
+        let shared_type = self.binding_types.get(&binding).map(|t| &t.expected)
+            .filter(|t| matches!(t, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)))
+            .cloned().unwrap_or_else(|| semantic_source_type(self.builder.value_type(value)));
+        if self.context.analysis.binding(binding).shared && !matches!(shared_type, Type::Builtin(BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet, _)) {
+            self.error("NAPALM-L107", "shared requires a Map/Set value (stored as ConcurrentMap/ConcurrentSet)", span);
+        }
         let value = self.check_binding_assignment(binding, value, span);
         self.write_binding_unchecked(binding, value);
     }

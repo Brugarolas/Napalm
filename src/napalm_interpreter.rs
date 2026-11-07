@@ -60,8 +60,17 @@ use self::fetch_backend::{
 #[path = "napalm_concurrent.rs"]
 mod concurrent_runtime;
 use self::concurrent_runtime::{
-    ConcurrentCompletion, ConcurrentJobId, ConcurrentKey, ConcurrentRuntime, ConcurrentValue,
+    ConcurrentCompletion, ConcurrentJobId, ConcurrentKey, ConcurrentRuntime, ConcurrentValue, SharedTransfer,
 };
+#[path = "napalm_vm_mutex.rs"]
+mod vm_mutex;
+use self::vm_mutex::{LockWaker, SYNC_SHARED};
+
+/// Number of concurrent tasks parked on a contended VmAdaptativeMutex.
+#[allow(dead_code)]
+pub(crate) fn vm_mutex_parked_tasks() -> u64 {
+    vm_mutex::PARKED_TASKS.load(Ordering::Relaxed)
+}
 #[path = "napalm_shared_memo.rs"]
 mod shared_memo;
 use self::shared_memo::{
@@ -1167,8 +1176,6 @@ struct MapShape {
     /// Structural layout memberships. These are immutable shape facts and map
     /// logical interface/record slots to concrete hidden-shape slots.
     families: Box<[ShapeFamilyMembership]>,
-    /// Shared hidden-class transitions. Only string keys participate.
-    transitions: FastMap<(MapStringKey, ShapeSlotContract), u32>,
 }
 
 impl MapShape {
@@ -1189,9 +1196,15 @@ impl MapShape {
     }
 }
 
-#[derive(Debug)]
-struct MapShapeTable {
-    shapes: Vec<MapShape>,
+const MAP_SHAPE_CHUNK_BITS: u32 = 10;
+const MAP_SHAPE_CHUNK: usize = 1 << MAP_SHAPE_CHUNK_BITS;
+const MAP_SHAPE_CHUNK_MASK: u32 = MAP_SHAPE_CHUNK as u32 - 1;
+const MAP_SHAPE_CHUNKS: usize = MAX_MAP_SHAPES / MAP_SHAPE_CHUNK;
+
+/// Family/contract metadata. Written while linking layouts and installing
+/// contracts; read only on PIC misses, contract checks and trace recording.
+#[derive(Default)]
+struct ShapeMetadata {
     typed_variants: FastMap<(u32, u32), u32>,
     family_ids: FastMap<Type, u32>,
     /// Compiler structural layout id -> runtime family id. Dense vector lookup
@@ -1200,75 +1213,161 @@ struct MapShapeTable {
     families: Vec<ShapeFamily>,
 }
 
+type ShapeTransitionKey = (u32, MapStringKey, ShapeSlotContract);
+
+/// Program-wide hidden-class table, shared by the owner VM and every concurrent
+/// worker so shaped objects remain meaningful when they cross threads through
+/// shared collections.
+///
+/// Shapes are immutable once published and live in an append-only chunked
+/// arena: lookups by id never lock, and `&MapShape` references stay valid for
+/// the table lifetime. A shape id can only be observed after its publication
+/// (`len` Release store), because objects carrying it are published later.
+/// Creating shapes is serialized by `writer`; lock order is `writer` → `meta`.
+struct MapShapeTable {
+    chunks: [AtomicPtr<MapShape>; MAP_SHAPE_CHUNKS],
+    len: AtomicU32,
+    /// Hidden-class transitions `(parent, key, slot contract) -> child`.
+    transitions: papaya::HashMap<ShapeTransitionKey, u32, runtime_hash::AesBuildHasher>,
+    meta: parking_lot::RwLock<ShapeMetadata>,
+    writer: parking_lot::Mutex<()>,
+}
+
+// Shapes are read concurrently from every worker VM.
+const _: fn() = || {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<MapShape>();
+    shareable::<ShapeMetadata>();
+    shareable::<MapShapeTable>();
+};
+
+impl std::fmt::Debug for MapShapeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapShapeTable").field("len", &self.len()).finish_non_exhaustive()
+    }
+}
+
 impl Default for MapShapeTable {
     fn default() -> Self {
-        Self {
-            shapes: vec![MapShape {
-                keys: Vec::<MapStringKey>::new().into_boxed_slice(),
-                slots: Vec::<ShapeSlotContract>::new().into_boxed_slice(),
-                families: Vec::<ShapeFamilyMembership>::new().into_boxed_slice(),
-                transitions: FastMap::default(),
-            }],
-            typed_variants: FastMap::default(),
-            family_ids: FastMap::default(),
-            layout_families: Vec::new(),
-            families: Vec::new(),
+        let table = Self {
+            chunks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
+            len: AtomicU32::new(0),
+            transitions: papaya::HashMap::with_hasher(Default::default()),
+            meta: parking_lot::RwLock::new(ShapeMetadata::default()),
+            writer: parking_lot::Mutex::new(()),
+        };
+        let writer = table.writer.lock();
+        // Shape 0 is the empty root shape.
+        table.publish(&writer, MapShape {
+            keys: Vec::<MapStringKey>::new().into_boxed_slice(),
+            slots: Vec::<ShapeSlotContract>::new().into_boxed_slice(),
+            families: Vec::<ShapeFamilyMembership>::new().into_boxed_slice(),
+        });
+        drop(writer);
+        table
+    }
+}
+
+impl Drop for MapShapeTable {
+    fn drop(&mut self) {
+        let len = *self.len.get_mut() as usize;
+        for (index, chunk) in self.chunks.iter_mut().enumerate() {
+            let chunk = *chunk.get_mut();
+            if chunk.is_null() {
+                continue;
+            }
+            let live = len.saturating_sub(index * MAP_SHAPE_CHUNK).min(MAP_SHAPE_CHUNK);
+            unsafe {
+                for slot in 0..live {
+                    std::ptr::drop_in_place(chunk.add(slot));
+                }
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    chunk.cast::<std::mem::MaybeUninit<MapShape>>(),
+                    MAP_SHAPE_CHUNK,
+                )));
+            }
         }
     }
 }
 
 impl MapShapeTable {
     #[inline(always)]
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire) as usize
+    }
+
+    /// Append an immutable shape. The caller proves it holds `writer`.
+    fn publish(&self, _writer: &parking_lot::MutexGuard<'_, ()>, shape: MapShape) -> Option<u32> {
+        let id = self.len.load(Ordering::Relaxed) as usize;
+        if id >= MAX_MAP_SHAPES {
+            return None;
+        }
+        let chunk_slot = &self.chunks[id >> MAP_SHAPE_CHUNK_BITS];
+        let mut chunk = chunk_slot.load(Ordering::Relaxed);
+        if chunk.is_null() {
+            let storage = Box::<[MapShape]>::new_uninit_slice(MAP_SHAPE_CHUNK);
+            chunk = Box::into_raw(storage).cast::<MapShape>();
+            chunk_slot.store(chunk, Ordering::Release);
+        }
+        unsafe { chunk.add(id & MAP_SHAPE_CHUNK_MASK as usize).write(shape) };
+        self.len.store(id as u32 + 1, Ordering::Release);
+        Some(id as u32)
+    }
+
+    #[inline(always)]
+    fn shape(&self, shape: u32) -> &MapShape {
+        debug_assert!((shape as usize) < self.len());
+        let chunk = unsafe { self.chunks.get_unchecked((shape >> MAP_SHAPE_CHUNK_BITS) as usize) }
+            .load(Ordering::Acquire);
+        unsafe { &*chunk.add((shape & MAP_SHAPE_CHUNK_MASK) as usize) }
+    }
+
+    #[inline]
+    fn get_shape(&self, shape: u32) -> Option<&MapShape> {
+        ((shape as usize) < self.len()).then(|| self.shape(shape))
+    }
+
+    #[inline(always)]
     fn slot_hashed(&self, shape: u32, hash: u64, key: &[u8]) -> Option<u16> {
-        debug_assert!((shape as usize) < self.shapes.len());
-        unsafe { self.shapes.get_unchecked(shape as usize) }.slot_hashed(hash, key)
+        self.shape(shape).slot_hashed(hash, key)
     }
 
     #[inline(always)]
     fn key_at(&self, shape: u32, slot: u16) -> &MapStringKey {
-        debug_assert!((shape as usize) < self.shapes.len());
-        let keys = &unsafe { self.shapes.get_unchecked(shape as usize) }.keys;
+        let keys = &self.shape(shape).keys;
         debug_assert!((slot as usize) < keys.len());
         unsafe { keys.get_unchecked(slot as usize) }
     }
 
     #[inline(always)]
     fn slot_contract(&self, shape: u32, slot: u16) -> &ShapeSlotContract {
-        debug_assert!((shape as usize) < self.shapes.len());
-        let slots = &unsafe { self.shapes.get_unchecked(shape as usize) }.slots;
+        let slots = &self.shape(shape).slots;
         debug_assert!((slot as usize) < slots.len());
         unsafe { slots.get_unchecked(slot as usize) }
     }
 
     #[inline(always)]
     fn keys(&self, shape: u32) -> &[MapStringKey] {
-        debug_assert!((shape as usize) < self.shapes.len());
-        &unsafe { self.shapes.get_unchecked(shape as usize) }.keys
+        &self.shape(shape).keys
     }
 
     /// Return the shared child shape and the slot introduced by `key`.
-    fn transition(&mut self, shape: u32, key: MapStringKey) -> Option<(u32, u16)> {
+    fn transition(&self, shape: u32, key: MapStringKey) -> Option<(u32, u16)> {
         self.transition_with_contract(shape, key, ShapeSlotContract::default())
     }
 
     fn transition_with_contract(
-        &mut self,
+        &self,
         shape: u32,
         key: MapStringKey,
         contract: ShapeSlotContract,
     ) -> Option<(u32, u16)> {
-        let parent_index = shape as usize;
-        debug_assert!(parent_index < self.shapes.len());
-        if let Some(slot) = unsafe { self.shapes.get_unchecked(parent_index) }
-            .slot_hashed(key.hash, key.as_ref())
-        {
+        let parent = self.shape(shape);
+        if let Some(slot) = parent.slot_hashed(key.hash, key.as_ref()) {
             return Some((shape, slot));
         }
-        let slot = unsafe { self.shapes.get_unchecked(parent_index) }.keys.len();
-        if key.as_ref().len() > MAX_SHAPED_MAP_KEY_BYTES
-            || slot >= MAX_SHAPED_MAP_SLOTS
-            || self.shapes.len() >= MAX_MAP_SHAPES
-        {
+        let slot = parent.keys.len();
+        if key.as_ref().len() > MAX_SHAPED_MAP_KEY_BYTES || slot >= MAX_SHAPED_MAP_SLOTS {
             return None;
         }
 
@@ -1276,83 +1375,86 @@ impl MapShapeTable {
         // new slot contract is therefore the only additional transition identity.
         // Caching `(key, contract)` keeps typed optional-field growth shared across
         // objects while never aliasing it with an untyped/open-property child.
-        let transition_key = (key.clone(), contract.clone());
-        if let Some(&child) = unsafe { self.shapes.get_unchecked(parent_index) }
-            .transitions
-            .get(&transition_key)
-        {
+        let transition_key = (shape, key, contract);
+        if let Some(&child) = self.transitions.pin().get(&transition_key) {
             return Some((child, slot as u16));
         }
 
-        let parent = unsafe { self.shapes.get_unchecked(parent_index) };
+        let writer = self.writer.lock();
+        // Another VM may have created the same child while we waited.
+        if let Some(&child) = self.transitions.pin().get(&transition_key) {
+            return Some((child, slot as u16));
+        }
+        let (_, key, contract) = &transition_key;
         let mut keys = parent.keys.to_vec();
         let mut slots = parent.slots.to_vec();
-        keys.push(key);
-        slots.push(contract);
-        let child = self.shapes.len() as u32;
-        let parent_families = self.shapes[parent_index].families.to_vec();
-        let mut child_families = parent_families;
-        for membership in &mut child_families {
-            let Some(family) = self.families.get(membership.family as usize) else { continue };
-            if let Some(logical) = family
-                .keys
-                .iter()
-                .position(|candidate| candidate.hash == transition_key.0.hash
-                    && candidate.as_ref() == transition_key.0.as_ref())
-            {
-                if logical < membership.physical_slots.len()
-                    && membership.physical_slots[logical] == u16::MAX
+        keys.push(key.clone());
+        slots.push(contract.clone());
+        let mut child_families = parent.families.to_vec();
+        {
+            let meta = self.meta.read();
+            for membership in &mut child_families {
+                let Some(family) = meta.families.get(membership.family as usize) else { continue };
+                if let Some(logical) = family
+                    .keys
+                    .iter()
+                    .position(|candidate| candidate.hash == key.hash
+                        && candidate.as_ref() == key.as_ref())
                 {
-                    membership.physical_slots[logical] = slot as u16;
+                    if logical < membership.physical_slots.len()
+                        && membership.physical_slots[logical] == u16::MAX
+                    {
+                        membership.physical_slots[logical] = slot as u16;
+                    }
                 }
             }
         }
-        self.shapes.push(MapShape {
+        let child = self.publish(&writer, MapShape {
             keys: keys.into_boxed_slice(),
             slots: slots.into_boxed_slice(),
             families: child_families.into_boxed_slice(),
-            transitions: FastMap::default(),
-        });
-        self.shapes[parent_index]
-            .transitions
-            .insert(transition_key, child);
+        })?;
+        self.transitions.pin().insert(transition_key, child);
         Some((child, slot as u16))
     }
 
-    fn ensure_family(&mut self, contract: &Type) -> Option<u32> {
-        if let Some(&family) = self.family_ids.get(contract) {
+    fn ensure_family_locked(meta: &mut ShapeMetadata, contract: &Type) -> Option<u32> {
+        if let Some(&family) = meta.family_ids.get(contract) {
             return Some(family);
         }
         let fields = match contract {
             Type::Interface(fields) | Type::Record(fields) => fields,
             _ => return None,
         };
-        let family = self.families.len() as u32;
+        let family = meta.families.len() as u32;
         let keys = fields
             .iter()
             .map(|field| MapStringKey::new(Arc::from(field.name.as_bytes())))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        self.families.push(ShapeFamily { contract: contract.clone(), keys });
-        self.family_ids.insert(contract.clone(), family);
+        meta.families.push(ShapeFamily { contract: contract.clone(), keys });
+        meta.family_ids.insert(contract.clone(), family);
         Some(family)
     }
 
     #[inline]
     fn family_id(&self, contract: &Type) -> Option<u32> {
-        self.family_ids.get(contract).copied()
+        self.meta.read().family_ids.get(contract).copied()
     }
 
-    fn register_layout_family(&mut self, layout: &StructuralLayoutInfo) -> Option<u32> {
-        let family = self.ensure_family(&layout.contract)?;
+    /// Idempotent for every VM of one program: the owner and its workers link
+    /// the same structural layouts into the same shared families.
+    fn register_layout_family(&self, layout: &StructuralLayoutInfo) -> Option<u32> {
+        let mut meta = self.meta.write();
+        let family = Self::ensure_family_locked(&mut meta, &layout.contract)?;
         let index = layout.id.0 as usize;
-        if self.layout_families.len() <= index {
-            self.layout_families.resize(index + 1, None);
+        if meta.layout_families.len() <= index {
+            meta.layout_families.resize(index + 1, None);
         }
-        match self.layout_families[index] {
+        match meta.layout_families[index] {
             Some(existing) if existing != family => return None,
             Some(_) => {}
-            None => self.layout_families[index] = Some(family),
+            None => meta.layout_families[index] = Some(family),
         }
         Some(family)
     }
@@ -1364,7 +1466,7 @@ impl MapShapeTable {
         family: u32,
         logical: PropertySlotId,
     ) -> Option<Option<u16>> {
-        let shape = self.shapes.get(shape as usize)?;
+        let shape = self.get_shape(shape)?;
         let membership = shape.families.iter().find(|entry| entry.family == family)?;
         let slot = *membership.physical_slots.get(logical.0 as usize)?;
         Some((slot != u16::MAX).then_some(slot))
@@ -1376,7 +1478,7 @@ impl MapShapeTable {
         layout: StructuralLayoutId,
         logical: PropertySlotId,
     ) -> Option<Option<u16>> {
-        let family = self.layout_families.get(layout.0 as usize).copied().flatten()?;
+        let family = self.meta.read().layout_families.get(layout.0 as usize).copied().flatten()?;
         self.family_slot_by_id(shape, family, logical)
     }
 
@@ -1390,20 +1492,19 @@ impl MapShapeTable {
         self.family_slot_by_id(shape, family, logical)
     }
 
-    fn apply_contract(&mut self, shape: u32, contract: &Type) -> Option<u32> {
+    fn apply_contract(&self, shape: u32, contract: &Type) -> Option<u32> {
         let fields = match contract {
             Type::Interface(fields) | Type::Record(fields) => fields,
             _ => return Some(shape),
         };
-        let family = self.ensure_family(contract)?;
+        let writer = self.writer.lock();
+        let mut meta = self.meta.write();
+        let family = Self::ensure_family_locked(&mut meta, contract)?;
         let cache_key = (shape, family);
-        if let Some(&typed) = self.typed_variants.get(&cache_key) {
+        if let Some(&typed) = meta.typed_variants.get(&cache_key) {
             return Some(typed);
         }
-        if self.shapes.len() >= MAX_MAP_SHAPES {
-            return None;
-        }
-        let parent = self.shapes.get(shape as usize)?;
+        let parent = self.get_shape(shape)?;
         let keys = parent.keys.clone();
         let mut slots = parent.slots.to_vec();
         for (slot, key) in keys.iter().enumerate() {
@@ -1437,62 +1538,127 @@ impl MapShapeTable {
             });
         }
 
-        let typed = self.shapes.len() as u32;
-        self.shapes.push(MapShape {
+        let typed = self.publish(&writer, MapShape {
             keys,
             slots: slots.into_boxed_slice(),
             families: memberships.into_boxed_slice(),
-            transitions: FastMap::default(),
-        });
-        self.typed_variants.insert(cache_key, typed);
+        })?;
+        meta.typed_variants.insert(cache_key, typed);
         Some(typed)
     }
 }
 
-/// Ordered dictionary fallback. Hashing finds entries; the dense vector preserves
-/// insertion order across shape promotion, GC, updates and delete/reinsert.
+/// HashSet equality/hash use only the encoded key. The original value keeps
+/// strings and heap elements available to iteration and GC without allocating.
+#[derive(Debug)]
+struct SetEntry(MapKey, Value);
+impl PartialEq for SetEntry { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl Eq for SetEntry {}
+impl std::hash::Hash for SetEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.0.hash(state); }
+}
+impl std::borrow::Borrow<MapKey> for SetEntry { fn borrow(&self) -> &MapKey { &self.0 } }
+
+/// Contract metadata belongs to the concurrent table too. Ordinary handle
+/// contracts are VM-local mutable vectors and cannot be reused across workers.
 #[derive(Debug, Default)]
-struct MapDictionary {
-    indices: FastMap<MapKey, usize>,
-    entries: Vec<(MapKey, Value)>,
-    /// Created with `new Map()` (see `InlineMapValues::map_origin`).
-    map_origin: bool,
+struct ConcurrentTable<T> {
+    entries: T,
+    contracts: parking_lot::RwLock<Vec<Type>>,
+}
+impl<T> std::ops::Deref for ConcurrentTable<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.entries }
 }
 
+/// Objects retain ordered dictionary fallback; language Map and Set use only
+/// the project's AES-keyed hashbrown tables, without shapes or property caches.
+#[derive(Debug)]
+enum MapDictionary {
+    Object { indices: FastMap<MapKey, usize>, entries: Vec<(MapKey, Value)> },
+    Map(FastMap<MapKey, Value>),
+    Set(HashSet<SetEntry>),
+    ConcurrentMap(ConcurrentTable<crate::napalm_collections::ConcurrentMap<MapKey, Value>>),
+    ConcurrentSet(ConcurrentTable<crate::napalm_collections::ConcurrentSet<SetEntry>>),
+}
+impl Default for MapDictionary {
+    fn default() -> Self { Self::Object { indices: FastMap::default(), entries: Vec::new() } }
+}
 impl MapDictionary {
-    fn len(&self) -> usize { self.entries.len() }
-    fn is_empty(&self) -> bool { self.entries.is_empty() }
-    fn reserve(&mut self, additional: usize) {
-        self.indices.reserve(additional);
-        self.entries.reserve(additional);
-    }
-    fn external_bytes(&self) -> usize {
-        self.indices.capacity() * std::mem::size_of::<(MapKey, usize)>()
-            + self.entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
-    }
-    fn get(&self, key: &MapKey) -> Option<&Value> {
-        self.indices.get(key).map(|&index| &self.entries[index].1)
-    }
-    fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> {
-        if let Some(&index) = self.indices.get(&key) {
-            return Some(std::mem::replace(&mut self.entries[index].1, value));
+    fn concurrent_contracts(&self) -> Option<&parking_lot::RwLock<Vec<Type>>> { match self {
+        Self::ConcurrentMap(m) => Some(&m.contracts), Self::ConcurrentSet(s) => Some(&s.contracts), _ => None,
+    } }
+    fn is_concurrent(&self) -> bool { matches!(self, Self::ConcurrentMap(_) | Self::ConcurrentSet(_)) }
+    fn concurrent_insert(&self, key: MapKey, value: Value) -> bool { match self {
+        Self::ConcurrentMap(m) => m.pin().insert(key, value).is_none(),
+        Self::ConcurrentSet(s) => s.pin().insert(SetEntry(key, value)),
+        _ => unreachable!(),
+    } }
+    fn concurrent_remove(&self, key: &MapKey) -> Option<Value> { match self {
+        Self::ConcurrentMap(m) => m.pin().remove(key).copied(),
+        Self::ConcurrentSet(s) => { let pin = s.pin(); let value = pin.get(key).map(|e| e.1); if pin.remove(key) { value } else { None } },
+        _ => unreachable!(),
+    } }
+    fn concurrent_clear(&self) { match self {
+        Self::ConcurrentMap(m) => m.pin().clear(), Self::ConcurrentSet(s) => s.pin().clear(), _ => unreachable!(),
+    } }
+    fn is_map_origin(&self) -> bool { !matches!(self, Self::Object { .. }) }
+    fn len(&self) -> usize { match self {
+        Self::Object { entries, .. } => entries.len(), Self::Map(m) => m.len(), Self::Set(s) => s.len(),
+        Self::ConcurrentMap(m) => m.len(), Self::ConcurrentSet(s) => s.len(),
+    } }
+    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn reserve(&mut self, additional: usize) { match self {
+        Self::Object { indices, entries } => { indices.reserve(additional); entries.reserve(additional); }
+        Self::Map(m) => m.reserve(additional), Self::Set(s) => s.reserve(additional),
+        Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => {},
+    } }
+    fn external_bytes(&self) -> usize { match self {
+        Self::Object { indices, entries } => indices.capacity() * std::mem::size_of::<(MapKey, usize)>() + entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        Self::Map(m) => m.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        Self::Set(s) => s.capacity() * std::mem::size_of::<SetEntry>(),
+        Self::ConcurrentMap(m) => m.len() * std::mem::size_of::<(MapKey, Value)>(),
+        Self::ConcurrentSet(s) => s.len() * std::mem::size_of::<SetEntry>(),
+    } }
+    fn get(&self, key: &MapKey) -> Option<Value> { match self {
+        Self::Object { indices, entries } => indices.get(key).map(|&i| entries[i].1),
+        Self::Map(m) => m.get(key).copied(), Self::Set(s) => s.get(key).map(|e| e.1),
+        Self::ConcurrentMap(m) => m.pin().get(key).copied(),
+        Self::ConcurrentSet(s) => s.pin().get(key).map(|e| e.1),
+    } }
+    fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> { match self {
+        Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent writes require a shared borrow"),
+        Self::Map(m) => m.insert(key, value),
+        Self::Set(s) => s.replace(SetEntry(key, value)).map(|e| e.1),
+        Self::Object { indices, entries } => {
+            if let Some(&i) = indices.get(&key) { return Some(std::mem::replace(&mut entries[i].1, value)); }
+            indices.insert(key.clone(), entries.len()); entries.push((key, value)); None
         }
-        self.indices.insert(key.clone(), self.entries.len());
-        self.entries.push((key, value));
-        None
-    }
-    fn remove(&mut self, key: &MapKey) -> Option<Value> {
-        let index = self.indices.remove(key)?;
-        let (_, value) = self.entries.remove(index);
-        for (offset, (key, _)) in self.entries[index..].iter().enumerate() {
-            *self.indices.get_mut(key).unwrap() = index + offset;
+    } }
+    fn remove(&mut self, key: &MapKey) -> Option<Value> { match self {
+        Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent removal requires a shared borrow"),
+        Self::Map(m) => m.remove(key), Self::Set(s) => s.take(key).map(|e| e.1),
+        Self::Object { indices, entries } => {
+            let index = indices.remove(key)?; let (_, value) = entries.remove(index);
+            for (offset, (key, _)) in entries[index..].iter().enumerate() { *indices.get_mut(key).unwrap() = index + offset; }
+            Some(value)
         }
-        Some(value)
-    }
-    fn clear(&mut self) { self.indices.clear(); self.entries.clear(); }
-    fn iter(&self) -> impl Iterator<Item = (&MapKey, &Value)> {
-        self.entries.iter().map(|(key, value)| (key, value))
-    }
+    } }
+    fn clear(&mut self) { match self {
+        Self::Object { indices, entries } => { indices.clear(); entries.clear(); }
+        Self::Map(m) => m.clear(), Self::Set(s) => s.clear(),
+        Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => self.concurrent_clear(),
+    } }
+    fn iter(&self) -> Box<dyn Iterator<Item = (MapKey, Value)> + '_> { match self {
+        Self::Object { entries, .. } => Box::new(entries.iter().cloned()),
+        Self::Map(m) => Box::new(m.iter().map(|(k,v)| (k.clone(), *v))),
+        Self::Set(s) => Box::new(s.iter().map(|e| (e.0.clone(), e.1))),
+        Self::ConcurrentMap(m) => Box::new(m.pin().iter().map(|(k,v)| (k.clone(), *v)).collect::<Vec<_>>().into_iter()),
+        Self::ConcurrentSet(s) => Box::new(s.pin().iter().map(|e| (e.0.clone(), e.1)).collect::<Vec<_>>().into_iter()),
+    } }
+    fn nth_key(&self, index: usize) -> Option<MapKey> { self.iter().nth(index).map(|(k,_)| k) }
+    fn nth_value(&self, index: usize) -> Option<Value> { self.iter().nth(index).map(|(_,v)| v) }
+
 }
 
 const SMALL_MAP_INLINE_FIELDS: usize = 4;
@@ -1641,15 +1807,13 @@ impl NapalmMap {
 
     /// An empty Map created with `new Map()` (as opposed to `{}`).
     fn new_map_origin() -> Self {
-        let mut values = InlineMapValues::new();
-        values.map_origin = 1;
-        Self::with_shaped_buffer(0, values)
+        Self { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Map(FastMap::default()))) }
     }
 
     fn is_map_origin(&self) -> bool {
         match &self.storage {
             NapalmMapStorage::Shaped { values, .. } => values.map_origin != 0,
-            NapalmMapStorage::Dictionary(entries) => entries.map_origin,
+            NapalmMapStorage::Dictionary(entries) => entries.is_map_origin(),
         }
     }
 
@@ -1688,7 +1852,7 @@ impl NapalmMap {
                 Some(unsafe { *values.get_unchecked(slot) })
             }
             (NapalmMapStorage::Shaped { .. }, _) => None,
-            (NapalmMapStorage::Dictionary(entries), _) => entries.get(key).copied(),
+            (NapalmMapStorage::Dictionary(entries), _) => entries.get(key),
         }
     }
 
@@ -1698,7 +1862,7 @@ impl NapalmMap {
     /// `Heap::alloc` eventually publishes it.
     fn insert_unpublished(
         &mut self,
-        shapes: &mut MapShapeTable,
+        shapes: &MapShapeTable,
         key: MapKey,
         value: Value,
     ) -> Option<u16> {
@@ -1744,7 +1908,6 @@ impl NapalmMap {
                 let keys = shapes.keys(shape);
                 debug_assert_eq!(keys.len(), values.len());
                 let mut entries = MapDictionary::default();
-                entries.map_origin = values.map_origin != 0;
                 entries.reserve(values.len());
                 for (key, value) in keys.iter().cloned().zip(values.as_slice().iter().copied()) {
                     entries.insert(MapKey::String(key), value);
@@ -1764,14 +1927,14 @@ impl NapalmMap {
                 debug_assert!(index < keys.len());
                 Some(MapKey::String(unsafe { keys.get_unchecked(index) }.clone()))
             }
-            NapalmMapStorage::Dictionary(entries) => entries.entries.get(index).map(|(key, _)| key.clone()),
+            NapalmMapStorage::Dictionary(entries) => entries.nth_key(index),
         }
     }
 
     fn nth_value(&self, index: usize) -> Option<Value> {
         match &self.storage {
             NapalmMapStorage::Shaped { values, .. } => values.get(index).copied(),
-            NapalmMapStorage::Dictionary(entries) => entries.entries.get(index).map(|(_, value)| *value),
+            NapalmMapStorage::Dictionary(entries) => entries.nth_value(index),
         }
     }
 }
@@ -2875,8 +3038,13 @@ impl HandleTable {
             entry.promise_value.store(0, Ordering::Relaxed);
         }
         debug_assert!(metadata <= crate::napalm_tracing_jit::TRACE_HEAP_METADATA_MAX);
-        let packed_kind = (kind as u32)
-            | (metadata << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT);
+        // Shared objects are mutated under VmAdaptativeMutex by the interpreter
+        // only: an Invalid kind makes every native heap guard fail.
+        let packed_kind = if entry.sync.load(Ordering::Relaxed) & SYNC_SHARED != 0 {
+            TraceHeapKind::Invalid as u32
+        } else {
+            (kind as u32) | (metadata << crate::napalm_tracing_jit::TRACE_HEAP_METADATA_SHIFT)
+        };
         // Publish kind+metadata last so generated code cannot observe a partially
         // refreshed sidecar. receiver_class remains an independent semantic key.
         entry.kind.store(packed_kind, Ordering::Release);
@@ -3059,9 +3227,9 @@ unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
                 visit_values_prefetched(values.as_slice(), visitor);
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, &value) in entries.iter() {
+                for (key, value) in entries.iter() {
                     if let MapKey::Object(handle) = key {
-                        visit_handle(*handle, visitor);
+                        visit_handle(handle, visitor);
                     }
                     visit_value(value, visitor);
                 }
@@ -3600,8 +3768,8 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 for &value in values { push_value_handle(value, roots); }
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, &value) in entries.iter() {
-                    if let MapKey::Object(handle) = key { roots.push(*handle); }
+                for (key, value) in entries.iter() {
+                    if let MapKey::Object(handle) = key { roots.push(handle); }
                     push_value_handle(value, roots);
                 }
             }
@@ -3713,7 +3881,11 @@ struct Heap {
     /// register/bank writes until the next safepoint are covered by StickyImmix's
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
-    map_shapes: MapShapeTable,
+    /// Shared with every concurrent worker VM of the same program.
+    map_shapes: Arc<MapShapeTable>,
+    /// Set once this VM can observe shared collections; selects the dispatch
+    /// loop that takes VmAdaptativeMutex locks around heap operations.
+    shared_mode: bool,
     /// Scratch buffer for pulling stable handles from the global table in small
     /// batches; they are then appended to the mutator's swept handle log.
     recycled_handles: Vec<u32>,
@@ -3771,7 +3943,8 @@ impl Default for Heap {
             allocation_roots,
             _allocation_root_registration: allocation_root_registration,
             stack_owner: Value::NULL,
-            map_shapes: MapShapeTable::default(),
+            map_shapes: Arc::new(MapShapeTable::default()),
+            shared_mode: false,
             recycled_handles: Vec::with_capacity(HANDLE_RECYCLE_BATCH),
             contract_class_ids: Vec::new(),
             class_implements: Vec::new(),
@@ -4192,7 +4365,7 @@ impl Heap {
                 None => cacheable = false,
             }
             let key = self.map_key(key_value)?;
-            match map.insert_unpublished(&mut self.map_shapes, key, value) {
+            match map.insert_unpublished(&self.map_shapes, key, value) {
                 Some(slot) => slots[index] = slot,
                 None => cacheable = false,
             }
@@ -4322,6 +4495,14 @@ impl Heap {
         item: Value,
         mut cache: Option<&mut MapInlineCacheState>,
     ) -> Result<bool, RuntimeError> {
+        if self.concurrent_table(map_value).is_some() {
+            self.check_map_write(map_value, Some(&key), Some(item))?;
+            // Everything reachable from a shared table is shared, whichever
+            // tier performed the insertion.
+            self.mark_shared_deep(item);
+            if let MapKey::Object(handle) = &key { self.mark_shared_deep(Value::from_heap(*handle)); }
+            return Ok(self.concurrent_table(map_value).unwrap().concurrent_insert(key, item));
+        }
         let existing_shaped_slot = match &key {
             MapKey::String(bytes) => self.object(map_value).and_then(|object| {
                 let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
@@ -4408,6 +4589,10 @@ impl Heap {
         item: Value,
         cache: &mut MapInlineCacheState,
     ) -> Result<bool, RuntimeError> {
+        if self.concurrent_table(map_value).is_some() {
+            let key = self.map_key(key_value)?;
+            return self.map_set_encoded(map_value, key, item, None);
+        }
         // Classify the key before taking a mutable view of the map. For shaped
         // string properties keep only a raw pointer to the immutable string so a
         // PIC hit does not clone Arc<[u8]> or build/hash a temporary MapKey.
@@ -4542,6 +4727,9 @@ impl Heap {
         key: &MapKey,
     ) -> Result<(Value, bool), RuntimeError> {
         self.check_map_write(map_value, Some(key), None)?;
+        if let Some(table) = self.concurrent_table(map_value) {
+            return Ok(match table.concurrent_remove(key) { Some(v) => (v, true), None => (Value::NULL, false) });
+        }
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -4575,6 +4763,7 @@ impl Heap {
 
     fn map_clear_storage(&mut self, map_value: Value) -> Result<bool, RuntimeError> {
         self.check_map_write(map_value, None, None)?;
+        if let Some(table) = self.concurrent_table(map_value) { table.concurrent_clear(); return Ok(true); }
         let object = self
             .object(map_value)
             .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
@@ -4598,6 +4787,14 @@ impl Heap {
     }
 
     #[inline]
+    fn concurrent_table(&self, value: Value) -> Option<&MapDictionary> {
+        match self.get(value) {
+            Some(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(table) })) if table.is_concurrent() => Some(table),
+            Some(HeapObject::Set { map }) => self.concurrent_table(*map),
+            _ => None,
+        }
+    }
+
     fn map_external_bytes(&self, map_value: Value) -> Option<usize> {
         match self.get(map_value) {
             Some(HeapObject::Map(map)) => Some(map.external_bytes()),
@@ -4700,7 +4897,7 @@ impl Heap {
         self.remember_stack_owner();
     }
 
-    fn register_roots(&mut self, provider: Arc<dyn GcRootProvider>) -> GcRootRegistration {
+    fn register_roots(&self, provider: Arc<dyn GcRootProvider>) -> GcRootRegistration {
         self.mutator.register_roots(provider)
     }
 
@@ -4860,7 +5057,7 @@ impl HostContext<'_> {
     }
 
     pub fn allocate_set(&mut self) -> Value {
-        let map = self.allocate_map();
+        let map = self.heap.alloc(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Set(HashSet::default()))) }));
         let map = self.root(map);
         self.heap.alloc(HeapObject::Set { map: map.value() })
     }
@@ -4876,7 +5073,19 @@ impl HostContext<'_> {
         self.heap.alloc(HeapObject::Map(NapalmMap::default()))
     }
 
-    /// `new Map()`: same representation as `{}`, remembered only for `typeof`.
+    /// `new Map()` always allocates an AES-keyed hashbrown table.
+    pub fn allocate_concurrent_collection(&mut self, set: bool) -> Value {
+        let table = if set { MapDictionary::ConcurrentSet(Default::default()) }
+                    else { MapDictionary::ConcurrentMap(Default::default()) };
+        let map = self.heap.alloc(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(Box::new(table)) }));
+        self.heap.mark_concurrent_table(map);
+        if !set { return map; }
+        let root = self.root(map);
+        let set = self.heap.alloc(HeapObject::Set { map: root.value() });
+        self.heap.mark_concurrent_table(set);
+        set
+    }
+
     pub fn allocate_map_instance(&mut self) -> Value {
         self.heap.alloc(HeapObject::Map(NapalmMap::new_map_origin()))
     }
@@ -5163,6 +5372,33 @@ impl HostContext<'_> {
         let value = self.root(value);
         let key = self.map_nth_key(map, index)?;
         Ok(self.heap.alloc(HeapObject::MapEntry { key, value: value.value() }))
+    }
+
+    /// Take one table snapshot so keys and values remain paired even while a
+    /// concurrent table changes. Root the complete snapshot before allocating
+    /// managed strings or result lists.
+    pub fn map_pairs(&mut self, map: Value) -> Result<Vec<(HostRoot, HostRoot)>, RuntimeError> {
+        let entries = map_entries(self.heap, map)?;
+        let entries: Vec<_> = entries.into_iter().map(|(key, value)| {
+            let value = self.root(value);
+            let key_root = match &key {
+                MapKey::Object(handle) => Some(self.root(Value::from_heap(*handle))),
+                _ => None,
+            };
+            (key, value, key_root)
+        }).collect();
+        let mut pairs = Vec::with_capacity(entries.len());
+        for (key, value, _key_root) in entries {
+            let key = match key {
+                MapKey::Null => Value::NULL,
+                MapKey::Bool(v) => Value::from_bool(v),
+                MapKey::Num(bits) => Value::from_num(f64::from_bits(bits)),
+                MapKey::String(bytes) => self.allocate_bytes(bytes),
+                MapKey::Object(handle) => Value::from_heap(handle),
+            };
+            pairs.push((self.root(key), value));
+        }
+        Ok(pairs)
     }
 
     pub fn map_keys(&mut self, map: Value) -> Result<Value, RuntimeError> {
@@ -5568,6 +5804,9 @@ struct PreparedFunction {
     /// Raw bytecode PC for each prepared-op index. Kept out of PreparedOp so the
     /// executable stream stays 24 bytes/op; diagnostics/tiering pay this cold load.
     raw_pcs: Vec<u32>,
+    /// Per prepared op: operand registers the shared-mode dispatch loop must
+    /// lock (see `napalm_vm_mutex.rs`). Zero for pure opcodes.
+    shared_operands: Vec<u8>,
     call_args: Vec<Reg>,
     switches: Vec<PreparedSwitch>,
     gc_maps: Vec<ReferenceMap>,
@@ -6187,6 +6426,7 @@ impl PreparedProgram {
         );
         let gc_map_by_op = temps.iter().map(|temp| temp.gc_map).collect();
         let raw_pcs = temps.iter().map(|temp| temp.raw_pc).collect();
+        let shared_operands = temps.iter().map(|temp| vm_mutex::shared_operand_mask(temp.opcode)).collect();
 
         let mut memo_arg_kinds = [RegisterKind::Value; 4];
         for binding in &function.frame.parameters {
@@ -6208,6 +6448,7 @@ impl PreparedProgram {
             ops,
             original_ops,
             raw_pcs,
+            shared_operands,
             call_args,
             switches,
             gc_maps,
@@ -7347,6 +7588,9 @@ enum RunState {
     Returned,
     Suspended,
     Failed,
+    /// Leave the current dispatch quantum and re-select the dispatch loop
+    /// (entering shared mode after the first `launch`).
+    Reschedule,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -7462,6 +7706,13 @@ pub struct Interpreter<'p> {
     /// warm-up traces to be adopted directly by isolated workers.
     shared_jit_profile: Option<Arc<SharedJitProfile>>,
     shared_jit_repository: Option<Arc<SharedJitRepository>>,
+    /// VmAdaptativeMutex locks held by the current shared-mode operation.
+    held_locks: Vec<u32>,
+    /// Lock a parked concurrent task waits for (`ExecutionResult::Suspended`).
+    blocked_on: Option<u32>,
+    /// Result register (and frame) of the current shared-mode operation.
+    shared_result: Option<(u8, usize)>,
+    shared_op_active: bool,
     /// Whole-function Cranelift tier for hot call/recursion-heavy functions.
     /// Auto-memoized functions are permanently excluded by the tier itself.
     whole_function_jit: Option<Box<WholeFunctionJit>>,
@@ -7732,6 +7983,16 @@ impl<'p> Interpreter<'p> {
     }
 
     pub fn with_host(program: &'p BytecodeProgram, host: Box<dyn Host>) -> Result<Self, RuntimeError> {
+        Self::with_host_and_shapes(program, host, None)
+    }
+
+    /// Concurrent workers join the owner's hidden-class table so shaped objects
+    /// stay valid across VMs. `None` creates a private table.
+    fn with_host_and_shapes(
+        program: &'p BytecodeProgram,
+        host: Box<dyn Host>,
+        shapes: Option<Arc<MapShapeTable>>,
+    ) -> Result<Self, RuntimeError> {
         // All hot-path unchecked indexing and threaded dispatch rely on this
         // one-time validation barrier. Never execute unverified bytecode.
         BytecodeVerifier::verify_program(program)
@@ -7746,6 +8007,9 @@ impl<'p> Interpreter<'p> {
                 .into_boxed_slice(),
         });
         let mut heap = Heap::default();
+        if let Some(shapes) = shapes {
+            heap.map_shapes = shapes;
+        }
         heap.contract_class_ids = program.metadata.classes.iter().map(|class| class.id).collect();
         heap.class_implements = program.metadata.classes.iter().map(|class| class.implements.clone()).collect();
         heap.class_field_names = vec![Vec::new(); program.metadata.classes.len()];
@@ -7863,7 +8127,8 @@ impl<'p> Interpreter<'p> {
                         || info
                             .worker_function_bindings
                             .iter()
-                            .any(|binding| binding.slot.0 == slot);
+                            .any(|binding| binding.slot.0 == slot)
+                        || info.shared_slots.iter().any(|shared| shared.0 == slot);
                     function.ops[index].cache = worker_readable as u32;
                 }
                 let module = unsafe { modules.get_unchecked_mut(module_index) };
@@ -8000,6 +8265,10 @@ impl<'p> Interpreter<'p> {
             jit: Some(jit),
             shared_jit_profile,
             shared_jit_repository,
+            held_locks: Vec::with_capacity(4),
+            blocked_on: None,
+            shared_result: None,
+            shared_op_active: false,
             whole_function_jit,
             native_shadow_top: std::ptr::null_mut(),
             jit_entry_threshold,
@@ -8552,6 +8821,10 @@ impl<'p> Interpreter<'p> {
     }
 
     pub fn run_function(&mut self, function: FuncId, args: &[Value]) -> Result<ExecutionResult, RuntimeError> {
+        self.run_function_with_captures(function, args, &[])
+    }
+
+    fn run_function_with_captures(&mut self, function: FuncId, args: &[Value], captures: &[Value]) -> Result<ExecutionResult, RuntimeError> {
         let _gc_roots = self.gc_root_registration();
         let function_index = *self.prepared.function_by_id.get(&function)
             .ok_or_else(|| RuntimeError::new(format!("unknown function {:?}", function)))?;
@@ -8590,7 +8863,18 @@ impl<'p> Interpreter<'p> {
         for (index, value) in args.iter().copied().enumerate() {
             words[index] = value.word();
         }
-        self.push_frame_direct(function_index, &words[..args.len()], None, None)?;
+        if captures.is_empty() {
+            self.push_frame_direct(function_index, &words[..args.len()], None, None)?;
+        } else {
+            let capture_words: Vec<_> = captures.iter().map(|v| v.word()).collect();
+            let reference_indices = self.prepared.functions[function_index as usize].capture_reference_indices.clone();
+            let closure = self.heap.alloc(HeapObject::Closure {
+                function_index,
+                captures: capture_words.into_boxed_slice(),
+                reference_indices,
+            });
+            self.push_frame_direct(function_index, &words[..args.len()], Some(closure), None)?;
+        }
         self.dispatch_loop();
         let result = self.finish_result();
         self.sync_persistent_roots();
@@ -8642,6 +8926,7 @@ impl<'p> Interpreter<'p> {
         match self.run_state {
             RunState::Returned => Ok(ExecutionResult::Returned(self.result)),
             RunState::Suspended => Ok(ExecutionResult::Suspended(self.result)),
+            RunState::Reschedule => Err(RuntimeError::new("interpreter stopped while rescheduling")),
             RunState::Failed => Err(self.error.take().unwrap_or_else(|| RuntimeError::new("interpreter failed"))),
             RunState::Running => Err(RuntimeError::new("interpreter stopped while still running")),
         }
@@ -8650,6 +8935,14 @@ impl<'p> Interpreter<'p> {
     #[inline(never)]
     fn dispatch_loop(&mut self) {
         loop {
+            if unlikely(self.heap.shared_mode) {
+                // Shared collections exist: heap operations take per-object locks.
+                self.dispatch_shared_quantum();
+                if self.blocked_on.is_some() {
+                    // Parked on a VmAdaptativeMutex; the worker scheduler resumes us.
+                    break;
+                }
+            } else {
             // Leaving Running (return to host, suspension, failure) happens once
             // per scheduling quantum; keep the handler call on the fallthrough.
             while likely(self.run_state == RunState::Running) {
@@ -8673,7 +8966,12 @@ impl<'p> Interpreter<'p> {
                 let op = unsafe { self.hot_ops.add(pc) };
                 unsafe { handler(self, op) };
             }
+            }
 
+            if unlikely(self.run_state == RunState::Reschedule) {
+                self.run_state = RunState::Running;
+                continue;
+            }
             if unlikely(self.run_state == RunState::Failed) {
                 break;
             }
@@ -9853,10 +10151,13 @@ impl<'p> Interpreter<'p> {
                 match self.event_loop.time_until_next() {
                     Some(timeout) if timeout.is_zero() => continue,
                     Some(timeout) => {
-                        let _ = self.external_wake_rx.recv_timeout(timeout);
+                        // Waiting for a worker must allow that worker to collect.
+                        let receiver = &self.external_wake_rx;
+                        let _ = unsafe { self.heap.mutator.with_native(|| receiver.recv_timeout(timeout)) };
                     }
                     None => {
-                        if self.external_wake_rx.recv().is_err() {
+                        let receiver = &self.external_wake_rx;
+                        if unsafe { self.heap.mutator.with_native(|| receiver.recv()) }.is_err() {
                             return false;
                         }
                     }
@@ -9868,7 +10169,7 @@ impl<'p> Interpreter<'p> {
                 return false;
             };
             if !wait.is_zero() {
-                std::thread::park_timeout(wait);
+                unsafe { self.heap.mutator.with_native(|| std::thread::park_timeout(wait)); }
             }
         }
     }
@@ -11477,6 +11778,11 @@ impl<'p> Interpreter<'p> {
         memo: &mut FastMap<u32, ConcurrentValue>,
         next_id: &mut u32,
     ) -> Result<ConcurrentValue, RuntimeError> {
+        if self.heap.concurrent_table(value).is_some() {
+            let provider: Arc<dyn GcRootProvider> = Arc::new(SingleHandleRoot { handle: value.heap_handle().unwrap() });
+            let root = SharedTransfer { value, _registration: self.heap.register_roots(provider) };
+            return Ok(ConcurrentValue::Shared(Arc::new(root)));
+        }
         const MAX_DEPTH: usize = 256;
         if depth > MAX_DEPTH {
             return Err(RuntimeError::new("concurrent argument graph is nested too deeply"));
@@ -11654,6 +11960,11 @@ impl<'p> Interpreter<'p> {
             return Err(RuntimeError::new("concurrent transfer graph is nested too deeply"));
         }
         match value {
+            ConcurrentValue::Shared(root) => {
+                // This VM can now reach shared state: lock heap operations.
+                self.heap.shared_mode = true;
+                Ok(root.value)
+            }
             ConcurrentValue::Null => Ok(Value::NULL),
             ConcurrentValue::Bool(value) => Ok(Value::from_bool(*value)),
             ConcurrentValue::Num(bits) => Ok(Value::from_num(f64::from_bits(*bits))),
@@ -11735,8 +12046,8 @@ impl<'p> Interpreter<'p> {
                 "nested `launch` from a concurrent worker is disabled to avoid recursive worker-pool creation",
             ));
         }
-        let (function_index, capture_count) = match self.heap.get(closure) {
-            Some(HeapObject::Closure { function_index, captures, .. }) => (*function_index, captures.len()),
+        let (function_index, captures) = match self.heap.get(closure) {
+            Some(HeapObject::Closure { function_index, captures, .. }) => (*function_index, captures.iter().map(|word| Value::from_word(*word)).collect::<Vec<_>>()),
             _ => return Err(RuntimeError::new("`launch` target is not a function")),
         };
         let (function_id, function_arity, function_capture_count, is_concurrent, is_async) = {
@@ -11759,10 +12070,19 @@ impl<'p> Interpreter<'p> {
         if is_async {
             return Err(RuntimeError::new("a concurrent function cannot also be async"));
         }
-        if capture_count != 0 || function_capture_count != 0 {
-            return Err(RuntimeError::new(
-                "concurrent functions cannot capture lexical state; pass values as arguments",
-            ));
+        if captures.len() != function_capture_count as usize || captures.iter().any(|v| self.heap.concurrent_table(*v).is_none()) {
+            return Err(RuntimeError::new("concurrent captures must be shared ConcurrentMap/ConcurrentSet values"));
+        }
+        let transfer_captures = self.snapshot_concurrent_arguments(&captures)?;
+        let mut shared_globals = Vec::new();
+        for (module_index, module) in self.program.metadata.modules.iter().enumerate() {
+            for slot in &module.shared_slots {
+                let value = self.modules[module_index].variables[slot.0 as usize];
+                if self.heap.concurrent_table(value).is_none() {
+                    return Err(RuntimeError::new("shared collection is not initialized at launch"));
+                }
+                shared_globals.push((module_index, slot.0 as usize, self.snapshot_concurrent_value(value)?));
+            }
         }
         if args.len() != function_arity as usize {
             return Err(RuntimeError::new(format!(
@@ -11794,6 +12114,7 @@ impl<'p> Interpreter<'p> {
                 shared_jit_profile,
                 shared_jit_repository,
                 shared_memo,
+                self.heap.map_shapes.clone(),
             )?);
         }
 
@@ -11803,8 +12124,13 @@ impl<'p> Interpreter<'p> {
             .concurrent
             .as_mut()
             .expect("concurrent runtime disappeared after initialization")
-            .submit(function_id, transfer_args);
+            .submit(function_id, transfer_args, transfer_captures, shared_globals);
         self.pending_concurrent.insert(id, promise);
+        if self.heap.shared_mode && self.run_state == RunState::Running {
+            // Workers can now touch shared objects concurrently: leave the
+            // ordinary dispatch quantum for the locking one.
+            self.run_state = RunState::Reschedule;
+        }
         if let Err(error) = self.set_promise_cancel_handle(promise, Some(CancelHandle::Concurrent(id))) {
             if let Some(runtime) = self.concurrent.as_mut() {
                 runtime.cancel(id);
@@ -15948,6 +16274,13 @@ impl Interpreter<'_> {
             Type::Module => matches!(self.heap.get(Value::from_word(word)), Some(HeapObject::ModuleObject { .. })),
             Type::Builtin(builtin, element) => {
                 let value = Value::from_word(word);
+                if matches!(builtin, BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet) {
+                    return match self.heap.concurrent_table(value) {
+                        Some(MapDictionary::ConcurrentMap(_)) if *builtin == BuiltinId::ConcurrentMap => element.is_none() || self.heap.interface_matches(value, expected),
+                        Some(MapDictionary::ConcurrentSet(_)) if *builtin == BuiltinId::ConcurrentSet => element.is_none() || self.heap.interface_matches(value, expected),
+                        _ => false,
+                    };
+                }
                 match (builtin, self.heap.get(value)) {
                     (BuiltinId::Event, Some(HeapObject::Event { state })) => {
                         element.as_ref().map_or(true, |expected| unsafe { state.get() }.payload_type.as_ref() == Some(expected.as_ref()))
@@ -15986,7 +16319,7 @@ impl Interpreter<'_> {
             match ty {
                 Type::Interface(_) | Type::Record(_) | Type::GenericInstance { .. } | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
                 Type::Builtin(
-                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver,
+                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
                     Some(_),
                 ) => true,
                 Type::Union(types) => types.iter().any(needs_contract),
@@ -16178,11 +16511,12 @@ impl Interpreter<'_> {
         if value.is_num() {
             return "Number".to_owned();
         }
-        let contracts: &[Type] = value
+        let concurrent_contracts = self.heap.concurrent_table(value).and_then(MapDictionary::concurrent_contracts).map(|c| c.read().clone());
+        let contracts: &[Type] = concurrent_contracts.as_deref().unwrap_or_else(|| value
             .heap_handle()
             .and_then(|handle| self.heap.handle_table.contracts(handle))
             .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .unwrap_or(&[]));
         let generic = |base: &str, argument: Option<&Type>| match argument {
             Some(argument) => format!("{base}<{}>", self.type_display(argument)),
             None => base.to_owned(),
@@ -16197,14 +16531,15 @@ impl Interpreter<'_> {
                 generic("Array", element)
             }
             Some(HeapObject::Map(map)) => {
+                let base = if self.heap.concurrent_table(value).is_some() { "ConcurrentMap" } else { "Map" };
                 if let Some((key, item)) = contracts.iter().find_map(|contract| match contract {
                     Type::GenericMap(key, item) => Some((key, item)),
                     _ => None,
                 }) {
-                    return format!("Map<{}, {}>", self.type_display(key), self.type_display(item));
+                    return format!("{base}<{}, {}>", self.type_display(key), self.type_display(item));
                 }
                 if map.is_map_origin() {
-                    return "Map".to_owned();
+                    return base.to_owned();
                 }
                 let names: Vec<&str> = contracts
                     .iter()
@@ -16217,6 +16552,11 @@ impl Interpreter<'_> {
                 }
             }
             Some(HeapObject::Set { .. }) => {
+                let concurrent = self.heap.concurrent_table(value).is_some();
+                if concurrent {
+                    let element = contracts.iter().find_map(|t| match t { Type::GenericMap(k, _) => Some(&**k), _ => None });
+                    return generic("ConcurrentSet", element);
+                }
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::Set(Some(element)) => Some(&**element),
                     _ => None,
@@ -16955,7 +17295,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_define_class_specialized, // DefineClassWithImplements
     h_define_class_specialized, // DefineDerivedClassWithImplements
     h_implement_structural_contract, // ImplementInterfaceOrType
-    h_unsupported_specialized_opcode, // MapLookupOrInsert (pending master merge)
+    h_map_lookup_or_insert_pending, // MapLookupOrInsert
     h_define_typed_array, // DefineArrayWithGenerics
     h_new_class_instance, // NewClassInstance
     h_new_interface_or_type_object, // NewInterfaceOrTypeObject
@@ -20808,6 +21148,14 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
     let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
     let mode = next & crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK;
     let next_pc = next & !crate::napalm_tracing_jit::TRACE_RUNTIME_MODE_MASK;
+    if vm.heap.shared_mode {
+        // Shared objects are only touched by the interpreter under their
+        // VmAdaptativeMutex: leave the trace before the runtime step runs.
+        match vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc))) {
+            Ok(()) => if unsafe { vm.current_op_touches_shared() } { return 1; },
+            Err(error) => { vm.fail(error); return 1; }
+        }
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc)))?;
         let continuation = TraceLocation::new(FuncId(function), BytecodePc(next_pc));
@@ -20887,7 +21235,7 @@ mod tests {
 
     fn simple_program(chunk: crate::napalm_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new(), hidden_variable_count: 0 });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new(), worker_function_bindings: Vec::new(), shared_slots: Vec::new(), hidden_variable_count: 0 });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
@@ -25252,4 +25600,9 @@ let result = 1;
         assert_eq!(source_result(&optimized_vm), 99.0);
     }
 
+}
+
+// Deliberately reserved for the future interpreter/JIT implementation.
+unsafe fn h_map_lookup_or_insert_pending(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    vm.fail_at(&*ptr, "MapLookupOrInsert execution is not implemented yet");
 }

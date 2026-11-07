@@ -252,6 +252,8 @@ enum BuiltinPrimitive {
     ListNewNumber,
 
     MapNew,
+    ConcurrentMapNew,
+    ConcurrentSetNew,
     MapSet,
     MapDelete,
     MapSpreadInto,
@@ -268,6 +270,7 @@ enum BuiltinPrimitive {
     SetIterate,
     SetIteratorValue,
     SetValues,
+    SetEntries,
     MapCount,
     MapContainsKey,
     MapSubscript,
@@ -674,7 +677,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     b.ret(result);
     manifest.list_functions.push((reduce_method, b.finish()));
 
-    // Map/Set primitives share the ordered Map storage and its key equality.
+    // Collections share the API and key equality; their storage is distinct.
+    manifest.register(program, static_(BuiltinId::ConcurrentMap), "new", MethodKind::Method, 0, BuiltinPrimitive::ConcurrentMapNew);
+    manifest.register(program, static_(BuiltinId::ConcurrentSet), "new", MethodKind::Method, 0, BuiltinPrimitive::ConcurrentSetNew);
     manifest.register(program, static_(BuiltinId::Map), "new", MethodKind::Method, 0, BuiltinPrimitive::MapNew);
     manifest.register(program, static_(BuiltinId::Set), "new", MethodKind::Method, 0, BuiltinPrimitive::SetNew);
     let set = instance(BuiltinClass::Set);
@@ -690,6 +695,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::SetIteratorValue),
         ("values", MethodKind::Method, 0, BuiltinPrimitive::SetValues),
         ("keys", MethodKind::Method, 0, BuiltinPrimitive::SetValues),
+        ("entries", MethodKind::Method, 0, BuiltinPrimitive::SetEntries),
     ] {
         manifest.register(program, set, name, kind, arity, op);
     }
@@ -926,6 +932,17 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // tracing JIT can inline these bodies and use shaped/PIC access or checked
     // dictionary helpers without losing the contracts on generic Maps.
     let module = program.add_module("<core:collections>", 0);
+    for (class, arity) in [(BuiltinClass::Map, 2), (BuiltinClass::Set, 1)] {
+        let method = program.intern_method("set_if_not_exists", MethodKind::Method, arity);
+        let mut b = Builder::new(program, module, format!("{class:?}.set_if_not_exists"),
+            FunctionKind::Method, vec![Type::Top; arity as usize + 1], Type::Top);
+        let map = b.param(0);
+        let key = b.param(1);
+        let value = if arity == 1 { key } else { b.param(2) };
+        let result = b.emit1(Inst::MapLookupOrInsert { map, key, value }, Type::Top);
+        b.ret(result);
+        manifest.collection_functions.push((instance(class), method, b.finish()));
+    }
     for (name, kind, arity) in [
         ("get", MethodKind::Method, 1),
         ("set", MethodKind::Method, 2),
@@ -2837,6 +2854,8 @@ fn execute_primitive(
         }
 
         MapNew => Ok(context.allocate_map_instance()),
+        ConcurrentMapNew => Ok(context.allocate_concurrent_collection(false)),
+        ConcurrentSetNew => Ok(context.allocate_concurrent_collection(true)),
         SetNew => Ok(context.allocate_set()),
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),
         MapContainsKey => Ok(Value::from_bool(context.map_contains_key(this, argument(args,0)?)?)),
@@ -2860,34 +2879,24 @@ fn execute_primitive(
             Ok(destination)
         }
         MapKeysList | MapValuesList | MapEntriesList => {
-            let len = context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
-            let mut pairs = Vec::with_capacity(len);
-            // map_nth_key may allocate managed Strings. Keep each materialized key
-            // rooted until the result List has been published.
-            let mut key_roots = Vec::with_capacity(len);
-            for index in 0..len {
-                let key = context.map_nth_key(this, index)?;
-                key_roots.push(context.root(key));
-                let value = context.map_nth_value(this, index)?;
-                pairs.push((key, value));
-            }
+            let mut pairs = context.map_pairs(this)?;
             // Napalm object enumeration is deterministic for ordinary Maps. Proxy
             // ownKeys preserves its trap-provided order separately.
             pairs.sort_by(|(left, _), (right, _)| {
-                context.format_value(*left).cmp(&context.format_value(*right))
+                context.format_value(left.value()).cmp(&context.format_value(right.value()))
             });
             match op {
                 MapKeysList => Ok(context.allocate_list(
-                    pairs.into_iter().map(|(key, _)| key).collect()
+                    pairs.iter().map(|(key, _)| key.value()).collect()
                 )),
                 MapValuesList => Ok(context.allocate_list(
-                    pairs.into_iter().map(|(_, value)| value).collect()
+                    pairs.iter().map(|(_, value)| value.value()).collect()
                 )),
                 MapEntriesList => {
                     let mut entries = Vec::with_capacity(pairs.len());
                     let mut entry_roots = Vec::with_capacity(pairs.len());
-                    for (key, value) in pairs {
-                        let entry = context.allocate_list(vec![key, value]);
+                    for (key, value) in &pairs {
+                        let entry = context.allocate_list(vec![key.value(), value.value()]);
                         entry_roots.push(context.root(entry));
                         entries.push(entry);
                     }
@@ -2896,7 +2905,7 @@ fn execute_primitive(
                 _ => unreachable!(),
             }
         }
-        SetCount | SetIsEmpty | SetAdd | SetHas | SetDelete | SetClear | SetIterate | SetIteratorValue | SetValues => {
+        SetCount | SetIsEmpty | SetAdd | SetHas | SetDelete | SetClear | SetIterate | SetIteratorValue | SetValues | SetEntries => {
             let map = context.set_source(this)?;
             match op {
                 SetCount => Ok(Value::from_num(context.map_len(map).unwrap() as f64)),
@@ -2919,7 +2928,22 @@ fn execute_primitive(
                     Ok(if next >= 0 && (next as usize) < context.map_len(map).unwrap() { Value::from_num(next as f64) } else { Value::FALSE })
                 }
                 SetIteratorValue => context.map_nth_value(map, integer(argument(args,0)?, "iterator")? as usize),
-                SetValues => Ok(this),
+                SetValues => {
+                    let pairs = context.map_pairs(map)?;
+                    Ok(context.allocate_list(pairs.iter().map(|(_, value)| value.value()).collect()))
+                },
+                SetEntries => {
+                    let mut entries = Vec::new();
+                    let mut roots = Vec::new();
+                    let pairs = context.map_pairs(map)?;
+                    for (_, value) in &pairs {
+                        let value = value.value();
+                        let entry = context.allocate_list(vec![value, value]);
+                        roots.push(context.root(entry));
+                        entries.push(entry);
+                    }
+                    Ok(context.allocate_list(entries))
+                }
                 _ => unreachable!(),
             }
         }
