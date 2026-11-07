@@ -834,6 +834,10 @@ pub trait TraceRuntime {
 
     fn trace_current_location(&self) -> TraceLocation;
 
+    /// Shared operands must be handled by the interpreter's locking dispatch,
+    /// including while recording. Check before inspecting mutable heap data.
+    fn trace_current_op_touches_shared(&self) -> bool { false }
+
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, Self::RuntimeError>;
 
     fn trace_write_slot(
@@ -6188,6 +6192,10 @@ impl<'a> TraceRecorder<'a> {
                 }))?;
 
             let op = decode_at(program, location).map_err(RecordOutcome::Fatal)?;
+
+            if runtime.trace_current_op_touches_shared() {
+                return Err(RecordOutcome::Abort(RecordingAbort::UnsupportedOpcode(op.opcode)));
+            }
 
             let expected = if matches!(mode, RecordingMode::Entry) {
                 // A boundary may be discovered after speculative guards have been

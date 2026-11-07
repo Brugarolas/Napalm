@@ -9235,6 +9235,10 @@ impl<'p> Interpreter<'p> {
 
         self.set_pc(target);
 
+        // A fused heap operation may end in a backedge. Release its locks in
+        // shared dispatch before recording or running any subsequent opcode.
+        if self.shared_op_active { return; }
+
         // During recording/native runtime helpers the manager is temporarily
         // taken out of the Interpreter, which also prevents recursive tiering.
         // The manager itself is boxed, so this hot transition moves one pointer
@@ -17579,7 +17583,9 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     let index = vm.hot_pc as usize;
 
     let threshold = vm.jit_entry_threshold;
-    if threshold == 0 || vm.jit.is_none() {
+    if threshold == 0 || vm.jit.is_none() || vm.shared_op_active {
+        // Shared dispatch already locked this opcode. Execute only its baseline
+        // handler; a trace could advance to unrelated operations under those locks.
         // The tracing manager is temporarily removed from Interpreter while a
         // recording/native entry owns &mut TracingJit. Recursive bytecode calls
         // may legitimately reach another entry hook during that window. Execute
@@ -17690,6 +17696,10 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
                 let function = vm.current_function_index();
                 vm.prepared.functions[function].install_entry_hook(next);
             }
+            // The outer dispatch locked only the entry opcode's operands.
+            // A trace/recording can stop at a different shared operation: let
+            // the shared quantum acquire that operation's locks before it runs.
+            if vm.heap.shared_mode { return; }
         }
     }
 
@@ -20233,6 +20243,10 @@ impl TraceRuntime for Interpreter<'_> {
         Some((CLASS_KIND_STATIC | target as u64, accepted, known))
     }
 
+    fn trace_current_op_touches_shared(&self) -> bool {
+        self.heap.shared_mode && unsafe { self.current_op_touches_shared() }
+    }
+
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, RuntimeError> {
         let frame = self.current_frame();
         let banks = self.current_banks();
@@ -20270,6 +20284,7 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_execute_unfused_step(&mut self) -> Result<TraceStep, RuntimeError> {
+        if let Some(step) = self.defer_shared_trace_step() { return Ok(step); }
         let before = self.trace_current_location();
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
@@ -20326,6 +20341,7 @@ impl TraceRuntime for Interpreter<'_> {
 
 
     fn trace_execute_call_to_return(&mut self) -> Result<TraceStep, RuntimeError> {
+        if let Some(step) = self.defer_shared_trace_step() { return Ok(step); }
         let before = self.trace_current_location();
         if self.hot_frame.is_null() {
             return Err(RuntimeError::new("trace call boundary has no active frame"));
@@ -20394,6 +20410,7 @@ impl TraceRuntime for Interpreter<'_> {
             && self.current_fiber == caller_fiber
             && self.fiber(caller_fiber).frames.len() > caller_depth
         {
+            if self.defer_shared_trace_step().is_some() { break; }
             if self.hot_frame.is_null() {
                 break;
             }

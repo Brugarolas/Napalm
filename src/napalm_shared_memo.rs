@@ -146,10 +146,9 @@ impl SharedMemoTables {
     #[inline]
     pub(super) fn get(&self, function: u32, key: &MemoKey) -> Option<RegisterWord> {
         let table = self.tables.get(function as usize)?.as_ref()?;
-        // Skip entering the reclamation epoch for functions nobody has published.
-        if table.len.load(Ordering::Relaxed) == 0 {
-            return None;
-        }
+        // The admission counter can lag publication: a racing publisher can
+        // observe the entry before its winner increments len. Only the table
+        // itself determines whether a key is present.
         let entries = table.entries.pin();
         let entry = entries.get(key)?;
         let live = table.generation.load(Ordering::Relaxed);
@@ -210,6 +209,21 @@ mod tests {
         shared.publish(0, key(1), RegisterWord(7));
         assert_eq!(shared.get(0, &key(1)), None, "unmemoized slots never cache");
         assert_eq!(shared.get(9, &key(1)), None);
+    }
+
+    #[test]
+    fn shared_memo_reads_published_entries_before_admission_count_catches_up() {
+        let shared = SharedMemoTables::new([MemoizationKind::Recursive].into_iter()).unwrap();
+        let table = shared.tables[0].as_ref().unwrap();
+        // Pause the winning publisher between try_insert and len.fetch_add.
+        assert!(table.entries.pin().try_insert(key(0), SharedMemoEntry {
+            value: RegisterWord(42), generation: AtomicU32::new(0),
+        }).is_ok());
+        shared.publish(0, key(0), RegisterWord(99));
+        assert_eq!(table.len.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.get(0, &key(0)), Some(RegisterWord(42)));
+        table.len.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(shared.get(0, &key(0)), Some(RegisterWord(42)));
     }
 
     #[test]

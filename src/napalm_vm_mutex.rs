@@ -223,6 +223,18 @@ impl Heap {
 }
 
 impl Interpreter<'_> {
+    /// Trace recording and call helpers execute baseline handlers directly.
+    /// Yield before a shared operation so they cannot bypass the locking loop,
+    /// including inside an inlined/called function. The PC stays unchanged.
+    pub(super) fn defer_shared_trace_step(&mut self) -> Option<TraceStep> {
+        if !self.heap.shared_mode || !unsafe { self.current_op_touches_shared() } {
+            return None;
+        }
+        let before = self.trace_current_location();
+        self.run_state = RunState::Reschedule;
+        Some(TraceStep { before, after: before, frame_changed: false, running: false })
+    }
+
     #[inline]
     unsafe fn shared_operand_words(
         &self,

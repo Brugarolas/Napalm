@@ -460,6 +460,114 @@ fn napalm_collections_specialized_field_stores_publish_shared_values() {
 }
 
 #[test]
+fn shared_trace_recording_and_steps_defer_before_mutation() {
+    let mut asm = Assembler::new();
+    asm.emit_ab(Opcode::ListAppend, 0, 1);
+    asm.emit_a(Opcode::Return, 0);
+    let mut chunk = asm.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    references.set_general(Reg(1), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::RuntimeMutation, references,
+    });
+    let program = simple_program(chunk, 2);
+    let mut vm = Interpreter::new(&program).unwrap();
+    vm.set_jit_options(Some(TracingJitOptions { hot_entry_threshold: 1, ..Default::default() }));
+    let _roots = vm.gc_root_registration();
+    vm.run_state = RunState::Running;
+    vm.push_frame_direct(0, &[], None, None).unwrap();
+    let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(list);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(list);
+    unsafe { vm.set_reg(0, list.word()); vm.set_reg(1, Value::TRUE.word()); }
+    let location = vm.trace_current_location();
+
+    let mut jit = vm.jit.take().unwrap();
+    jit.preheat_entry(location);
+    jit.on_entry(&mut vm).unwrap();
+    vm.jit = Some(jit);
+    assert_eq!(vm.trace_current_location(), location);
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values.is_empty()));
+
+    // Inlined/call recording also uses individual unfused steps. It must yield
+    // without advancing the PC, so dispatch can acquire the operation's lock.
+    let step = vm.trace_execute_unfused_step().unwrap();
+    assert!(!step.running);
+    assert_eq!(step.after, location);
+    assert!(matches!(vm.run_state, RunState::Reschedule));
+}
+
+#[test]
+fn shared_whole_function_helper_parks_until_the_lock_is_released() {
+    use crate::napalm_bytecode::{IncomingSource, ParameterBinding, ArgReg};
+    // Hand-built calls keep this test independent of HIR inlining/DCE.
+    let mut caller = Assembler::new();
+    caller.emit_call_direct(Reg(0), crate::napalm_ir::CallConv::Napalm, &[Reg(0)], FuncId(1)).unwrap();
+    caller.emit_a(Opcode::Return, 0);
+    let mut chunk = caller.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::Call, references: references.clone(),
+    });
+    let mut program = simple_program(chunk, 2);
+    program.functions[0].kind = FunctionKind::Closure;
+    program.functions[0].arity = 1;
+    program.functions[0].frame.parameters.push(ParameterBinding {
+        source: IncomingSource::Argument(ArgReg(0)), destination: Reg(0), kind: RegisterKind::Value,
+    });
+    let mut body = Assembler::new();
+    body.emit_a(Opcode::LoadTrue, 1);
+    body.emit_ab(Opcode::ListAppend, 0, 1);
+    body.emit_a(Opcode::Return, 0);
+    let mut callee = program.functions[0].clone();
+    callee.id = FuncId(1);
+    callee.chunk = body.finish().unwrap();
+    callee.chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(1), kind: SafepointKind::RuntimeMutation, references,
+    });
+    program.push_function(callee).unwrap();
+    program.rebuild_indexes().unwrap();
+    let mut vm = Interpreter::new(&program).unwrap();
+    let _roots = vm.gc_root_registration();
+    vm.set_jit_options(Some(TracingJitOptions {
+        hot_entry_threshold: 2, hot_loop_threshold: u32::MAX, ..Default::default()
+    }));
+    let local = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(local);
+    for _ in 0..128 { vm.run_function(FuncId(0), &[local]).unwrap(); }
+    assert!(vm.whole_function_jit_stats().unwrap().native_entries > 0);
+    let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(list);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(list);
+    vm.is_concurrent_worker = true;
+    let handle = list.heap_handle().unwrap();
+    assert!(vm_mutex::VmAdaptativeMutex::try_lock(&vm.heap.handle_table.entry(handle).sync));
+
+    let native_entries = vm.whole_function_jit_stats().unwrap().native_entries;
+    let result = vm.run_function(FuncId(0), &[list]).unwrap();
+    assert!(vm.whole_function_jit_stats().unwrap().native_entries > native_entries);
+    assert!(matches!(result, ExecutionResult::Suspended(_)));
+    assert_eq!(vm.blocked_on_shared_lock(), Some(handle));
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values.is_empty()));
+
+    let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notification = woke.clone();
+    assert!(vm.park_blocked_task(Box::new(move || {
+        notification.store(true, Ordering::Release);
+    })).is_ok());
+    vm_mutex::VmAdaptativeMutex::unlock(handle, &vm.heap.handle_table.entry(handle).sync);
+    assert!(woke.load(Ordering::Acquire));
+    assert!(matches!(vm.resume_blocked_task().unwrap(), ExecutionResult::Returned(_)));
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values == &[Value::TRUE]));
+    assert!(vm.held_locks.is_empty());
+    assert!(!vm.shared_op_active);
+}
+
+#[test]
 fn napalm_collections_contended_shared_lock_parks_tasks() {
     // One long operation (spreading a large shared List) holds the lock for
     // longer than the 1 ms spin budget, so contending workers park their task

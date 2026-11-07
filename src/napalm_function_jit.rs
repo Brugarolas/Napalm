@@ -3622,9 +3622,8 @@ unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> 
         .opcode().unwrap();
 
     // Shared collections must execute through the locking interpreter quantum.
-    // Bail out at this PC before the conditional insertion has any effect.
-    if opcode == Opcode::MapLookupOrInsert && vm.heap.shared_mode
-        && unsafe { vm.current_op_touches_shared() }
+    // Bail out at this PC before the operation has any effect.
+    if vm.heap.shared_mode && unsafe { vm.current_op_touches_shared() }
     {
         return std::ptr::null_mut();
     }
