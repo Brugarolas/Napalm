@@ -22368,6 +22368,68 @@ return result
         }
     }
 
+    /// If-conversion of one-armed `if`s over loaded data, arms that repeat a
+    /// list read, arms whose read is not a repeat (must keep the branch: the
+    /// read is out of range exactly when the arm is not taken), rarely taken
+    /// accumulator branches, and `%` with a runtime divisor: native results must
+    /// match the interpreter on mixed negative/fractional data.
+    #[test]
+    fn if_conversion_and_dynamic_remainder_match_interpreter() {
+        let source = r#"
+function scan(a, m) {
+  let lo = 1000000;
+  let hi = -1000000;
+  let best = 0;
+  let edge = 0;
+  let acc = 0;
+  let resets = 0;
+  let rem = 0;
+  for (let i = 0; i < a.length; i++) {
+    const v = a[i];
+    if (v < lo) { lo = v; }
+    if (v > hi) { hi = v; }
+    best = v * 2;
+    if (a[i] + 1 < best) { best = a[i] + 1; }
+    if (i + 1 < a.length) { edge = edge + a[i + 1]; }
+    acc = acc + 3;
+    if (acc > 500) { acc = 0; resets = resets + 1; }
+    rem = rem + (v % m) + (i % m);
+  }
+  return lo * 1000 + hi + best + edge + acc + resets * 7 + rem;
+}
+let data = [];
+let seed = 99;
+for (let i = 0; i < 600; i++) {
+  seed = (seed * 1103515245 + 12345) % 2147483648;
+  data.push((seed % 2001) / 4 - 250);
+}
+let total = 0;
+for (let r = 0; r < 40; r++) {
+  total = total + scan(data, 7) + scan(data, -3.5) + scan(data, 2147483647);
+}
+var result = total;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut results = Vec::new();
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            results.push(source_result(&vm).to_bits());
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.native_iterations > 0, "{stats:?}");
+            }
+        }
+        assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));
+    }
+
     #[test]
     fn direct_ordinary_invoke_unwinds_into_caller_catch() {
         let source = r#"

@@ -1013,6 +1013,22 @@ impl TraceRecorder<'_> {
         registers: &[Option<TraceValueId>], builder: &mut crate::napalm_trace_ir::TraceBuilder,
         exit: SideExitId,
     ) -> Result<TraceValueId, RecordingAbort> {
+        self.numeric_invoke(program, function, op, registers, builder, exit, false)
+    }
+
+    /// Shared by the inliner and diamond if-conversion. With `cse`, each node
+    /// reuses an identical node already in the trace (an earlier guard on the
+    /// same value dominates this point of a linear trace), so an arm that
+    /// recomputes the condition's arithmetic adds nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn numeric_invoke(
+        &self, program: &BytecodeProgram, function: &BytecodeFunction, op: &RecordedOp,
+        registers: &[Option<TraceValueId>], builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        exit: SideExitId, cse: bool,
+    ) -> Result<TraceValueId, RecordingAbort> {
+        let emit = |builder: &mut crate::napalm_trace_ir::TraceBuilder, kind: TraceInst, ty: TraceType, rep: TraceRep| {
+            if cse { cse_emit1(builder, kind, ty, rep) } else { builder.emit1(kind, ty, rep) }
+        };
         let cache = function.chunk.inline_caches.get(op.x as usize).ok_or(RecordingAbort::UnsupportedCall)?;
         let signature = program.metadata.method(cache.method).ok_or(RecordingAbort::UnsupportedCall)?;
         if signature.kind != MethodKind::Method || signature.arity != 1 || op.args.len() != 1 {
@@ -1029,25 +1045,27 @@ impl TraceRecorder<'_> {
                     "+" => F64BinOp::Add, "-" => F64BinOp::Sub, "*" => F64BinOp::Mul,
                     "/" => F64BinOp::Div, _ => F64BinOp::Rem,
                 };
-                let lhs = builder.emit1(TraceInst::GuardF64 { value: left, exit }, TraceType::F64, TraceRep::F64);
-                let rhs = builder.emit1(TraceInst::GuardF64 { value: right, exit }, TraceType::F64, TraceRep::F64);
-                let result = builder.emit1(TraceInst::F64Binary { op, lhs, rhs }, TraceType::F64, TraceRep::F64);
-                Ok(builder.emit1(TraceInst::BoxF64 { value: result }, TraceType::Num, TraceRep::Tagged))
+                let lhs = emit(builder, TraceInst::GuardF64 { value: left, exit }, TraceType::F64, TraceRep::F64);
+                let rhs = emit(builder, TraceInst::GuardF64 { value: right, exit }, TraceType::F64, TraceRep::F64);
+                let result = emit(builder, TraceInst::F64Binary { op, lhs, rhs }, TraceType::F64, TraceRep::F64);
+                Ok(emit(builder, TraceInst::BoxF64 { value: result }, TraceType::Num, TraceRep::Tagged))
             }
             Some(name @ ("&" | "|" | "^" | "<<" | ">>")) => {
                 let op = match name {
                     "&" => IntBinOp::BitAnd, "|" => IntBinOp::BitOr, "^" => IntBinOp::BitXor,
                     "<<" => IntBinOp::Shl, _ => IntBinOp::ShrU,
                 };
-                let lhs = builder.emit1(TraceInst::GuardUInt32 { value: left, exit }, TraceType::UInt32, TraceRep::UInt32);
-                let rhs = builder.emit1(TraceInst::GuardUInt32 { value: right, exit }, TraceType::UInt32, TraceRep::UInt32);
-                let result = builder.emit1(TraceInst::IntBinary { op, lhs, rhs }, TraceType::UInt32, TraceRep::UInt32);
-                Ok(builder.emit1(TraceInst::BoxUInt32 { value: result }, TraceType::Num, TraceRep::Tagged))
+                let lhs = emit(builder, TraceInst::GuardUInt32 { value: left, exit }, TraceType::UInt32, TraceRep::UInt32);
+                let rhs = emit(builder, TraceInst::GuardUInt32 { value: right, exit }, TraceType::UInt32, TraceRep::UInt32);
+                let result = emit(builder, TraceInst::IntBinary { op, lhs, rhs }, TraceType::UInt32, TraceRep::UInt32);
+                Ok(emit(builder, TraceInst::BoxUInt32 { value: result }, TraceType::Num, TraceRep::Tagged))
             }
             _ => Err(RecordingAbort::UnsupportedCall),
         }
     }
 
+    /// If-conversion of a short diamond (`c ? a : b`, `if/else`) or one-armed
+    /// `if (c) { ... }`: both arms are evaluated and merged with Select.
     pub(super) fn inline_numeric_diamond<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, function: &BytecodeFunction,
         branch: &RecordedOp, condition: TraceValueId,
@@ -1059,7 +1077,10 @@ impl TraceRecorder<'_> {
         let mut pc = branch.next_pc;
         let mut join = None;
         for _ in 0..8 {
-            if pc.0 >= alternate.0 { break; }
+            // One-armed `if (c) { ... }`: the fallthrough arm reaches the branch
+            // target, which is the join; the other arm is empty.
+            if pc == alternate { join = Some(alternate); break; }
+            if pc.0 > alternate.0 { break; }
             let op = decode_at(program, TraceLocation::new(function.id, pc))
                 .map_err(|_| RecordingAbort::UnsupportedCall)?;
             if op.opcode == Opcode::Jump {
@@ -1070,6 +1091,15 @@ impl TraceRecorder<'_> {
             arms[0].push(op);
         }
         let join = join.filter(|pc| pc.0 >= alternate.0).ok_or(RecordingAbort::UnsupportedCall)?;
+        if arms[0].is_empty() { return Err(RecordingAbort::UnsupportedCall); }
+        // A one-armed `if` pays for its arm on every iteration once converted,
+        // and a Select on a loop-carried value lengthens the recurrence. That
+        // only wins when the branch is unpredictable, typically when it tests
+        // data loaded in this iteration (`if (a[i] < lo) lo = a[i]`), not a
+        // counter or accumulator (`if (acc > limit) ...`, rarely taken).
+        if join == alternate && !condition_reads_heap(builder.trace(), condition) {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
         pc = alternate;
         for _ in 0..8 {
             if pc == join { break; }
@@ -1092,7 +1122,9 @@ impl TraceRecorder<'_> {
             {
                 return Err(RecordingAbort::UnsupportedCall);
             }
-            if op.opcode == Opcode::Invoke && !runtime.trace_standard_numeric_method(function.id, op.x) {
+            if op.opcode == Opcode::Invoke && !runtime.trace_standard_numeric_method(function.id, op.x)
+                && runtime.trace_standard_list_method(function.id, op.x) != Some(TraceListMethod::Subscript)
+            {
                 return Err(RecordingAbort::UnsupportedCall);
             }
             let roles = crate::napalm_bytecode::operand_roles(op.opcode);
@@ -1139,7 +1171,10 @@ impl TraceRecorder<'_> {
                         self.guard_store_value(builder, source()?, &descriptor.expected, branch.location.pc)
                             .ok_or(RecordingAbort::UnsupportedCall)?
                     }
-                    Opcode::Invoke => self.inline_numeric_invoke(program, function, op, state, builder, exit)?,
+                    Opcode::Invoke if runtime.trace_standard_numeric_method(function.id, op.x) => {
+                        self.numeric_invoke(program, function, op, state, builder, exit, true)?
+                    }
+                    Opcode::Invoke => repeated_list_read(builder, op, state)?,
                     _ => return Err(RecordingAbort::UnsupportedCall),
                 };
                 state[op.a as usize] = Some(value);
@@ -1173,4 +1208,139 @@ impl TraceRecorder<'_> {
             max_steps: arms[0].len() + arms[1].len() + 3,
         })
     }
+}
+
+/// Numeric guards of the same value are interchangeable (the first one
+/// dominates every later point of a linear trace), but the recorder emits a
+/// fresh guard per use. Map every such guard result to the first one so CSE
+/// sees through the duplicates.
+fn guard_representatives(trace: &crate::napalm_trace_ir::Trace) -> HashMap<TraceValueId, TraceValueId> {
+    let mut first = HashMap::<(u8, TraceValueId), TraceValueId>::default();
+    let mut representatives = HashMap::default();
+    for node in &trace.nodes {
+        let (kind, value) = match node.kind {
+            TraceInst::GuardF64 { value, .. } => (0u8, value),
+            TraceInst::GuardInt32 { value, .. } => (1, value),
+            TraceInst::GuardUInt32 { value, .. } => (2, value),
+            _ => continue,
+        };
+        let Some(&result) = node.results.first() else { continue };
+        let result = trace.canonical_value(result);
+        let representative = *first.entry((kind, trace.canonical_value(value))).or_insert(result);
+        representatives.insert(result, representative);
+    }
+    representatives
+}
+
+fn representative(
+    trace: &crate::napalm_trace_ir::Trace, representatives: &HashMap<TraceValueId, TraceValueId>, value: TraceValueId,
+) -> TraceValueId {
+    let value = trace.canonical_value(value);
+    representatives.get(&value).copied().unwrap_or(value)
+}
+
+/// Kind with representative operands and (for the guards CSE may reuse) no exit.
+fn cse_key(
+    trace: &crate::napalm_trace_ir::Trace, representatives: &HashMap<TraceValueId, TraceValueId>, kind: &TraceInst,
+) -> TraceInst {
+    let mut key = kind.clone();
+    key.visit_operands(|value| *value = representative(trace, representatives, *value));
+    if matches!(key, TraceInst::GuardF64 { .. } | TraceInst::GuardInt32 { .. } | TraceInst::GuardUInt32 { .. }) {
+        key.set_exit(SideExitId(u32::MAX));
+    }
+    key
+}
+
+/// Bounded backward search window for recording-time CSE.
+const CSE_WINDOW: usize = 512;
+
+/// Representative result of a node identical to `kind` (pure, or a numeric
+/// guard of the same value: an earlier guard dominates every later point).
+fn cse_lookup(builder: &crate::napalm_trace_ir::TraceBuilder, kind: &TraceInst) -> Option<TraceValueId> {
+    let pure = kind.is_speculatable()
+        || matches!(kind, TraceInst::GuardF64 { .. } | TraceInst::GuardInt32 { .. } | TraceInst::GuardUInt32 { .. });
+    if !pure {
+        return None;
+    }
+    let trace = builder.trace();
+    let representatives = guard_representatives(trace);
+    let key = cse_key(trace, &representatives, kind);
+    trace.nodes.iter().rev().take(CSE_WINDOW)
+        .find(|node| node.results.len() == 1 && cse_key(trace, &representatives, &node.kind) == key)
+        .map(|node| representative(trace, &representatives, node.results[0]))
+}
+
+fn cse_emit1(
+    builder: &mut crate::napalm_trace_ir::TraceBuilder, kind: TraceInst, ty: TraceType, rep: TraceRep,
+) -> TraceValueId {
+    match cse_lookup(builder, &kind) {
+        Some(existing) => existing,
+        None => builder.emit1(kind, ty, rep),
+    }
+}
+
+/// `list[i]` inside an if-converted arm, accepted only as an exact repeat of a
+/// list read this trace already performed: same List value, same Int32 index,
+/// and only effect-free nodes since then (no store, call, runtime or GC). That
+/// read succeeded, nothing can have changed the element, so the untaken arm can
+/// never fail or observe anything new; it simply reuses the value. Any other
+/// read could fail only on the untaken path (`if (i < n) x = a[i]`) and keeps
+/// the branch.
+fn repeated_list_read(
+    builder: &crate::napalm_trace_ir::TraceBuilder, op: &RecordedOp, state: &[Option<TraceValueId>],
+) -> Result<TraceValueId, RecordingAbort> {
+    if op.c != 1 || op.args.len() != 1 {
+        return Err(RecordingAbort::UnsupportedCall);
+    }
+    let trace = builder.trace();
+    let representatives = guard_representatives(trace);
+    let rep = |value: TraceValueId| representative(trace, &representatives, value);
+    let list = state[op.b as usize].map(rep).ok_or(RecordingAbort::UnsupportedCall)?;
+    let index = state[op.args[0].0 as usize].map(rep).ok_or(RecordingAbort::UnsupportedCall)?;
+    let effect_free = |kind: &TraceInst| {
+        kind.is_speculatable() || kind.is_entry_guard() || kind.is_heap_read()
+            || matches!(kind, TraceInst::Nop | TraceInst::LoadFrameSlot { .. } | TraceInst::CommitFrameSlot { .. }
+                | TraceInst::F64ToInt32 { .. } | TraceInst::IntBinaryChecked { .. })
+    };
+    // Int32 views of the arm's index: results of a GuardInt32 of it.
+    let int_index = trace.nodes.iter().find_map(|node| match node.kind {
+        TraceInst::GuardInt32 { value, .. } if rep(value) == index => node.results.first().map(|&result| rep(result)),
+        _ => None,
+    });
+    let Some(int_index) = int_index else { return Err(RecordingAbort::UnsupportedCall) };
+    for node in trace.nodes.iter().rev().take(CSE_WINDOW) {
+        if let TraceInst::HeapListGet { list: read_list, index: read_index, .. } = node.kind {
+            if rep(read_list) == list && rep(read_index) == int_index && node.results.len() == 1 {
+                return Ok(node.results[0]);
+            }
+        }
+        // Everything after the matching read (scanned first) must be effect-free.
+        if !effect_free(&node.kind) {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+    }
+    Err(RecordingAbort::UnsupportedCall)
+}
+
+/// Whether `condition` depends, within a few producers, on a heap read
+/// recorded in the trace (List/Map/String loads), as opposed to only loop
+/// phis, entry values and arithmetic on them.
+fn condition_reads_heap(trace: &crate::napalm_trace_ir::Trace, condition: TraceValueId) -> bool {
+    let mut pending = vec![trace.canonical_value(condition)];
+    let mut seen = HashSet::<TraceValueId>::default();
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value) || seen.len() > 32 {
+            continue;
+        }
+        let Some(TraceValueOrigin::InstResult { node }) = trace.value(value).map(|info| info.origin.clone()) else {
+            continue;
+        };
+        let Some(node) = trace.nodes.get(node) else { continue };
+        if node.kind.is_heap_read() {
+            return true;
+        }
+        let mut operands = node.kind.clone();
+        operands.visit_operands(|operand| pending.push(trace.canonical_value(*operand)));
+    }
+    false
 }

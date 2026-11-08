@@ -1985,7 +1985,10 @@ impl LlvmLowering<'_> {
             .map(f64::abs)
             .filter(|n| n.fract() == 0.0 && (1.0..=i32::MAX as f64).contains(n))
         else {
-            return self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+            if constant.is_some() {
+                return self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+            }
+            return self.f64_remainder_dynamic(lhs, rhs);
         };
         // x % (+/-1) is the signed fractional part of x for every finite
         // binary64 value. For infinities/NaNs the subtraction produces NaN,
@@ -2017,6 +2020,50 @@ impl LlvmLowering<'_> {
         let integer = self.cast("fptosi", &magnitude, Ty::I32);
         let quotient = self.bin("udiv", &integer, &V::i32(divisor as i32));
         let multiple = self.bin("mul", &quotient, &V::i32(divisor as i32));
+        let multiple = self.cast("sitofp", &multiple, Ty::F64);
+        let remainder = self.bin("fsub", &magnitude, &multiple);
+        let fast_result = self.def(
+            Ty::F64,
+            &format!("call double @llvm.copysign.f64(double {}, double {})", remainder.op, lhs.op),
+        );
+        let fast_end = self.current.clone();
+        self.br(&done);
+
+        self.begin(&slow);
+        let slow_result = self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+        let slow_end = self.current.clone();
+        self.br(&done);
+
+        self.begin(&done);
+        self.def(
+            Ty::F64,
+            &format!("phi double [ {}, %{fast_end} ], [ {}, %{slow_end} ]", fast_result.op, slow_result.op),
+        )
+    }
+
+    /// Runtime-divisor `x % y`; mirrors the Cranelift lowering (see there).
+    fn f64_remainder_dynamic(&mut self, lhs: &V, rhs: &V) -> V {
+        let fast = self.new_block();
+        let slow = self.new_block();
+        let done = self.new_block();
+        let magnitude = self.intrinsic_f64("fabs", lhs);
+        let divisor = self.intrinsic_f64("fabs", rhs);
+        let x_in_range = self.fcmp("ole", &magnitude, &V::f64(i32::MAX as f64));
+        let d_low = self.fcmp("oge", &divisor, &V::f64(1.0));
+        let d_high = self.fcmp("ole", &divisor, &V::f64(i32::MAX as f64));
+        let truncated = self.intrinsic_f64("trunc", &divisor);
+        let d_integral = self.fcmp("oeq", &truncated, &divisor);
+        let ok = self.and1(&x_in_range, &d_low);
+        let ok = self.and1(&ok, &d_high);
+        let ok = self.and1(&ok, &d_integral);
+        self.cond_br(&ok, &fast, &slow, Some(MD_HOT_TRUE));
+
+        self.begin(&fast);
+        // Both conversions are dominated by the range checks above.
+        let integer = self.cast("fptosi", &magnitude, Ty::I32);
+        let d = self.cast("fptosi", &divisor, Ty::I32);
+        let quotient = self.bin("udiv", &integer, &d);
+        let multiple = self.bin("mul", &quotient, &d);
         let multiple = self.cast("sitofp", &multiple, Ty::F64);
         let remainder = self.bin("fsub", &magnitude, &multiple);
         let fast_result = self.def(

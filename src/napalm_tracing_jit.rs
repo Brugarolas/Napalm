@@ -8673,7 +8673,10 @@ impl CraneliftLoweringState<'_, '_> {
         let Some(divisor) = constant.map(f64::abs)
             .filter(|n| n.fract() == 0.0 && (1.0..=i32::MAX as f64).contains(n))
         else {
-            return self.call_scalar_helper(native_frem as usize, &[lhs, rhs]);
+            if constant.is_some() {
+                return self.call_scalar_helper(native_frem as usize, &[lhs, rhs]);
+            }
+            return self.f64_remainder_dynamic(lhs, rhs);
         };
 
         let fast = self.builder.create_block();
@@ -8693,6 +8696,48 @@ impl CraneliftLoweringState<'_, '_> {
         let integer = self.builder.ins().fcvt_to_sint_sat(types::I32, magnitude);
         let quotient = self.builder.ins().udiv_imm(integer, divisor as i64);
         let multiple = self.builder.ins().imul_imm(quotient, divisor as i64);
+        let multiple = self.builder.ins().fcvt_from_sint(types::F64, multiple);
+        let remainder = self.builder.ins().fsub(magnitude, multiple);
+        let result = self.builder.ins().fcopysign(remainder, lhs);
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+
+        self.builder.switch_to_block(slow);
+        let result = self.call_scalar_helper(native_frem as usize, &[lhs, rhs]);
+        self.builder.ins().jump(done, &[BlockArg::Value(result)]);
+        self.builder.switch_to_block(done);
+        self.builder.block_params(done)[0]
+    }
+
+    /// `x % y` for a runtime divisor. When |x| <= i32::MAX and |y| is an integer
+    /// in 1..=i32::MAX, the same exact identity as the constant path applies
+    /// (fmod's result has x's sign and is |x| - trunc(|x|) div |y| * |y|);
+    /// everything else (NaN, infinities, fractional or huge operands, zero
+    /// divisor) calls fmod.
+    fn f64_remainder_dynamic(&mut self, lhs: Value, rhs: Value) -> Value {
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        self.builder.append_block_param(done, types::F64);
+        let magnitude = self.builder.ins().fabs(lhs);
+        let divisor = self.builder.ins().fabs(rhs);
+        let one = self.builder.ins().f64const(1.0);
+        let limit = self.builder.ins().f64const(i32::MAX as f64);
+        let x_in_range = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
+        let d_low = self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, divisor, one);
+        let d_high = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, divisor, limit);
+        let truncated = self.builder.ins().trunc(divisor);
+        let d_integral = self.builder.ins().fcmp(FloatCC::Equal, truncated, divisor);
+        let ok = self.builder.ins().band(x_in_range, d_low);
+        let ok = self.builder.ins().band(ok, d_high);
+        let ok = self.builder.ins().band(ok, d_integral);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+
+        self.builder.switch_to_block(fast);
+        let integer = self.builder.ins().fcvt_to_sint_sat(types::I32, magnitude);
+        let d = self.builder.ins().fcvt_to_sint_sat(types::I32, divisor);
+        let quotient = self.builder.ins().udiv(integer, d);
+        let multiple = self.builder.ins().imul(quotient, d);
         let multiple = self.builder.ins().fcvt_from_sint(types::F64, multiple);
         let remainder = self.builder.ins().fsub(magnitude, multiple);
         let result = self.builder.ins().fcopysign(remainder, lhs);
@@ -14539,6 +14584,67 @@ mod tests {
                 let actual = f64::from_bits(general[1].0);
                 assert!(if expected.is_nan() { actual.is_nan() } else { actual.to_bits() == expected.to_bits() },
                     "{input:?} % {divisor:?}: {actual:?} != {expected:?}");
+            }
+        }
+    }
+
+    /// `x % y` with a runtime divisor: the integer fast path must agree with
+    /// fmod bit for bit, and everything outside it must reach fmod.
+    #[test]
+    fn dynamic_remainder_matches_ieee_edges_and_multiple_boundaries() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut b = crate::napalm_trace_ir::TraceBuilder::new(
+            TraceId(0), TraceAnchor { kind: TraceKind::Side, location });
+        let lhs = b.read_slot(FrameSlot::General(Reg(0)), TraceType::F64, TraceRep::F64);
+        let rhs = b.read_slot(FrameSlot::General(Reg(2)), TraceType::F64, TraceRep::F64);
+        let result = b.emit1(TraceInst::F64Binary { op: F64BinOp::Rem, lhs, rhs }, TraceType::F64, TraceRep::F64);
+        b.write_slot(FrameSlot::General(Reg(1)), result);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        b.set_terminator(TraceTerminator::Exit(exit));
+        let trace = b.finish().unwrap();
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+
+        let divisors = [0.0, -0.0, 0.5, 1.0, -1.0, 1.5, 2.0, 3.0, 7.0, -7.0, 97.0, 1000003.0,
+            i32::MAX as f64, -(i32::MAX as f64), i32::MAX as f64 + 1.0, u32::MAX as f64,
+            f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::from_bits(1)];
+        let mut inputs = vec![
+            -0.0, 0.0, 0.5, -0.5, 1.0, -1.0, 6.5, 7.0, f64::MIN_POSITIVE, f64::from_bits(1),
+            i32::MAX as f64, i32::MAX as f64 + 0.5, i32::MAX as f64 + 1.0, u32::MAX as f64,
+            f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        ];
+        let mut random = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            inputs.push((random as u32 as f64) / 8.0);
+            inputs.push((random >> 40) as f64);
+        }
+        for divisor in divisors.into_iter().chain(inputs.iter().take(200).map(|x| x.trunc().max(1.0))) {
+            for &input in &inputs {
+                for input in [input, -input] {
+                    let expected = input % divisor;
+                    let mut general = [RegisterWord(input.to_bits()), RegisterWord(0), RegisterWord(divisor.to_bits())];
+                    let mut activation = TraceActivation::new(TraceActivationInputs {
+                        general: general.as_mut_ptr(), arguments: std::ptr::null_mut(),
+                        returns: std::ptr::null_mut(), special: std::ptr::null_mut(),
+                        runtime: std::ptr::null_mut(), execute: unexpected_runtime,
+                        heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
+                        factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
+                        factory_bytes: 0, factory_alignment: 0,
+                        factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+                    });
+                    activation.current_links = compiled.native_links.as_ptr();
+                    assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    let actual = f64::from_bits(general[1].0);
+                    assert!(if expected.is_nan() { actual.is_nan() } else { actual.to_bits() == expected.to_bits() },
+                        "{input:?} % {divisor:?}: {actual:?} != {expected:?}");
+                }
             }
         }
     }
