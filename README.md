@@ -1,4 +1,7 @@
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/brugarolas)
+
+<p align="center">
+  <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
+</p>
 
 # Napalm
 
@@ -7,6 +10,18 @@ Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dy
 For the complete, current language reference and runnable examples, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
 Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
+
+## Stats
+
+<p align="center">
+  <a href="https://github.com/Brugarolas/Napalm/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
+  <a href="https://github.com/Brugarolas/Napalm/stargazers"><img src="https://img.shields.io/github/stars/Brugarolas/Napalm?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/Brugarolas/Napalm/issues"><img src="https://img.shields.io/github/issues/Brugarolas/Napalm?style=flat-square" alt="Issues"></a>
+</p>
+
+<p align="center">
+  <img src="https://repobeats.axiom.co/api/embed/44379307ec6623c00131593148f800c0122f9562.svg" alt="Repobeats analytics image">
+</p>
 
 ## Run
 
