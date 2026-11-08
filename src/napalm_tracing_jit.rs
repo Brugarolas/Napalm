@@ -7658,6 +7658,32 @@ impl<'a> CraneliftTraceCompiler<'a> {
                     state.lower_node(node)?;
                     preheader_nodes[node.id] = true;
                 }
+
+                // Load the sidecar `data` pointer once for objects whose entry
+                // and kind the preheader already proved: without a runtime
+                // boundary a List/String/Cell buffer cannot be reallocated. The
+                // per-epoch caches carry the value into the loop body; no guard
+                // is added and no exit is reordered.
+                for node in &self.trace.nodes {
+                    if preheader_nodes[node.id] {
+                        continue;
+                    }
+                    let (value, kind) = match &node.kind {
+                        TraceInst::HeapListGet { list, .. } | TraceInst::HeapListSet { list, .. } => {
+                            (*list, TraceHeapKind::List)
+                        }
+                        TraceInst::HeapLoadCell { cell, .. } | TraceInst::HeapStoreCell { cell, .. } => {
+                            (*cell, TraceHeapKind::Cell)
+                        }
+                        TraceInst::HeapStringAsciiCodePointAt { string, .. }
+                        | TraceInst::HeapStringCodePointAt { string, .. } => (*string, TraceHeapKind::String),
+                        _ => continue,
+                    };
+                    let key = (self.trace.canonical_value(value), kind as u32);
+                    if let Some(&(entry, _)) = state.heap_entries.get(&key) {
+                        let _ = state.heap_entry_data(entry);
+                    }
+                }
             }
 
             // Mirror the old B3 backend exactly: loop-carried values are mutable
@@ -13828,6 +13854,83 @@ mod tests {
                     let exit = run_scalar_trace(&trace, &mut registers, 0, 0);
                     assert_eq!(exit, if passes { success.0 } else { failure.0 }, "{op:?} {input} case={observed}");
                     assert_eq!(registers[1].0, if passes { 7 } else { 99 });
+                }
+            }
+        }
+    }
+
+    /// `for (i = ...; i < 10; i++) out = list[i]`: a Num induction variable used
+    /// both as f64 (compare/add) and as an i32 index. Promoting the phi to raw
+    /// F64 (GuardInt32 -> F64ToInt32) must not change any architectural result,
+    /// including -0, fractional, NaN, out-of-range and non-number entries.
+    #[test]
+    fn f64_induction_with_integer_index_use_promotes_and_matches_native() {
+        // Constant bound: `i < 10`.
+        check_induction_promotion(false, &[0, 10]);
+        // Int32 register bound (`i < list.length` shape), including the i32::MAX
+        // edge that proves the integer increment never overflows.
+        check_induction_promotion(true, &[0, 10, i32::MAX, i32::MIN, -5]);
+    }
+
+    fn check_induction_promotion(register_bound: bool, bounds: &[i32]) {
+        let mut b = crate::napalm_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor {
+            kind: TraceKind::Loop,
+            location: TraceLocation::new(FuncId(0), BytecodePc(0)),
+        });
+        let slot = FrameSlot::General(Reg(0));
+        let start = b.read_slot(slot, TraceType::Any, TraceRep::Tagged);
+        let phi = b.add_loop_phi(slot, start, TraceType::Any, TraceRep::Tagged);
+        let limit = if register_bound {
+            let length = b.read_slot(FrameSlot::General(Reg(2)), TraceType::Int32, TraceRep::Int32);
+            b.emit1(TraceInst::Int32ToF64 { value: length }, TraceType::F64, TraceRep::F64)
+        } else {
+            b.constant(TraceConstant::F64Bits(10.0f64.to_bits()))
+        };
+        let number = b.add_side_exit(ExitReason::GuardNumber, BytecodePc(0));
+        let i = b.emit1(TraceInst::GuardF64 { value: phi, exit: number }, TraceType::F64, TraceRep::F64);
+        let more = b.emit1(TraceInst::F64Compare { op: CmpKind::Lt, lhs: i, rhs: limit }, TraceType::Bool, TraceRep::Bool);
+        let done = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        b.emit0(TraceInst::GuardSwitch { tag: more, observed: TraceSwitchGuard::Case(1), exit: done });
+        let integer = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+        let index = b.emit1(TraceInst::GuardInt32 { value: phi, exit: integer }, TraceType::Int32, TraceRep::Int32);
+        b.write_slot(FrameSlot::General(Reg(1)), index);
+        let one = b.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
+        let next = b.emit1(TraceInst::F64Binary { op: F64BinOp::Add, lhs: i, rhs: one }, TraceType::F64, TraceRep::F64);
+        let boxed = b.emit1(TraceInst::BoxF64 { value: next }, TraceType::Num, TraceRep::Tagged);
+        b.write_slot(slot, boxed);
+        b.set_loop_backedge(phi, boxed).unwrap();
+        b.add_native_budget_exit(BytecodePc(0));
+        b.set_terminator(TraceTerminator::LoopBack);
+        let original = b.finish().unwrap();
+        let mut optimized = original.clone();
+        crate::napalm_trace_ir_optimizing::optimization_passes().optimize_trace(&mut optimized).unwrap();
+        // Tagged -> F64 (with the index use) -> Int32 induction variable.
+        assert_eq!(optimized.stats.promoted_f64_loop_phis, 1, "{:?}", optimized.stats);
+        assert_eq!(optimized.stats.promoted_i32_loop_phis, 1, "{:?}", optimized.stats);
+        assert!(optimized.loop_phis.iter().any(|phi| phi.rep == TraceRep::Int32));
+        assert!(!optimized.nodes.iter().any(|node| matches!(
+            node.kind,
+            TraceInst::F64ToInt32 { .. } | TraceInst::F64Compare { .. } | TraceInst::GuardInt32 { .. }
+        )), "{:?}", optimized.nodes);
+
+        let near_max = |delta: i32| RegisterWord(((i32::MAX - delta) as f64).to_bits());
+        let inputs = [
+            RegisterWord(0.0f64.to_bits()), RegisterWord(3.0f64.to_bits()), RegisterWord(9.0f64.to_bits()),
+            RegisterWord(10.0f64.to_bits()), RegisterWord((-1.0f64).to_bits()), RegisterWord((-0.0f64).to_bits()),
+            RegisterWord(2.5f64.to_bits()), RegisterWord(CANONICAL_NAN), RegisterWord((-3e9f64).to_bits()),
+            RegisterWord((i32::MIN as f64).to_bits()), near_max(2), near_max(0),
+            RegisterWord(((i32::MAX as f64) + 1.0).to_bits()), RegisterWord(TAG_NULL), RegisterWord(TAG_TRUE),
+        ];
+        for &bound in bounds {
+            for input in inputs {
+                for budget in [1, 3, 64] {
+                    // Exit ids differ (promotion adds an entry exit resuming at
+                    // the same header PC); architectural register state must not.
+                    let mut baseline = [input, RegisterWord(77), RegisterWord(bound as u32 as u64)];
+                    let mut actual = baseline;
+                    run_scalar_trace(&original, &mut baseline, 0, budget);
+                    run_scalar_trace(&optimized, &mut actual, 0, budget);
+                    assert_eq!(actual, baseline, "input={:#x} bound={bound} budget={budget}", input.0);
                 }
             }
         }

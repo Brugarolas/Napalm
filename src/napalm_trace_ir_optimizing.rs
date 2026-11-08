@@ -4,7 +4,7 @@
 //! therefore performs phi translation across that backedge; it does not invent
 //! an arbitrary branch CFG or move effects across runtime synchronization.
 
-use crate::napalm_ir::{IntBinOp, IntUnaryOp};
+use crate::napalm_ir::{CmpKind, F64BinOp, IntBinOp, IntUnaryOp};
 use crate::napalm_trace_ir::*;
 use crate::napalm_trace_ir_optimizer::{
     Optimize as TraceOptimize, TraceOptimization, alias_value, append_preheader,
@@ -46,11 +46,15 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         // Establish compact representations and remove recorder-level boxing noise.
         .with_pass(TraceCanonicalization {
             promote_loop_representations,
+            promote_integer_induction: false,
         })
         .with_pass(SparseConditionalConstantPropagation)
         .with_pass(ConversionSimplification)
+        // Integer IV speculation needs the folded + 1.0 step, so it runs after
+        // constant propagation and before the induction/range passes.
         .with_pass(TraceCanonicalization {
             promote_loop_representations: false,
+            promote_integer_induction: promote_loop_representations,
         })
         .with_pass(PredicateSimplification)
         .with_pass(BooleanMaterializationElimination)
@@ -82,6 +86,7 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         .with_pass(ConversionSimplification)
         .with_pass(TraceCanonicalization {
             promote_loop_representations: false,
+            promote_integer_induction: false,
         })
         .with_pass(PredicateSimplification)
         .with_pass(BooleanMaterializationElimination)
@@ -376,6 +381,8 @@ impl TraceOptimization for PartialRedundancyElimination {
 /// Existing box/guard cancellation and loop representation specialization.
 pub struct TraceCanonicalization {
     pub promote_loop_representations: bool,
+    /// Integer induction-variable speculation (see promote_integer_induction).
+    pub promote_integer_induction: bool,
 }
 
 impl TraceOptimization for TraceCanonicalization {
@@ -397,6 +404,9 @@ impl TraceOptimization for TraceCanonicalization {
             self.hoist_invariant_numeric_guards(trace);
             if self.promote_loop_representations {
                 self.promote_loop_representations(trace);
+            }
+            if self.promote_integer_induction {
+                self.promote_integer_induction(trace);
             }
             self.cancel_box_guard_pairs(trace);
         }
@@ -651,6 +661,14 @@ impl TraceCanonicalization {
                     (TraceInst::GuardF64 { value, .. }, TraceRep::F64) => {
                         trace.canonical_value(*value) == phi.value
                     }
+                    // A Num induction variable that is also used as an index
+                    // (`i < n` in f64, `list[i]` in i32). Once the phi is raw F64
+                    // the tag check is the phi's entry guard; the remaining
+                    // GuardInt32 checks (-0, range, exactness) are exactly
+                    // F64ToInt32, which replaces it below.
+                    (TraceInst::GuardInt32 { value, .. }, TraceRep::F64) => {
+                        trace.canonical_value(*value) == phi.value
+                    }
                     (TraceInst::GuardInt32 { value, .. }, TraceRep::Int32) => {
                         trace.canonical_value(*value) == phi.value
                     }
@@ -730,6 +748,18 @@ impl TraceCanonicalization {
                     alias_value(trace, result, candidate.phi_value);
                     trace.nodes[index].kind = TraceInst::Nop;
                     trace.stats.eliminated_guards += 1;
+                    continue;
+                }
+                // Integer view of the now-raw F64 phi: same exit, same checks
+                // minus the (already proven) Num tag test.
+                if candidate.rep == TraceRep::F64 {
+                    if let TraceInst::GuardInt32 { value, exit } = kind {
+                        if trace.canonical_value(value) == candidate.phi_value {
+                            trace.nodes[index].kind =
+                                TraceInst::F64ToInt32 { value: candidate.phi_value, exit };
+                            trace.stats.peephole_simplified += 1;
+                        }
+                    }
                 }
             }
 
@@ -756,6 +786,205 @@ impl TraceCanonicalization {
                 TraceRep::UInt32 => trace.stats.promoted_u32_loop_phis += 1,
                 _ => {}
             }
+        }
+    }
+
+    /// Integer induction-variable speculation for `for (i = a; i < n; i++)`.
+    ///
+    /// Applies to an F64 loop phi `P` (already unboxed by
+    /// `promote_loop_representations`) whose backedge is `P + 1.0`, that is
+    /// compared `P < X` by a guard executed earlier in the same iteration, where
+    /// `X` is an Int32 converted to F64 or an integral constant in the i32 range,
+    /// and that is also used as an i32 (`F64ToInt32(P)`, i.e. the recording saw
+    /// an exact integer). `P` becomes an Int32 phi:
+    ///
+    /// * entry: the phi's entry guard becomes GuardInt32. Rejecting a non-integer
+    ///   entry value only means not entering the trace (the exit resumes at the
+    ///   header with untouched state), which is always correct;
+    /// * `P < X` -> `IntCompare(P, L)`: exact, both conversions are lossless;
+    /// * `P + 1.0` -> `IntBinary Add(P, 1)`: it cannot overflow because the guard
+    ///   proved `P < X <= i32::MAX` before the add in the same iteration, and
+    ///   `f64(P) + 1.0 == f64(P + 1)` for every such `P`;
+    /// * `F64ToInt32(P)` -> `P` (it could never fail on an exact Int32);
+    /// * snapshots box the Int32 to the same Napalm number (never -0: the entry
+    ///   guard rejects -0 and `-1 + 1` is +0 in both domains).
+    ///
+    /// Loop condition and index then live in one integer domain, so both
+    /// backends can relate `i < len` to the list bounds guards.
+    fn promote_integer_induction(&self, trace: &mut Trace) {
+        enum Bound {
+            Value(TraceValueId),
+            Const(i32),
+        }
+
+        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let is_f64_one = |trace: &Trace, value: TraceValueId| {
+            matches!(
+                trace.value(trace.canonical_value(value)).map(|v| &v.origin),
+                Some(TraceValueOrigin::Constant(TraceConstant::F64Bits(bits))) if f64::from_bits(*bits) == 1.0
+            )
+        };
+        let int32_bound = |trace: &Trace, value: TraceValueId| -> Option<Bound> {
+            let value = trace.canonical_value(value);
+            match &trace.value(value)?.origin {
+                TraceValueOrigin::Constant(TraceConstant::F64Bits(bits)) => {
+                    let number = f64::from_bits(*bits);
+                    (number.fract() == 0.0 && number >= i32::MIN as f64 && number <= i32::MAX as f64)
+                        .then(|| Bound::Const(number as i32))
+                }
+                _ => match Self::producer(trace, value)? {
+                    (_, TraceInst::Int32ToF64 { value: source }) => {
+                        let source = trace.canonical_value(source);
+                        (trace.value(source)?.rep == TraceRep::Int32).then_some(Bound::Value(source))
+                    }
+                    _ => None,
+                },
+            }
+        };
+
+        for phi_index in 0..trace.loop_phis.len() {
+            let phi = trace.loop_phis[phi_index].clone();
+            if phi.rep != TraceRep::F64 || phi.entry_exit.is_none() {
+                continue;
+            }
+            let p = trace.canonical_value(phi.value);
+            let Some(backedge) = phi.backedge.map(|value| trace.canonical_value(value)) else { continue };
+
+            // Backedge: P + 1.0 (either operand order).
+            let Some((add_node, TraceInst::F64Binary { op: F64BinOp::Add, lhs, rhs })) =
+                Self::producer(trace, backedge)
+            else {
+                continue;
+            };
+            let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
+            let step = if lhs == p { rhs } else if rhs == p { lhs } else { continue };
+            if !is_f64_one(trace, step) || preheader.contains(&add_node) {
+                continue;
+            }
+
+            // A body guard `P < X` (or `X > P`) that precedes the increment.
+            let mut guard = None;
+            for node in &trace.nodes[..add_node] {
+                if preheader.contains(&node.id) {
+                    continue;
+                }
+                let TraceInst::GuardSwitch { tag, observed: TraceSwitchGuard::Case(1), .. } = &node.kind else {
+                    continue;
+                };
+                let Some((compare_node, TraceInst::F64Compare { op, lhs, rhs })) = Self::producer(trace, *tag)
+                else {
+                    continue;
+                };
+                let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
+                let bound = match op {
+                    CmpKind::Lt if lhs == p && rhs != p => int32_bound(trace, rhs),
+                    CmpKind::Gt if rhs == p && lhs != p => int32_bound(trace, lhs),
+                    _ => None,
+                };
+                if let Some(bound) = bound {
+                    guard = Some((compare_node, op, bound));
+                    break;
+                }
+            }
+            let Some((compare_node, compare_op, bound)) = guard else { continue };
+
+            // Every hot-path use of P and of the incremented value must be one we
+            // rewrite; anything else keeps the F64 phi.
+            let mut integer_uses = 0usize;
+            let mut compatible = true;
+            for node in &trace.nodes {
+                if node.id == compare_node || node.id == add_node || matches!(node.kind, TraceInst::Nop) {
+                    continue;
+                }
+                let mut uses_p = false;
+                let mut uses_next = false;
+                let mut operands = node.kind.clone();
+                operands.visit_operands(|operand| {
+                    let operand = trace.canonical_value(*operand);
+                    uses_p |= operand == p;
+                    uses_next |= operand == backedge;
+                });
+                if !uses_p && !uses_next {
+                    continue;
+                }
+                match &node.kind {
+                    TraceInst::F64ToInt32 { .. } => integer_uses += uses_p as usize,
+                    TraceInst::BoxF64 { .. } => {}
+                    _ => {
+                        compatible = false;
+                        break;
+                    }
+                }
+            }
+            for (index, other) in trace.loop_phis.iter().enumerate() {
+                if index == phi_index {
+                    continue;
+                }
+                let refers = |value: TraceValueId| {
+                    let value = trace.canonical_value(value);
+                    value == p || value == backedge
+                };
+                if refers(other.initial) || other.backedge.is_some_and(refers) {
+                    compatible = false;
+                }
+            }
+            if !compatible || integer_uses == 0 {
+                continue;
+            }
+
+            // Rewrite.
+            let mut new_constant = |trace: &mut Trace, value: i32| {
+                let id = TraceValueId(trace.values.len() as u32);
+                trace.values.push(TraceValue {
+                    id,
+                    ty: TraceType::Int32,
+                    rep: TraceRep::Int32,
+                    origin: TraceValueOrigin::Constant(TraceConstant::Int32(value)),
+                });
+                id
+            };
+            let bound = match bound {
+                Bound::Value(value) => value,
+                Bound::Const(value) => new_constant(trace, value),
+            };
+            let one = new_constant(trace, 1);
+
+            trace.loop_phis[phi_index].rep = TraceRep::Int32;
+            for value in [p, backedge] {
+                if let Some(value) = trace.value_mut(value) {
+                    value.rep = TraceRep::Int32;
+                    value.ty = TraceType::Int32;
+                }
+            }
+            trace.nodes[compare_node].kind = match compare_op {
+                CmpKind::Lt => TraceInst::IntCompare { op: CmpKind::Lt, lhs: p, rhs: bound },
+                _ => TraceInst::IntCompare { op: CmpKind::Gt, lhs: bound, rhs: p },
+            };
+            trace.nodes[add_node].kind = TraceInst::IntBinary { op: IntBinOp::Add, lhs: p, rhs: one };
+
+            for index in 0..trace.nodes.len() {
+                let kind = trace.nodes[index].kind.clone();
+                match kind {
+                    TraceInst::F64ToInt32 { value, .. } => {
+                        let value = trace.canonical_value(value);
+                        if value == p || value == backedge {
+                            if let Some(result) = trace.nodes[index].results.first().copied() {
+                                alias_value(trace, result, value);
+                            }
+                            trace.nodes[index].kind = TraceInst::Nop;
+                            trace.stats.eliminated_guards += 1;
+                        }
+                    }
+                    TraceInst::BoxF64 { value } => {
+                        let value = trace.canonical_value(value);
+                        if value == p || value == backedge {
+                            trace.nodes[index].kind = TraceInst::BoxInt32 { value };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            trace.stats.promoted_i32_loop_phis += 1;
         }
     }
 

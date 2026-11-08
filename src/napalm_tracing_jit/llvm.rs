@@ -2325,6 +2325,17 @@ impl LlvmLowering<'_> {
         let chunk = self.load(Ty::Ptr, &chunk_slot, Mem::Sidecar);
         let entry_offset = self.bin("mul", &entry_index, &V::i64(std::mem::size_of::<TraceHeapEntry>() as i64));
         let entry = self.gep8_dyn(&chunk, &entry_offset);
+        // A heap-tagged word always names an entry of an installed handle chunk,
+        // and chunks are never freed or moved while the VM lives. LLVM cannot
+        // derive that through the variable chunk offset, so state it: with it,
+        // LICM may hoist conditional sidecar loads (List data pointer, kind,
+        // receiver class...) out of loops that contain no runtime boundary.
+        self.line(&format!(
+            "call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr {entry}, i64 {size}), \"align\"(ptr {entry}, i64 {align}) ]",
+            entry = entry.op,
+            size = std::mem::size_of::<TraceHeapEntry>(),
+            align = std::mem::align_of::<TraceHeapEntry>(),
+        ));
         let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::SidecarAddress);
         let dead = self.def(Ty::I1, &format!("icmp eq ptr {}, null", address.op));
         self.emit_side_exit(exit, &dead)?;
@@ -3725,6 +3736,36 @@ impl LlvmLowering<'_> {
             }
         }
 
+        // Sidecar `data` pointers of objects whose entry and kind the preheader
+        // already proved. Without a runtime boundary a List/String/Cell buffer
+        // cannot be reallocated, so the pointer is loop-invariant; loading it here
+        // (no new guard, no reordered exit) hands LLVM the hoisted value. LLVM
+        // cannot hoist it itself: the entry address `chunk + idx * 48` has a
+        // variable offset, so dereferenceability (needed to speculate the load
+        // above the body's guards) is not derivable.
+        if epoch_free_loop {
+            for node in &trace.nodes {
+                if preheader_nodes[node.id] {
+                    continue;
+                }
+                let (value, kind) = match &node.kind {
+                    TraceInst::HeapListGet { list, .. } | TraceInst::HeapListSet { list, .. } => {
+                        (*list, TraceHeapKind::List)
+                    }
+                    TraceInst::HeapLoadCell { cell, .. } | TraceInst::HeapStoreCell { cell, .. } => {
+                        (*cell, TraceHeapKind::Cell)
+                    }
+                    TraceInst::HeapStringAsciiCodePointAt { string, .. }
+                    | TraceInst::HeapStringCodePointAt { string, .. } => (*string, TraceHeapKind::String),
+                    _ => continue,
+                };
+                let key = (trace.canonical_value(value), kind as u32);
+                if let Some((entry, _)) = self.heap_entries.get(&key).cloned() {
+                    let _ = self.heap_entry_data(&entry);
+                }
+            }
+        }
+
         // Loop-carried state lives in entry-block allocas; SROA/mem2reg turns them
         // into SSA phis (the LLVM analogue of Cranelift's frontend Variables).
         let mut phi_slots = Vec::with_capacity(trace.loop_phis.len());
@@ -4399,11 +4440,15 @@ mod tests {
         let ir = lower_trace(&trace, &plans, slots, 0,
             "shape_preheader_guard", proof_test_host()).expect("lowering");
         let main_loop = ir.find("loop:\n").expect("loop label");
-        let shape_assumption = ir.find("call void @llvm.assume(i1")
+        // Condition assumes only (`i1 %tN`); the sidecar dereferenceability
+        // bundle (`i1 true) [...]`) is a separate, path-independent fact.
+        let shape_assumption = ir.find("call void @llvm.assume(i1 %")
             .expect("shape assumption");
         assert!(shape_assumption < main_loop, "shape proof not hoisted: {ir}");
-        assert_eq!(ir.matches("call void @llvm.assume(i1").count(), 1,
+        assert_eq!(ir.matches("call void @llvm.assume(i1 %").count(), 1,
             "shape guard unexpectedly reexecuted in body: {ir}");
+        let entry_bundle = ir.find("[ \"dereferenceable\"(ptr").expect("sidecar dereferenceability bundle");
+        assert!(entry_bundle < main_loop, "sidecar entry proof not hoisted: {ir}");
         validate_proof_ir(&ir);
     }
 

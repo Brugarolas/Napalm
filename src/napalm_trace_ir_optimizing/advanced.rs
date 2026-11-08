@@ -2086,7 +2086,7 @@ mod tests {
         b.emit1(TraceInst::Copy { value: dead }, TraceType::Int32, TraceRep::Int32);
         let mut trace = finish(b);
         Optimize::new()
-            .with_pass(TraceCanonicalization { promote_loop_representations: true })
+            .with_pass(TraceCanonicalization { promote_loop_representations: true, promote_integer_induction: false })
             .with_pass(DeadCodeElimination)
             .verify_after_each_pass(true)
             .optimize_trace(&mut trace)
