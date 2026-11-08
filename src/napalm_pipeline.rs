@@ -18,8 +18,9 @@ mod debug_dump {
     use crate::napalm_bytecode::disassemble;
     use std::fs::{File, OpenOptions};
     use std::io::{BufWriter, Write};
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     const LOG_PATH: &str = "run_log.txt";
 
@@ -45,9 +46,7 @@ mod debug_dump {
     }
 
     fn with_log(write: impl FnOnce(&mut BufWriter<File>)) {
-        let mut guard = log()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = log().lock();
         let Some(writer) = guard.as_mut() else {
             return;
         };

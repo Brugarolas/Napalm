@@ -591,6 +591,7 @@ fn recursive_memo_functions(
 #[derive(Default)]
 pub struct InterpreterOptimizationBundle;
 
+
 impl FunctionOptimization for InterpreterOptimizationBundle {
     /// This deliberately uses the most aggressive behavior:
     /// - an initial local fixed-point to expose cheap opportunities early;
@@ -2288,7 +2289,7 @@ impl FunctionOptimization for ControlFlowCleanup {
             function.nodes.push(Node {
                 id,
                 kind: Inst::Unreachable,
-                results: Vec::new(),
+                results: SmallVec::new(),
                 effect_in: Some(function.blocks[block_ix].effect),
                 effect_out: None,
                 source,

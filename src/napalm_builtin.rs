@@ -2882,9 +2882,8 @@ fn execute_primitive(
             let mut pairs = context.map_pairs(this)?;
             // Napalm object enumeration is deterministic for ordinary Maps. Proxy
             // ownKeys preserves its trap-provided order separately.
-            pairs.sort_by(|(left, _), (right, _)| {
-                context.format_value(left.value()).cmp(&context.format_value(right.value()))
-            });
+            // Format each key once (stable sort), not twice per comparison.
+            pairs.sort_by_cached_key(|(key, _)| context.format_value(key.value()));
             match op {
                 MapKeysList => Ok(context.allocate_list(
                     pairs.iter().map(|(key, _)| key.value()).collect()

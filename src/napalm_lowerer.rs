@@ -37,6 +37,7 @@ use crate::napalm_collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 use compact_str::{CompactString, ToCompactString};
 use bumpalo::{Bump, collections::Vec as BumpVec};
+use std::cell::OnceCell;
 use std::io;
 
 const MAX_NAPALM_ARITY: usize = 16;
@@ -366,7 +367,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
             let ExprKind::Name(name) = &invoke.receiver.as_ref()?.kind else { return None; };
             match name.value.as_str() {
                 "Map" => direct(K::Map), "Set" => direct(K::Set(None)),
-                "ConcurrentMap" | "ConcurrentSet" => direct(K::BuiltinGeneric(name.value.clone(), None)),
+                "ConcurrentMap" | "ConcurrentSet" => direct(K::BuiltinGeneric(name.value.to_string(), None)),
                 _ => None,
             }
         }
@@ -395,7 +396,7 @@ fn contract_key(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
+fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<CompactString, Type>) -> bool {
     match &a.kind {
         TypeAnnotationKind::Named(n) => known.contains_key(&*contract_key(n)),
         TypeAnnotationKind::Opaque(_) => false,
@@ -411,11 +412,11 @@ fn supported_interface_annotation(a: &TypeAnnotation, known: &HashMap<String, Ty
 
 fn supported_alias_annotation(
     annotation: &TypeAnnotation,
-    known: &HashMap<String, Type>,
-    type_params: &HashSet<String>,
+    known: &HashMap<CompactString, Type>,
+    type_params: &HashSet<CompactString>,
 ) -> bool {
     match &annotation.kind {
-        TypeAnnotationKind::Named(name) => type_params.contains(name) || known.contains_key(&*contract_key(name)),
+        TypeAnnotationKind::Named(name) => type_params.contains(name.as_str()) || known.contains_key(&*contract_key(name)),
         TypeAnnotationKind::Opaque(_) => false,
         TypeAnnotationKind::Object(fields) => fields
             .iter()
@@ -433,7 +434,7 @@ fn supported_alias_annotation(
     }
 }
 
-fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<String, Type>) -> bool {
+fn invalid_structural_annotation(annotation: &TypeAnnotation, known: &HashMap<CompactString, Type>) -> bool {
     match &annotation.kind {
         TypeAnnotationKind::Object(_) => !supported_interface_annotation(annotation, known),
         TypeAnnotationKind::List(Some(t)) | TypeAnnotationKind::Set(Some(t)) => invalid_structural_annotation(t, known),
@@ -471,17 +472,17 @@ fn annotation_mentions_type_params(annotation: &TypeAnnotation, params: &[Ident]
 /// concrete arguments when instantiating a generic class (`T` -> number).
 fn resolve_type_annotation(
     annotation: &TypeAnnotation,
-    classes: &HashMap<String, ClassId>,
-    interfaces: &HashMap<String, Type>,
+    classes: &HashMap<CompactString, ClassId>,
+    interfaces: &HashMap<CompactString, Type>,
 ) -> Type {
     resolve_type_annotation_with(annotation, classes, interfaces, &HashMap::default())
 }
 
 fn resolve_type_annotation_with(
     annotation: &TypeAnnotation,
-    classes: &HashMap<String, ClassId>,
-    interfaces: &HashMap<String, Type>,
-    env: &HashMap<String, Type>,
+    classes: &HashMap<CompactString, ClassId>,
+    interfaces: &HashMap<CompactString, Type>,
+    env: &HashMap<CompactString, Type>,
 ) -> Type {
     use TypeAnnotationKind as K;
 
@@ -520,13 +521,13 @@ fn resolve_type_annotation_with(
             })
         }
         K::Object(fields) => Type::Interface(fields.iter().map(|field| ir::InterfaceFieldType {
-            name: field.name.value.clone(),
+            name: field.name.value.to_string(),
             ty: resolve_type_annotation_with(&field.annotation, classes, interfaces, env),
             optional: field.optional,
             readonly: field.readonly,
         }).collect()),
         K::Closure => Type::Closure(None),
-        K::Named(name) if env.contains_key(name) => env[name].clone(),
+        K::Named(name) if env.contains_key(name.as_str()) => env[name.as_str()].clone(),
         K::Named(name) if interfaces.contains_key(&*contract_key(name)) => interfaces[&*contract_key(name)].clone(),
         K::Named(name) => match name.split('<').next().unwrap_or(name).rsplit('.').next().unwrap_or(name) {
             "Range" => Type::Range,
@@ -755,7 +756,7 @@ struct FunctionNodeId(usize);
 
 #[derive(Clone, Debug)]
 struct BindingInfo {
-    name: String,
+    name: CompactString,
     declaration: Span,
     owner: FunctionNodeId,
     captured: bool,
@@ -795,17 +796,99 @@ struct RootAnalysis<'ast> {
     declaration_map: HashMap<Span, BindingId>,
     use_map: HashMap<Span, BindingId>,
     closure_map: HashMap<Span, FunctionNodeId>,
+    /// Resolved static contracts of every annotated binding. The analysis and
+    /// the module's class/interface tables are immutable while functions lower,
+    /// so this is computed once per analysis instead of once per function
+    /// (which made lowering quadratic in the number of annotated bindings).
+    resolved_binding_types: OnceCell<HashMap<BindingId, StaticBindingType>>,
+    /// Direct closure children of each node, in node order.
+    children: OnceCell<Vec<SmallVec<[FunctionNodeId; 4]>>>,
 }
 
-impl RootAnalysis<'_> {
+impl<'ast> RootAnalysis<'ast> {
+    fn new(root: FunctionNode<'ast>) -> Self {
+        Self {
+            nodes: vec![root],
+            bindings: Vec::new(),
+            declaration_map: HashMap::default(),
+            use_map: HashMap::default(),
+            closure_map: HashMap::default(),
+            resolved_binding_types: OnceCell::new(),
+            children: OnceCell::new(),
+        }
+    }
+
     fn binding(&self, id: BindingId) -> &BindingInfo {
         &self.bindings[id.0 as usize]
+    }
+
+    fn children(&self, parent: FunctionNodeId) -> &[FunctionNodeId] {
+        let children = self.children.get_or_init(|| {
+            let mut children = vec![SmallVec::new(); self.nodes.len()];
+            for (index, node) in self.nodes.iter().enumerate() {
+                if let Some(parent) = node.parent {
+                    children[parent.0].push(FunctionNodeId(index));
+                }
+            }
+            children
+        });
+        &children[parent.0]
+    }
+
+    fn resolved_binding_types(
+        &self,
+        classes: &HashMap<CompactString, ClassId>,
+        interfaces: &HashMap<CompactString, Type>,
+    ) -> &HashMap<BindingId, StaticBindingType> {
+        self.resolved_binding_types.get_or_init(|| {
+            self.bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, binding)| {
+                    binding.source_type.as_ref().map(|annotation| {
+                        (
+                            BindingId(index as u32),
+                            StaticBindingType {
+                                expected: resolve_type_annotation(annotation, classes, interfaces),
+                                origin: annotation.span,
+                                display: display_type_annotation(annotation),
+                            },
+                        )
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// Function-local view of static binding contracts: the analysis-wide resolved
+/// annotations shared by reference, plus refinements registered while lowering
+/// this function (which shadow the shared entry).
+struct BindingTypes<'a> {
+    shared: &'a HashMap<BindingId, StaticBindingType>,
+    local: HashMap<BindingId, StaticBindingType>,
+}
+
+impl<'a> BindingTypes<'a> {
+    #[inline]
+    fn get(&self, binding: &BindingId) -> Option<&StaticBindingType> {
+        self.local.get(binding).or_else(|| self.shared.get(binding))
+    }
+
+    #[inline]
+    fn contains_key(&self, binding: &BindingId) -> bool {
+        self.local.contains_key(binding) || self.shared.contains_key(binding)
+    }
+
+    #[inline]
+    fn insert(&mut self, binding: BindingId, ty: StaticBindingType) {
+        self.local.insert(binding, ty);
     }
 }
 
 struct Analyzer<'ast> {
     analysis: RootAnalysis<'ast>,
-    scopes: Vec<HashMap<String, BindingId>>,
+    scopes: Vec<HashMap<CompactString, BindingId>>,
     current_function: FunctionNodeId,
     function_stack: Vec<FunctionNodeId>,
     module_root: bool,
@@ -829,13 +912,7 @@ impl<'ast> Analyzer<'ast> {
             has_structured_exceptions: false,
         };
         let mut analyzer = Self {
-            analysis: RootAnalysis {
-                nodes: vec![root],
-                bindings: Vec::new(),
-                declaration_map: HashMap::default(),
-                use_map: HashMap::default(),
-                closure_map: HashMap::default(),
-            },
+            analysis: RootAnalysis::new(root),
             scopes: vec![HashMap::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
@@ -870,13 +947,7 @@ impl<'ast> Analyzer<'ast> {
             has_structured_exceptions: false,
         };
         let mut analyzer = Self {
-            analysis: RootAnalysis {
-                nodes: vec![root],
-                bindings: Vec::new(),
-                declaration_map: HashMap::default(),
-                use_map: HashMap::default(),
-                closure_map: HashMap::default(),
-            },
+            analysis: RootAnalysis::new(root),
             scopes: vec![HashMap::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
@@ -900,7 +971,7 @@ impl<'ast> Analyzer<'ast> {
     fn declare_synthetic_this(&mut self, span: Span) -> BindingId {
         let id = BindingId(self.analysis.bindings.len() as u32);
         self.analysis.bindings.push(BindingInfo {
-            name: "this".to_owned(),
+            name: "this".into(),
             declaration: Span::empty(span.start),
             owner: self.current_function,
             captured: false,
@@ -1347,7 +1418,7 @@ impl<'ast> Analyzer<'ast> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MethodKey {
-    name: String,
+    name: CompactString,
     kind: MethodKind,
     arity: u8,
 }
@@ -1407,10 +1478,10 @@ struct ClassPlan {
     superclass: Option<ClassId>,
     /// Instance fields declared directly by this class. Slots always start at
     /// zero; runtime class linking adds the inherited field base once.
-    fields: HashMap<String, FieldSlot>,
-    field_types: HashMap<String, Type>,
-    static_fields: HashMap<String, StaticFieldSlot>,
-    static_field_types: HashMap<String, Type>,
+    fields: HashMap<CompactString, FieldSlot>,
+    field_types: HashMap<CompactString, Type>,
+    static_fields: HashMap<CompactString, StaticFieldSlot>,
+    static_field_types: HashMap<CompactString, Type>,
     methods: Vec<MethodPlan>,
 }
 
@@ -1423,8 +1494,8 @@ struct StaticBindingType {
 
 #[derive(Clone, Debug)]
 struct ModuleLayout {
-    shared: HashSet<String>,
-    slots: HashMap<String, ModuleSlot>,
+    shared: HashSet<CompactString>,
+    slots: HashMap<CompactString, ModuleSlot>,
 }
 
 impl ModuleLayout {
@@ -1445,11 +1516,11 @@ struct ModuleLowerer<'p, 's, 'a> {
     source_file: ir::StringId,
     module_id: Option<ModuleId>,
     module_layout: ModuleLayout,
-    module_binding_types: HashMap<String, StaticBindingType>,
+    module_binding_types: HashMap<CompactString, StaticBindingType>,
     symbols: SymbolTable,
     class_plans: HashMap<Span, ClassPlan>,
-    top_level_classes: HashMap<String, ClassId>,
-    interface_types: HashMap<String, Type>,
+    top_level_classes: HashMap<CompactString, ClassId>,
+    interface_types: HashMap<CompactString, Type>,
     string_ids: HashMap<CompactString, ir::StringId>,
     /// Source import spelling -> canonical resolved module StringId. Kept
     /// separate from string_ids so an ordinary literal like "./dep" retains
@@ -1459,7 +1530,7 @@ struct ModuleLowerer<'p, 's, 'a> {
     method_functions: HashMap<Span, FuncId>,
     /// Synchronous module-level closures are immutable code identities for
     /// isolated workers. Their managed closure objects are never transferred.
-    worker_function_names: HashSet<String>,
+    worker_function_names: HashSet<CompactString>,
 }
 
 impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
@@ -1473,7 +1544,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     ) -> Self {
         let source_file = program.intern_string(source_name);
         let line_starts = source_line_starts(source);
-        let worker_function_names: HashSet<String> = ast
+        let worker_function_names: HashSet<CompactString> = ast
             .statements
             .iter()
             .filter_map(|statement| match &statement.kind {
@@ -1585,7 +1656,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     }
 
     fn plan_module_slots(&mut self) {
-        let mut declarations: Vec<(String, Span)> = Vec::new();
+        let mut declarations: Vec<(CompactString, Span)> = Vec::new();
         for statement in &self.ast.statements {
             match &statement.kind {
                 StmtKind::Variable { name, shared, .. } => {
@@ -1615,7 +1686,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         for builtin in BuiltinId::ALL {
             self.module_layout
                 .slots
-                .insert(builtin.binding_name().to_owned(), ModuleSlot(next));
+                .insert(builtin.binding_name().into(), ModuleSlot(next));
             next += 1;
         }
 
@@ -1625,7 +1696,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         collect_class_declarations(&self.ast.statements, &mut classes);
         for (class, _) in classes {
             self.module_layout.slots.insert(
-                format!("<class:{}>", class.name.span.start), ModuleSlot(next),
+                compact_str::format_compact!("<class:{}>", class.name.span.start), ModuleSlot(next),
             );
             next += 1;
         }
@@ -1684,7 +1755,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
                 for field in &decl.fields {
                     let field_ty = ir::InterfaceFieldType {
-                        name: field.name.value.clone(),
+                        name: field.name.value.to_string(),
                         ty: resolve_type_annotation(
                             &field.annotation,
                             &self.top_level_classes,
@@ -1755,9 +1826,9 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         // Let the runtime name these contracts (`typeof` reports
         // "Object implementation of Name"). Sorted for deterministic output.
-        let mut named: Vec<(&String, &Type)> = self.interface_types.iter().collect();
+        let mut named: Vec<(&CompactString, &Type)> = self.interface_types.iter().collect();
         named.sort_by(|left, right| left.0.cmp(right.0));
-        let named: Vec<(String, Type)> = named.into_iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
+        let named: Vec<(CompactString, Type)> = named.into_iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
         for (name, ty) in named {
             let id = self.program.intern_string(&name);
             if !self.program.contract_names.iter().any(|(existing, existing_ty)| *existing == id && *existing_ty == ty) {
@@ -1809,7 +1880,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 .iter()
                 .map(|arg| resolve_type_annotation(arg, &self.top_level_classes, &self.interface_types))
                 .collect();
-            let env: HashMap<String, Type> = class
+            let env: HashMap<CompactString, Type> = class
                 .type_params
                 .iter()
                 .zip(&args)
@@ -1907,8 +1978,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // Napalm module-level bindings are public by name. Builtins and hidden
         // lexical class roots deliberately stay private. Imported bindings are
         // included, matching Napalm's ordinary module-variable semantics.
-        let mut names = Vec::<(String, ModuleSlot)>::new();
-        let mut seen = HashSet::<String>::default();
+        let mut names = Vec::<(CompactString, ModuleSlot)>::new();
+        let mut seen = HashSet::<CompactString>::default();
 
         for statement in &self.ast.statements {
             match &statement.kind {
@@ -1965,7 +2036,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
         self.module_layout
             .slots
-            .insert(name.to_owned(), ModuleSlot(*next));
+            .insert(name.into(), ModuleSlot(*next));
         *next += 1;
     }
 
@@ -2002,7 +2073,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 ClassPlan {
                     id,
                     class_slot: self.module_layout.get(&format!("<class:{}>", class.name.span.start)).unwrap(),
-                    name: class.name.value.clone(),
+                    name: class.name.value.to_string(),
                     declaration_span: class.name.span,
                     superclass: None,
                     fields: HashMap::default(),
@@ -2185,14 +2256,14 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         //   absolute = superclass.total_instance_fields + local_slot
         //
         // once, when CreateClass executes.
-        let mut fields = HashMap::default();
+        let mut fields = HashMap::<CompactString, FieldSlot>::default();
         for (index, name) in locals.into_iter().enumerate() {
-            fields.insert(name.to_owned(), FieldSlot(index as u16));
+            fields.insert(name.into(), FieldSlot(index as u16));
         }
 
-        let mut static_fields = HashMap::default();
+        let mut static_fields = HashMap::<CompactString, StaticFieldSlot>::default();
         for (index, name) in statics.into_iter().enumerate() {
-            static_fields.insert(name.to_owned(), StaticFieldSlot(index as u16));
+            static_fields.insert(name.into(), StaticFieldSlot(index as u16));
         }
 
         let mut field_types = HashMap::default();
@@ -2254,7 +2325,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             info.own_instance_field_types = vec![Type::Top; fields.len()];
             for (name, slot) in &fields {
                 info.own_instance_field_types[slot.0 as usize] =
-                    field_types.get(name).cloned().unwrap_or(Type::Top);
+                    field_types.get(name.as_str()).cloned().unwrap_or(Type::Top);
             }
             info.own_instance_field_names = field_names;
             info.own_generic_fields = generic_fields;
@@ -2262,7 +2333,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             info.static_field_types = vec![Type::Top; static_fields.len()];
             for (name, slot) in &static_fields {
                 info.static_field_types[slot.0 as usize] =
-                    static_field_types.get(name).cloned().unwrap_or(Type::Top);
+                    static_field_types.get(name.as_str()).cloned().unwrap_or(Type::Top);
             }
         }
 
@@ -2283,55 +2354,55 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         // Compiler-generated protocol calls.
         keys.insert(MethodKey {
-            name: "iterate".to_owned(),
+            name: "iterate".into(),
             kind: MethodKind::Method,
             arity: 1,
         });
         keys.insert(MethodKey {
-            name: "iteratorValue".to_owned(),
+            name: "iteratorValue".into(),
             kind: MethodKind::Method,
             arity: 1,
         });
         keys.insert(MethodKey {
-            name: "toString".to_owned(),
+            name: "toString".into(),
             kind: MethodKind::Getter,
             arity: 0,
         });
         keys.insert(MethodKey {
-            name: "toString".to_owned(),
+            name: "toString".into(),
             kind: MethodKind::Method,
             arity: 0,
         });
         // Napalm surface sugar lowered by the compiler itself.
         keys.insert(MethodKey {
-            name: "keys".to_owned(),
+            name: "keys".into(),
             kind: MethodKind::Getter,
             arity: 0,
         });
         keys.insert(MethodKey {
-            name: "[]".to_owned(),
+            name: "[]".into(),
             kind: MethodKind::SubscriptGetter,
             arity: 1,
         });
         keys.insert(MethodKey {
-            name: "__spreadInto".to_owned(),
+            name: "__spreadInto".into(),
             kind: MethodKind::Method,
             arity: 1,
         });
         // `inherits`, `implements` and `instanceof Contract` lower to hidden
         // System natives.
         keys.insert(MethodKey {
-            name: "__inherits".to_owned(),
+            name: "__inherits".into(),
             kind: MethodKind::Method,
             arity: 2,
         });
         keys.insert(MethodKey {
-            name: "__implements".to_owned(),
+            name: "__implements".into(),
             kind: MethodKind::Method,
             arity: 3,
         });
         keys.insert(MethodKey {
-            name: "__typeof".to_owned(),
+            name: "__typeof".into(),
             kind: MethodKind::Method,
             arity: 1,
         });
@@ -2421,7 +2492,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 // public static factories allocate once before calling them.
                 let body_symbol = if method.is_constructor {
                     let key = MethodKey {
-                        name: format!("<init>{name}"), kind: MethodKind::Method, arity: arity as u8,
+                        name: compact_str::format_compact!("<init>{name}"), kind: MethodKind::Method, arity: arity as u8,
                     };
                     let symbol = self.program.intern_method(&key.name, key.kind, key.arity);
                     self.symbols.methods.insert(key, symbol);
@@ -2440,12 +2511,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     Some(MethodContextSpec {
                         class: class_plan.id,
                         method_symbol: body_symbol,
-                        constructor: method.is_constructor,
                         static_method: method.is_static,
-                        fields: class_plan.fields.clone(),
-                        field_types: class_plan.field_types.clone(),
-                        static_fields: class_plan.static_fields.clone(),
-                        static_field_types: class_plan.static_field_types.clone(),
                     }),
                 );
 
@@ -2496,13 +2562,13 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             // Do not replace an explicitly defined static new().
             if !class.is_foreign && !class.methods.iter().any(|method| method.is_constructor) {
                 let explicit_static = |arity: usize| class.methods.iter().any(|method| method.is_static
-                    && method_signature_key(&method.signature) == Some(("new".to_owned(), MethodKind::Method, arity)));
+                    && method_signature_key(&method.signature) == Some(("new".into(), MethodKind::Method, arity)));
                 let fields = class
                     .methods
                     .iter()
                     .find(|method| !method.is_static
                         && method_signature_key(&method.signature)
-                            == Some((INHERITED_FIELD_INITIALIZER.to_owned(), MethodKind::Method, 0)))
+                            == Some((INHERITED_FIELD_INITIALIZER.into(), MethodKind::Method, 0)))
                     .and_then(|method| self.method_functions.get(&method.span).copied());
                 // (own arity, superclass initializer arity to forward to)
                 let forwards: Vec<(usize, Option<usize>)> = if class.superclass.is_none() {
@@ -2529,7 +2595,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     let initializer =
                         self.compile_inherited_initializer(module, &class_plan, arity, target, fields);
                     let key = MethodKey {
-                        name: "<init>new".to_owned(), kind: MethodKind::Method, arity: arity as u8,
+                        name: "<init>new".into(), kind: MethodKind::Method, arity: arity as u8,
                     };
                     let init_symbol = self.program.intern_method(&key.name, key.kind, key.arity);
                     self.symbols.methods.insert(key, init_symbol);
@@ -2645,17 +2711,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         parent: FunctionNodeId,
         method_context: Option<MethodContextSpec>,
     ) {
-        let children: Vec<_> = analysis
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                (node.parent == Some(parent)).then_some(FunctionNodeId(index))
-            })
-            .collect();
-
-        for child in children {
-            self.compile_closure_descendants(module, analysis, child, method_context.clone());
+        for &child in analysis.children(parent) {
+            self.compile_closure_descendants(module, analysis, child, method_context);
             let span = analysis.nodes[child.0]
                 .closure_span
                 .expect("non-root function nodes are closures");
@@ -2853,32 +2910,20 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 .class_plans
                 .values()
                 .find(|plan| plan.id == class)
-                .cloned()
                 .expect("class plan must exist for method function");
             MethodContext {
                 class,
                 method_symbol: spec.method_symbol,
                 constructor: spec.constructor,
                 static_method: spec.static_method,
-                fields: plan.fields,
-                field_types: plan.field_types,
-                static_fields: plan.static_fields,
-                static_field_types: plan.static_field_types,
+                fields: &plan.fields,
+                field_types: &plan.field_types,
+                static_fields: &plan.static_fields,
+                static_field_types: &plan.static_field_types,
             }
         });
 
-        let closure_ids: HashMap<FunctionNodeId, FuncId> = analysis
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, _)| {
-                let id = FunctionNodeId(index);
-                self.closure_functions
-                    .get(&(analysis as *const _ as usize, id.0))
-                    .copied()
-                    .map(|function| (id, function))
-            })
-            .collect();
+        let binding_types = analysis.resolved_binding_types(&self.top_level_classes, &self.interface_types);
 
         let context = FunctionCompilerContext {
             source_name: self.source_name,
@@ -2898,7 +2943,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             import_ids: &self.import_ids,
             analysis,
             node_id,
-            closure_ids,
+            closure_functions: &self.closure_functions,
             method_context,
             has_receiver,
             is_concurrent: spec.is_concurrent,
@@ -2906,7 +2951,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             return_contract,
         };
         let diagnostics = &mut self.diagnostics;
-        let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values);
+        let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values, binding_types);
         compiler.initialize_parameters();
         compiler.lower_body();
         let function_id = compiler.finish();
@@ -2946,28 +2991,28 @@ struct FunctionSpec {
     is_concurrent: bool,
 }
 
-#[derive(Clone, Debug)]
+/// Enclosing-method identity for closures nested in a method body. Closures
+/// only need the class/symbol identity; field tables come from `ClassPlan`.
+#[derive(Clone, Copy, Debug)]
 struct MethodContextSpec {
     class: ClassId,
     method_symbol: MethodSymbol,
-    constructor: bool,
     static_method: bool,
-    fields: HashMap<String, FieldSlot>,
-    field_types: HashMap<String, Type>,
-    static_fields: HashMap<String, StaticFieldSlot>,
-    static_field_types: HashMap<String, Type>,
 }
 
-#[derive(Clone, Debug)]
-struct MethodContext {
+/// Borrows the class tables from the module's `ClassPlan` (immutable while
+/// functions lower), so it is `Copy`: field accesses used to clone four
+/// HashMaps per `this.x` / `super` / static-field expression.
+#[derive(Clone, Copy, Debug)]
+struct MethodContext<'a> {
     class: ClassId,
     method_symbol: Option<MethodSymbol>,
     constructor: bool,
     static_method: bool,
-    fields: HashMap<String, FieldSlot>,
-    field_types: HashMap<String, Type>,
-    static_fields: HashMap<String, StaticFieldSlot>,
-    static_field_types: HashMap<String, Type>,
+    fields: &'a HashMap<CompactString, FieldSlot>,
+    field_types: &'a HashMap<CompactString, Type>,
+    static_fields: &'a HashMap<CompactString, StaticFieldSlot>,
+    static_field_types: &'a HashMap<CompactString, Type>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3030,10 +3075,10 @@ struct FunctionCompilerContext<'a> {
     source_file: ir::StringId,
     module: ModuleId,
     module_layout: &'a ModuleLayout,
-    module_binding_types: &'a HashMap<String, StaticBindingType>,
-    worker_function_names: &'a HashSet<String>,
-    top_level_classes: &'a HashMap<String, ClassId>,
-    interface_types: &'a HashMap<String, Type>,
+    module_binding_types: &'a HashMap<CompactString, StaticBindingType>,
+    worker_function_names: &'a HashSet<CompactString>,
+    top_level_classes: &'a HashMap<CompactString, ClassId>,
+    interface_types: &'a HashMap<CompactString, Type>,
     implicit_this: bool,
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
@@ -3041,8 +3086,11 @@ struct FunctionCompilerContext<'a> {
     import_ids: &'a HashMap<CompactString, ir::StringId>,
     analysis: &'a RootAnalysis<'a>,
     node_id: FunctionNodeId,
-    closure_ids: HashMap<FunctionNodeId, FuncId>,
-    method_context: Option<MethodContext>,
+    /// Already-compiled closures keyed by (analysis address, node index).
+    /// Children are compiled before their parent, so every nested closure this
+    /// function creates is present.
+    closure_functions: &'a HashMap<(usize, usize), FuncId>,
+    method_context: Option<MethodContext<'a>>,
     has_receiver: bool,
     is_concurrent: bool,
     allows_await: bool,
@@ -3056,7 +3104,7 @@ struct FunctionCompiler<'p, 'a, 'd> {
     context: FunctionCompilerContext<'a>,
     diagnostics: &'d mut Vec<Diagnostic>,
     env: HashMap<BindingId, Storage>,
-    binding_types: HashMap<BindingId, StaticBindingType>,
+    binding_types: BindingTypes<'a>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
     cleanup_scopes: Vec<CleanupScope>,
@@ -3073,32 +3121,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         context: FunctionCompilerContext<'a>,
         diagnostics: &'d mut Vec<Diagnostic>,
         env: HashMap<BindingId, Storage>,
+        shared_binding_types: &'a HashMap<BindingId, StaticBindingType>,
     ) -> Self {
-        let binding_types = context
-            .analysis
-            .bindings
-            .iter()
-            .enumerate()
-            .filter_map(|(index, binding)| {
-                binding.source_type.as_ref().map(|annotation| {
-                    (
-                        BindingId(index as u32),
-                        StaticBindingType {
-                            expected: resolve_type_annotation(annotation, context.top_level_classes, context.interface_types),
-                            origin: annotation.span,
-                            display: display_type_annotation(annotation),
-                        },
-                    )
-                })
-            })
-            .collect();
-
         Self {
             builder,
             context,
             diagnostics,
             env,
-            binding_types,
+            binding_types: BindingTypes { shared: shared_binding_types, local: HashMap::default() },
             loops: Vec::new(),
             constructor_this: None,
             cleanup_scopes: Vec::new(),
@@ -3973,23 +4003,24 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.builder
             .branch(condition, then_block, Vec::new(), else_block, Vec::new());
 
+        // `self.env` already equals `incoming` on entry to the then-branch, and
+        // every branch env is moved out (join_predecessors reassigns self.env).
         let incoming = self.env.clone();
         let mut predecessors = Vec::new();
 
         self.builder.position_at(then_block);
-        self.env = incoming.clone();
         self.lower_scoped_stmt(then_stmt);
+        let then_env = std::mem::replace(&mut self.env, incoming.clone());
         if !self.current_terminated() {
-            predecessors.push((self.builder.current_block(), self.env.clone()));
+            predecessors.push((self.builder.current_block(), then_env));
         }
 
         self.builder.position_at(else_block);
-        self.env = incoming.clone();
         if let Some(else_stmt) = else_stmt {
             self.lower_scoped_stmt(else_stmt);
         }
         if !self.current_terminated() {
-            predecessors.push((self.builder.current_block(), self.env.clone()));
+            predecessors.push((self.builder.current_block(), std::mem::take(&mut self.env)));
         }
 
         self.join_predecessors(predecessors, incoming);
@@ -4015,10 +4046,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             _ => {
                 let join = self.new_block(&[]);
-                let mut merged = fallback.clone();
+                let keys: Vec<_> = fallback.keys().copied().collect();
+                let mut merged = fallback;
                 let mut params = Vec::new();
 
-                let keys: Vec<_> = fallback.keys().copied().collect();
                 for binding in keys {
                     let values: Vec<_> = predecessors
                         .iter()
@@ -4629,7 +4660,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_field(&mut self, name: &Ident) -> ValueId {
-        let Some(method) = self.context.method_context.clone() else {
+        let Some(method) = self.context.method_context else {
             self.error("NAPALM-L020", "instance field used outside a class method", name.span);
             return self.builder.const_null();
         };
@@ -4651,7 +4682,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_static_field(&mut self, name: &Ident) -> ValueId {
-        let Some(method) = self.context.method_context.clone() else {
+        let Some(method) = self.context.method_context else {
             self.error("NAPALM-L022", "static field used outside a class method", name.span);
             return self.builder.const_null();
         };
@@ -4678,7 +4709,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_super(&mut self, super_expr: &front::SuperExpr, span: Span) -> ValueId {
-        let Some(method) = self.context.method_context.clone() else {
+        let Some(method) = self.context.method_context else {
             self.error("NAPALM-L025", "'super' used outside a method", span);
             return self.builder.const_null();
         };
@@ -4707,7 +4738,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.lower_call(receiver, &name, kind, &super_expr.args, Some(method.class), span)
     }
 
-    fn context_symbol_signature(&self, symbol: MethodSymbol) -> Option<(String, MethodKind)> {
+    fn context_symbol_signature(&self, symbol: MethodSymbol) -> Option<(CompactString, MethodKind)> {
         self.context
             .symbols
             .methods
@@ -5421,7 +5452,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         super_expr: &front::SuperExpr,
         span: Span,
     ) -> ValueId {
-        let Some(method_context) = self.context.method_context.clone() else {
+        let Some(method_context) = self.context.method_context else {
             self.error("NAPALM-L025", "'super' used outside a method", span);
             return self.builder.const_null();
         };
@@ -5669,16 +5700,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
 
+        // The short-circuit edge lowers nothing, so its env *is* `incoming`;
+        // `self.env` still equals it when the rhs starts, and the rhs env is
+        // moved out because `self.env` is reassigned to the merge below.
         self.builder.position_at(short_block);
-        self.env = incoming.clone();
         let short_end = self.builder.current_block();
-        let short_env = self.env.clone();
+        let short_env = &incoming;
 
         self.builder.position_at(rhs_block);
-        self.env = incoming.clone();
         let rhs_value = self.lower_expr(right);
         let rhs_end = self.builder.current_block();
-        let rhs_env = self.env.clone();
+        let rhs_env = std::mem::take(&mut self.env);
         let result_type = self.common_value_type(&[left_value, rhs_value]);
         self.builder.refine_value_type(result_param, result_type);
 
@@ -5729,25 +5761,26 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let result_param = self.builder.add_block_param(join, Type::Top);
         self.builder
             .branch(condition, then_block, Vec::new(), else_block, Vec::new());
+        // `self.env` equals `incoming` when the then-arm starts; both arm envs
+        // are moved out because `self.env` is reassigned to the merge below.
         let incoming = self.env.clone();
 
         self.builder.position_at(then_block);
-        self.env = incoming.clone();
         let then_value = self.lower_expr(then_expr);
         let then_end = self.builder.current_block();
-        let then_env = self.env.clone();
+        let then_env = std::mem::replace(&mut self.env, incoming.clone());
 
         self.builder.position_at(else_block);
-        self.env = incoming.clone();
         let else_value = self.lower_expr(else_expr);
         let else_end = self.builder.current_block();
-        let else_env = self.env.clone();
+        let else_env = std::mem::take(&mut self.env);
         let result_type = self.common_value_type(&[then_value, else_value]);
         self.builder.refine_value_type(result_param, result_type);
 
-        let mut merged_env = incoming.clone();
+        let keys = incoming.keys().copied().collect::<Vec<_>>();
+        let mut merged_env = incoming;
         let mut env_params = Vec::new();
-        for binding in incoming.keys().copied().collect::<Vec<_>>() {
+        for binding in keys {
             match (then_env.get(&binding).copied(), else_env.get(&binding).copied()) {
                 (Some(Storage::Value(a)), Some(Storage::Value(b))) if a != b => {
                     let param_type = self.merged_binding_type(binding, &[a, b]);
@@ -6194,7 +6227,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 }
             }
             ExprKind::Field(name) => {
-                let Some(method) = self.context.method_context.clone() else {
+                let Some(method) = self.context.method_context else {
                     self.error("NAPALM-L029", "field assignment outside a method", name.span);
                     return value;
                 };
@@ -6229,7 +6262,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 }
             }
             ExprKind::StaticField(name) => {
-                let Some(method) = self.context.method_context.clone() else {
+                let Some(method) = self.context.method_context else {
                     self.error("NAPALM-L031", "static field assignment outside a method", name.span);
                     return value;
                 };
@@ -6852,7 +6885,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.error("NAPALM-L035", "closure was not discovered during capture analysis", body.span);
             return self.builder.const_null();
         };
-        let Some(function) = self.context.closure_ids.get(&node_id).copied() else {
+        let analysis_key = self.context.analysis as *const _ as usize;
+        let Some(function) = self.context.closure_functions.get(&(analysis_key, node_id.0)).copied() else {
             self.error("NAPALM-L036", "closure function was not compiled", body.span);
             return self.builder.const_null();
         };
@@ -6975,7 +7009,7 @@ fn method_formal_params(signature: &MethodSignatureAst) -> Vec<Ident> {
     }
 }
 
-fn method_signature_key(signature: &MethodSignatureAst) -> Option<(String, MethodKind, usize)> {
+fn method_signature_key(signature: &MethodSignatureAst) -> Option<(CompactString, MethodKind, usize)> {
     Some(match signature {
         MethodSignatureAst::Getter { name } => (name.value.clone(), MethodKind::Getter, 0),
         MethodSignatureAst::Method { name, params } => {
@@ -6983,16 +7017,16 @@ fn method_signature_key(signature: &MethodSignatureAst) -> Option<(String, Metho
         }
         MethodSignatureAst::Setter { name, .. } => (name.value.clone(), MethodKind::Setter, 1),
         MethodSignatureAst::PrefixOperator { operator } => {
-            (operator.as_str().to_owned(), MethodKind::Method, 0)
+            (operator.as_str().into(), MethodKind::Method, 0)
         }
         MethodSignatureAst::InfixOperator { operator, .. } => {
-            (operator.as_str().to_owned(), MethodKind::Method, 1)
+            (operator.as_str().into(), MethodKind::Method, 1)
         }
         MethodSignatureAst::SubscriptGetter { params } => {
-            ("[]".to_owned(), MethodKind::SubscriptGetter, params.len())
+            ("[]".into(), MethodKind::SubscriptGetter, params.len())
         }
         MethodSignatureAst::SubscriptSetter { params, .. } => (
-            "[]=".to_owned(),
+            "[]=".into(),
             MethodKind::SubscriptSetter,
             params.len() + 1,
         ),
@@ -7002,7 +7036,7 @@ fn method_signature_key(signature: &MethodSignatureAst) -> Option<(String, Metho
 fn display_method_signature(signature: &MethodSignatureAst) -> String {
     let (name, _, arity) = method_signature_key(signature).unwrap();
     if arity == 0 {
-        name
+        name.into_string()
     } else {
         format!("{}({})", name, (0..arity).map(|_| "_").collect::<Vec<_>>().join(","))
     }
@@ -7371,7 +7405,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 UnaryOp::Complement => "~",
             };
             out.insert(MethodKey {
-                name: name.to_owned(),
+                name: name.into(),
                 kind: MethodKind::Method,
                 arity: 0,
             });
@@ -7387,7 +7421,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 BinaryOp::Is | BinaryOp::Pipeline | BinaryOp::Inherits | BinaryOp::Implements
             ) {
                 out.insert(MethodKey {
-                    name: binary_operator_name(*operator).to_owned(),
+                    name: binary_operator_name(*operator).into(),
                     kind: MethodKind::Method,
                     arity: 1,
                 });
@@ -7419,7 +7453,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
         }
         ExprKind::Subscript { receiver, args } => {
             out.insert(MethodKey {
-                name: "[]".to_owned(),
+                name: "[]".into(),
                 kind: MethodKind::SubscriptGetter,
                 arity: args.len() as u8,
             });
@@ -7427,7 +7461,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             // setter would exceed the argument limit once its value is added.
             if args.len() < MAX_NAPALM_ARITY {
                 out.insert(MethodKey {
-                    name: "[]=".to_owned(),
+                    name: "[]=".into(),
                     kind: MethodKind::SubscriptSetter,
                     arity: (args.len() + 1) as u8,
                 });
@@ -7458,7 +7492,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                     }
                     front::OptionalChainSegment::Subscript { key, .. } => {
                         out.insert(MethodKey {
-                            name: "[]".to_owned(),
+                            name: "[]".into(),
                             kind: MethodKind::SubscriptGetter,
                             arity: 1,
                         });
@@ -7466,7 +7500,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                     }
                     front::OptionalChainSegment::Call { args, .. } => {
                         out.insert(MethodKey {
-                            name: "call".to_owned(),
+                            name: "call".into(),
                             kind: MethodKind::Method,
                             arity: args.len() as u8,
                         });
@@ -7479,7 +7513,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
         | ExprKind::Update { target, value, .. }
         | ExprKind::LogicalAssign { target, value, .. } => {
             if let ExprKind::Update { operator, .. } = &expr.kind {
-                out.insert(MethodKey { name: binary_operator_name(*operator).to_owned(), kind: MethodKind::Method, arity: 1 });
+                out.insert(MethodKey { name: binary_operator_name(*operator).into(), kind: MethodKind::Method, arity: 1 });
             }
             if let ExprKind::Name(name) = &target.kind {
                 out.insert(MethodKey {

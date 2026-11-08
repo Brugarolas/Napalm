@@ -1104,7 +1104,7 @@ const MAX_INLINE_INSTS: usize = 24;
 struct InlineBody {
     params: Vec<ValueId>,
     /// (instruction, result types, source) in program order, Return excluded.
-    insts: Vec<(Inst, Vec<ValueId>, Vec<Type>, Option<crate::napalm_ir::SourceSpan>)>,
+    insts: Vec<(Inst, smallvec::SmallVec<[ValueId; 1]>, Vec<Type>, Option<crate::napalm_ir::SourceSpan>)>,
     returned: ValueId,
 }
 

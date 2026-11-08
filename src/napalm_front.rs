@@ -94,7 +94,10 @@ impl<T> Spanned<T> {
     }
 }
 
-pub type Ident = Spanned<String>;
+/// Identifiers are almost always <= 24 bytes, so `CompactString` keeps them
+/// inline: no heap allocation when parsed, and the many AST/lowering clones of
+/// a name are plain copies.
+pub type Ident = Spanned<compact_str::CompactString>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -3046,15 +3049,15 @@ impl<'a> Parser<'a> {
                 Ok(Expr::new(ExprKind::String(bytes), token.span))
             }
             TokenKind::Identifier => {
-                let ident = Spanned::new(self.slice(token.span).to_owned(), token.span);
+                let ident = Spanned::new(self.slice(token.span).into(), token.span);
                 Ok(Expr::new(ExprKind::Name(ident), token.span))
             }
             TokenKind::Field => {
-                let ident = Spanned::new(self.slice(token.span).to_owned(), token.span);
+                let ident = Spanned::new(self.slice(token.span).into(), token.span);
                 Ok(Expr::new(ExprKind::Field(ident), token.span))
             }
             TokenKind::StaticField => {
-                let ident = Spanned::new(self.slice(token.span).to_owned(), token.span);
+                let ident = Spanned::new(self.slice(token.span).into(), token.span);
                 Ok(Expr::new(ExprKind::StaticField(ident), token.span))
             }
             TokenKind::This => Ok(Expr::new(ExprKind::This, token.span)),
@@ -3255,7 +3258,7 @@ impl<'a> Parser<'a> {
 
         match &mut expression.kind {
             ExprKind::Name(name) => {
-                let name = std::mem::replace(name, Spanned::new(String::new(), name.span));
+                let name = std::mem::replace(name, Spanned::new(Default::default(), name.span));
                 expression.kind = ExprKind::Invoke(InvokeExpr {
                     receiver: None,
                     name,
@@ -3829,7 +3832,7 @@ impl<'a> Parser<'a> {
             return self.error_at_current(code, message, "expected an identifier here");
         }
         let token = self.advance();
-        Ok(Spanned::new(self.slice(token.span).to_owned(), token.span))
+        Ok(Spanned::new(self.slice(token.span).into(), token.span))
     }
 
     fn peek_operator_name(&self) -> Option<OperatorName> {
