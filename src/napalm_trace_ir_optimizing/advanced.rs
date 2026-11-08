@@ -464,9 +464,52 @@ impl TraceOptimization for RangeAnalysis {
                 else { Range::point(initial) };
             ranges.insert(phi.value, bounds);
         }
+        // Speculated integer inductions whose step was proven not to wrap
+        // (`Trace::no_signed_wrap`) are monotone from their entry value, whose
+        // Int32 entry view may carry preheader facts (see
+        // promote_integer_induction). Applied once the preheader is processed.
+        let mut monotone = Vec::new();
+        for phi in &trace.loop_phis {
+            if phi.rep != TraceRep::Int32 { continue; }
+            let Some((node, TraceInst::IntBinary { op, lhs, rhs })) = phi.backedge
+                .and_then(|value| TraceCanonicalization::producer(trace, value)) else { continue };
+            if !trace.proven_no_signed_wrap(&trace.nodes[node]) || !same_value(trace, lhs, phi.value) { continue; }
+            let Some(step) = constant(trace, rhs).and_then(integer) else { continue };
+            let increasing = match op {
+                IntBinOp::Add => step > 0,
+                IntBinOp::Sub => step < 0,
+                _ => continue,
+            };
+            let source = trace.canonical_value(phi.initial);
+            let start = trace.values.iter().find(|value| value.rep == TraceRep::Int32
+                && matches!(value.origin, TraceValueOrigin::GuardedEntry { value: other, .. }
+                    if trace.canonical_value(other) == source))
+                .map(|value| value.id)
+                .or_else(|| (trace.value(source).map(|value| value.rep) == Some(TraceRep::Int32)).then_some(source));
+            monotone.push((trace.canonical_value(phi.value), start, increasing));
+        }
+        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let mut body_started = false;
         let mut less_than = HashSet::default();
         let mut changed = false;
         for id in order(trace) {
+            if !body_started && !preheader.contains(&id) {
+                body_started = true;
+                for &(value, start, increasing) in &monotone {
+                    let initial = start.map_or(Range::FULL, |start| range(trace, &ranges, start));
+                    let bounds = if increasing {
+                        Range { lo: initial.lo, hi: Range::FULL.hi }
+                    } else {
+                        Range { lo: Range::FULL.lo, hi: initial.hi }
+                    };
+                    ranges.insert(value, bounds);
+                    if let (false, Some(start)) = (increasing, start) {
+                        let limits: Vec<TraceValueId> = less_than.iter()
+                            .filter(|(lhs, _)| *lhs == start).map(|&(_, rhs)| rhs).collect();
+                        less_than.extend(limits.into_iter().map(|limit| (value, limit)));
+                    }
+                }
+            }
             let kind = trace.nodes[id].kind.clone();
             let get = |v| range(trace, &ranges, v);
             let inferred = match kind {
@@ -487,6 +530,12 @@ impl TraceOptimization for RangeAnalysis {
                     if r.is_some_and(|r| r.lo >= Range::FULL.lo && r.hi <= Range::FULL.hi) {
                         if matches!(kind, TraceInst::IntBinaryChecked { .. }) {
                             trace.nodes[id].kind = TraceInst::IntBinary { op, lhs, rhs };
+                            // The range proof is exactly a no-signed-wrap proof;
+                            // keep it for the backends instead of degrading the
+                            // checked operation to wrapping arithmetic.
+                            if matches!(op, IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul) && !trace.preheader.contains(&id) {
+                                trace.no_signed_wrap.push(crate::napalm_trace_ir::NoSignedWrap { node: id, op, lhs, rhs });
+                            }
                             trace.stats.eliminated_overflow_checks += 1;
                             changed = true;
                         }
@@ -501,7 +550,12 @@ impl TraceOptimization for RangeAnalysis {
                 TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => { ranges.clear(); less_than.clear(); }
                 TraceInst::GuardBounds { index, length, .. } => {
                     let (i, l) = (range(trace, &ranges, index), range(trace, &ranges, length));
-                    if i.lo >= 0 && (i.hi < l.lo || less_than.contains(&(index, length))) {
+                    // A list's own bounds guard also hands the backends the
+                    // normalized index for the following HeapListGet/Set, which
+                    // would otherwise redo the (costlier) negative-index check.
+                    let list_length = matches!(TraceCanonicalization::producer(trace, length),
+                        Some((_, TraceInst::HeapListLen { .. })));
+                    if !list_length && i.lo >= 0 && (i.hi < l.lo || less_than.contains(&(index, length))) {
                         trace.nodes[id].kind = TraceInst::Nop;
                         trace.stats.eliminated_bounds_checks += 1;
                         changed = true;
@@ -509,8 +563,20 @@ impl TraceOptimization for RangeAnalysis {
                     ranges.insert(index, i.intersect(Range { lo: 0, hi: l.hi - 1 }));
                     less_than.insert((index, length));
                 }
-                TraceInst::GuardTruthy { value, .. } | TraceInst::GuardFalsey { value, .. } => {
-                    if let Some((mut op, mut lhs, mut rhs)) = comparison(trace, value, matches!(kind, TraceInst::GuardTruthy { .. })) {
+                TraceInst::GuardTruthy { value, .. } | TraceInst::GuardFalsey { value, .. }
+                | TraceInst::GuardSwitch { tag: value, observed: TraceSwitchGuard::Case(0 | 1), .. } => {
+                    let truth = match &kind {
+                        TraceInst::GuardSwitch { observed: TraceSwitchGuard::Case(case), .. } => *case == 1,
+                        _ => matches!(kind, TraceInst::GuardTruthy { .. }),
+                    };
+                    // A switch's Case(0|1) means false/true only on a raw Bool.
+                    let raw_bool = trace.value(trace.canonical_value(value)).is_some_and(|info| info.rep == TraceRep::Bool);
+                    let fact = if matches!(kind, TraceInst::GuardSwitch { .. }) && !raw_bool {
+                        None
+                    } else {
+                        comparison(trace, value, truth)
+                    };
+                    if let Some((mut op, mut lhs, mut rhs)) = fact {
                         if matches!(op, CmpKind::Gt | CmpKind::Ge) {
                             std::mem::swap(&mut lhs, &mut rhs);
                             op = if op == CmpKind::Gt { CmpKind::Lt } else { CmpKind::Le };
@@ -711,7 +777,9 @@ impl TraceOptimization for LoadStorePRE {
                 if !kind.is_heap_read() { continue; }
                 let result = trace.nodes[id].results[0];
                 let rep = trace.value(result).unwrap().rep;
-                let key = load(&kind, rep).unwrap();
+                // Heap reads without a memory model (e.g. String code points)
+                // are simply not candidates for loop-carried reuse.
+                let Some(key) = load(&kind, rep) else { continue };
                 if stores_seen.iter().any(|store| memory_store_clobbers(trace, store, &key)) {
                     continue;
                 }

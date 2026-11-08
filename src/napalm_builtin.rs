@@ -1534,6 +1534,22 @@ impl Host for BuiltinHost {
         }
     }
 
+    fn standard_string_method(
+        &self,
+        primitive: PrimitiveId,
+        name: &str,
+        arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceStringMethod> {
+        use crate::napalm_tracing_jit::TraceStringMethod;
+        use BuiltinPrimitive::*;
+        match (self.manifest.implementation(primitive), name, arity) {
+            (Some(StringSubscript), "[]", 1) => Some(TraceStringMethod::Subscript),
+            (Some(StringEq), "==", 1) => Some(TraceStringMethod::Eq),
+            (Some(StringNe), "!=", 1) => Some(TraceStringMethod::Ne),
+            _ => None,
+        }
+    }
+
     fn call_primitive(
         &mut self,
         context: &mut HostContext<'_>,
@@ -2426,6 +2442,24 @@ fn execute_primitive(
         }
         StringSubscript => {
             let raw = integer(argument(args, 0)?, "index")?;
+            // ASCII receivers index bytes directly, and one-character ASCII
+            // results reuse the VM's shared Strings instead of allocating.
+            let ascii = context.string_utf8(this)
+                .filter(|text| text.is_ascii())
+                .map(|text| {
+                    let len = text.len() as i64;
+                    let index = if raw < 0 { len + raw } else { raw };
+                    (0..len).contains(&index).then(|| text.as_bytes()[index as usize])
+                });
+            if let Some(byte) = ascii {
+                return Ok(match byte {
+                    None => Value::NULL,
+                    Some(byte) => match context.ascii_char_string(byte) {
+                        Some(shared) => shared,
+                        None => context.allocate_bytes([byte]),
+                    },
+                });
+            }
             let output = {
                 let text = context.string_utf8(this)
                     .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;

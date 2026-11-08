@@ -513,13 +513,39 @@ pub struct Trace {
     /// at the trace anchor with the end-of-iteration architectural state.
     pub native_budget_exit: Option<SideExitId>,
     pub terminator: TraceTerminator, pub stats: TraceStats,
-    /// Nodes whose `IntBinary` Add/Sub was proven never to overflow i32 on any
-    /// execution reaching it (induction increments bounded by a dominating
-    /// guard). Backends may emit no-signed-wrap arithmetic for them; LLVM
-    /// re-validates the node shape before emitting `nsw`.
-    pub no_signed_wrap: Vec<usize>,
+    /// `IntBinary` nodes proven never to overflow i32 on any execution reaching
+    /// them (induction steps bounded by a dominating guard, range-proven
+    /// arithmetic). Backends may emit no-signed-wrap arithmetic for them; see
+    /// `proven_no_signed_wrap`.
+    pub no_signed_wrap: Vec<NoSignedWrap>,
 }
+
+/// One no-signed-wrap proof, pinned to the exact operation it was made for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoSignedWrap {
+    pub node: usize,
+    pub op: IntBinOp,
+    pub lhs: TraceValueId,
+    pub rhs: TraceValueId,
+}
+
 impl Trace {
+    /// Whether `node` is still exactly the body `IntBinary` a no-signed-wrap
+    /// proof was made for. Proofs depend on the guards dominating the node, so
+    /// a rewritten or preheader-hoisted node never inherits one.
+    pub fn proven_no_signed_wrap(&self, node: &TraceNode) -> bool {
+        let TraceInst::IntBinary { op, lhs, rhs } = node.kind else { return false };
+        if self.preheader.contains(&node.id) {
+            return false;
+        }
+        let (lhs, rhs) = (self.canonical_value(lhs), self.canonical_value(rhs));
+        self.no_signed_wrap.iter().any(|proof| {
+            proof.node == node.id
+                && proof.op == op
+                && self.canonical_value(proof.lhs) == lhs
+                && self.canonical_value(proof.rhs) == rhs
+        })
+    }
     pub fn value(&self, v: TraceValueId) -> Option<&TraceValue> { self.values.get(v.0 as usize) }
     pub fn value_mut(&mut self, v: TraceValueId) -> Option<&mut TraceValue> { self.values.get_mut(v.0 as usize) }
     pub fn canonical_value(&self, mut v: TraceValueId) -> TraceValueId {

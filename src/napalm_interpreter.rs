@@ -4181,6 +4181,12 @@ struct Heap {
     /// Per class slot: property name of every absolute instance field, used to
     /// validate generic-instance contracts (`Holder<number>`).
     class_field_names: Vec<Vec<String>>,
+    /// Internal List of the 128 one-character ASCII Strings, rooted for the VM's
+    /// lifetime and never exposed itself. `string[i]` returns these shared
+    /// (immutable, content-compared) Strings instead of allocating, and native
+    /// traces load them with an ordinary List read indexed by the code point.
+    /// NULL until the VM finishes construction.
+    ascii_char_strings: Value,
     #[cfg(test)]
     allocations: Vec<Value>,
 }
@@ -4233,6 +4239,7 @@ impl Default for Heap {
             contract_class_ids: Vec::new(),
             class_implements: Vec::new(),
             class_field_names: Vec::new(),
+            ascii_char_strings: Value::NULL,
             #[cfg(test)]
             allocations: Vec::new(),
         }
@@ -5389,6 +5396,15 @@ impl HostContext<'_> {
         }
     }
 
+    /// The shared one-character String for an ASCII byte (see
+    /// `Heap::ascii_char_strings`), if the VM has built the table.
+    pub fn ascii_char_string(&self, byte: u8) -> Option<Value> {
+        match self.heap.get(self.heap.ascii_char_strings) {
+            Some(HeapObject::List(chars)) => chars.get(byte as usize).copied(),
+            _ => None,
+        }
+    }
+
     pub fn allocate_string(&mut self, value: impl AsRef<str>) -> Value {
         self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(value.as_ref().as_bytes()))))
     }
@@ -5903,6 +5919,13 @@ pub trait Host {
         _name: &str,
         _arity: u8,
     ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> { None }
+    /// Opt in only for the stock String `[]` / `==` / `!=` implementations.
+    fn standard_string_method(
+        &self,
+        _primitive: PrimitiveId,
+        _name: &str,
+        _arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceStringMethod> { None }
     /// Opt in only for the stock bitwise Object ==/!= implementation.
     fn standard_identity_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
@@ -8387,6 +8410,17 @@ impl<'p> Interpreter<'p> {
             let value = heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(string.as_bytes()))));
             init_roots.push(value);
             strings.push(value);
+        }
+        {
+            let mut chars = Vec::with_capacity(128);
+            for byte in 0u8..128 {
+                let value = heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(&[byte][..]))));
+                init_roots.push(value);
+                chars.push(value);
+            }
+            let table = heap.alloc(HeapObject::List(chars));
+            init_roots.push(table);
+            heap.ascii_char_strings = table;
         }
 
         let mut builtin_values = Vec::with_capacity(BuiltinId::COUNT);
@@ -20037,7 +20071,10 @@ impl TraceRuntime for Interpreter<'_> {
     ) -> Option<VmBindingDescriptor> {
         match kind {
             VmBindingKind::StableTagged => {
-                // StableTagged is currently emitted only for program String
+                if raw == self.heap.ascii_char_strings.word().0 && !self.heap.ascii_char_strings.is_null() {
+                    return Some(VmBindingDescriptor::AsciiCharTable);
+                }
+                // Otherwise StableTagged is emitted only for program String
                 // constants. Resolve by rooted value rather than by string bytes so
                 // duplicate source strings remain harmless and allocation-free.
                 let id = self
@@ -20132,6 +20169,9 @@ impl TraceRuntime for Interpreter<'_> {
             VmBindingDescriptor::ProfileCounters => Some(0),
             VmBindingDescriptor::ProgramString(id) => {
                 self.strings.get(id.0 as usize).map(|value| value.word().0)
+            }
+            VmBindingDescriptor::AsciiCharTable => {
+                (!self.heap.ascii_char_strings.is_null()).then(|| self.heap.ascii_char_strings.word().0)
             }
             VmBindingDescriptor::ModuleVariable { module, slot } => {
                 let module_slot = *self.prepared.module_by_id.get(module)? as usize;
@@ -20293,6 +20333,32 @@ impl TraceRuntime for Interpreter<'_> {
         let signature = self.program.metadata.method(cache.method)?;
         let name = self.program.metadata.string(signature.name).unwrap_or("");
         self.host.standard_list_method(primitive, name, signature.arity)
+    }
+
+    fn trace_standard_string_method(
+        &self,
+        function: FuncId,
+        cache: u32,
+    ) -> Option<crate::napalm_tracing_jit::TraceStringMethod> {
+        let function = self.program.function(function)?;
+        let cache = function.chunk.inline_caches.get(cache as usize)?;
+        if cache.home_class.is_some() {
+            return None;
+        }
+        let Some(CallTarget::Primitive(primitive)) =
+            self.builtin_methods[BuiltinClass::String as usize][cache.method.0 as usize]
+        else {
+            return None;
+        };
+        let signature = self.program.metadata.method(cache.method)?;
+        let name = self.program.metadata.string(signature.name).unwrap_or("");
+        self.host.standard_string_method(primitive, name, signature.arity)
+    }
+
+    fn trace_ascii_char_table(&self) -> Option<RegisterWord> {
+        let table = self.heap.ascii_char_strings;
+        matches!(self.heap.get(table), Some(HeapObject::List(chars)) if chars.len() == 128)
+            .then(|| table.word())
     }
 
     fn trace_standard_map_method(
@@ -20816,15 +20882,15 @@ impl TraceRuntime for Interpreter<'_> {
             return None;
         }
         let signature = self.program.metadata.method(descriptor.method)?;
-        if signature.kind != crate::napalm_ir::MethodKind::Getter || signature.arity != 0 {
-            return None;
-        }
+        let expected = match (signature.kind, signature.arity) {
+            (crate::napalm_ir::MethodKind::Getter, 0) => NativeBuiltin::MapPropertyGet(descriptor.method),
+            (crate::napalm_ir::MethodKind::Setter, 1) => NativeBuiltin::MapPropertySet(descriptor.method),
+            _ => return None,
+        };
 
         let map_value = Value::from_word(map);
         let class = self.heap.receiver_class(map_value)?;
-        if self.lookup_method(class, descriptor.method, None)
-            != Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(descriptor.method)))
-        {
+        if self.lookup_method(class, descriptor.method, None) != Some(CallTarget::NativeBuiltin(expected)) {
             return None;
         }
         let map = match self.heap.get(map_value)? {

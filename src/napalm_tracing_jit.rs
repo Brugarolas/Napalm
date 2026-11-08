@@ -647,6 +647,18 @@ pub enum TraceMapMethod {
     SubscriptSet,
 }
 
+/// Stock String methods a trace replays natively for ASCII receivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceStringMethod {
+    /// `string[i]`: an in-range Int32 index into an ASCII String yields the
+    /// VM's shared one-character String (`trace_ascii_char_table`).
+    Subscript,
+    /// `a == b` / `a != b`, specialized only when both sides are characters
+    /// produced by `Subscript` in the same trace (compared by code point).
+    Eq,
+    Ne,
+}
+
 pub trait TraceRuntime {
     type RuntimeError: Error + Send + Sync + 'static;
 
@@ -663,6 +675,15 @@ pub trait TraceRuntime {
     /// Which stock Map subscript method an Invoke site resolves to for Map
     /// receivers under the current method tables, if any.
     fn trace_standard_map_method(&self, _function: FuncId, _cache: u32) -> Option<TraceMapMethod> { None }
+
+    /// Which stock String method an Invoke site resolves to for String
+    /// receivers under the current method tables, if any.
+    fn trace_standard_string_method(&self, _function: FuncId, _cache: u32) -> Option<TraceStringMethod> { None }
+
+    /// Stable word of the VM's internal List of the 128 one-character ASCII
+    /// Strings: element `c` is exactly what stock `string[i]` returns for an
+    /// ASCII character `c`. The List is never mutated or exposed.
+    fn trace_ascii_char_table(&self) -> Option<RegisterWord> { None }
 
     /// Whether an observed value satisfies a *pure* type check (one that installs
     /// no persistent contract), e.g. `Instance<C>`. Such checks depend only on the
@@ -892,10 +913,10 @@ pub trait TraceRuntime {
         None
     }
 
-    /// Observe an ordinary dynamic getter that currently resolves to the Map
-    /// property fallback. The runtime validates the actual method target, so the
-    /// recorder may replace Invoke with a native shape/slot load guarded by the
-    /// method epoch and observed map shape.
+    /// Observe an ordinary dynamic getter (arity 0) or setter (arity 1) that
+    /// currently resolves to the Map property fallback. The runtime validates the
+    /// actual method target, so the recorder may replace Invoke with a native
+    /// shape/slot load or store guarded by the method epoch and observed shape.
     fn trace_map_property_access(
         &self,
         _function: FuncId,
@@ -1300,6 +1321,8 @@ pub enum RecordingAbort {
     PathDidNotClose,
     EnclosingLoop,
     NestedCycle(TraceLocation),
+    /// A callee's loop trace has no profile yet; decide later (not a failure).
+    CalleeLoopWarming(FuncId),
     TraceTooLong,
     RepresentationConflict,
     InterpreterStopped,
@@ -1322,6 +1345,9 @@ impl fmt::Display for RecordingAbort {
                 location.function,
                 location.pc.0,
             ),
+            Self::CalleeLoopWarming(function) => {
+                write!(f, "callee {function:?} owns a loop trace without a profile yet")
+            }
             Self::TraceTooLong => f.write_str("trace exceeded configured instruction limit"),
             Self::RepresentationConflict => {
                 f.write_str("one loop-entry register requires incompatible representations")
@@ -1543,6 +1569,12 @@ struct TraceRecorder<'a> {
     options: &'a TracingJitOptions,
     trace_id: TraceId,
     anchor: TraceLocation,
+    /// Functions owning loop traces, `true` when one does real work per entry.
+    /// A call to such a function must not be buried inside this trace: callees
+    /// of a native RuntimeCall run in the interpreter with the tracing manager
+    /// checked out, so their own loops could never enter native code again.
+    /// `false` means the loop has no profile yet (decide on a later attempt).
+    native_loop_functions: HashMap<FuncId, bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -1562,6 +1594,24 @@ impl<'a> TraceRecorder<'a> {
             options,
             trace_id,
             anchor,
+            native_loop_functions: HashMap::default(),
+        }
+    }
+
+    fn with_native_loop_functions(mut self, functions: HashMap<FuncId, bool>) -> Self {
+        self.native_loop_functions = functions;
+        self
+    }
+
+    /// The bytecode callee a call site currently resolves to, when cheaply known.
+    fn observed_callee<R: TraceRuntime>(&self, runtime: &R, op: &RecordedOp) -> Option<FuncId> {
+        match op.opcode {
+            Opcode::CallDirect => Some(FuncId(op.x)),
+            Opcode::Invoke => {
+                let receiver = runtime.trace_read_slot(FrameSlot::General(Reg(op.b))).ok()?;
+                runtime.trace_inline_target(op.location.function, op.x, receiver).map(|(callee, _)| callee)
+            }
+            _ => None,
         }
     }
 
@@ -2235,7 +2285,7 @@ impl<'a> TraceRecorder<'a> {
         op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<bool, RecordingAbort> {
-        if op.opcode != Opcode::Invoke || op.c != 0 {
+        if op.opcode != Opcode::Invoke || op.c > 1 {
             return Ok(false);
         }
         let Some(descriptor) = function.chunk.inline_caches.get(op.x as usize) else {
@@ -2247,9 +2297,12 @@ impl<'a> TraceRecorder<'a> {
         let Some(signature) = program.metadata.method(descriptor.method) else {
             return Ok(false);
         };
-        if signature.kind != MethodKind::Getter || signature.arity != 0 {
-            return Ok(false);
-        }
+        // `o.name` (getter, arity 0) or `o.name = value` (setter, arity 1).
+        let setter = match (signature.kind, signature.arity, op.c) {
+            (MethodKind::Getter, 0, 0) => false,
+            (MethodKind::Setter, 1, 1) if op.args.len() == 1 && !runtime.trace_reactive_tracking_active() => true,
+            _ => return Ok(false),
+        };
 
         let map_word = runtime
             .trace_read_slot(FrameSlot::General(Reg(op.b)))
@@ -2261,8 +2314,25 @@ impl<'a> TraceRecorder<'a> {
         ) else {
             return Ok(false);
         };
+        if setter && (access.readonly || access.write_runtime_checked) {
+            return Ok(false);
+        }
 
         let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        let stored = if setter {
+            let value = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+            match &access.write_type {
+                // The slot contract is checked before any effect; a failure
+                // replays the original Invoke, which reports the type error.
+                Some(expected) => match self.guard_store_value(builder, value, expected, op.location.pc) {
+                    Some(value) => Some(value),
+                    None => return Ok(false),
+                },
+                None => Some(value),
+            }
+        } else {
+            None
+        };
         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
         builder.emit0(TraceInst::GuardMethodEpoch {
             expected: runtime.trace_method_epoch(),
@@ -2275,6 +2345,23 @@ impl<'a> TraceRecorder<'a> {
             .trace_materialize_constant(TraceConstant::String(signature.name))
             .map_err(|_| RecordingAbort::UnsupportedConstant)?;
         let key = builder.constant(TraceConstant::StableTagged(key_word.0));
+        if let Some(value) = stored {
+            // Same effect as MapPropertySet on an existing slot: no structural
+            // transition, the slot contract was guarded above, and the
+            // backend's shaped store carries the write barrier. The Invoke
+            // result is the assigned value.
+            builder.emit0(TraceInst::HeapMapSetShaped {
+                map,
+                key,
+                value,
+                expected_key: access.key_bytes,
+                shape: access.shape,
+                slot: access.slot as u32,
+                exit,
+            });
+            self.write_gpr(builder, op.a, value);
+            return Ok(true);
+        }
         let field_type = access.read_type.clone().unwrap_or(Type::Top);
         let (trace_ty, trace_rep) = Self::semantic_trace_layout(&field_type);
         let result = builder.emit1(
@@ -2294,6 +2381,109 @@ impl<'a> TraceRecorder<'a> {
         }
         self.write_gpr(builder, op.a, result);
         Ok(true)
+    }
+
+    /// Native fast path for stock String Invokes on ASCII receivers:
+    ///
+    /// * `s[i]` -> `HeapStringAsciiCodePointAt` + a read of the VM's shared
+    ///   one-character String List at that code point. This is exactly the
+    ///   value stock `[]` returns (it hands out the same shared Strings), with
+    ///   the same negative-index normalization; non-ASCII receivers and
+    ///   out-of-range indices replay the original Invoke (which yields null).
+    /// * `c == d` / `c != d` where both sides are such characters from this
+    ///   trace -> integer comparison of their code points (stock String `==`
+    ///   compares bytes, and one ASCII byte is one code point).
+    fn record_string_invoke<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<bool, RecordingAbort> {
+        if op.opcode != Opcode::Invoke || op.c != 1 || op.args.len() != 1 {
+            return Ok(false);
+        }
+        let Some(method) = runtime.trace_standard_string_method(op.location.function, op.x) else {
+            return Ok(false);
+        };
+        let Some(table_word) = runtime.trace_ascii_char_table() else {
+            return Ok(false);
+        };
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        if runtime.trace_heap_object_kind(receiver_word) != Some(TraceHeapObjectKind::String) {
+            return Ok(false);
+        }
+        // The code point behind a value produced by the Subscript path below.
+        let code_point_of = |builder: &crate::napalm_trace_ir::TraceBuilder, value: TraceValueId| {
+            let trace = builder.trace();
+            let value = trace.canonical_value(value);
+            let TraceValueOrigin::InstResult { node } = trace.value(value)?.origin else { return None };
+            let TraceInst::HeapListGet { list, index, .. } = trace.nodes.get(node)?.kind else { return None };
+            matches!(
+                trace.value(trace.canonical_value(list))?.origin,
+                TraceValueOrigin::Constant(TraceConstant::StableTagged(bits)) if bits == table_word.0
+            )
+            .then_some(index)
+        };
+
+        match method {
+            TraceStringMethod::Subscript => {
+                if !runtime.trace_string_is_ascii(receiver_word) {
+                    return Ok(false);
+                }
+                let index_word = runtime
+                    .trace_read_slot(FrameSlot::General(op.args[0]))
+                    .map_err(|_| RecordingAbort::UnsupportedCall)?;
+                if word_exact_i32(index_word).is_none() {
+                    return Ok(false);
+                }
+                let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let index = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::GuardMethodEpoch {
+                    expected: runtime.trace_method_epoch(),
+                    exit,
+                });
+                let index = builder.emit1(TraceInst::GuardInt32 { value: index, exit }, TraceType::Int32, TraceRep::Int32);
+                let string = self.guard_heap_object(builder, string, TraceHeapObjectKind::String, exit);
+                let code_point = builder.emit1(
+                    TraceInst::HeapStringAsciiCodePointAt { string, index, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let table = builder.constant(TraceConstant::StableTagged(table_word.0));
+                let character = builder.emit1(
+                    TraceInst::HeapListGet { list: table, index: code_point, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                builder.set_proven_type(character, Type::String);
+                self.write_gpr(builder, op.a, character);
+                Ok(true)
+            }
+            TraceStringMethod::Eq | TraceStringMethod::Ne => {
+                let lhs = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let rhs = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let (Some(lhs), Some(rhs)) = (code_point_of(builder, lhs), code_point_of(builder, rhs)) else {
+                    return Ok(false);
+                };
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::GuardMethodEpoch {
+                    expected: runtime.trace_method_epoch(),
+                    exit,
+                });
+                let op_kind = if method == TraceStringMethod::Eq { CmpKind::Eq } else { CmpKind::Ne };
+                let condition = builder.emit1(
+                    TraceInst::IntCompare { op: op_kind, lhs, rhs },
+                    TraceType::Bool,
+                    TraceRep::Bool,
+                );
+                let boxed = self.tagged_bool(builder, condition);
+                self.write_gpr(builder, op.a, boxed);
+                Ok(true)
+            }
+        }
     }
 
     /// Native fast path for the stock `list.length` and `list[i]` Invokes. Every
@@ -2808,6 +2998,16 @@ impl<'a> TraceRecorder<'a> {
         op: &RecordedOp,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
+        // Keep calls into functions with their own native loops on the baseline
+        // path (see `native_loop_functions`): their loops then keep running
+        // natively, which beats tracing this caller around an interpreted callee.
+        if let Some(callee) = self.observed_callee(runtime, op).filter(|&callee| callee != self.anchor.function) {
+            match self.native_loop_functions.get(&callee) {
+                Some(true) => return Err(RecordingAbort::NestedCycle(TraceLocation::new(callee, BytecodePc(0)))),
+                Some(false) => return Err(RecordingAbort::CalleeLoopWarming(callee)),
+                None => {}
+            }
+        }
         // InvokeSuper's X operand is an inline-cache slot, not a FuncId. The
         // current bounded inliner only has explicit dynamic-dispatch support for
         // ordinary Invoke, so never let InvokeSuper fall through its generic
@@ -4483,6 +4683,7 @@ impl<'a> TraceRecorder<'a> {
                     || self.record_list_invoke(runtime, op, builder)?
                     || self.record_map_invoke(runtime, op, builder)?
                     || self.record_map_property_invoke(runtime, program, function, op, builder)?
+                    || self.record_string_invoke(runtime, op, builder)?
                 {
                     Ok(ExpectedStep::Exact(next))
                 } else {
@@ -6716,6 +6917,8 @@ pub enum VmBindingKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum VmBindingDescriptor {
     ProgramString(StringId),
+    /// The VM's internal one-character ASCII String List.
+    AsciiCharTable,
     ModuleVariable { module: ModuleId, slot: u32 },
     StaticField { class: ClassId, slot: u32 },
     ProfileCounter { function: FuncId, counter: u32 },
@@ -6772,6 +6975,11 @@ struct CompiledTrace {
     /// Consecutive entries that did too little work to amortize a transition.
     /// A long streak requests a temporary cooldown in the interpreter.
     short_exit_streak: u16,
+    /// Manager entries into this trace and the native loop iterations those
+    /// activations completed (both backends report them; the instrumented
+    /// `profile` is written by Cranelift code only).
+    activations: u64,
+    activation_iterations: u64,
     debug_text: Option<String>,
     /// Native visits since installation: manager entries plus completed native
     /// loop iterations reported by side exits. Drives the LLVM tier.
@@ -7896,6 +8104,8 @@ impl<'a> CraneliftTraceCompiler<'a> {
             _shared_repository_owner: None,
             exits: self.exit_plans,
             short_exit_streak: 0,
+            activations: 0,
+            activation_iterations: 0,
             debug_text: disassembly.or(clif_text),
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
@@ -11791,6 +12001,8 @@ impl TracingJit {
             _shared_code: None,
             _shared_repository_owner: None,
             short_exit_streak: 0,
+            activations: 0,
+            activation_iterations: 0,
             debug_text: image.debug_text,
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
@@ -12505,6 +12717,8 @@ impl TracingJit {
             _shared_code: Some(code),
             _shared_repository_owner: self.shared_repository.clone(),
             short_exit_streak: 0,
+            activations: 0,
+            activation_iterations: 0,
             debug_text,
             tier_visits: 0,
             llvm: LlvmTierState::Cold,
@@ -12655,7 +12869,11 @@ impl TracingJit {
         let id = TraceId(self.next_trace_id);
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started += 1;
-        let recorder = TraceRecorder::new(&self.options, id, location);
+        // Entry and side recordings have no retry path: only definite verdicts.
+        let mut loop_functions = self.native_loop_functions();
+        loop_functions.retain(|_, long| *long);
+        let recorder = TraceRecorder::new(&self.options, id, location)
+            .with_native_loop_functions(loop_functions);
         let result = match recorder.record_impl(runtime, RecordingMode::Entry) {
             Ok(trace) => {
                 self.stats.recordings_succeeded += 1;
@@ -12794,6 +13012,49 @@ impl TracingJit {
         self.entries.get(&location).and_then(|state| state.trace)
     }
 
+    /// Functions owning an installed loop trace that does real work per entry
+    /// (on average at least `LONG_NATIVE_LOOP_ITERATIONS` native iterations
+    /// per manager entry). Very short loops (`while (j < 4)`) cost little in
+    /// the interpreter, so tracing their callers around a direct call pays.
+    /// Loops still compiling, or with fewer than `MIN_PROFILE_ENTRIES` entries,
+    /// are reported as warming so the caller retries instead of guessing.
+    fn native_loop_functions(&self) -> HashMap<FuncId, bool> {
+        // A `while (j < 4)` helper loop averages 3 native iterations per entry
+        // (its first iteration runs in the interpreter); a loop with frequent
+        // data-dependent side exits still averages more and gains far more
+        // from native code than the caller loses.
+        const LONG_NATIVE_LOOP_ITERATIONS: u64 = 4;
+        const MIN_PROFILE_ENTRIES: u64 = 2;
+        let mut functions = HashMap::<FuncId, bool>::default();
+        for (key, state) in &self.loops {
+            let verdict = match state.trace.and_then(|trace| self.compiled(trace)) {
+                Some(compiled) => {
+                    let (entries, iterations) = (compiled.activations, compiled.activation_iterations);
+                    if jit_events_enabled() {
+                        eprintln!(
+                            "[napalm-jit] callee loop {:?}:{} profile: {entries} entries, {iterations} iterations",
+                            key.location.function, key.location.pc.0
+                        );
+                    }
+                    if entries < MIN_PROFILE_ENTRIES {
+                        Some(false)
+                    } else if iterations >= entries.saturating_mul(LONG_NATIVE_LOOP_ITERATIONS) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                None if state.pending.is_some() => Some(false),
+                None => None,
+            };
+            if let Some(verdict) = verdict {
+                let entry = functions.entry(key.location.function).or_insert(verdict);
+                *entry |= verdict;
+            }
+        }
+        functions
+    }
+
     pub(crate) fn entry_blacklisted(&self, location: TraceLocation) -> bool {
         self.entries.get(&location).is_some_and(|state| state.blacklisted)
     }
@@ -12876,7 +13137,8 @@ impl TracingJit {
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started += 1;
 
-        let recorder = TraceRecorder::new(&self.options, trace_id, location);
+        let recorder = TraceRecorder::new(&self.options, trace_id, location)
+            .with_native_loop_functions(self.native_loop_functions());
         let trace = match recorder.record(runtime) {
             Ok(trace) => trace,
             Err(RecordOutcome::Abort(reason)) => {
@@ -12892,7 +13154,7 @@ impl TracingJit {
                     );
                 }
                 let state = self.loops.get_mut(&key).unwrap();
-                if matches!(reason, RecordingAbort::EnclosingLoop) {
+                if matches!(reason, RecordingAbort::EnclosingLoop | RecordingAbort::CalleeLoopWarming(_)) {
                     // This path may be short only for the current invocation
                     // (e.g. Mandelbrot's early pixels). Retry less often, but do
                     // not permanently disable a loop that can become hot later.
@@ -13173,6 +13435,12 @@ impl TracingJit {
             }
             let result = unsafe { dispatcher(&mut activation) };
             let producer = TraceId(activation.next_trace);
+            if let Some(entered) = self.compiled_mut(trace_id) {
+                entered.activations = entered.activations.saturating_add(1);
+                entered.activation_iterations = entered
+                    .activation_iterations
+                    .saturating_add(activation.native_iterations as u64);
+            }
 
             match result {
                 TRACE_RESULT_SIDE_EXIT => {
@@ -13271,7 +13539,10 @@ impl TracingJit {
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started = self.stats.recordings_started.saturating_add(1);
 
-        let recorder = TraceRecorder::new(&self.options, trace_id, start);
+        let mut loop_functions = self.native_loop_functions();
+        loop_functions.retain(|_, long| *long);
+        let recorder = TraceRecorder::new(&self.options, trace_id, start)
+            .with_native_loop_functions(loop_functions);
         let trace = match recorder.record_side(runtime, close_at, link_to) {
             Ok(trace) => trace,
             Err(RecordOutcome::Abort(reason)) => {
@@ -13865,7 +14136,7 @@ mod tests {
     /// including -0, fractional, NaN, out-of-range and non-number entries.
     #[test]
     fn f64_induction_with_integer_index_use_promotes_and_matches_native() {
-        let up = InductionShape { cmp: CmpKind::Lt, iv_left: true, case: 1, bound: Some(10.0), op: F64BinOp::Add, step: 1.0, step_left: false, float_use: false };
+        let up = InductionShape::up();
         // Constant bound: `i < 10`.
         check_induction_promotion(up, true, &[0]);
         // Int32 register bound (`i < list.length` shape), including the i32::MAX
@@ -13879,11 +14150,12 @@ mod tests {
     }
 
     /// Decreasing loops, `<=`/`>=` and steps != 1: promoted exactly when the
-    /// dominating guard proves the step stays inside i32, and never otherwise.
+    /// dominating guard proves the step stays inside i32 (directly, or through
+    /// an entry check on a variable bound), and never otherwise.
     #[test]
     fn integer_induction_generalizations_match_native_and_respect_overflow_proofs() {
-        let down = InductionShape { cmp: CmpKind::Gt, iv_left: true, case: 1, bound: Some(0.0), op: F64BinOp::Sub, step: 1.0, step_left: false, float_use: false };
-        let registers: &[i32] = &[0, 10, -5, i32::MAX, i32::MIN, i32::MIN + 1];
+        let down = InductionShape { cmp: CmpKind::Gt, bound: Some(0.0), op: F64BinOp::Sub, ..InductionShape::up() };
+        let registers: &[i32] = &[0, 10, -5, i32::MAX, i32::MAX - 1, i32::MIN, i32::MIN + 1];
         // `for (i = n; i > 0; i--)`, also against a register bound (i > MIN).
         check_induction_promotion(down, true, &[0]);
         check_induction_promotion(InductionShape { bound: None, ..down }, true, registers);
@@ -13892,18 +14164,19 @@ mod tests {
         check_induction_promotion(ge, true, &[0]);
         check_induction_promotion(InductionShape { cmp: CmpKind::Le, iv_left: false, ..ge }, true, &[0]);
         check_induction_promotion(InductionShape { op: F64BinOp::Add, step: -1.0, ..ge }, true, &[0]);
-        // `i >= n` with a register n may sit at i32::MIN: `i - 1` could wrap.
-        check_induction_promotion(InductionShape { bound: None, ..ge }, false, registers);
-        // `i >= MIN` with a constant bound overflows too; `i >= MIN + 1` doesn't.
+        // `i >= n` with a register n: an entry check `n >= MIN + 1` keeps `i - 1`
+        // from wrapping (entering with n == MIN simply exits at the header).
+        check_induction_promotion(InductionShape { bound: None, ..ge }, true, registers);
+        // `i >= MIN` with a constant bound overflows; `i >= MIN + 1` doesn't.
         check_induction_promotion(InductionShape { bound: Some(i32::MIN as f64), ..ge }, false, &[0]);
         check_induction_promotion(InductionShape { bound: Some(i32::MIN as f64 + 1.0), ..ge }, true, &[0]);
 
-        let le = InductionShape { cmp: CmpKind::Le, iv_left: true, case: 1, bound: Some(100.0), op: F64BinOp::Add, step: 1.0, step_left: false, float_use: false };
+        let le = InductionShape { cmp: CmpKind::Le, bound: Some(100.0), ..InductionShape::up() };
         // `i <= 100`, up to the last bound that still leaves room for `+1`.
         check_induction_promotion(le, true, &[0]);
         check_induction_promotion(InductionShape { bound: Some(i32::MAX as f64 - 1.0), ..le }, true, &[0]);
         check_induction_promotion(InductionShape { bound: Some(i32::MAX as f64), ..le }, false, &[0]);
-        check_induction_promotion(InductionShape { bound: None, ..le }, false, registers);
+        check_induction_promotion(InductionShape { bound: None, ..le }, true, registers);
 
         // Steps != 1.
         let lt = InductionShape { cmp: CmpKind::Lt, ..le };
@@ -13912,8 +14185,8 @@ mod tests {
         check_induction_promotion(InductionShape { step: 4.0, bound: Some(i32::MAX as f64 - 3.0), ..lt }, true, &[0]);
         check_induction_promotion(InductionShape { step: 4.0, bound: Some(i32::MAX as f64 - 2.0), ..lt }, false, &[0]);
         check_induction_promotion(InductionShape { step: 3.0, op: F64BinOp::Sub, cmp: CmpKind::Ge, bound: Some(0.0), ..lt }, true, &[0]);
-        // A register bound only proves `+1`: `i < n; i += 2` must stay F64.
-        check_induction_promotion(InductionShape { step: 2.0, bound: None, ..lt }, false, registers);
+        // A register bound proves `i < n; i += 2` through the entry check `n <= MAX - 1`.
+        check_induction_promotion(InductionShape { step: 2.0, bound: None, ..lt }, true, registers);
         // Non-integral steps are never integer inductions.
         check_induction_promotion(InductionShape { step: 0.5, bound: Some(10.0), ..lt }, false, &[0]);
 
@@ -13921,7 +14194,22 @@ mod tests {
         check_induction_promotion(InductionShape { float_use: true, bound: Some(10.0), ..lt }, true, &[0]);
         check_induction_promotion(InductionShape { float_use: true, bound: None, ..lt }, true, registers);
         check_induction_promotion(InductionShape { float_use: true, ..down }, true, &[0]);
-        check_induction_promotion(InductionShape { float_use: true, bound: None, ..ge }, false, registers);
+        check_induction_promotion(InductionShape { float_use: true, bound: None, ..ge }, true, registers);
+    }
+
+    /// `const n = s.length; for (j = 1; j <= n; j++) ... a[j - 1]`: a Num entry
+    /// bound becomes an Int32 entry guard, and `F64ToInt32(j - 1)` becomes
+    /// checked integer arithmetic with the same exit.
+    #[test]
+    fn integer_induction_handles_num_entry_bounds_and_derived_indices() {
+        let le = InductionShape { cmp: CmpKind::Le, bound: None, tagged_bound: true, ..InductionShape::up() };
+        let registers: &[i32] = &[0, 10, -5, i32::MAX, i32::MAX - 1, i32::MIN];
+        check_induction_promotion(le, true, registers);
+        check_induction_promotion(InductionShape { derived: true, ..le }, true, registers);
+        check_induction_promotion(InductionShape { derived: true, float_use: true, ..le }, true, registers);
+        check_induction_promotion(InductionShape { derived: true, bound: Some(10.0), tagged_bound: false, ..le }, true, &[0]);
+        let down = InductionShape { cmp: CmpKind::Ge, op: F64BinOp::Sub, ..le };
+        check_induction_promotion(InductionShape { derived: true, ..down }, true, registers);
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -13931,14 +14219,27 @@ mod tests {
         iv_left: bool,
         /// GuardSwitch case the loop continues on.
         case: i64,
-        /// Constant F64 bound, or `None` for an Int32 register (Reg(2)).
+        /// Constant F64 bound, or `None` for a register bound (Reg(2)).
         bound: Option<f64>,
+        /// The register bound is a tagged Num (`GuardF64`), not a raw Int32.
+        tagged_bound: bool,
         op: F64BinOp,
         step: f64,
         /// `step op i` instead of `i op step`.
         step_left: bool,
         /// Also uses `i` as a plain number (`Reg(3) = i * 3.5`).
         float_use: bool,
+        /// Also uses `i - 1` as an integer (`Reg(4) = int(i - 1)`).
+        derived: bool,
+    }
+
+    impl InductionShape {
+        fn up() -> Self {
+            Self {
+                cmp: CmpKind::Lt, iv_left: true, case: 1, bound: Some(10.0), tagged_bound: false,
+                op: F64BinOp::Add, step: 1.0, step_left: false, float_use: false, derived: false,
+            }
+        }
     }
 
     fn check_induction_promotion(shape: InductionShape, expect_integer: bool, bounds: &[i32]) {
@@ -13950,6 +14251,11 @@ mod tests {
         let start = b.read_slot(slot, TraceType::Any, TraceRep::Tagged);
         let phi = b.add_loop_phi(slot, start, TraceType::Any, TraceRep::Tagged);
         let limit = match shape.bound {
+            None if shape.tagged_bound => {
+                let tagged = b.read_slot(FrameSlot::General(Reg(2)), TraceType::Any, TraceRep::Tagged);
+                let bound_exit = b.add_side_exit(ExitReason::GuardNumber, BytecodePc(0));
+                b.emit1(TraceInst::GuardF64 { value: tagged, exit: bound_exit }, TraceType::F64, TraceRep::F64)
+            }
             None => {
                 let length = b.read_slot(FrameSlot::General(Reg(2)), TraceType::Int32, TraceRep::Int32);
                 b.emit1(TraceInst::Int32ToF64 { value: length }, TraceType::F64, TraceRep::F64)
@@ -13971,6 +14277,14 @@ mod tests {
             let boxed = b.emit1(TraceInst::BoxF64 { value: scaled }, TraceType::Num, TraceRep::Tagged);
             b.write_slot(FrameSlot::General(Reg(3)), boxed);
         }
+        if shape.derived {
+            let one = b.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
+            let behind = b.emit1(TraceInst::F64Binary { op: F64BinOp::Sub, lhs: i, rhs: one }, TraceType::F64, TraceRep::F64);
+            let boxed = b.emit1(TraceInst::BoxF64 { value: behind }, TraceType::Num, TraceRep::Tagged);
+            let derived_exit = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+            let behind = b.emit1(TraceInst::GuardInt32 { value: boxed, exit: derived_exit }, TraceType::Int32, TraceRep::Int32);
+            b.write_slot(FrameSlot::General(Reg(4)), behind);
+        }
         let step = b.constant(TraceConstant::F64Bits(shape.step.to_bits()));
         let (lhs, rhs) = if shape.step_left { (step, i) } else { (i, step) };
         let next = b.emit1(TraceInst::F64Binary { op: shape.op, lhs, rhs }, TraceType::F64, TraceRep::F64);
@@ -13986,14 +14300,22 @@ mod tests {
         assert_eq!(optimized.stats.promoted_f64_loop_phis, 1, "{:?}", optimized.stats);
         assert_eq!(optimized.stats.promoted_i32_loop_phis, expect_integer as usize, "{shape:?} {:?}", optimized.stats);
         assert_eq!(optimized.loop_phis.iter().any(|phi| phi.rep == TraceRep::Int32), expect_integer);
-        assert_eq!(optimized.no_signed_wrap.len(), expect_integer as usize);
+        // The step's proof (RangeAnalysis may add proofs for derived arithmetic).
+        assert_eq!(!optimized.no_signed_wrap.is_empty(), expect_integer, "{shape:?}");
         if expect_integer {
             assert!(!optimized.nodes.iter().any(|node| matches!(
                 node.kind,
                 TraceInst::F64ToInt32 { .. } | TraceInst::F64Compare { .. } | TraceInst::GuardInt32 { .. }
-            )), "{:?}", optimized.nodes);
+            )), "{shape:?} {:?}", optimized.nodes);
             let materialized = optimized.nodes.iter().filter(|node| matches!(node.kind, TraceInst::Int32ToF64 { .. })).count();
             assert_eq!(materialized > 0, shape.float_use, "{shape:?} {:?}", optimized.nodes);
+            // The derived index is integer arithmetic: checked, or unchecked once
+            // RangeAnalysis proves it cannot overflow. Only the step otherwise.
+            let integer_ops = optimized.nodes.iter()
+                .filter(|node| matches!(node.kind, TraceInst::IntBinaryChecked { .. } | TraceInst::IntBinary { .. }))
+                .count();
+            // (`i - 1` beside a `-1` step is the same value and merges with it.)
+            assert!((1..=1 + shape.derived as usize).contains(&integer_ops), "{shape:?} {:?}", optimized.nodes);
         }
 
         let word = |value: f64| RegisterWord(value.to_bits());
@@ -14004,16 +14326,35 @@ mod tests {
             word(i32::MAX as f64), word(i32::MAX as f64 + 1.0), word(i32::MIN as f64 - 1.0),
             RegisterWord(TAG_NULL), RegisterWord(TAG_TRUE),
         ];
-        for &bound in bounds {
+        // Tagged bounds also see non-integral, -0, out-of-range and NaN words.
+        let mut bound_words: Vec<RegisterWord> = bounds.iter().map(|&bound| if shape.tagged_bound {
+            word(bound as f64)
+        } else {
+            RegisterWord(bound as u32 as u64)
+        }).collect();
+        if shape.tagged_bound {
+            bound_words.extend([word(2.5), word(-0.0), word(3e9), RegisterWord(CANONICAL_NAN), RegisterWord(TAG_NULL)]);
+        }
+        let is_entry_exit = |exit: u32| optimized.exits.get(exit as usize).is_some_and(|exit| {
+            matches!(exit.target, ExitTarget::Interpreter(location) if location == optimized.anchor.location)
+                && exit.frames.iter().all(|frame| frame.writes.is_empty())
+        });
+        for &bound in &bound_words {
             for input in inputs {
                 for budget in [1, 3, 64] {
-                    // Exit ids differ (promotion adds an entry exit resuming at
-                    // the same header PC); architectural register state must not.
-                    let mut baseline = [input, RegisterWord(77), RegisterWord(bound as u32 as u64), RegisterWord(55)];
-                    let mut actual = baseline;
+                    // Exit ids differ (promotion adds entry exits resuming at the
+                    // same header PC); architectural register state must not,
+                    // except that the optimized trace may decline to enter at all
+                    // (state untouched: the interpreter resumes at the header).
+                    let initial = [input, RegisterWord(77), bound, RegisterWord(55), RegisterWord(66)];
+                    let mut baseline = initial;
+                    let mut actual = initial;
                     run_scalar_trace(&original, &mut baseline, 0, budget);
-                    run_scalar_trace(&optimized, &mut actual, 0, budget);
-                    assert_eq!(actual, baseline, "input={:#x} bound={bound} budget={budget}", input.0);
+                    let exit = run_scalar_trace(&optimized, &mut actual, 0, budget);
+                    if actual == initial && is_entry_exit(exit) {
+                        continue;
+                    }
+                    assert_eq!(actual, baseline, "{shape:?} input={:#x} bound={:#x} budget={budget}", input.0, bound.0);
                 }
             }
         }

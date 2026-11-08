@@ -1177,33 +1177,6 @@ impl LlvmLowering<'_> {
         self.def(ty, &format!("{op}{flags} {} {}, {}", ty.ir(), lhs.op, rhs.op))
     }
 
-    /// `nsw` on an induction step the optimizer proved cannot overflow
-    /// (`Trace::no_signed_wrap`). The node shape is re-validated so a later
-    /// rewrite of that node can never inherit the flag: it must still be
-    /// `Int32 loop phi ± Int32 constant` producing that phi's backedge.
-    fn proven_no_signed_wrap(&self, node: &crate::napalm_trace_ir::TraceNode) -> bool {
-        use crate::napalm_trace_ir::{TraceConstant, TraceValueOrigin};
-        let trace = self.trace;
-        if !trace.no_signed_wrap.contains(&node.id) {
-            return false;
-        }
-        let TraceInst::IntBinary { op: IntBinOp::Add | IntBinOp::Sub, lhs, rhs } = node.kind else {
-            return false;
-        };
-        let Some(result) = node.results.first().map(|value| trace.canonical_value(*value)) else {
-            return false;
-        };
-        let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
-        let constant_rhs = trace.value(rhs).is_some_and(|value| {
-            matches!(value.origin, TraceValueOrigin::Constant(TraceConstant::Int32(_)))
-        });
-        constant_rhs
-            && trace.loop_phis.iter().any(|phi| {
-                phi.rep == TraceRep::Int32
-                    && trace.canonical_value(phi.value) == lhs
-                    && phi.backedge.is_some_and(|backedge| trace.canonical_value(backedge) == result)
-            })
-    }
 
     fn icmp(&mut self, pred: &str, lhs: &V, rhs: &V) -> V {
         let (lhs, rhs) = self.same_int(lhs, rhs);
@@ -3130,10 +3103,11 @@ impl LlvmLowering<'_> {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
                 let mask = |state: &mut Self, rhs: &V| state.bin("and", rhs, &V { op: "31".to_owned(), ty: rhs.ty });
-                let nsw = self.proven_no_signed_wrap(node);
+                let nsw = self.trace.proven_no_signed_wrap(node);
                 let result = match op {
                     IntBinOp::Add if nsw => self.bin("add nsw", &lhs, &rhs),
                     IntBinOp::Sub if nsw => self.bin("sub nsw", &lhs, &rhs),
+                    IntBinOp::Mul if nsw => self.bin("mul nsw", &lhs, &rhs),
                     IntBinOp::Add => self.bin("add", &lhs, &rhs),
                     IntBinOp::Sub => self.bin("sub", &lhs, &rhs),
                     IntBinOp::Mul => self.bin("mul", &lhs, &rhs),
@@ -4483,24 +4457,21 @@ mod tests {
         validate_proof_ir(&ir);
     }
 
-    /// `Trace::no_signed_wrap` becomes `add nsw` only on the exact induction
-    /// shape it was proven for; any other listed node keeps wrapping `add`.
+    /// `Trace::no_signed_wrap` becomes `add nsw` only on the exact operation it
+    /// was proven for; a node rewritten afterwards keeps wrapping `add`.
     #[test]
     fn proven_induction_step_gets_nsw_only_on_revalidated_shape() {
         use crate::napalm_ir::IntBinOp;
-        use crate::napalm_trace_ir::{TraceAnchor, TraceBuilder, TraceConstant, TraceKind, TraceTerminator};
-        let lower = |listed: bool, step_from_register: bool| {
+        use crate::napalm_trace_ir::{NoSignedWrap, TraceAnchor, TraceBuilder, TraceConstant, TraceKind, TraceTerminator};
+        let lower = |listed: bool, rewritten_after_proof: bool| {
             let anchor = TraceAnchor { kind: TraceKind::Loop,
                 location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
             let mut builder = TraceBuilder::new(TraceId(60005), anchor);
             let slot = FrameSlot::General(Reg(0));
             let start = builder.read_slot(slot, TraceType::Int32, TraceRep::Int32);
             let phi = builder.add_loop_phi(slot, start, TraceType::Int32, TraceRep::Int32);
-            let step = if step_from_register {
-                builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Int32, TraceRep::Int32)
-            } else {
-                builder.constant(TraceConstant::Int32(3))
-            };
+            let other = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Int32, TraceRep::Int32);
+            let step = builder.constant(TraceConstant::Int32(3));
             let next = builder.emit1(TraceInst::IntBinary { op: IntBinOp::Add, lhs: phi, rhs: step },
                 TraceType::Int32, TraceRep::Int32);
             builder.write_slot(slot, next);
@@ -4508,10 +4479,13 @@ mod tests {
             builder.add_native_budget_exit(BytecodePc(0));
             builder.set_terminator(TraceTerminator::LoopBack);
             let mut trace = builder.finish().expect("well-formed induction loop");
+            let add = trace.nodes.iter()
+                .position(|node| matches!(node.kind, TraceInst::IntBinary { .. })).unwrap();
             if listed {
-                let add = trace.nodes.iter()
-                    .position(|node| matches!(node.kind, TraceInst::IntBinary { .. })).unwrap();
-                trace.no_signed_wrap.push(add);
+                trace.no_signed_wrap.push(NoSignedWrap { node: add, op: IntBinOp::Add, lhs: phi, rhs: step });
+            }
+            if rewritten_after_proof {
+                trace.nodes[add].kind = TraceInst::IntBinary { op: IntBinOp::Add, lhs: phi, rhs: other };
             }
             let plans = trace.exits.iter()
                 .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
@@ -4524,7 +4498,7 @@ mod tests {
         assert!(proven.contains("add nsw i32"), "{proven}");
         let unlisted = lower(false, false);
         assert!(!unlisted.contains(" nsw "), "{unlisted}");
-        // Listed but no longer `phi + constant`: the flag must not be inherited.
+        // Proven for `phi + 3`, later rewritten to `phi + r1`: not inherited.
         let reshaped = lower(true, true);
         assert!(!reshaped.contains(" nsw "), "{reshaped}");
     }
