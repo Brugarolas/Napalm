@@ -4744,7 +4744,9 @@ fn compile_program_impl(
         }
     }
 
-    if options.verify_bytecode {
+    // The bytecode optimizer publishes only a program its final verifier pass
+    // accepted, so re-verifying that exact program here would be redundant.
+    if options.verify_bytecode && !options.optimize_bytecode {
         BytecodeVerifier::verify_program(&bytecode)
             .map_err(|error| CompileError::BytecodeVerification(error.to_string()))?;
     }

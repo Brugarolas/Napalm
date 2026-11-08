@@ -38,6 +38,8 @@ pub(super) const OPERAND_B: u8 = 1 << 1;
 pub(super) const OPERAND_C: u8 = 1 << 2;
 /// Packed call registers (receiver/arguments of Invoke/CallPrimitive/...).
 pub(super) const OPERAND_PACKED: u8 = 1 << 3;
+/// MapLookupOrInsert stores its value register in the first extension word.
+pub(super) const OPERAND_X: u8 = 1 << 4;
 /// a/b/c plus at most 17 packed call registers.
 const MAX_OPERANDS: usize = 20;
 
@@ -135,6 +137,7 @@ pub(super) fn shared_operand_mask(opcode: Opcode) -> u8 {
     let packed = match opcode {
         Invoke | InvokeSuper | CallPrimitive | CallClosure | InvokeMethodDirect
             | NewClassInstance | NewObjectWithProperties | NewInterfaceOrTypeObject => OPERAND_PACKED,
+        MapLookupOrInsert => OPERAND_X,
         _ => 0,
     };
     let touches_heap = packed != 0
@@ -220,6 +223,18 @@ impl Heap {
 }
 
 impl Interpreter<'_> {
+    /// Trace recording and call helpers execute baseline handlers directly.
+    /// Yield before a shared operation so they cannot bypass the locking loop,
+    /// including inside an inlined/called function. The PC stays unchanged.
+    pub(super) fn defer_shared_trace_step(&mut self) -> Option<TraceStep> {
+        if !self.heap.shared_mode || !unsafe { self.current_op_touches_shared() } {
+            return None;
+        }
+        let before = self.trace_current_location();
+        self.run_state = RunState::Reschedule;
+        Some(TraceStep { before, after: before, frame_changed: false, running: false })
+    }
+
     #[inline]
     unsafe fn shared_operand_words(
         &self,
@@ -231,6 +246,7 @@ impl Interpreter<'_> {
         if mask & OPERAND_A != 0 { out[count] = unsafe { self.reg(op.a) }; count += 1; }
         if mask & OPERAND_B != 0 { out[count] = unsafe { self.reg(op.b) }; count += 1; }
         if mask & OPERAND_C != 0 { out[count] = unsafe { self.reg(op.c) }; count += 1; }
+        if mask & OPERAND_X != 0 { out[count] = unsafe { self.reg(op.x as u8) }; count += 1; }
         if mask & OPERAND_PACKED != 0 {
             if op.c <= 4 {
                 for index in 0..op.c as usize {

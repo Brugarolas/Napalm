@@ -1177,6 +1177,7 @@ impl LlvmLowering<'_> {
         self.def(ty, &format!("{op}{flags} {} {}, {}", ty.ir(), lhs.op, rhs.op))
     }
 
+
     fn icmp(&mut self, pred: &str, lhs: &V, rhs: &V) -> V {
         let (lhs, rhs) = self.same_int(lhs, rhs);
         self.def(Ty::I1, &format!("icmp {pred} {} {}, {}", lhs.ty.ir(), lhs.op, rhs.op))
@@ -2325,6 +2326,17 @@ impl LlvmLowering<'_> {
         let chunk = self.load(Ty::Ptr, &chunk_slot, Mem::Sidecar);
         let entry_offset = self.bin("mul", &entry_index, &V::i64(std::mem::size_of::<TraceHeapEntry>() as i64));
         let entry = self.gep8_dyn(&chunk, &entry_offset);
+        // A heap-tagged word always names an entry of an installed handle chunk,
+        // and chunks are never freed or moved while the VM lives. LLVM cannot
+        // derive that through the variable chunk offset, so state it: with it,
+        // LICM may hoist conditional sidecar loads (List data pointer, kind,
+        // receiver class...) out of loops that contain no runtime boundary.
+        self.line(&format!(
+            "call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr {entry}, i64 {size}), \"align\"(ptr {entry}, i64 {align}) ]",
+            entry = entry.op,
+            size = std::mem::size_of::<TraceHeapEntry>(),
+            align = std::mem::align_of::<TraceHeapEntry>(),
+        ));
         let address = self.load_at(Ty::Ptr, &entry, offset_of!(TraceHeapEntry, address) as i64, Mem::SidecarAddress);
         let dead = self.def(Ty::I1, &format!("icmp eq ptr {}, null", address.op));
         self.emit_side_exit(exit, &dead)?;
@@ -3091,7 +3103,11 @@ impl LlvmLowering<'_> {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
                 let mask = |state: &mut Self, rhs: &V| state.bin("and", rhs, &V { op: "31".to_owned(), ty: rhs.ty });
+                let nsw = self.trace.proven_no_signed_wrap(node);
                 let result = match op {
+                    IntBinOp::Add if nsw => self.bin("add nsw", &lhs, &rhs),
+                    IntBinOp::Sub if nsw => self.bin("sub nsw", &lhs, &rhs),
+                    IntBinOp::Mul if nsw => self.bin("mul nsw", &lhs, &rhs),
                     IntBinOp::Add => self.bin("add", &lhs, &rhs),
                     IntBinOp::Sub => self.bin("sub", &lhs, &rhs),
                     IntBinOp::Mul => self.bin("mul", &lhs, &rhs),
@@ -3721,6 +3737,36 @@ impl LlvmLowering<'_> {
                         )?;
                         self.guard_map_shape_once(*map, &metadata, *shape, *exit)?;
                     }
+                }
+            }
+        }
+
+        // Sidecar `data` pointers of objects whose entry and kind the preheader
+        // already proved. Without a runtime boundary a List/String/Cell buffer
+        // cannot be reallocated, so the pointer is loop-invariant; loading it here
+        // (no new guard, no reordered exit) hands LLVM the hoisted value. LLVM
+        // cannot hoist it itself: the entry address `chunk + idx * 48` has a
+        // variable offset, so dereferenceability (needed to speculate the load
+        // above the body's guards) is not derivable.
+        if epoch_free_loop {
+            for node in &trace.nodes {
+                if preheader_nodes[node.id] {
+                    continue;
+                }
+                let (value, kind) = match &node.kind {
+                    TraceInst::HeapListGet { list, .. } | TraceInst::HeapListSet { list, .. } => {
+                        (*list, TraceHeapKind::List)
+                    }
+                    TraceInst::HeapLoadCell { cell, .. } | TraceInst::HeapStoreCell { cell, .. } => {
+                        (*cell, TraceHeapKind::Cell)
+                    }
+                    TraceInst::HeapStringAsciiCodePointAt { string, .. }
+                    | TraceInst::HeapStringCodePointAt { string, .. } => (*string, TraceHeapKind::String),
+                    _ => continue,
+                };
+                let key = (trace.canonical_value(value), kind as u32);
+                if let Some((entry, _)) = self.heap_entries.get(&key).cloned() {
+                    let _ = self.heap_entry_data(&entry);
                 }
             }
         }
@@ -4399,12 +4445,62 @@ mod tests {
         let ir = lower_trace(&trace, &plans, slots, 0,
             "shape_preheader_guard", proof_test_host()).expect("lowering");
         let main_loop = ir.find("loop:\n").expect("loop label");
-        let shape_assumption = ir.find("call void @llvm.assume(i1")
+        // Condition assumes only (`i1 %tN`); the sidecar dereferenceability
+        // bundle (`i1 true) [...]`) is a separate, path-independent fact.
+        let shape_assumption = ir.find("call void @llvm.assume(i1 %")
             .expect("shape assumption");
         assert!(shape_assumption < main_loop, "shape proof not hoisted: {ir}");
-        assert_eq!(ir.matches("call void @llvm.assume(i1").count(), 1,
+        assert_eq!(ir.matches("call void @llvm.assume(i1 %").count(), 1,
             "shape guard unexpectedly reexecuted in body: {ir}");
+        let entry_bundle = ir.find("[ \"dereferenceable\"(ptr").expect("sidecar dereferenceability bundle");
+        assert!(entry_bundle < main_loop, "sidecar entry proof not hoisted: {ir}");
         validate_proof_ir(&ir);
+    }
+
+    /// `Trace::no_signed_wrap` becomes `add nsw` only on the exact operation it
+    /// was proven for; a node rewritten afterwards keeps wrapping `add`.
+    #[test]
+    fn proven_induction_step_gets_nsw_only_on_revalidated_shape() {
+        use crate::napalm_ir::IntBinOp;
+        use crate::napalm_trace_ir::{NoSignedWrap, TraceAnchor, TraceBuilder, TraceConstant, TraceKind, TraceTerminator};
+        let lower = |listed: bool, rewritten_after_proof: bool| {
+            let anchor = TraceAnchor { kind: TraceKind::Loop,
+                location: TraceLocation::new(FuncId(0), BytecodePc(0)) };
+            let mut builder = TraceBuilder::new(TraceId(60005), anchor);
+            let slot = FrameSlot::General(Reg(0));
+            let start = builder.read_slot(slot, TraceType::Int32, TraceRep::Int32);
+            let phi = builder.add_loop_phi(slot, start, TraceType::Int32, TraceRep::Int32);
+            let other = builder.read_slot(FrameSlot::General(Reg(1)), TraceType::Int32, TraceRep::Int32);
+            let step = builder.constant(TraceConstant::Int32(3));
+            let next = builder.emit1(TraceInst::IntBinary { op: IntBinOp::Add, lhs: phi, rhs: step },
+                TraceType::Int32, TraceRep::Int32);
+            builder.write_slot(slot, next);
+            builder.set_loop_backedge(phi, next).unwrap();
+            builder.add_native_budget_exit(BytecodePc(0));
+            builder.set_terminator(TraceTerminator::LoopBack);
+            let mut trace = builder.finish().expect("well-formed induction loop");
+            let add = trace.nodes.iter()
+                .position(|node| matches!(node.kind, TraceInst::IntBinary { .. })).unwrap();
+            if listed {
+                trace.no_signed_wrap.push(NoSignedWrap { node: add, op: IntBinOp::Add, lhs: phi, rhs: step });
+            }
+            if rewritten_after_proof {
+                trace.nodes[add].kind = TraceInst::IntBinary { op: IntBinOp::Add, lhs: phi, rhs: other };
+            }
+            let plans = trace.exits.iter()
+                .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
+            let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+                "induction_nsw", proof_test_host()).expect("lowering");
+            validate_proof_ir(&ir);
+            ir
+        };
+        let proven = lower(true, false);
+        assert!(proven.contains("add nsw i32"), "{proven}");
+        let unlisted = lower(false, false);
+        assert!(!unlisted.contains(" nsw "), "{unlisted}");
+        // Proven for `phi + 3`, later rewritten to `phi + r1`: not inherited.
+        let reshaped = lower(true, true);
+        assert!(!reshaped.contains(" nsw "), "{reshaped}");
     }
 
     #[test]

@@ -2183,7 +2183,9 @@ impl Inst {
 pub struct Node {
     pub id: InstId,
     pub kind: Inst,
-    pub results: Vec<ValueId>,
+    /// Almost every instruction yields zero or one SSA value; keep that inline
+    /// (same 24-byte footprint as a Vec) instead of one heap block per node.
+    pub results: SmallVec<[ValueId; 1]>,
     pub effect_in: Option<EffectId>,
     pub effect_out: Option<EffectId>,
     pub source: Option<SourceSpan>,
@@ -2936,22 +2938,33 @@ impl<'p> Builder<'p> {
     }
 
     pub fn emit1(&mut self, kind: Inst, ty: Type) -> ValueId {
-        let (_, results) = self.emit(kind, &[ty]);
+        let (_, results) = self.emit_owned(kind, std::iter::once(ty), 1);
         results[0]
     }
 
-    pub fn emit(&mut self, kind: Inst, result_types: &[Type]) -> (InstId, Vec<ValueId>) {
+    pub fn emit(&mut self, kind: Inst, result_types: &[Type]) -> (InstId, SmallVec<[ValueId; 1]>) {
+        self.emit_owned(kind, result_types.iter().cloned(), result_types.len())
+    }
+
+    /// Shared emission core; takes result types by value so `emit1` moves its
+    /// `Type` instead of cloning it.
+    fn emit_owned(
+        &mut self,
+        kind: Inst,
+        result_types: impl Iterator<Item = Type>,
+        result_count: usize,
+    ) -> (InstId, SmallVec<[ValueId; 1]>) {
         assert!(
             !self.block_terminated(self.current_block),
             "cannot emit after terminator in {:?}",
             self.current_block
         );
         assert!(
-            result_types.len() <= u8::MAX as usize,
+            result_count <= u8::MAX as usize,
             "an instruction cannot produce more than 255 SSA values"
         );
         assert_eq!(
-            result_types.len(),
+            result_count,
             kind.result_count(),
             "wrong result count for instruction {kind:?}"
         );
@@ -2967,8 +2980,8 @@ impl<'p> Builder<'p> {
             EffectBehavior::Sink(_) => (Some(self.current_effect), None),
         };
 
-        let mut results = Vec::with_capacity(result_types.len());
-        for (index, ty) in result_types.iter().cloned().enumerate() {
+        let mut results = SmallVec::<[ValueId; 1]>::with_capacity(result_count);
+        for (index, ty) in result_types.enumerate() {
             let value = ValueId(self.function.values.len() as u32);
             self.function.values.push(Value {
                 id: value,

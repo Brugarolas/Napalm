@@ -38,13 +38,13 @@ bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator 
 cranelift = { path = "./crates/wasmtime/cranelift/umbrella", features = ["jit", "module", "native"] } # JIT compiler back-end framework for Rust
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "gzip", "brotli", "deflate", "zstd"] } # HTTP client for Rust
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net", "sync"] } # Asynchronous runtime for Rust
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] } # Fast JSON parsing using SIMD
 mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
-llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C API
 #rusqlite = { version = "0.41.1", features = ["bundled", "uuid", "chrono", "vtab", "array"] } # SQLite database library for Rust
 
+llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C API
 # Safe Rust bindings to the LLVM C API (LLVM trace tier).
 # Windows: the official LLVM release libraries use the static CRT (/MT) plus
 # rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the

@@ -1109,6 +1109,76 @@ impl Hash for MapKey {
     }
 }
 
+/// Borrowed lookup form of [`MapKey`]. It feeds the hasher exactly like the owned
+/// key, so hashbrown/papaya tables can probe with it through `Equivalent`
+/// without cloning a String key's `Arc` (an atomic inc/dec pair per lookup) or
+/// copying a property name into a fresh `Arc<[u8]>` allocation.
+#[derive(Clone, Copy, Debug)]
+enum MapKeyRef<'a> {
+    Null,
+    Bool(bool),
+    Num(u64),
+    String { bytes: &'a [u8], hash: u64 },
+    Object(u32),
+}
+
+impl<'a> MapKeyRef<'a> {
+    #[inline]
+    fn from_key(key: &'a MapKey) -> Self {
+        match key {
+            MapKey::Null => Self::Null,
+            MapKey::Bool(value) => Self::Bool(*value),
+            MapKey::Num(bits) => Self::Num(*bits),
+            MapKey::String(string) => Self::String { bytes: string.bytes.as_ref(), hash: string.hash },
+            MapKey::Object(handle) => Self::Object(*handle),
+        }
+    }
+
+    /// A UTF-8 property name; hashes with the process-wide content hash used
+    /// by `MapStringKey::new` and `NapalmString::new`.
+    #[inline]
+    fn name(bytes: &'a [u8]) -> Self {
+        Self::String { bytes, hash: fast_hash_bytes(bytes) }
+    }
+}
+
+impl Hash for MapKeyRef<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Must stay byte-for-byte identical to `impl Hash for MapKey`.
+        match *self {
+            Self::Null => state.write_u8(0),
+            Self::Bool(value) => { state.write_u8(1); state.write_u8(value as u8); }
+            Self::Num(bits) => { state.write_u8(2); state.write_u64(bits); }
+            Self::String { hash, .. } => { state.write_u8(3); state.write_u64(hash); }
+            Self::Object(handle) => { state.write_u8(4); state.write_u32(handle); }
+        }
+    }
+}
+
+impl hashbrown::Equivalent<MapKey> for MapKeyRef<'_> {
+    #[inline]
+    fn equivalent(&self, key: &MapKey) -> bool {
+        match (*self, key) {
+            (Self::Null, MapKey::Null) => true,
+            (Self::Bool(left), MapKey::Bool(right)) => left == *right,
+            (Self::Num(left), MapKey::Num(right)) => left == *right,
+            (Self::String { bytes, hash }, MapKey::String(right)) => {
+                hash == right.hash && bytes == right.bytes.as_ref()
+            }
+            (Self::Object(left), MapKey::Object(right)) => left == *right,
+            _ => false,
+        }
+    }
+}
+
+impl hashbrown::Equivalent<SetEntry> for MapKeyRef<'_> {
+    #[inline]
+    fn equivalent(&self, entry: &SetEntry) -> bool {
+        hashbrown::Equivalent::<MapKey>::equivalent(self, &entry.0)
+    }
+}
+
 const MAX_SHAPED_MAP_SLOTS: usize = 16;
 /// Keep native string-key guards bounded: at most eight 64-bit compares.
 const MAX_SHAPED_MAP_KEY_BYTES: usize = 64;
@@ -1571,13 +1641,164 @@ impl<T> std::ops::Deref for ConcurrentTable<T> {
     fn deref(&self) -> &T { &self.entries }
 }
 
-/// Objects retain ordered dictionary fallback; language Map and Set use only
-/// the project's AES-keyed hashbrown tables, without shapes or property caches.
+/// Dense, position-addressable hash table backing dictionary-mode language
+/// `Map`/`Set` (indexmap layout: an AES-keyed `HashTable<u32>` of positions into
+/// a dense entry `Vec`).
+///
+/// Map/Set iteration builtins walk entries by position (`nth_key(i)`). On a plain
+/// hashbrown map that is an O(i) bucket scan per step, i.e. O(n²) per loop; here
+/// it is an O(1) index. Removal swaps the last entry into the hole so it stays
+/// O(1); order is insertion order until the first removal.
+#[derive(Debug, Default)]
+struct IndexedTable {
+    indices: hashbrown::HashTable<u32>,
+    entries: Vec<(MapKey, Value)>,
+    hasher: AesBuildHasher,
+}
+
+impl IndexedTable {
+    #[inline]
+    fn find(&self, key: MapKeyRef<'_>) -> Option<usize> {
+        let hash = self.hasher.hash_one(key);
+        let entries = &self.entries;
+        self.indices
+            .find(hash, |&index| hashbrown::Equivalent::<MapKey>::equivalent(&key, &entries[index as usize].0))
+            .map(|&index| index as usize)
+    }
+
+    #[inline]
+    fn get(&self, key: MapKeyRef<'_>) -> Option<Value> {
+        self.find(key).map(|index| self.entries[index].1)
+    }
+
+    #[inline]
+    fn push_new(&mut self, hash: u64, key: MapKey, value: Value) -> Value {
+        let Self { indices, entries, hasher } = self;
+        let index = u32::try_from(entries.len()).expect("Map/Set exceeds u32::MAX entries");
+        indices.insert_unique(hash, index, |&index| hasher.hash_one(&entries[index as usize].0));
+        entries.push((key, value));
+        value
+    }
+
+    /// Insert or overwrite the value, keeping the stored key (HashMap::insert).
+    fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> {
+        let hash = self.hasher.hash_one(&key);
+        let entries = &self.entries;
+        if let Some(&index) = self.indices.find(hash, |&index| entries[index as usize].0 == key) {
+            return Some(std::mem::replace(&mut self.entries[index as usize].1, value));
+        }
+        self.push_new(hash, key, value);
+        None
+    }
+
+    /// Insert or overwrite the whole entry, key included (HashSet::replace).
+    fn replace(&mut self, key: MapKey, value: Value) -> Option<Value> {
+        let hash = self.hasher.hash_one(&key);
+        let entries = &self.entries;
+        if let Some(&index) = self.indices.find(hash, |&index| entries[index as usize].0 == key) {
+            return Some(std::mem::replace(&mut self.entries[index as usize], (key, value)).1);
+        }
+        self.push_new(hash, key, value);
+        None
+    }
+
+    /// The present value, or `value` after inserting it.
+    fn get_or_insert(&mut self, key: MapKey, value: Value) -> Value {
+        let hash = self.hasher.hash_one(&key);
+        let entries = &self.entries;
+        if let Some(&index) = self.indices.find(hash, |&index| entries[index as usize].0 == key) {
+            return self.entries[index as usize].1;
+        }
+        self.push_new(hash, key, value)
+    }
+
+    fn remove(&mut self, key: MapKeyRef<'_>) -> Option<Value> {
+        let hash = self.hasher.hash_one(key);
+        let entries = &self.entries;
+        let found = self
+            .indices
+            .find_entry(hash, |&index| hashbrown::Equivalent::<MapKey>::equivalent(&key, &entries[index as usize].0))
+            .ok()?;
+        let index = found.remove().0 as usize;
+        let last = self.entries.len() - 1;
+        if index != last {
+            // The last entry moves into the hole: repoint its table slot.
+            let moved_hash = self.hasher.hash_one(&self.entries[last].0);
+            let slot = self
+                .indices
+                .find_mut(moved_hash, |&candidate| candidate as usize == last)
+                .expect("moved Map/Set entry must be indexed");
+            *slot = index as u32;
+        }
+        Some(self.entries.swap_remove(index).1)
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        let Self { indices, entries, hasher } = self;
+        indices.reserve(additional, |&index| hasher.hash_one(&entries[index as usize].0));
+        entries.reserve(additional);
+    }
+
+    fn clear(&mut self) {
+        self.indices.clear();
+        self.entries.clear();
+    }
+
+    #[inline]
+    fn len(&self) -> usize { self.entries.len() }
+
+    fn external_bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
+            + self.indices.capacity() * (std::mem::size_of::<u32>() + 1)
+    }
+}
+
+#[cfg(test)]
+mod indexed_table_tests {
+    use super::*;
+
+    fn string_key(text: &str) -> MapKey {
+        MapKey::String(MapStringKey::new(Arc::from(text.as_bytes())))
+    }
+
+    #[test]
+    fn swap_remove_keeps_every_entry_reachable_and_positional() {
+        let mut table = IndexedTable::default();
+        for index in 0..200u32 {
+            let key = if index % 2 == 0 { string_key(&format!("k{index}")) } else { MapKey::Num(f64::from(index).to_bits()) };
+            assert!(table.insert(key, Value::from_num(f64::from(index))).is_none());
+        }
+        // Overwrite keeps the stored key and returns the previous value.
+        assert_eq!(table.insert(string_key("k0"), Value::from_num(-1.0)).and_then(|v| v.as_num()), Some(0.0));
+        // Remove a mix of front, middle and last entries (exercises the moved-slot repoint).
+        for index in [0u32, 199, 57, 100, 1, 198] {
+            let key = if index % 2 == 0 { string_key(&format!("k{index}")) } else { MapKey::Num(f64::from(index).to_bits()) };
+            assert!(table.remove(MapKeyRef::from_key(&key)).is_some(), "remove {index}");
+            assert!(table.remove(MapKeyRef::from_key(&key)).is_none(), "double remove {index}");
+        }
+        assert_eq!(table.len(), 194);
+        let mut seen = std::collections::HashSet::new();
+        for position in 0..table.len() {
+            let (key, value) = &table.entries[position];
+            let bits = value.as_num().unwrap().to_bits();
+            assert_eq!(table.get(MapKeyRef::from_key(key)).and_then(|v| v.as_num()).map(f64::to_bits), Some(bits));
+            assert!(seen.insert(bits), "entry visited twice");
+        }
+        assert_eq!(table.get(MapKeyRef::name(b"k2")).and_then(|v| v.as_num()), Some(2.0));
+        assert!(table.get(MapKeyRef::name(b"k0")).is_none());
+        assert_eq!(table.get_or_insert(string_key("k4"), Value::NULL).as_num(), Some(4.0));
+        assert!(table.replace(string_key("k6"), Value::from_num(6.5)).is_some());
+        assert_eq!(table.get(MapKeyRef::name(b"k6")).and_then(|v| v.as_num()), Some(6.5));
+    }
+}
+
+/// Objects retain ordered dictionary fallback; language Map and Set use dense
+/// AES-keyed indexed tables, without shapes or property caches.
 #[derive(Debug)]
 enum MapDictionary {
     Object { indices: FastMap<MapKey, usize>, entries: Vec<(MapKey, Value)> },
-    Map(FastMap<MapKey, Value>),
-    Set(HashSet<SetEntry>),
+    Map(IndexedTable),
+    Set(IndexedTable),
     ConcurrentMap(ConcurrentTable<crate::napalm_collections::ConcurrentMap<MapKey, Value>>),
     ConcurrentSet(ConcurrentTable<crate::napalm_collections::ConcurrentSet<SetEntry>>),
 }
@@ -1602,6 +1823,40 @@ impl MapDictionary {
     fn concurrent_clear(&self) { match self {
         Self::ConcurrentMap(m) => m.pin().clear(), Self::ConcurrentSet(s) => s.pin().clear(), _ => unreachable!(),
     } }
+    fn concurrent_lookup_or_insert(&self, key: MapKey, value: Value) -> (Value, bool) {
+        match self {
+            Self::ConcurrentMap(map) => match map.pin().try_insert(key, value) {
+                Ok(inserted) => (*inserted, true),
+                Err(occupied) => (*occupied.current, false),
+            },
+            Self::ConcurrentSet(set) => {
+                let pin = set.pin();
+                loop {
+                    if let Some(existing) = pin.get(&key) { return (existing.1, false); }
+                    if pin.insert(SetEntry(key.clone(), value)) { return (value, true); }
+                    // Another writer won. Retry: a concurrent delete may
+                    // already have removed its element. Never replace it.
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn lookup_or_insert(&mut self, key: MapKey, value: Value) -> (Value, bool) {
+        let before = self.len();
+        let result = match self {
+            Self::Map(table) | Self::Set(table) => table.get_or_insert(key, value),
+            Self::Object { indices, entries } => {
+                let index = *indices.entry(key.clone()).or_insert_with(|| {
+                    let index = entries.len();
+                    entries.push((key, value));
+                    index
+                });
+                entries[index].1
+            }
+            _ => unreachable!("concurrent insertion requires a shared borrow"),
+        };
+        (result, self.len() != before)
+    }
     fn is_map_origin(&self) -> bool { !matches!(self, Self::Object { .. }) }
     fn len(&self) -> usize { match self {
         Self::Object { entries, .. } => entries.len(), Self::Map(m) => m.len(), Self::Set(s) => s.len(),
@@ -1610,26 +1865,28 @@ impl MapDictionary {
     fn is_empty(&self) -> bool { self.len() == 0 }
     fn reserve(&mut self, additional: usize) { match self {
         Self::Object { indices, entries } => { indices.reserve(additional); entries.reserve(additional); }
-        Self::Map(m) => m.reserve(additional), Self::Set(s) => s.reserve(additional),
+        Self::Map(table) | Self::Set(table) => table.reserve(additional),
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => {},
     } }
     fn external_bytes(&self) -> usize { match self {
         Self::Object { indices, entries } => indices.capacity() * std::mem::size_of::<(MapKey, usize)>() + entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
-        Self::Map(m) => m.capacity() * std::mem::size_of::<(MapKey, Value)>(),
-        Self::Set(s) => s.capacity() * std::mem::size_of::<SetEntry>(),
+        Self::Map(table) | Self::Set(table) => table.external_bytes(),
         Self::ConcurrentMap(m) => m.len() * std::mem::size_of::<(MapKey, Value)>(),
         Self::ConcurrentSet(s) => s.len() * std::mem::size_of::<SetEntry>(),
     } }
-    fn get(&self, key: &MapKey) -> Option<Value> { match self {
-        Self::Object { indices, entries } => indices.get(key).map(|&i| entries[i].1),
-        Self::Map(m) => m.get(key).copied(), Self::Set(s) => s.get(key).map(|e| e.1),
-        Self::ConcurrentMap(m) => m.pin().get(key).copied(),
-        Self::ConcurrentSet(s) => s.pin().get(key).map(|e| e.1),
+    #[inline]
+    fn get(&self, key: &MapKey) -> Option<Value> { self.get_ref(MapKeyRef::from_key(key)) }
+    /// Allocation- and refcount-free probe with a borrowed key.
+    fn get_ref(&self, key: MapKeyRef<'_>) -> Option<Value> { match self {
+        Self::Object { indices, entries } => indices.get(&key).map(|&i| entries[i].1),
+        Self::Map(table) | Self::Set(table) => table.get(key),
+        Self::ConcurrentMap(m) => m.pin().get(&key).copied(),
+        Self::ConcurrentSet(s) => s.pin().get(&key).map(|e| e.1),
     } }
     fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> { match self {
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent writes require a shared borrow"),
-        Self::Map(m) => m.insert(key, value),
-        Self::Set(s) => s.replace(SetEntry(key, value)).map(|e| e.1),
+        Self::Map(table) => table.insert(key, value),
+        Self::Set(table) => table.replace(key, value),
         Self::Object { indices, entries } => {
             if let Some(&i) = indices.get(&key) { return Some(std::mem::replace(&mut entries[i].1, value)); }
             indices.insert(key.clone(), entries.len()); entries.push((key, value)); None
@@ -1637,7 +1894,7 @@ impl MapDictionary {
     } }
     fn remove(&mut self, key: &MapKey) -> Option<Value> { match self {
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent removal requires a shared borrow"),
-        Self::Map(m) => m.remove(key), Self::Set(s) => s.take(key).map(|e| e.1),
+        Self::Map(table) | Self::Set(table) => table.remove(MapKeyRef::from_key(key)),
         Self::Object { indices, entries } => {
             let index = indices.remove(key)?; let (_, value) = entries.remove(index);
             for (offset, (key, _)) in entries[index..].iter().enumerate() { *indices.get_mut(key).unwrap() = index + offset; }
@@ -1646,18 +1903,40 @@ impl MapDictionary {
     } }
     fn clear(&mut self) { match self {
         Self::Object { indices, entries } => { indices.clear(); entries.clear(); }
-        Self::Map(m) => m.clear(), Self::Set(s) => s.clear(),
+        Self::Map(table) | Self::Set(table) => table.clear(),
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => self.concurrent_clear(),
     } }
     fn iter(&self) -> Box<dyn Iterator<Item = (MapKey, Value)> + '_> { match self {
         Self::Object { entries, .. } => Box::new(entries.iter().cloned()),
-        Self::Map(m) => Box::new(m.iter().map(|(k,v)| (k.clone(), *v))),
-        Self::Set(s) => Box::new(s.iter().map(|e| (e.0.clone(), e.1))),
+        Self::Map(table) | Self::Set(table) => Box::new(table.entries.iter().cloned()),
         Self::ConcurrentMap(m) => Box::new(m.pin().iter().map(|(k,v)| (k.clone(), *v)).collect::<Vec<_>>().into_iter()),
         Self::ConcurrentSet(s) => Box::new(s.pin().iter().map(|e| (e.0.clone(), e.1)).collect::<Vec<_>>().into_iter()),
     } }
-    fn nth_key(&self, index: usize) -> Option<MapKey> { self.iter().nth(index).map(|(k,_)| k) }
-    fn nth_value(&self, index: usize) -> Option<Value> { self.iter().nth(index).map(|(_,v)| v) }
+    /// Visit every entry by reference. GC tracing uses this: `iter()` boxes an
+    /// iterator and clones each key (an Arc inc/dec per String key per trace),
+    /// and snapshots concurrent tables into a Vec.
+    #[inline]
+    fn for_each_entry(&self, mut f: impl FnMut(&MapKey, Value)) { match self {
+        Self::Object { entries, .. } => for (key, value) in entries { f(key, *value) },
+        Self::Map(table) | Self::Set(table) => for (key, value) in &table.entries { f(key, *value) },
+        Self::ConcurrentMap(m) => for (key, value) in m.pin().iter() { f(key, *value) },
+        Self::ConcurrentSet(s) => for entry in s.pin().iter() { f(&entry.0, entry.1) },
+    } }
+    /// Positional access for the index-based Map/Set iteration protocol. Dense
+    /// tables answer in O(1); concurrent tables walk their buckets once without
+    /// snapshotting the whole table or cloning every skipped key.
+    fn nth_key(&self, index: usize) -> Option<MapKey> { match self {
+        Self::Object { entries, .. } => entries.get(index).map(|(key, _)| key.clone()),
+        Self::Map(table) | Self::Set(table) => table.entries.get(index).map(|(key, _)| key.clone()),
+        Self::ConcurrentMap(m) => m.pin().iter().nth(index).map(|(key, _)| key.clone()),
+        Self::ConcurrentSet(s) => s.pin().iter().nth(index).map(|entry| entry.0.clone()),
+    } }
+    fn nth_value(&self, index: usize) -> Option<Value> { match self {
+        Self::Object { entries, .. } => entries.get(index).map(|&(_, value)| value),
+        Self::Map(table) | Self::Set(table) => table.entries.get(index).map(|&(_, value)| value),
+        Self::ConcurrentMap(m) => m.pin().iter().nth(index).map(|(_, value)| *value),
+        Self::ConcurrentSet(s) => s.pin().iter().nth(index).map(|entry| entry.1),
+    } }
 
 }
 
@@ -1807,7 +2086,7 @@ impl NapalmMap {
 
     /// An empty Map created with `new Map()` (as opposed to `{}`).
     fn new_map_origin() -> Self {
-        Self { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Map(FastMap::default()))) }
+        Self { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Map(IndexedTable::default()))) }
     }
 
     fn is_map_origin(&self) -> bool {
@@ -1845,14 +2124,19 @@ impl NapalmMap {
 
     #[inline]
     fn get(&self, shapes: &MapShapeTable, key: &MapKey) -> Option<Value> {
+        self.get_ref(shapes, MapKeyRef::from_key(key))
+    }
+
+    #[inline]
+    fn get_ref(&self, shapes: &MapShapeTable, key: MapKeyRef<'_>) -> Option<Value> {
         match (&self.storage, key) {
-            (NapalmMapStorage::Shaped { shape, values }, MapKey::String(bytes)) => {
-                let slot = shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref())? as usize;
+            (NapalmMapStorage::Shaped { shape, values }, MapKeyRef::String { bytes, hash }) => {
+                let slot = shapes.slot_hashed(*shape, hash, bytes)? as usize;
                 debug_assert!(slot < values.len());
                 Some(unsafe { *values.get_unchecked(slot) })
             }
             (NapalmMapStorage::Shaped { .. }, _) => None,
-            (NapalmMapStorage::Dictionary(entries), _) => entries.get(key),
+            (NapalmMapStorage::Dictionary(entries), _) => entries.get_ref(key),
         }
     }
 
@@ -3227,12 +3511,12 @@ unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
                 visit_values_prefetched(values.as_slice(), visitor);
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, value) in entries.iter() {
+                entries.for_each_entry(|key, value| {
                     if let MapKey::Object(handle) = key {
-                        visit_handle(handle, visitor);
+                        visit_handle(*handle, visitor);
                     }
                     visit_value(value, visitor);
-                }
+                });
             }
         }
     }
@@ -3768,10 +4052,10 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 for &value in values { push_value_handle(value, roots); }
             }
             NapalmMapStorage::Dictionary(entries) => {
-                for (key, value) in entries.iter() {
-                    if let MapKey::Object(handle) = key { roots.push(handle); }
+                entries.for_each_entry(|key, value| {
+                    if let MapKey::Object(handle) = key { roots.push(*handle); }
                     push_value_handle(value, roots);
-                }
+                });
             }
         },
         HeapObject::Cell(word) => push_value_handle(Value::from_word(**word), roots),
@@ -3897,6 +4181,12 @@ struct Heap {
     /// Per class slot: property name of every absolute instance field, used to
     /// validate generic-instance contracts (`Holder<number>`).
     class_field_names: Vec<Vec<String>>,
+    /// Internal List of the 128 one-character ASCII Strings, rooted for the VM's
+    /// lifetime and never exposed itself. `string[i]` returns these shared
+    /// (immutable, content-compared) Strings instead of allocating, and native
+    /// traces load them with an ordinary List read indexed by the code point.
+    /// NULL until the VM finishes construction.
+    ascii_char_strings: Value,
     #[cfg(test)]
     allocations: Vec<Value>,
 }
@@ -3949,6 +4239,7 @@ impl Default for Heap {
             contract_class_ids: Vec::new(),
             class_implements: Vec::new(),
             class_field_names: Vec::new(),
+            ascii_char_strings: Value::NULL,
             #[cfg(test)]
             allocations: Vec::new(),
         }
@@ -4201,6 +4492,39 @@ impl Heap {
         Err(RuntimeError::new("value cannot be used as a map key"))
     }
 
+    /// Lookup-only twin of `map_key`: borrows a String key's bytes and cached
+    /// hash instead of cloning its `Arc`.
+    #[inline(always)]
+    fn map_key_ref(&self, value: Value) -> Result<MapKeyRef<'_>, RuntimeError> {
+        if value.is_null() { return Ok(MapKeyRef::Null); }
+        if let Some(value) = value.as_bool() { return Ok(MapKeyRef::Bool(value)); }
+        if let Some(number) = value.as_num() {
+            let bits = if number == 0.0 {
+                0.0f64.to_bits()
+            } else if number.is_nan() {
+                CANONICAL_NAN
+            } else {
+                number.to_bits()
+            };
+            return Ok(MapKeyRef::Num(bits));
+        }
+        if let Some(handle) = value.heap_handle() {
+            if let Some(HeapObject::String(string)) = self.get(value) {
+                return Ok(MapKeyRef::String { bytes: string.bytes.as_ref(), hash: string.hash });
+            }
+            return Ok(MapKeyRef::Object(handle));
+        }
+        Err(RuntimeError::new("value cannot be used as a map key"))
+    }
+
+    #[inline]
+    fn map_get_ref(&self, map_value: Value, key: MapKeyRef<'_>) -> Result<Value, RuntimeError> {
+        match self.get(map_value) {
+            Some(HeapObject::Map(map)) => Ok(map.get_ref(&self.map_shapes, key).unwrap_or(Value::NULL)),
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
     #[inline(always)]
     fn map_len(&self, map_value: Value) -> Option<usize> {
         match self.get(map_value) {
@@ -4249,8 +4573,8 @@ impl Heap {
 
         // `map` is already resolved above. Reuse it for dictionary lookup rather
         // than paying a second stable-handle table lookup for the same receiver.
-        let key = self.map_key(key_value)?;
-        Ok(map.get(&self.map_shapes, &key).unwrap_or(Value::NULL))
+        let key = self.map_key_ref(key_value)?;
+        Ok(map.get_ref(&self.map_shapes, key).unwrap_or(Value::NULL))
     }
 
     /// Property-name fast path used by quickened dynamic Map getters. The method
@@ -4283,14 +4607,8 @@ impl Heap {
             return Ok(Value::NULL);
         }
 
-        // Dictionary mode is deliberately the cold fallback. It needs an owned
-        // key because dictionary entries may outlive this lookup, while shaped
-        // object-like maps stay entirely allocation-free on the hot path.
-        let encoded = MapKey::String(MapStringKey {
-            bytes: Arc::from(key),
-            hash,
-        });
-        Ok(map.get(&self.map_shapes, &encoded).unwrap_or(Value::NULL))
+        // Dictionary mode probes with a borrowed key: no Arc allocation/copy.
+        Ok(map.get_ref(&self.map_shapes, MapKeyRef::String { bytes: key, hash }).unwrap_or(Value::NULL))
     }
 
     fn alloc_map_from_pairs<const N: usize>(
@@ -4484,6 +4802,50 @@ impl Heap {
             }
         }
         result
+    }
+
+    /// Conditional insertion preserves present nulls and the canonical Set
+    /// element. Contracts are checked only on the insertion path.
+    fn map_lookup_or_insert(
+        &mut self, receiver: Value, key_value: Value, mut value: Value,
+    ) -> Result<Value, RuntimeError> {
+        let map_value = match self.get(receiver) {
+            Some(HeapObject::Map(_)) => receiver,
+            Some(HeapObject::Set { map }) => { value = key_value; *map }
+            _ => return Err(RuntimeError::new("MapLookupOrInsert receiver is not a Map or Set")),
+        };
+        let key = self.map_key(key_value)?;
+        let contracted = self.has_contract(map_value);
+        let shaped = matches!(self.get(map_value),
+            Some(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Shaped { .. } })));
+        if contracted || shaped {
+            let Some(HeapObject::Map(map)) = self.get(map_value) else { unreachable!() };
+            if let Some(existing) = map.get(&self.map_shapes, &key) {
+                return Ok(existing);
+            }
+            if contracted { self.check_map_write(map_value, Some(&key), Some(value))?; }
+        }
+        self.remember_if_reference(map_value, key_value);
+        self.remember_if_reference(map_value, value);
+        let (result, inserted) = if self.concurrent_table(map_value).is_some() {
+            // Publish the graph before another worker can observe the entry.
+            self.mark_shared_deep(key_value);
+            self.mark_shared_deep(value);
+            self.concurrent_table(map_value).unwrap().concurrent_lookup_or_insert(key, value)
+        } else if shaped {
+            (value, self.map_set_encoded(map_value, key, value, None)?)
+        } else {
+            let Some(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(table) })) = self.get_mut(map_value)
+                else { unreachable!() };
+            table.lookup_or_insert(key, value)
+        };
+        if inserted {
+            if let Some(bytes) = self.map_external_bytes(map_value) {
+                self.set_external_bytes(map_value, bytes);
+            }
+            self.refresh_jit_view(map_value);
+        }
+        Ok(result)
     }
 
     /// Insert/update a map entry. The boolean reports a structural mutation
@@ -5034,6 +5396,15 @@ impl HostContext<'_> {
         }
     }
 
+    /// The shared one-character String for an ASCII byte (see
+    /// `Heap::ascii_char_strings`), if the VM has built the table.
+    pub fn ascii_char_string(&self, byte: u8) -> Option<Value> {
+        match self.heap.get(self.heap.ascii_char_strings) {
+            Some(HeapObject::List(chars)) => chars.get(byte as usize).copied(),
+            _ => None,
+        }
+    }
+
     pub fn allocate_string(&mut self, value: impl AsRef<str>) -> Value {
         self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(value.as_ref().as_bytes()))))
     }
@@ -5057,7 +5428,7 @@ impl HostContext<'_> {
     }
 
     pub fn allocate_set(&mut self) -> Value {
-        let map = self.heap.alloc(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Set(HashSet::default()))) }));
+        let map = self.heap.alloc(HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Dictionary(Box::new(MapDictionary::Set(IndexedTable::default()))) }));
         let map = self.root(map);
         self.heap.alloc(HeapObject::Set { map: map.value() })
     }
@@ -5303,8 +5674,8 @@ impl HostContext<'_> {
     }
 
     pub fn map_get(&self, value: Value, key: Value) -> Result<Value, RuntimeError> {
-        let key = self.map_key(key)?;
-        self.heap.map_get_encoded(value, &key)
+        let key = self.heap.map_key_ref(key)?;
+        self.heap.map_get_ref(value, key)
     }
 
     pub fn map_set(&mut self, value: Value, key: Value, item: Value) -> Result<Value, RuntimeError> {
@@ -5344,9 +5715,9 @@ impl HostContext<'_> {
     }
 
     pub fn map_contains_key(&self, value: Value, key: Value) -> Result<bool, RuntimeError> {
-        let key = self.map_key(key)?;
+        let key = self.heap.map_key_ref(key)?;
         match self.heap.get(value) {
-            Some(HeapObject::Map(map)) => Ok(map.get(&self.heap.map_shapes, &key).is_some()),
+            Some(HeapObject::Map(map)) => Ok(map.get_ref(&self.heap.map_shapes, key).is_some()),
             _ => Err(RuntimeError::new("receiver is not a Map")),
         }
     }
@@ -5548,6 +5919,13 @@ pub trait Host {
         _name: &str,
         _arity: u8,
     ) -> Option<crate::napalm_tracing_jit::TraceMapMethod> { None }
+    /// Opt in only for the stock String `[]` / `==` / `!=` implementations.
+    fn standard_string_method(
+        &self,
+        _primitive: PrimitiveId,
+        _name: &str,
+        _arity: u8,
+    ) -> Option<crate::napalm_tracing_jit::TraceStringMethod> { None }
     /// Opt in only for the stock bitwise Object ==/!= implementation.
     fn standard_identity_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
@@ -8033,6 +8411,17 @@ impl<'p> Interpreter<'p> {
             init_roots.push(value);
             strings.push(value);
         }
+        {
+            let mut chars = Vec::with_capacity(128);
+            for byte in 0u8..128 {
+                let value = heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(&[byte][..]))));
+                init_roots.push(value);
+                chars.push(value);
+            }
+            let table = heap.alloc(HeapObject::List(chars));
+            init_roots.push(table);
+            heap.ascii_char_strings = table;
+        }
 
         let mut builtin_values = Vec::with_capacity(BuiltinId::COUNT);
         for builtin in BuiltinId::ALL {
@@ -9155,6 +9544,10 @@ impl<'p> Interpreter<'p> {
             .get_unchecked(target as usize);
 
         self.set_pc(target);
+
+        // A fused heap operation may end in a backedge. Release its locks in
+        // shared dispatch before recording or running any subsequent opcode.
+        if self.shared_op_active { return; }
 
         // During recording/native runtime helpers the manager is temporarily
         // taken out of the Interpreter, which also prevents recursive tiering.
@@ -14993,8 +15386,7 @@ impl Interpreter<'_> {
     }
 
     fn proxy_trap(&self, handler: Value, name: &str) -> Result<Option<Value>, RuntimeError> {
-        let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(name.as_bytes())));
-        let value = self.heap.map_get_encoded(handler, &key)
+        let value = self.heap.map_get_ref(handler, MapKeyRef::name(name.as_bytes()))
             .map_err(|_| RuntimeError::new("Proxy handler must be an object/Map"))?;
         if value.is_null() {
             return Ok(None);
@@ -15292,12 +15684,12 @@ impl Interpreter<'_> {
                     Ok(parts) => parts,
                     Err(error) => { self.fail_at(op, error.message); return; }
                 };
-                let name = match self.proxy_property_name(method) {
-                    Ok(name) => name,
-                    Err(error) => { self.fail_at(op, error.message); return; }
+                let Some(signature) = self.program.metadata.methods.get(method.0 as usize) else {
+                    self.fail_at(op, "Proxy property method metadata is missing");
+                    return;
                 };
-                let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(name.as_bytes())));
-                let value = match self.heap.map_get_encoded(target, &key) {
+                let name = self.program.metadata.string(signature.name).unwrap_or("");
+                let value = match self.heap.map_get_ref(target, MapKeyRef::name(name.as_bytes())) {
                     Ok(value) => value,
                     Err(error) => { self.fail_at(op, error.message); return; }
                 };
@@ -15308,12 +15700,15 @@ impl Interpreter<'_> {
                 self.enter_bytecode_call(op, function, None, args, Some(value));
             }
             NativeBuiltin::MapPropertyGet(method) | NativeBuiltin::MapPropertySet(method) | NativeBuiltin::MapPropertyCall(method) => {
-                let signature = &self.program.metadata.methods[method.0 as usize];
-                let key = MapKey::String(MapStringKey::new(Arc::from(self.program.metadata.string(signature.name).unwrap_or("").as_bytes())));
+                let program = self.program;
+                let signature = &program.metadata.methods[method.0 as usize];
+                let name = program.metadata.string(signature.name).unwrap_or("").as_bytes();
                 let map = Value::from_word(receiver);
                 let result = if matches!(native, NativeBuiltin::MapPropertySet(_)) {
                     let item = arg(0);
                     self.heap.remember_if_reference(map, item);
+                    // Only writes need an owned key; reads/calls probe borrowed.
+                    let key = MapKey::String(MapStringKey::new(Arc::from(name)));
                     self.heap.map_set_encoded(map, key, item, None).map(|structural| {
                         if structural {
                             if let Some(bytes) = self.heap.map_external_bytes(map) {
@@ -15323,7 +15718,7 @@ impl Interpreter<'_> {
                         }
                         item
                     })
-                } else { self.heap.map_get_encoded(map, &key) };
+                } else { self.heap.map_get_ref(map, MapKeyRef::name(name)) };
                 match result {
                     Ok(value) if matches!(native, NativeBuiltin::MapPropertyCall(_)) => {
                         let function = match self.heap.get(value) {
@@ -17295,7 +17690,7 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_define_class_specialized, // DefineClassWithImplements
     h_define_class_specialized, // DefineDerivedClassWithImplements
     h_implement_structural_contract, // ImplementInterfaceOrType
-    h_map_lookup_or_insert_pending, // MapLookupOrInsert
+    h_map_lookup_or_insert, // MapLookupOrInsert
     h_define_typed_array, // DefineArrayWithGenerics
     h_new_class_instance, // NewClassInstance
     h_new_interface_or_type_object, // NewInterfaceOrTypeObject
@@ -17500,7 +17895,9 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     let index = vm.hot_pc as usize;
 
     let threshold = vm.jit_entry_threshold;
-    if threshold == 0 || vm.jit.is_none() {
+    if threshold == 0 || vm.jit.is_none() || vm.shared_op_active {
+        // Shared dispatch already locked this opcode. Execute only its baseline
+        // handler; a trace could advance to unrelated operations under those locks.
         // The tracing manager is temporarily removed from Interpreter while a
         // recording/native entry owns &mut TracingJit. Recursive bytecode calls
         // may legitimately reach another entry hook during that window. Execute
@@ -17611,6 +18008,10 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
                 let function = vm.current_function_index();
                 vm.prepared.functions[function].install_entry_hook(next);
             }
+            // The outer dispatch locked only the entry opcode's operands.
+            // A trace/recording can stop at a different shared operation: let
+            // the shared quantum acquire that operation's locks before it runs.
+            if vm.heap.shared_mode { return; }
         }
     }
 
@@ -19108,6 +19509,21 @@ unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
         Err(error)=>vm.fail_at(op,error.message),
     }
 }
+/// Shared by baseline dispatch and both native runtime-call ABIs. Read the
+/// fourth operand after the safepoint, including when A aliases that register.
+unsafe fn h_map_lookup_or_insert(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = unsafe { &*ptr };
+    vm.mark_gc_point(op);
+    vm.maybe_collect();
+    let receiver = Value::from_word(unsafe { vm.reg(op.b) });
+    let key = Value::from_word(unsafe { vm.reg(op.c) });
+    let value = Value::from_word(unsafe { vm.reg(op.x as u8) });
+    match vm.heap.map_lookup_or_insert(receiver, key, value) {
+        Ok(value) => unsafe { vm.set_reg(op.a, value.word()); vm.advance(op); },
+        Err(error) => vm.fail_at(op, error.message),
+    }
+}
+
 unsafe fn h_load_property(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let op = unsafe { &*ptr };
     let map = Value::from_word(unsafe { vm.reg(op.b) });
@@ -19655,7 +20071,10 @@ impl TraceRuntime for Interpreter<'_> {
     ) -> Option<VmBindingDescriptor> {
         match kind {
             VmBindingKind::StableTagged => {
-                // StableTagged is currently emitted only for program String
+                if raw == self.heap.ascii_char_strings.word().0 && !self.heap.ascii_char_strings.is_null() {
+                    return Some(VmBindingDescriptor::AsciiCharTable);
+                }
+                // Otherwise StableTagged is emitted only for program String
                 // constants. Resolve by rooted value rather than by string bytes so
                 // duplicate source strings remain harmless and allocation-free.
                 let id = self
@@ -19750,6 +20169,9 @@ impl TraceRuntime for Interpreter<'_> {
             VmBindingDescriptor::ProfileCounters => Some(0),
             VmBindingDescriptor::ProgramString(id) => {
                 self.strings.get(id.0 as usize).map(|value| value.word().0)
+            }
+            VmBindingDescriptor::AsciiCharTable => {
+                (!self.heap.ascii_char_strings.is_null()).then(|| self.heap.ascii_char_strings.word().0)
             }
             VmBindingDescriptor::ModuleVariable { module, slot } => {
                 let module_slot = *self.prepared.module_by_id.get(module)? as usize;
@@ -19911,6 +20333,32 @@ impl TraceRuntime for Interpreter<'_> {
         let signature = self.program.metadata.method(cache.method)?;
         let name = self.program.metadata.string(signature.name).unwrap_or("");
         self.host.standard_list_method(primitive, name, signature.arity)
+    }
+
+    fn trace_standard_string_method(
+        &self,
+        function: FuncId,
+        cache: u32,
+    ) -> Option<crate::napalm_tracing_jit::TraceStringMethod> {
+        let function = self.program.function(function)?;
+        let cache = function.chunk.inline_caches.get(cache as usize)?;
+        if cache.home_class.is_some() {
+            return None;
+        }
+        let Some(CallTarget::Primitive(primitive)) =
+            self.builtin_methods[BuiltinClass::String as usize][cache.method.0 as usize]
+        else {
+            return None;
+        };
+        let signature = self.program.metadata.method(cache.method)?;
+        let name = self.program.metadata.string(signature.name).unwrap_or("");
+        self.host.standard_string_method(primitive, name, signature.arity)
+    }
+
+    fn trace_ascii_char_table(&self) -> Option<RegisterWord> {
+        let table = self.heap.ascii_char_strings;
+        matches!(self.heap.get(table), Some(HeapObject::List(chars)) if chars.len() == 128)
+            .then(|| table.word())
     }
 
     fn trace_standard_map_method(
@@ -20139,6 +20587,10 @@ impl TraceRuntime for Interpreter<'_> {
         Some((CLASS_KIND_STATIC | target as u64, accepted, known))
     }
 
+    fn trace_current_op_touches_shared(&self) -> bool {
+        self.heap.shared_mode && unsafe { self.current_op_touches_shared() }
+    }
+
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, RuntimeError> {
         let frame = self.current_frame();
         let banks = self.current_banks();
@@ -20176,6 +20628,7 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_execute_unfused_step(&mut self) -> Result<TraceStep, RuntimeError> {
+        if let Some(step) = self.defer_shared_trace_step() { return Ok(step); }
         let before = self.trace_current_location();
         let fiber = self.current_fiber;
         let depth = self.fiber(fiber).frames.len();
@@ -20232,6 +20685,7 @@ impl TraceRuntime for Interpreter<'_> {
 
 
     fn trace_execute_call_to_return(&mut self) -> Result<TraceStep, RuntimeError> {
+        if let Some(step) = self.defer_shared_trace_step() { return Ok(step); }
         let before = self.trace_current_location();
         if self.hot_frame.is_null() {
             return Err(RuntimeError::new("trace call boundary has no active frame"));
@@ -20300,6 +20754,7 @@ impl TraceRuntime for Interpreter<'_> {
             && self.current_fiber == caller_fiber
             && self.fiber(caller_fiber).frames.len() > caller_depth
         {
+            if self.defer_shared_trace_step().is_some() { break; }
             if self.hot_frame.is_null() {
                 break;
             }
@@ -20427,15 +20882,15 @@ impl TraceRuntime for Interpreter<'_> {
             return None;
         }
         let signature = self.program.metadata.method(descriptor.method)?;
-        if signature.kind != crate::napalm_ir::MethodKind::Getter || signature.arity != 0 {
-            return None;
-        }
+        let expected = match (signature.kind, signature.arity) {
+            (crate::napalm_ir::MethodKind::Getter, 0) => NativeBuiltin::MapPropertyGet(descriptor.method),
+            (crate::napalm_ir::MethodKind::Setter, 1) => NativeBuiltin::MapPropertySet(descriptor.method),
+            _ => return None,
+        };
 
         let map_value = Value::from_word(map);
         let class = self.heap.receiver_class(map_value)?;
-        if self.lookup_method(class, descriptor.method, None)
-            != Some(CallTarget::NativeBuiltin(NativeBuiltin::MapPropertyGet(descriptor.method)))
-        {
+        if self.lookup_method(class, descriptor.method, None) != Some(CallTarget::NativeBuiltin(expected)) {
             return None;
         }
         let map = match self.heap.get(map_value)? {
@@ -25600,9 +26055,4 @@ let result = 1;
         assert_eq!(source_result(&optimized_vm), 99.0);
     }
 
-}
-
-// Deliberately reserved for the future interpreter/JIT implementation.
-unsafe fn h_map_lookup_or_insert_pending(vm: &mut Interpreter, ptr: *const PreparedOp) {
-    vm.fail_at(&*ptr, "MapLookupOrInsert execution is not implemented yet");
 }

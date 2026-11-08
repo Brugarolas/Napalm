@@ -141,6 +141,193 @@ fn napalm_collections_concurrent_api_and_generics() {
 }
 
 #[test]
+fn napalm_collections_lookup_or_insert_preserves_existing_values() {
+    for constructor in ["Map", "ConcurrentMap"] {
+        run_napalm(&format!(r#"
+            const map = new {constructor}();
+            const first = map.set_if_not_exists('answer', 42);
+            const again = map.set_if_not_exists('answer', 99);
+            map.set_if_not_exists('null', null);
+            const presentNull = map.set_if_not_exists('null', 7);
+            const object = {{value: 5}};
+            const same = map.set_if_not_exists(object, object) == object;
+            const retained = map.set_if_not_exists(object, {{value: 9}}) == object;
+            map.set_if_not_exists(Num.nan, 11);
+            map.set_if_not_exists(-0, 12);
+            System.gc();
+            const result = [first, again, presentNull, same, retained,
+                map.set_if_not_exists(Num.nan, 20), map.set_if_not_exists(0, 30), map.size];
+        "#), "[42, 42, null, true, true, 11, 12, 5]");
+    }
+    for constructor in ["Set", "ConcurrentSet"] {
+        run_napalm(&format!(r#"
+            const set = new {constructor}();
+            const object = {{value: 3}};
+            const first = set.set_if_not_exists(object) == object;
+            const again = set.set_if_not_exists(object) == object;
+            set.set_if_not_exists(null);
+            const presentNull = set.set_if_not_exists(null);
+            set.set_if_not_exists(Num.nan);
+            set.set_if_not_exists(Num.nan);
+            System.gc();
+            const result = [first, again, presentNull, set.has(object), set.size];
+        "#), "[true, true, null, true, 3]");
+    }
+    // Object literals exercise shaped storage and its ordered dictionary fallback.
+    run_napalm(r#"
+        const map: any = {a: null};
+        const old = map.set_if_not_exists('a', 9);
+        for (let i = 0; i < 8; i++) map.set_if_not_exists('k' + i, i);
+        const result = [old, map.set_if_not_exists('k7', 99), map.k7];
+    "#, "[null, 7, 7]");
+}
+
+#[test]
+fn napalm_collections_lookup_or_insert_contracts() {
+    for constructor in ["Map", "ConcurrentMap"] {
+        run_napalm(&format!(r#"
+            const map = new {constructor}<string, number>();
+            const alias: any = map;
+            alias.set_if_not_exists('key', 42);
+            const result = alias.set_if_not_exists('key', false);
+        "#), "42");
+        interface_error(&format!(
+            "const map = new {constructor}<string, number>(); const alias: any = map; alias.set_if_not_exists('bad', false);"
+        ), false);
+        interface_error(&format!(
+            "const map = new {constructor}<string, number>(); const alias: any = map; alias.set_if_not_exists(1, 2);"
+        ), false);
+    }
+    for constructor in ["Set", "ConcurrentSet"] {
+        interface_error(&format!(
+            "const set = new {constructor}<number>(); const alias: any = set; alias.set_if_not_exists('bad');"
+        ), false);
+    }
+    interface_error(r#"
+        interface Item { value: number; }
+        const map = new Map<string, Item>();
+        const item: any = {value: 1};
+        map.set_if_not_exists('item', item);
+        item.value = false;
+    "#, false);
+    interface_error(r#"
+        function run() {
+            const map = new Map<number, number>();
+            for (let i = 0; i < 100; i++) {
+                const value: any = i < 99 ? i : false;
+                map.set_if_not_exists(i, value);
+            }
+        }
+        run();
+    "#, true);
+}
+
+#[test]
+fn napalm_collections_lookup_or_insert_references_survive_gc() {
+    run_napalm_checked(r#"
+        function run() {
+            const map = new Map();
+            const set = new Set();
+            let sum = 0;
+            for (let i = 0; i < 512; i++) {
+                const chosen = map.set_if_not_exists(i % 32, {value: i, items: [i]});
+                set.set_if_not_exists(chosen);
+                if (i % 64 == 0) System.gc();
+                sum += chosen.value + chosen.items[0];
+            }
+            System.gc();
+            return [sum, map.size, set.size, map.get(31).items[0]];
+        }
+        const result = run();
+    "#, "[15872, 32, 32, 31]", true);
+}
+
+#[test]
+fn napalm_collections_lookup_or_insert_is_atomic_across_workers() {
+    run_napalm(r#"
+        const shared map = new Map();
+        const shared set = new Set();
+        concurrent function fill(id) {
+            let errors = 0;
+            for (let key = 0; key < 64; key++) {
+                const candidate = {id: id, log: []};
+                const winner = map.set_if_not_exists(key, candidate);
+                if (winner != map.get(key)) errors++;
+                winner.log.push(id);
+                if (set.set_if_not_exists(key) != key) errors++;
+            }
+            return errors;
+        }
+        const pending = [];
+        for (let id = 0; id < 16; id++) pending.push(launch fill(id));
+        let errors = 0;
+        for (const task of pending) errors += await task;
+        System.gc();
+        let entries = 0;
+        for (let key = 0; key < 64; key++) entries += map.get(key).log.length;
+        const result = [errors, map.size, set.size, entries];
+    "#, "[0, 64, 64, 1024]");
+}
+
+#[test]
+fn napalm_collections_lookup_or_insert_in_native_tiers() {
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        function run() {
+            const map = new Map<number, number>();
+            const set = new Set<number>();
+            let sum = 0;
+            for (let i = 0; i < 4096; i++) {
+                sum += map.set_if_not_exists(i % 32, i) + set.set_if_not_exists(i % 32);
+            }
+            return sum + map.size + set.size;
+        }
+        const result = run();
+    "#);
+    for native in [false, true] {
+        for llvm in [false, true] {
+            if llvm && (!native || !cfg!(feature = "llvm-jit")) { continue; }
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                llvm_hot_threshold: if llvm { 1 } else { 0 },
+                llvm_background_compile: false,
+                native_loop_iteration_budget: 31,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 127040.0, "native={native}, llvm={llvm}");
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.native_iterations > 3000, "{stats:?}");
+                if llvm { assert!(stats.llvm_traces_installed > 0, "{stats:?}"); }
+            }
+        }
+    }
+
+    let (program, entry, manifest) = compile_typescript_module(r#"
+        function lookup(map: Map<number, number>, key: number, value: number) {
+            return map.set_if_not_exists(key, value);
+        }
+        const map = new Map<number, number>();
+        let sum = 0;
+        for (let i = 0; i < 4096; i++) sum += lookup(map, i % 32, i);
+        const result = sum + map.size;
+    "#);
+    let mut vm = source_vm(&program, &manifest);
+    vm.set_jit_options(Some(TracingJitOptions {
+        hot_entry_threshold: 2,
+        hot_loop_threshold: u32::MAX,
+        llvm_hot_threshold: 0,
+        ..Default::default()
+    }));
+    vm.run_module(entry).unwrap();
+    assert_eq!(source_result(&vm), 63520.0);
+    let stats = vm.whole_function_jit_stats().unwrap();
+    assert!(stats.native_entries > 100, "{stats:?}");
+}
+
+#[test]
 fn napalm_collections_shared_globals_and_local_captures() {
     run_napalm(r#"
         const shared m = new ConcurrentMap<number, number>();
@@ -270,6 +457,114 @@ fn napalm_collections_specialized_field_stores_publish_shared_values() {
         assert!(vm.heap.is_shared(last_source_variable(&vm)),
             "{opcode:?} must publish values stored into an already shared object");
     }
+}
+
+#[test]
+fn shared_trace_recording_and_steps_defer_before_mutation() {
+    let mut asm = Assembler::new();
+    asm.emit_ab(Opcode::ListAppend, 0, 1);
+    asm.emit_a(Opcode::Return, 0);
+    let mut chunk = asm.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    references.set_general(Reg(1), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::RuntimeMutation, references,
+    });
+    let program = simple_program(chunk, 2);
+    let mut vm = Interpreter::new(&program).unwrap();
+    vm.set_jit_options(Some(TracingJitOptions { hot_entry_threshold: 1, ..Default::default() }));
+    let _roots = vm.gc_root_registration();
+    vm.run_state = RunState::Running;
+    vm.push_frame_direct(0, &[], None, None).unwrap();
+    let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(list);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(list);
+    unsafe { vm.set_reg(0, list.word()); vm.set_reg(1, Value::TRUE.word()); }
+    let location = vm.trace_current_location();
+
+    let mut jit = vm.jit.take().unwrap();
+    jit.preheat_entry(location);
+    jit.on_entry(&mut vm).unwrap();
+    vm.jit = Some(jit);
+    assert_eq!(vm.trace_current_location(), location);
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values.is_empty()));
+
+    // Inlined/call recording also uses individual unfused steps. It must yield
+    // without advancing the PC, so dispatch can acquire the operation's lock.
+    let step = vm.trace_execute_unfused_step().unwrap();
+    assert!(!step.running);
+    assert_eq!(step.after, location);
+    assert!(matches!(vm.run_state, RunState::Reschedule));
+}
+
+#[test]
+fn shared_whole_function_helper_parks_until_the_lock_is_released() {
+    use crate::napalm_bytecode::{IncomingSource, ParameterBinding, ArgReg};
+    // Hand-built calls keep this test independent of HIR inlining/DCE.
+    let mut caller = Assembler::new();
+    caller.emit_call_direct(Reg(0), crate::napalm_ir::CallConv::Napalm, &[Reg(0)], FuncId(1)).unwrap();
+    caller.emit_a(Opcode::Return, 0);
+    let mut chunk = caller.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::Call, references: references.clone(),
+    });
+    let mut program = simple_program(chunk, 2);
+    program.functions[0].kind = FunctionKind::Closure;
+    program.functions[0].arity = 1;
+    program.functions[0].frame.parameters.push(ParameterBinding {
+        source: IncomingSource::Argument(ArgReg(0)), destination: Reg(0), kind: RegisterKind::Value,
+    });
+    let mut body = Assembler::new();
+    body.emit_a(Opcode::LoadTrue, 1);
+    body.emit_ab(Opcode::ListAppend, 0, 1);
+    body.emit_a(Opcode::Return, 0);
+    let mut callee = program.functions[0].clone();
+    callee.id = FuncId(1);
+    callee.chunk = body.finish().unwrap();
+    callee.chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(1), kind: SafepointKind::RuntimeMutation, references,
+    });
+    program.push_function(callee).unwrap();
+    program.rebuild_indexes().unwrap();
+    let mut vm = Interpreter::new(&program).unwrap();
+    let _roots = vm.gc_root_registration();
+    vm.set_jit_options(Some(TracingJitOptions {
+        hot_entry_threshold: 2, hot_loop_threshold: u32::MAX, ..Default::default()
+    }));
+    let local = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(local);
+    for _ in 0..128 { vm.run_function(FuncId(0), &[local]).unwrap(); }
+    assert!(vm.whole_function_jit_stats().unwrap().native_entries > 0);
+    let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(list);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(list);
+    vm.is_concurrent_worker = true;
+    let handle = list.heap_handle().unwrap();
+    assert!(vm_mutex::VmAdaptativeMutex::try_lock(&vm.heap.handle_table.entry(handle).sync));
+
+    let native_entries = vm.whole_function_jit_stats().unwrap().native_entries;
+    let result = vm.run_function(FuncId(0), &[list]).unwrap();
+    assert!(vm.whole_function_jit_stats().unwrap().native_entries > native_entries);
+    assert!(matches!(result, ExecutionResult::Suspended(_)));
+    assert_eq!(vm.blocked_on_shared_lock(), Some(handle));
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values.is_empty()));
+
+    let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notification = woke.clone();
+    assert!(vm.park_blocked_task(Box::new(move || {
+        notification.store(true, Ordering::Release);
+    })).is_ok());
+    vm_mutex::VmAdaptativeMutex::unlock(handle, &vm.heap.handle_table.entry(handle).sync);
+    assert!(woke.load(Ordering::Acquire));
+    assert!(matches!(vm.resume_blocked_task().unwrap(), ExecutionResult::Returned(_)));
+    assert!(matches!(vm.heap.get(list), Some(HeapObject::List(values)) if values == &[Value::TRUE]));
+    assert!(vm.held_locks.is_empty());
+    assert!(!vm.shared_op_active);
 }
 
 #[test]

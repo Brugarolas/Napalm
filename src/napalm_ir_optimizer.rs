@@ -1046,7 +1046,7 @@ impl<'f> InstFactory<'f> {
         self.function.nodes.push(Node {
             id,
             kind,
-            results: results.to_vec(),
+            results: SmallVec::from_slice(&results),
             effect_in: None,
             effect_out,
             source,

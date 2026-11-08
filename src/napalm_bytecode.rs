@@ -34,6 +34,31 @@
 #![allow(dead_code)]
 
 use crate::napalm_collections::{HashMap, HashSet};
+
+/// Dense set of instruction-boundary PCs (`0..=code.len()`) for verifier checks.
+/// The verifier runs on every compilation; a bitmap avoids hashing every PC.
+struct PcSet(Vec<bool>);
+
+impl PcSet {
+    #[inline]
+    fn with_len(code_len: usize) -> Self {
+        Self(vec![false; code_len + 1])
+    }
+
+    #[inline]
+    fn insert(&mut self, pc: BytecodePc) {
+        let index = pc.0 as usize;
+        if index >= self.0.len() {
+            self.0.resize(index + 1, false);
+        }
+        self.0[index] = true;
+    }
+
+    #[inline]
+    fn contains(&self, pc: &BytecodePc) -> bool {
+        self.0.get(pc.0 as usize).copied().unwrap_or(false)
+    }
+}
 use std::fmt;
 
 use crate::napalm_ir::{
@@ -1092,8 +1117,8 @@ define_opcodes! {
     DefineClassWithImplements = 139,
     DefineDerivedClassWithImplements = 140,
     ImplementInterfaceOrType = 141,
-    // A=result, B=Map/Set, C=key; x0=value GPR. Runtime implementation pending
-    // (lands with the master merge); never emitted by the compiler yet.
+    // A=result, B=Map/Set, C=key; x0=value GPR. Returns the existing value,
+    // or atomically inserts and returns the default. Sets use C as the value.
     MapLookupOrInsert = 142,
     DefineArrayWithGenerics = 143,
     NewClassInstance = 144,
@@ -1236,7 +1261,6 @@ impl Opcode {
                 | NewClassInstance | NewInterfaceOrTypeObject | NewObjectShape | NewObjectEmpty
                 | NewObjectWithProperties | SetFieldShape
                 | InvokeMethodDirect
-                | MapLookupOrInsert
         )
     }
 }
@@ -3163,9 +3187,9 @@ impl BytecodeVerifier {
             }
         }
 
-        let mut boundaries_by_function: HashMap<FuncId, HashSet<BytecodePc>> = HashMap::default();
+        let mut boundaries_by_function: HashMap<FuncId, PcSet> = HashMap::default();
         for function in &program.functions {
-            let mut boundaries = HashSet::default();
+            let mut boundaries = PcSet::with_len(function.chunk.code.len());
             boundaries.insert(BytecodePc(function.chunk.code.len() as u32));
             for decoded in Decoder::new(&function.chunk.code) {
                 let decoded = decoded.map_err(|error| VerificationError {
@@ -3467,7 +3491,7 @@ impl BytecodeVerifier {
 
         let chunk = &function.chunk;
         let mut instructions = Vec::new();
-        let mut boundaries = HashSet::default();
+        let mut boundaries = PcSet::with_len(chunk.code.len());
         boundaries.insert(BytecodePc(chunk.code.len() as u32));
 
         for decoded in Decoder::new(&chunk.code) {
@@ -3569,7 +3593,7 @@ impl BytecodeVerifier {
 
     fn verify_side_tables(
         function: &BytecodeFunction,
-        boundaries: &HashSet<BytecodePc>,
+        boundaries: &PcSet,
     ) -> Result<(), VerificationError> {
         let chunk = &function.chunk;
         let mut last_safepoint = None;
@@ -3781,7 +3805,7 @@ impl BytecodeVerifier {
     fn verify_instruction(
         function: &BytecodeFunction,
         inst: DecodedInstruction<'_>,
-        boundaries: &HashSet<BytecodePc>,
+        boundaries: &PcSet,
     ) -> Result<(), VerificationError> {
         use Opcode::*;
         let chunk = &function.chunk;

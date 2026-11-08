@@ -11,9 +11,10 @@
 //! Specialized super-instructions are selected by the bytecode compiler
 //! (`CompileOptions::emit_specialized_bytecode`), not by this pass pipeline.
 
-use std::collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet};
 use std::fmt;
 use smallbox::{SmallBox, smallbox, space::S1};
+use smallvec::SmallVec;
 
 use crate::napalm_bytecode::{
     BytecodePc, BytecodeProgram, BytecodeVerifier, Decoder, Opcode, Word,
@@ -165,11 +166,45 @@ fn nop(code: &mut [Word], pc: usize) {
     code[pc] = Word::abc(Opcode::Nop, 0, 0, 0);
 }
 
+/// Resume PCs that inlined deopt frames (owned by *other* functions) target in
+/// each function. Computed once per pass: rescanning every function's deopts
+/// for each function made entry discovery O(functions²) per pass. Non-compacting
+/// passes preserve instruction boundaries, so the index stays valid while a pass
+/// edits code.
+type InlinedResumes = HashMap<FuncId, SmallVec<[usize; 4]>>;
+
+fn inlined_resumes(program: &BytecodeProgram) -> InlinedResumes {
+    let mut result = InlinedResumes::default();
+    for f in &program.functions {
+        for d in &f.chunk.deopts {
+            for frame in &d.inlined_frames {
+                result.entry(frame.function).or_default().push(frame.resume_pc.word_index());
+            }
+        }
+    }
+    result
+}
+
+/// Dense set of instruction-boundary PCs (`0..=code.len()`).
+struct Boundaries(Vec<bool>);
+
+impl Boundaries {
+    #[inline]
+    fn insert(&mut self, pc: usize) {
+        if pc >= self.0.len() { self.0.resize(pc + 1, false); }
+        self.0[pc] = true;
+    }
+
+    #[inline]
+    fn contains(&self, pc: &usize) -> bool { self.0.get(*pc).copied().unwrap_or(false) }
+}
+
 /// Mark every possible non-fallthrough entry. A local rewrite must not rely on
 /// the preceding instruction if the current PC can be entered directly.
-fn entries(program: &BytecodeProgram, function_index: usize) -> Result<HashSet<usize>, OptimizationError> {
+fn entries(program: &BytecodeProgram, function_index: usize, inlined: &InlinedResumes) -> Result<Boundaries, OptimizationError> {
     let chunk = &program.functions[function_index].chunk;
-    let mut result = HashSet::from([0usize]);
+    let mut result = Boundaries(vec![false; chunk.code.len() + 1]);
+    result.insert(0);
     for i in decode(&chunk.code, "CFG entry discovery")? {
         if matches!(i.op, Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue) {
             let delta = chunk.code[i.pc + 1].0 as i32 as i64;
@@ -191,13 +226,8 @@ fn entries(program: &BytecodeProgram, function_index: usize) -> Result<HashSet<u
     }
     for e in &chunk.resume_points { result.insert(e.pc.word_index()); }
     for d in &chunk.deopts { result.insert(d.resume_pc.word_index()); }
-    let id = program.functions[function_index].id;
-    for f in &program.functions {
-        for d in &f.chunk.deopts {
-            for frame in &d.inlined_frames {
-                if frame.function == id { result.insert(frame.resume_pc.word_index()); }
-            }
-        }
+    if let Some(pcs) = inlined.get(&program.functions[function_index].id) {
+        for &pc in pcs { result.insert(pc); }
     }
     Ok(result)
 }
@@ -279,8 +309,9 @@ pub struct RemoveOverwrittenLoads;
 impl BytecodeOptimization for RemoveOverwrittenLoads {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed = false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries = entries(program, fi)?;
+            let boundaries = entries(program, fi, &inlined)?;
             let insts = decode(&program.functions[fi].chunk.code, self.name())?;
             let mut edits = Vec::new();
             for pair in insts.windows(2) {
@@ -309,11 +340,12 @@ pub struct CollapseDoubleSwaps;
 impl BytecodeOptimization for CollapseDoubleSwaps {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed=false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries=entries(program,fi)?;
+            let boundaries=entries(program, fi, &inlined)?;
             let insts=decode(&program.functions[fi].chunk.code,self.name())?;
             let mut edits=Vec::new();
-            let mut used=HashSet::new();
+            let mut used=HashSet::default();
             for pair in insts.windows(2) {
                 let (a,b)=(pair[0],pair[1]);
                 if a.op!=Opcode::Swap || b.op!=Opcode::Swap
@@ -335,8 +367,9 @@ pub struct CollapseDuplicateMoves;
 impl BytecodeOptimization for CollapseDuplicateMoves {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed=false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries=entries(program,fi)?;
+            let boundaries=entries(program, fi, &inlined)?;
             let insts=decode(&program.functions[fi].chunk.code,self.name())?;
             let removals=insts.windows(2).filter_map(|pair| {
                 let (a,b)=(pair[0],pair[1]);
@@ -386,8 +419,9 @@ pub struct PropagateAdjacentCopies;
 impl BytecodeOptimization for PropagateAdjacentCopies {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed = false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries = entries(program, fi)?;
+            let boundaries = entries(program, fi, &inlined)?;
             let insts = decode(&program.functions[fi].chunk.code, self.name())?;
             let mut edits = Vec::new();
             for pair in insts.windows(2) {
@@ -413,8 +447,9 @@ pub struct FoldIntegerIdentities;
 impl BytecodeOptimization for FoldIntegerIdentities {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed = false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries = entries(program, fi)?;
+            let boundaries = entries(program, fi, &inlined)?;
             let insts = decode(&program.functions[fi].chunk.code, self.name())?;
             let mut edits = Vec::new();
             for pair in insts.windows(2) {
@@ -503,8 +538,9 @@ pub struct FoldAdjacentConstants;
 impl BytecodeOptimization for FoldAdjacentConstants {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed = false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries = entries(program, fi)?;
+            let boundaries = entries(program, fi, &inlined)?;
             let code = &program.functions[fi].chunk.code;
             let insts = decode(code, self.name())?;
             let mut edits = Vec::new();
@@ -591,8 +627,9 @@ pub struct FoldRepeatedGuards;
 impl BytecodeOptimization for FoldRepeatedGuards {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed=false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries=entries(program,fi)?;
+            let boundaries=entries(program, fi, &inlined)?;
             let chunk=&program.functions[fi].chunk;
             let insts=decode(&chunk.code,self.name())?;
             let mut removals=Vec::new();
@@ -620,8 +657,9 @@ pub struct FoldLiteralBranches;
 impl BytecodeOptimization for FoldLiteralBranches {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed = false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries = entries(program, fi)?;
+            let boundaries = entries(program, fi, &inlined)?;
             let chunk = &program.functions[fi].chunk;
             let insts = decode(&chunk.code, self.name())?;
             let mut edits = Vec::new();
@@ -655,16 +693,19 @@ impl BytecodeOptimization for ThreadUnconditionalJumps {
         let mut changed=false;
         for f in &mut program.functions {
             let insts=decode(&f.chunk.code,self.name())?;
-            let by_pc=insts.iter().map(|i|(i.pc,*i)).collect::<HashMap<_,_>>();
+            // `insts` is sorted by PC: binary-search it instead of building a
+            // per-function HashMap; jump chains are short, so `visited` is too.
             let len=f.chunk.code.len() as i64;
             let mut edits=Vec::new();
             for i in &insts {
                 if !matches!(i.op,Opcode::Jump|Opcode::JumpIfFalse|Opcode::JumpIfTrue) {continue;}
                 let old_delta=f.chunk.code[i.pc+1].0 as i32 as i64;
                 let mut target=i.pc as i64+i.len as i64+old_delta;
-                let mut visited=HashSet::new();
-                while target>=0 && target<len && visited.insert(target) {
-                    let Some(next)=by_pc.get(&(target as usize)) else {break;};
+                let mut visited=SmallVec::<[i64; 4]>::new();
+                while target>=0 && target<len && !visited.contains(&target) {
+                    visited.push(target);
+                    let Ok(found)=insts.binary_search_by_key(&(target as usize),|i|i.pc) else {break;};
+                    let next=&insts[found];
                     if next.op!=Opcode::Jump {break;}
                     target=next.pc as i64+next.len as i64+f.chunk.code[next.pc+1].0 as i32 as i64;
                 }
@@ -691,8 +732,9 @@ pub struct InvertBranchOverJump;
 impl BytecodeOptimization for InvertBranchOverJump {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed=false;
+        let inlined = inlined_resumes(program);
         for fi in 0..program.functions.len() {
-            let boundaries=entries(program,fi)?;
+            let boundaries=entries(program, fi, &inlined)?;
             let chunk=&program.functions[fi].chunk;
             let insts=decode(&chunk.code,self.name())?;
             let mut edits=Vec::new();
@@ -741,13 +783,16 @@ impl BytecodeOptimization for RemoveFallthroughJumps {
 
 #[derive(Clone, Debug)]
 struct Relocation {
-    old_to_new: HashMap<usize, usize>,
+    /// Dense old-PC -> new-PC table; `NOT_A_BOUNDARY` marks interior words.
+    old_to_new: Vec<u32>,
 }
+
+const NOT_A_BOUNDARY: u32 = u32::MAX;
 
 impl Relocation {
     fn map(&self, pc: BytecodePc) -> Result<BytecodePc, OptimizationError> {
-        self.old_to_new.get(&pc.word_index()).copied()
-            .and_then(|new| u32::try_from(new).ok()).map(BytecodePc)
+        self.old_to_new.get(pc.word_index()).copied()
+            .filter(|&new| new != NOT_A_BOUNDARY).map(BytecodePc)
             .ok_or_else(||error("CompactBytecode",format!("PC {} is not an instruction boundary",pc.0)))
     }
 }
@@ -756,16 +801,16 @@ pub struct CompactBytecode;
 impl BytecodeOptimization for CompactBytecode {
     fn optimize(&mut self, program: &mut BytecodeProgram) -> Result<bool, OptimizationError> {
         let mut changed=false;
-        let mut relocations=HashMap::<FuncId,Relocation>::new();
+        let mut relocations=HashMap::<FuncId,Relocation>::default();
         for f in &mut program.functions {
             let old_code=&f.chunk.code;
             let insts=decode(old_code,self.name())?;
-            let mut mapping=HashMap::<usize,usize>::new();
+            let mut mapping=vec![NOT_A_BOUNDARY; old_code.len()+1];
             let mut new_code=Vec::with_capacity(old_code.len());
             // Store old instruction start and new start for later branch patching.
             let mut branches=Vec::new();
             for i in &insts {
-                mapping.insert(i.pc,new_code.len());
+                mapping[i.pc]=new_code.len() as u32;
                 if i.op==Opcode::Nop {continue;}
                 if matches!(i.op,Opcode::Jump|Opcode::JumpIfTrue|Opcode::JumpIfFalse) {
                     let target=(i.pc+i.len) as i64+old_code[i.pc+1].0 as i32 as i64;
@@ -773,12 +818,12 @@ impl BytecodeOptimization for CompactBytecode {
                 }
                 new_code.extend_from_slice(&old_code[i.pc..i.pc+i.len]);
             }
-            mapping.insert(old_code.len(),new_code.len());
+            mapping[old_code.len()]=new_code.len() as u32;
             for (new_pc,target) in branches {
                 let Ok(old_target)=usize::try_from(target) else {
                     return Err(error(self.name(),"negative branch target"));
                 };
-                let Some(&new_target)=mapping.get(&old_target) else {
+                let Some(new_target)=mapping.get(old_target).copied().filter(|&new| new != NOT_A_BOUNDARY) else {
                     return Err(error(self.name(),format!("branch target {old_target} is not a boundary")));
                 };
                 let delta=new_target as i64-(new_pc+2) as i64;
@@ -795,8 +840,8 @@ impl BytecodeOptimization for CompactBytecode {
             // two cancelling swaps have been eliminated). Never reassign its
             // old GC/liveness facts to a new PC: preserve only the snapshots
             // originally attached to surviving instructions.
-            let old_nops=insts.iter().filter(|i|i.op==Opcode::Nop)
-                .map(|i|i.pc).collect::<HashSet<_>>();
+            let mut old_nops=Boundaries(vec![false; old_code.len()+1]);
+            for i in insts.iter().filter(|i|i.op==Opcode::Nop) { old_nops.insert(i.pc); }
             f.chunk.safepoints.retain(|e|!old_nops.contains(&e.pc.word_index()));
             for e in &mut f.chunk.safepoints {e.pc=relocation.map(e.pc)?;}
             f.chunk.safepoints.sort_by_key(|e|e.pc.0);

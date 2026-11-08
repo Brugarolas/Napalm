@@ -200,16 +200,16 @@ enum ContractBody {
 #[derive(Clone, Default)]
 struct ClassSummary {
     /// Public instance properties (fields and accessors), including inherited ones.
-    properties: HashSet<String>,
+    properties: HashSet<CompactString>,
     /// Ordinary instance methods, including inherited ones.
-    methods: HashSet<String>,
+    methods: HashSet<CompactString>,
     /// Instance properties backed by a storage field, including inherited ones.
-    data_properties: HashSet<String>,
+    data_properties: HashSet<CompactString>,
     /// Properties guaranteed to be assigned while constructing an instance.
-    initialized: HashSet<String>,
+    initialized: HashSet<CompactString>,
     /// Required contract fields an abstract class leaves to its subclasses,
     /// as `(field, contract)` pairs.
-    pending: Vec<(String, String)>,
+    pending: Vec<(CompactString, String)>,
 }
 
 fn classify_variable_type(source: &str, span: Span) -> TypeAnnotation {
@@ -554,8 +554,8 @@ impl<'a> Parser<'a> {
             self.pos = index + 1;
             let parsed = if text == "interface" {
                 self.interface_decl().map(|(decl, type_params)| {
-                    (decl.name.value.clone(), ContractInfo {
-                        type_params: type_params.into_iter().map(|param| param.value).collect(),
+                    (decl.name.value.to_string(), ContractInfo {
+                        type_params: type_params.into_iter().map(|param| param.value.into_string()).collect(),
                         parents: decl.parents,
                         body: ContractBody::Fields(decl.fields),
                     })
@@ -566,8 +566,8 @@ impl<'a> Parser<'a> {
                         TypeAnnotationKind::Object(fields) => ContractBody::Fields(fields),
                         _ => ContractBody::Alias(decl.annotation),
                     };
-                    (decl.name.value.clone(), ContractInfo {
-                        type_params: decl.type_params.into_iter().map(|param| param.value).collect(),
+                    (decl.name.value.to_string(), ContractInfo {
+                        type_params: decl.type_params.into_iter().map(|param| param.value.into_string()).collect(),
                         parents: Vec::new(),
                         body,
                     })
@@ -620,14 +620,14 @@ impl<'a> Parser<'a> {
         let interface_templates: HashMap<String, (Vec<Ident>, Vec<InterfaceField>)> = self
             .interfaces
             .iter()
-            .filter(|decl| generic.contains_key(&decl.name.value))
-            .map(|decl| (decl.name.value.clone(), (decl.parents.clone(), decl.fields.clone())))
+            .filter(|decl| generic.contains_key(decl.name.value.as_str()))
+            .map(|decl| (decl.name.value.to_string(), (decl.parents.clone(), decl.fields.clone())))
             .collect();
         let alias_templates: HashMap<String, TypeAnnotation> = self
             .type_aliases
             .iter()
-            .filter(|decl| generic.contains_key(&decl.name.value))
-            .map(|decl| (decl.name.value.clone(), decl.annotation.clone()))
+            .filter(|decl| generic.contains_key(decl.name.value.as_str()))
+            .map(|decl| (decl.name.value.to_string(), decl.annotation.clone()))
             .collect();
 
         // Concrete uses anywhere in the module.
@@ -682,7 +682,7 @@ impl<'a> Parser<'a> {
             if generic_classes.contains_key(&base) && !generic.contains_key(&base) {
                 // Generic class: the lowerer derives the per-instance contract.
                 self.generic_class_uses.push(GenericClassUse {
-                    name: Spanned::new(name, span),
+                    name: Spanned::new(name.into(), span),
                     class: base,
                     args: args.iter().map(|arg| classify_variable_type(arg, span)).collect(),
                 });
@@ -698,12 +698,12 @@ impl<'a> Parser<'a> {
                     })
                     .collect();
                 if !self.interfaces.iter().any(|decl| decl.name.value == name) {
-                    self.interfaces.push(InterfaceDecl { name: Spanned::new(name, span), parents: parents.clone(), fields });
+                    self.interfaces.push(InterfaceDecl { name: Spanned::new(name.into(), span), parents: parents.clone(), fields });
                 }
             } else if let Some(annotation) = alias_templates.get(&base) {
                 let annotation = self.substitute_type_parameters(annotation, &info.type_params, &args, &mut work);
                 if !self.type_aliases.iter().any(|decl| decl.name.value == name) {
-                    self.type_aliases.push(TypeAliasDecl { name: Spanned::new(name, span), type_params: Vec::new(), annotation });
+                    self.type_aliases.push(TypeAliasDecl { name: Spanned::new(name.into(), span), type_params: Vec::new(), annotation });
                 }
             }
         }
@@ -711,7 +711,7 @@ impl<'a> Parser<'a> {
         // The bare generic declaration is the unconstrained form: parameters are `any`.
         let mut ignored = Vec::new();
         for index in 0..self.interfaces.len() {
-            let Some(info) = generic.get(&self.interfaces[index].name.value) else { continue };
+            let Some(info) = generic.get(self.interfaces[index].name.value.as_str()) else { continue };
             let any = vec!["any".to_owned(); info.type_params.len()];
             let fields: Vec<InterfaceField> = self.interfaces[index]
                 .fields
@@ -725,7 +725,7 @@ impl<'a> Parser<'a> {
             self.interfaces[index].fields = fields;
         }
         for index in 0..self.type_aliases.len() {
-            let Some(info) = generic.get(&self.type_aliases[index].name.value) else { continue };
+            let Some(info) = generic.get(self.type_aliases[index].name.value.as_str()) else { continue };
             let any = vec!["any".to_owned(); info.type_params.len()];
             let annotation = self.type_aliases[index].annotation.clone();
             self.type_aliases[index].annotation =
@@ -825,7 +825,7 @@ impl<'a> Parser<'a> {
         }
         let t = self.bump();
         Ok(Spanned::new(
-            self.source[t.span.as_range()].to_owned(),
+            self.source[t.span.as_range()].into(),
             t.span,
         ))
     }
@@ -941,7 +941,7 @@ impl<'a> Parser<'a> {
                 let mut import = self.import()?;
                 for (local, _) in &mut self.exports[export_start..] {
                     let imported = local.clone();
-                    local.value = format!("<reexport:{}>", local.span.start);
+                    local.value = compact_str::format_compact!("<reexport:{}>", local.span.start);
                     self.immutable.insert(local.span);
                     import.bindings.push(ImportBinding {
                         imported,
@@ -1394,7 +1394,7 @@ impl<'a> Parser<'a> {
         while !self.at("}") {
             let (member_name, member_span) = if self.peek().kind == Kind::Word {
                 let ident = self.ident()?;
-                (ident.value, ident.span)
+                (ident.value.into_string(), ident.span)
             } else if self.peek().kind == Kind::String {
                 let expr = self.string_expr()?;
                 let ExprKind::String(bytes) = expr.kind else {
@@ -1555,7 +1555,7 @@ impl<'a> Parser<'a> {
                     return self.error("a destructuring declaration needs an initializer");
                 };
                 let span = pattern.span();
-                let temporary = Spanned::new(format!("<destructure:{}>", span.start), span);
+                let temporary = Spanned::new(compact_str::format_compact!("<destructure:{}>", span.start), span);
                 let source = Expr::new(ExprKind::Name(temporary.clone()), span);
 
                 // Evaluate the RHS exactly once. The synthetic binding is not
@@ -1670,7 +1670,7 @@ impl<'a> Parser<'a> {
     }
 
     fn pattern_temporary(&mut self, tag: &str, span: Span, value: Expr, out: &mut Vec<Stmt>) -> Expr {
-        let name = Spanned::new(format!("<{tag}:{}>", span.start), Span::empty(span.start));
+        let name = Spanned::new(compact_str::format_compact!("<{tag}:{}>", span.start), Span::empty(span.start));
         out.push(Stmt { span, kind: StmtKind::Variable { shared: false, name: name.clone(), annotation: None, initializer: Some(value) } });
         Expr::new(ExprKind::Name(name), span)
     }
@@ -2078,7 +2078,7 @@ impl<'a> Parser<'a> {
                     pattern => {
                         let pattern_span = pattern.span();
                         let temporary = Spanned::new(
-                            format!("<for-destructure:{}>", pattern_span.start),
+                            compact_str::format_compact!("<for-destructure:{}>", pattern_span.start),
                             pattern_span,
                         );
                         let source = Expr::new(ExprKind::Name(temporary.clone()), pattern_span);
@@ -2187,7 +2187,7 @@ impl<'a> Parser<'a> {
                     if property { return self.error("parameter properties require a simple identifier"); }
                     let span = pattern.span();
                     self.parameter_patterns.insert(span, pattern);
-                    Spanned::new(format!("<parameter:{}>", span.start), span)
+                    Spanned::new(compact_str::format_compact!("<parameter:{}>", span.start), span)
                 }
             };
             // Optionality is a type-system marker: an omitted argument arrives as
@@ -2484,7 +2484,7 @@ impl<'a> Parser<'a> {
                         }
                         existing.optional &= field.optional;
                     }
-                    None => out.push((field, generic, contract.value.clone())),
+                    None => out.push((field, generic, contract.value.to_string())),
                 }
             }
         }
@@ -3392,7 +3392,7 @@ impl<'a> Parser<'a> {
                 {
                     let receiver = *invoke.receiver.expect("checked above");
                     let key = Expr::new(
-                        ExprKind::String(invoke.name.value.into_bytes()),
+                        ExprKind::String(invoke.name.value.as_bytes().to_vec()),
                         invoke.name.span,
                     );
                     (receiver, key)
@@ -3678,7 +3678,7 @@ impl<'a> Parser<'a> {
                         key
                     } else if self.peek().kind == Kind::Word {
                         let n = self.ident()?;
-                        Expr::new(ExprKind::String(n.value.into_bytes()), n.span)
+                        Expr::new(ExprKind::String(n.value.as_bytes().to_vec()), n.span)
                     } else if self.peek().kind == Kind::String {
                         self.string_expr()?
                     } else {
@@ -3689,7 +3689,7 @@ impl<'a> Parser<'a> {
                         self.expr(0)?
                     } else if let ExprKind::String(bytes) = &key.kind {
                         let target = Expr::new(ExprKind::Name(Spanned::new(
-                            String::from_utf8_lossy(bytes).into_owned(), key.span)), key.span);
+                            String::from_utf8_lossy(bytes).as_ref().into(), key.span)), key.span);
                         if self.eat("=") {
                             self.lines();
                             let value = self.expr(1)?;
@@ -3913,8 +3913,8 @@ impl<'a> Parser<'a> {
         let type_params = self.type_parameter_names()?;
         if !type_params.is_empty() {
             self.generic_classes.insert(
-                name.value.clone(),
-                type_params.iter().map(|param| param.value.clone()).collect(),
+                name.value.to_string(),
+                type_params.iter().map(|param| param.value.to_string()).collect(),
             );
         }
         let superclass = if self.eat("extends") {
@@ -3963,8 +3963,8 @@ impl<'a> Parser<'a> {
         let mut constructor_properties = Vec::new();
         // Instance properties with a field initializer / parameter property, and
         // plain declared fields that still need a constructor assignment.
-        let mut initialized_properties = HashSet::<String>::default();
-        let mut uninitialized_fields = HashSet::<String>::default();
+        let mut initialized_properties = HashSet::<CompactString>::default();
+        let mut uninitialized_fields = HashSet::<CompactString>::default();
         while !self.at("}") && self.peek().kind != Kind::Eof {
             let member_start = self.peek().span.start;
             let decorators = self.decorators()?;
@@ -4354,11 +4354,11 @@ impl<'a> Parser<'a> {
         // module; its members are then unknown and contract checks stay lenient.
         let super_summary = match superclass.as_ref().map(|expr| &expr.kind) {
             None => Some(ClassSummary::default()),
-            Some(ExprKind::Name(parent)) => self.class_summaries.get(&parent.value).cloned(),
+            Some(ExprKind::Name(parent)) => self.class_summaries.get(parent.value.as_str()).cloned(),
             Some(_) => None,
         };
         let contract_fields = self.implemented_contract_fields(&implements);
-        let mut conflicting = HashSet::<String>::default();
+        let mut conflicting = HashSet::<CompactString>::default();
         // Contract fields become ordinary class properties (fixed storage plus
         // accessors) unless the class or a known ancestor already declares them.
         for (field, generic, contract) in &contract_fields {
@@ -4414,7 +4414,7 @@ impl<'a> Parser<'a> {
         initialized.extend(initialized_properties);
         initialized.extend(constructor_properties.iter().map(|property| property.value.clone()));
         initialized.extend(property_names.iter().filter(|property| !uninitialized_fields.contains(*property)).cloned());
-        let mut pending = Vec::<(String, String)>::new();
+        let mut pending = Vec::<(CompactString, String)>::new();
         let inherited_pending = super_summary.as_ref().map(|summary| summary.pending.clone()).unwrap_or_default();
         let required = contract_fields
             .iter()
@@ -4468,15 +4468,15 @@ impl<'a> Parser<'a> {
                 .iter()
                 .filter(|field| !field.is_static)
                 .filter_map(|field| field.storage.value.strip_prefix('_'))
-                .map(str::to_owned),
+                .map(CompactString::from),
         );
         summary.initialized = initialized;
         summary.pending = pending;
         if super_summary.is_some() {
-            self.class_summaries.insert(name.value.clone(), summary);
+            self.class_summaries.insert(name.value.to_string(), summary);
         } else {
             // Unknown ancestry: subclasses must not be validated against it.
-            self.class_summaries.remove(&name.value);
+            self.class_summaries.remove(name.value.as_str());
         }
         initializers.splice(0..0, method_initializers);
         let has_initializers =
@@ -4662,7 +4662,7 @@ fn reactive_static_call(name: &str, args: Vec<Expr>, span: Span) -> Expr {
 }
 
 fn hidden_reactive_field(member: &Ident, kind: &str) -> Ident {
-    Spanned::new(format!("__reactive_{kind}${}", member.value), member.span)
+    Spanned::new(compact_str::format_compact!("__reactive_{kind}${}", member.value), member.span)
 }
 
 fn instance_field_expr(storage: &Ident) -> Expr {
@@ -4677,7 +4677,7 @@ fn synthesize_computed_property(
     let callback_storage = hidden_reactive_field(member, "computed");
     let cache_storage = hidden_reactive_field(member, "computed_cache");
     let callback_local = Spanned::new(
-        format!("<reactive:computed-local:{}>", member.value),
+        compact_str::format_compact!("<reactive:computed-local:{}>", member.value),
         local_span,
     );
     let span = member.span;
@@ -4965,9 +4965,9 @@ fn same_annotation(left: &TypeAnnotation, right: &TypeAnnotation) -> bool {
 fn class_storage_ident(property: &Ident, is_static: bool) -> Ident {
     Spanned::new(
         if is_static {
-            format!("__{}", property.value)
+            compact_str::format_compact!("__{}", property.value)
         } else {
-            format!("_{}", property.value)
+            compact_str::format_compact!("_{}", property.value)
         },
         property.span,
     )
@@ -4979,7 +4979,7 @@ fn synthesize_class_property(
     initializer: Option<Expr>,
 ) -> (MethodDecl, MethodDecl, Option<Stmt>) {
     let storage = Spanned::new(
-        format!("{}{}", if is_static { "__" } else { "_" }, member.value),
+        compact_str::format_compact!("{}{}", if is_static { "__" } else { "_" }, member.value),
         member.span,
     );
     let field = Expr::new(
@@ -5089,7 +5089,7 @@ fn enum_initializer_kind(
         ExprKind::String(_) => EnumMemberValueKind::String,
         ExprKind::Number(_) => EnumMemberValueKind::NumericConstant,
         ExprKind::Name(name) => prior
-            .get(&name.value)
+            .get(name.value.as_str())
             .copied()
             .unwrap_or(EnumMemberValueKind::ComputedNumeric),
         ExprKind::Grouped(inner) => enum_initializer_kind(inner, prior),
@@ -5139,7 +5139,7 @@ fn rewrite_enum_member_references(
     current_member: &str,
 ) {
     match &mut expr.kind {
-        ExprKind::Name(name) if name.value != current_member && members.contains(&name.value) => {
+        ExprKind::Name(name) if name.value != current_member && members.contains(name.value.as_str()) => {
             let member = name.value.clone();
             let span = name.span;
             *expr = enum_member_read(enum_name, &member, span);
@@ -5291,7 +5291,7 @@ impl DecoratorAst<'_> {
 
     fn state_field(&mut self, role: &str, fields: &mut Vec<ClassFieldDecl>) -> Ident {
         let mut name = self.ident(role);
-        name.value = format!("__{}", name.value);
+        name.value = compact_str::format_compact!("__{}", name.value);
         fields.push(ClassFieldDecl {
             storage: name.clone(), annotation: None, initializer: None, is_static: true,
         });
@@ -5426,7 +5426,7 @@ impl DecoratorAst<'_> {
 
     fn ident(&mut self, role: &str) -> Ident {
         let span = self.span();
-        Spanned::new(format!("<decorator:{role}:{}>", span.start), span)
+        Spanned::new(compact_str::format_compact!("<decorator:{role}:{}>", span.start), span)
     }
 
     fn read(&self, name: &Ident) -> Expr {
@@ -5686,7 +5686,7 @@ fn validate_bindings(
 ) {
     struct Validator<'a> {
         immutable: &'a HashSet<Span>,
-        scopes: Vec<HashMap<String, bool>>,
+        scopes: Vec<HashMap<CompactString, bool>>,
         diagnostics: &'a mut Vec<Diagnostic>,
     }
     impl Validator<'_> {
@@ -5971,7 +5971,7 @@ fn validate_bindings(
     v.statements(&module.statements);
     let mut exported = HashSet::default();
     for (local, public) in module.exports.as_ref().unwrap() {
-        if !v.scopes[0].contains_key(&local.value) {
+        if !v.scopes[0].contains_key(local.value.as_str()) {
             v.diagnostics.push(Diagnostic::error(
                 "NAPALM-B003",
                 format!("cannot export undefined binding '{}'", local.value),
@@ -6434,7 +6434,7 @@ mod napalm_syntax_tests {
             let ExprKind::Name(receiver) = &receiver.kind else {
                 panic!("Array constructor receiver must be List");
             };
-            (receiver.value.clone(), call.name.value.clone(), call.args.len())
+            (receiver.value.to_string(), call.name.value.to_string(), call.args.len())
         };
 
         assert_eq!(constructor(&module.statements[0]), ("List".into(), "new".into(), 1));
