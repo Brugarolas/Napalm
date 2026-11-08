@@ -1056,6 +1056,14 @@ pub struct TracingJitOptions {
     pub llvm_trace_regions: bool,
     /// Print the generated and the optimized LLVM IR.
     pub llvm_dump_ir: bool,
+    /// Compile root/entry/side traces with Cranelift on a background thread
+    /// instead of blocking the interpreter. The emitted machine code is
+    /// identical (same compiler, trace and options); only the installation
+    /// moment changes: baseline keeps running until the code is ready and the
+    /// trace is entered on a later visit. Worker VMs sharing a repository keep
+    /// the synchronous path. Off in unit tests for determinism
+    /// (`NAPALM_CRANELIFT_ASYNC` forces it on, `NAPALM_CRANELIFT_SYNC` off).
+    pub cranelift_background_compile: bool,
 }
 
 /// LLVM pass pipeline tuned for traces. A trace is one call-free function whose
@@ -1135,6 +1143,8 @@ impl Default for TracingJitOptions {
             llvm_pgo: std::env::var("NAPALM_LLVM_PGO").ok().as_deref() != Some("0"),
             llvm_trace_regions: std::env::var("NAPALM_LLVM_REGIONS").ok().as_deref() != Some("0"),
             llvm_dump_ir: std::env::var_os("NAPALM_LLVM_DUMP").is_some(),
+            cranelift_background_compile: std::env::var_os("NAPALM_CRANELIFT_SYNC").is_none()
+                && (!cfg!(test) || std::env::var_os("NAPALM_CRANELIFT_ASYNC").is_some()),
         }
     }
 }
@@ -11207,6 +11217,32 @@ impl SharedNativeCompiler {
             .recv()
             .map_err(|_| "shared JIT compiler thread terminated during compilation".to_owned())?
     }
+
+    /// Queue a compilation without waiting; the caller polls the receiver.
+    fn submit(
+        &self,
+        trace: Trace,
+        options: TracingJitOptions,
+    ) -> Result<std::sync::mpsc::Receiver<Result<SharedCodeImage, String>>, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(SharedCompilerRequest::Compile { trace, options, reply: reply_tx })
+            .map_err(|_| "background JIT compiler thread is unavailable".to_owned())?;
+        Ok(reply_rx)
+    }
+}
+
+/// Where a background-compiled trace is installed once its code is ready.
+enum PendingOrigin {
+    Loop(LoopKey),
+    Entry(TraceLocation),
+    Side { parent: TraceId, exit: SideExitId, root: TraceId, depth: u8 },
+}
+
+struct PendingCranelift {
+    id: TraceId,
+    origin: PendingOrigin,
+    reply: std::sync::mpsc::Receiver<Result<SharedCodeImage, String>>,
 }
 
 impl Drop for SharedNativeCompiler {
@@ -11472,6 +11508,9 @@ struct LoopState {
     shared_primed: bool,
     /// Stable repository identity corresponding to this worker-local trace copy.
     repository_trace: Option<SharedTraceVersion>,
+    /// Recorded trace waiting for background Cranelift code. No re-recording
+    /// while set; installation fills `trace`.
+    pending: Option<TraceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -11539,6 +11578,11 @@ pub struct TracingJit {
     /// after that region was compiled; once `child` is hot the region is
     /// recompiled with it.
     llvm_region_watch: Vec<(TraceId, TraceId)>,
+    /// Background Cranelift compiler thread (its JITModule owns the code of
+    /// background-compiled traces). Declared after `traces`.
+    cranelift_service: Option<Arc<SharedNativeCompiler>>,
+    /// Recorded traces whose background compilation has not been installed yet.
+    pending_cranelift: Vec<PendingCranelift>,
 }
 
 impl Default for TracingJit {
@@ -11652,6 +11696,184 @@ impl TracingJit {
             llvm_next_ticket: 1,
             llvm_regions: HashMap::default(),
             llvm_region_watch: Vec::new(),
+            cranelift_service: None,
+            pending_cranelift: Vec::new(),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Background Cranelift tier
+    // -------------------------------------------------------------------------
+
+    /// Repository workers keep synchronous compilation: their claim/publish
+    /// protocol assumes the code exists when the ticket is published.
+    #[inline]
+    fn cranelift_async(&self) -> bool {
+        self.options.cranelift_background_compile && self.shared_repository.is_none()
+    }
+
+    fn submit_cranelift(&mut self, trace: &Trace, origin: PendingOrigin) -> Result<(), String> {
+        if self.cranelift_service.is_none() {
+            let service = SharedNativeCompiler::new()
+                .ok_or_else(|| "background Cranelift compiler could not be started".to_owned())?;
+            self.cranelift_service = Some(Arc::new(service));
+        }
+        let reply = self
+            .cranelift_service
+            .as_ref()
+            .unwrap()
+            .submit(trace.clone(), self.options.clone())?;
+        self.pending_cranelift.push(PendingCranelift { id: trace.id, origin, reply });
+        // Test hook: exercise the complete background install path, but wait for
+        // the code so tiering timing stays deterministic.
+        #[cfg(test)]
+        if std::env::var_os("NAPALM_CRANELIFT_ASYNC_WAIT").is_some() {
+            let pending = self.pending_cranelift.pop().unwrap();
+            let result = pending
+                .reply
+                .recv()
+                .unwrap_or_else(|_| Err("background Cranelift compiler terminated".to_owned()));
+            self.install_background_trace(pending, result);
+        }
+        Ok(())
+    }
+
+    /// Rebuild exactly what `CraneliftTraceCompiler::compile` returns, from the
+    /// code image produced on the compiler thread. Generated code addresses
+    /// per-trace data only through the relocation table, so the table (and the
+    /// profile counters patched into it) can be created here.
+    fn compiled_from_image(image: SharedCodeImage) -> CompiledTrace {
+        let (mut vm_bindings, vm_binding_keys, _) = collect_vm_bindings(&image.trace);
+        debug_assert!(vm_binding_keys.as_ref() == image.binding_keys.as_ref());
+        let profile = install_profile_counters(&mut vm_bindings, &vm_binding_keys, image.exits.len());
+        let exit_count = image.exits.len();
+        let trace_id = image.trace.id;
+        CompiledTrace {
+            trace: image.trace,
+            code_ptr: image.entry_addr as *const u8,
+            entry: unsafe { std::mem::transmute::<usize, NativeTraceFn>(image.entry_addr) },
+            dispatcher: unsafe { std::mem::transmute::<usize, NativeDispatcherFn>(image.dispatcher_addr) },
+            vm_bindings,
+            vm_binding_keys,
+            exits: image.exits,
+            exit_hits: vec![0; exit_count],
+            side_trace_attempted: vec![false; exit_count],
+            native_links: vec![u32::MAX; exit_count].into_boxed_slice(),
+            root_trace: trace_id,
+            tree_depth: 0,
+            shared_trace: None,
+            _shared_code: None,
+            _shared_repository_owner: None,
+            short_exit_streak: 0,
+            debug_text: image.debug_text,
+            tier_visits: 0,
+            llvm: LlvmTierState::Cold,
+            llvm_has_code: false,
+            llvm_region_failed: false,
+            profile,
+        }
+    }
+
+    /// Install every finished background compilation. Called only from the
+    /// Rust manager, never while native code of this JIT is running.
+    fn poll_cranelift(&mut self) {
+        let mut index = 0;
+        while index < self.pending_cranelift.len() {
+            let result = match self.pending_cranelift[index].reply.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("background Cranelift compiler terminated".to_owned())
+                }
+            };
+            let pending = self.pending_cranelift.swap_remove(index);
+            self.install_background_trace(pending, result);
+        }
+    }
+
+    fn install_background_trace(&mut self, pending: PendingCranelift, result: Result<SharedCodeImage, String>) {
+        let id = pending.id;
+        match result {
+            Ok(image) => {
+                let mut compiled = Self::compiled_from_image(image);
+                match pending.origin {
+                    PendingOrigin::Loop(key) => {
+                        self.insert_compiled(id, compiled);
+                        if let Some(state) = self.loops.get_mut(&key) {
+                            state.pending = None;
+                            state.trace = Some(id);
+                        }
+                        self.stats.traces_compiled += 1;
+                    }
+                    PendingOrigin::Entry(location) => {
+                        self.insert_compiled(id, compiled);
+                        if let Some(state) = self.entries.get_mut(&location) {
+                            state.pending = None;
+                            state.trace = Some(id);
+                        }
+                        self.stats.traces_compiled += 1;
+                        self.stats.entry_traces_compiled += 1;
+                    }
+                    PendingOrigin::Side { parent, exit, root, depth } => {
+                        compiled.root_trace = root;
+                        compiled.tree_depth = depth;
+                        self.insert_compiled(id, compiled);
+                        if let Err(error) = self.stitch(parent, exit, id) {
+                            self.stats.last_abort = Some(error.to_string());
+                            return;
+                        }
+                        self.stats.traces_compiled = self.stats.traces_compiled.saturating_add(1);
+                        self.stats.side_traces_compiled = self.stats.side_traces_compiled.saturating_add(1);
+                    }
+                }
+                if jit_events_enabled() {
+                    eprintln!("[napalm-jit] installed background Cranelift code for {id:?}");
+                }
+            }
+            Err(error) => {
+                if jit_events_enabled() {
+                    eprintln!("[napalm-jit] background compile abort {id:?}: {error}");
+                }
+                self.stats.last_abort = Some(error);
+                match pending.origin {
+                    // Same backoff as the synchronous lowering-failure paths.
+                    PendingOrigin::Loop(key) => {
+                        let threshold = self.options.hot_loop_threshold;
+                        let blacklist_after = self.options.max_failures_before_blacklist;
+                        if let Some(state) = self.loops.get_mut(&key) {
+                            state.pending = None;
+                            state.failures = state.failures.saturating_add(1);
+                            state.hotness = threshold / 2;
+                            if state.failures >= blacklist_after {
+                                state.blacklisted = true;
+                                self.stats.blacklisted_loops += 1;
+                            }
+                        }
+                    }
+                    PendingOrigin::Entry(location) => {
+                        self.stats.recordings_aborted += 1;
+                        let threshold = self.options.hot_entry_threshold;
+                        let blacklist_after = self.options.max_failures_before_blacklist;
+                        if let Some(state) = self.entries.get_mut(&location) {
+                            state.pending = None;
+                            state.failures = state.failures.saturating_add(1);
+                            state.hotness = 0;
+                            state.retry_after = threshold.max(state.retry_after).saturating_mul(2);
+                            if state.failures >= blacklist_after {
+                                state.blacklisted = true;
+                                self.stats.blacklisted_entries += 1;
+                            }
+                        }
+                    }
+                    PendingOrigin::Side { .. } => {
+                        self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
+                        self.stats.side_recordings_aborted = self.stats.side_recordings_aborted.saturating_add(1);
+                    }
+                }
+            }
         }
     }
 
@@ -12364,10 +12586,14 @@ impl TracingJit {
         if self.options.hot_entry_threshold == 0 { return Ok(JitAction::Interpreted); }
         let location = runtime.trace_current_location();
         self.stats.entry_hits += 1;
+        if !self.pending_cranelift.is_empty() {
+            self.poll_cranelift();
+        }
         {
             let state = self.entries.entry(location).or_default();
             if state.blacklisted { return Ok(JitAction::Blacklisted); }
             if let Some(trace) = state.trace { return self.enter_compiled(runtime, trace); }
+            if state.pending.is_some() { return Ok(JitAction::Interpreted); }
             state.hotness = state.hotness.saturating_add(1);
             if state.hotness < self.options.hot_entry_threshold.max(state.retry_after) {
                 return Ok(JitAction::Interpreted);
@@ -12435,6 +12661,19 @@ impl TracingJit {
                         self.options.min_entry_trace_bytecodes,
                     ));
                     return Ok(JitAction::Blacklisted);
+                }
+                // Recording already executed the prefix, so even the synchronous
+                // path only enters this trace on a later visit: compiling in the
+                // background loses nothing.
+                if repository_ticket.is_none()
+                    && self.cranelift_async()
+                    && self.submit_cranelift(&trace, PendingOrigin::Entry(location)).is_ok()
+                {
+                    let state = self.entries.get_mut(&location).unwrap();
+                    if state.trace.is_none() {
+                        state.pending = Some(id);
+                    }
+                    return Ok(JitAction::Interpreted);
                 }
                 if let Some(ticket) = repository_ticket.as_ref() {
                     match self.compile_shared_code(runtime, &trace, ticket) {
@@ -12550,6 +12789,9 @@ impl TracingJit {
             .map_or(0, |profile| profile.bump_loop(location));
 
         self.stats.loop_header_hits += 1;
+        if !self.pending_cranelift.is_empty() {
+            self.poll_cranelift();
+        }
 
         {
             let state = self.loops.entry(key).or_default();
@@ -12566,6 +12808,11 @@ impl TracingJit {
 
             if let Some(trace) = state.trace {
                 return self.enter_compiled(runtime, trace);
+            }
+            // Code is still being generated in the background. Never report
+            // `Compiled` for it: the interpreter caches that TraceId.
+            if state.pending.is_some() {
+                return Ok(JitAction::Interpreted);
             }
 
             state.hotness = state.hotness.saturating_add(1);
@@ -12663,6 +12910,29 @@ impl TracingJit {
         self.stats.trace_gvn_eliminated += trace.stats.gvn_eliminated as u64;
         self.stats.trace_licm_hoisted += trace.stats.licm_hoisted as u64;
         self.stats.trace_pre_eliminated += trace.stats.pre_eliminated as u64;
+
+        // Background tier: baseline keeps running this loop while Cranelift
+        // generates the (identical) code; a later header visit enters it.
+        if repository_ticket.is_none()
+            && self.cranelift_async()
+            && self.submit_cranelift(&trace, PendingOrigin::Loop(key)).is_ok()
+        {
+            let state = self.loops.get_mut(&key).unwrap();
+            if state.trace.is_none() {
+                state.pending = Some(trace_id);
+            }
+            if jit_events_enabled() {
+                eprintln!(
+                    "[napalm-jit] queued {:?} at {:?}:{} for background Cranelift (bytecodes={}, nodes={}, exits={}, phis={})",
+                    trace_id, location.function, location.pc.0, trace.stats.recorded_bytecodes,
+                    trace.nodes.len(), trace.exits.len(), trace.loop_phis.len(),
+                );
+            }
+            if std::env::var_os("NAPALM_JIT_DUMP").is_some() {
+                dump_trace(&trace);
+            }
+            return Ok(JitAction::Interpreted);
+        }
 
         let compile_result = if let Some(ticket) = repository_ticket.as_ref() {
             match self.compile_shared_code(runtime, &trace, ticket) {
@@ -12819,6 +13089,10 @@ impl TracingJit {
         // an exit is still unlinked, a runtime helper terminates the trace, or the
         // source program itself returns/suspends.
         loop {
+            // Stitch side traces whose background Cranelift code just finished.
+            if !self.pending_cranelift.is_empty() {
+                self.poll_cranelift();
+            }
             // Tier-2: install finished LLVM code before building the activation,
             // and count this native visit toward LLVM hotness.
             self.poll_llvm();
@@ -13049,6 +13323,20 @@ impl TracingJit {
 
         if std::env::var_os("NAPALM_JIT_DUMP").is_some() {
             dump_trace(&trace);
+        }
+        // Background tier: the exit keeps returning to baseline until the code
+        // is ready, then `poll_cranelift` stitches it exactly as below. The
+        // caller only uses `Some` to continue in the (already compiled) root.
+        if repository_ticket.is_none() && self.cranelift_async() {
+            let depth = self
+                .compiled(parent)
+                .map(|compiled| compiled.tree_depth)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let origin = PendingOrigin::Side { parent, exit: parent_exit, root: link_to, depth };
+            if self.submit_cranelift(&trace, origin).is_ok() {
+                return Ok(Some(trace_id));
+            }
         }
         let mut compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
