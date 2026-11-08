@@ -789,56 +789,88 @@ impl TraceCanonicalization {
         }
     }
 
-    /// Integer induction-variable speculation for `for (i = a; i < n; i++)`.
+    /// Integer induction-variable speculation (`for (i = a; i < n; i++)`,
+    /// `for (i = n - 1; i >= 0; i--)`, `i += 4`, ...).
     ///
     /// Applies to an F64 loop phi `P` (already unboxed by
-    /// `promote_loop_representations`) whose backedge is `P + 1.0`, that is
-    /// compared `P < X` by a guard executed earlier in the same iteration, where
-    /// `X` is an Int32 converted to F64 or an integral constant in the i32 range,
-    /// and that is also used as an i32 (`F64ToInt32(P)`, i.e. the recording saw
-    /// an exact integer). `P` becomes an Int32 phi:
+    /// `promote_loop_representations`) whose backedge is `P + c` or `P - c` for
+    /// an integral constant step, that a guard executed earlier in the same
+    /// iteration bounds against `X` (an Int32 converted to F64, or an integral
+    /// constant in the i32 range) tightly enough to prove that the step cannot
+    /// leave the i32 range, and that is also used as an i32 (`F64ToInt32`, i.e.
+    /// the recording saw an exact integer). `P` becomes an Int32 phi:
     ///
     /// * entry: the phi's entry guard becomes GuardInt32. Rejecting a non-integer
     ///   entry value only means not entering the trace (the exit resumes at the
     ///   header with untouched state), which is always correct;
-    /// * `P < X` -> `IntCompare(P, L)`: exact, both conversions are lossless;
-    /// * `P + 1.0` -> `IntBinary Add(P, 1)`: it cannot overflow because the guard
-    ///   proved `P < X <= i32::MAX` before the add in the same iteration, and
-    ///   `f64(P) + 1.0 == f64(P + 1)` for every such `P`;
-    /// * `F64ToInt32(P)` -> `P` (it could never fail on an exact Int32);
-    /// * snapshots box the Int32 to the same Napalm number (never -0: the entry
-    ///   guard rejects -0 and `-1 + 1` is +0 in both domains).
+    /// * every `F64Compare` of `P` (or of the stepped value) against an integer
+    ///   bound becomes `IntCompare`: exact, both conversions are lossless and no
+    ///   operand can be NaN;
+    /// * the step becomes `IntBinary` Add/Sub, recorded in `no_signed_wrap`:
+    ///   it cannot overflow because of the dominating guard (see `step_is_safe`),
+    ///   and `f64(P) ± c == f64(P ± c)` for every such `P`;
+    /// * `F64ToInt32` of either value becomes the value itself (it could never
+    ///   fail on an exact Int32);
+    /// * any other body use of `P` (`a[i] * i`, `a[i + 1]`) reads one
+    ///   `Int32ToF64(P)` placed in a recycled Nop slot preceding all of them;
+    /// * snapshots box the Int32 to the same Napalm number. -0 cannot appear:
+    ///   the entry guard rejects it and an exact integer step yields +0 in both
+    ///   domains (`-1 + 1`, `1 - 1`).
     ///
-    /// Loop condition and index then live in one integer domain, so both
-    /// backends can relate `i < len` to the list bounds guards.
+    /// Loop condition and index then share one integer domain, so both backends
+    /// can relate `i < len` to the list bounds guards.
     fn promote_integer_induction(&self, trace: &mut Trace) {
-        enum Bound {
+        #[derive(Clone, Copy)]
+        enum Operand {
             Value(TraceValueId),
             Const(i32),
         }
+        /// Relation of P to X on the path that continues past the guard.
+        #[derive(Clone, Copy)]
+        enum Relation {
+            Lt,
+            Le,
+            Gt,
+            Ge,
+        }
+        const MAX_STEP: i64 = 1 << 30;
 
         let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
-        let is_f64_one = |trace: &Trace, value: TraceValueId| {
-            matches!(
-                trace.value(trace.canonical_value(value)).map(|v| &v.origin),
-                Some(TraceValueOrigin::Constant(TraceConstant::F64Bits(bits))) if f64::from_bits(*bits) == 1.0
-            )
-        };
-        let int32_bound = |trace: &Trace, value: TraceValueId| -> Option<Bound> {
-            let value = trace.canonical_value(value);
-            match &trace.value(value)?.origin {
+        let integral_constant = |trace: &Trace, value: TraceValueId| -> Option<i64> {
+            match &trace.value(trace.canonical_value(value))?.origin {
                 TraceValueOrigin::Constant(TraceConstant::F64Bits(bits)) => {
                     let number = f64::from_bits(*bits);
-                    (number.fract() == 0.0 && number >= i32::MIN as f64 && number <= i32::MAX as f64)
-                        .then(|| Bound::Const(number as i32))
+                    (number.fract() == 0.0 && number.abs() <= (1u64 << 53) as f64).then_some(number as i64)
                 }
-                _ => match Self::producer(trace, value)? {
-                    (_, TraceInst::Int32ToF64 { value: source }) => {
-                        let source = trace.canonical_value(source);
-                        (trace.value(source)?.rep == TraceRep::Int32).then_some(Bound::Value(source))
-                    }
-                    _ => None,
-                },
+                _ => None,
+            }
+        };
+        let int_operand = |trace: &Trace, value: TraceValueId| -> Option<Operand> {
+            let value = trace.canonical_value(value);
+            if let Some(number) = integral_constant(trace, value) {
+                return i32::try_from(number).ok().map(Operand::Const);
+            }
+            match Self::producer(trace, value)? {
+                (_, TraceInst::Int32ToF64 { value: source }) => {
+                    let source = trace.canonical_value(source);
+                    (trace.value(source)?.rep == TraceRep::Int32).then_some(Operand::Value(source))
+                }
+                _ => None,
+            }
+        };
+        // Can `P + step` leave the i32 range when P satisfies `P rel X`? A
+        // non-constant X is any Int32, so the worst case is X = MAX (upper
+        // bounds) or X = MIN (lower bounds).
+        let step_is_safe = |relation: Relation, bound: Operand, step: i64| -> bool {
+            let (max, min) = (i32::MAX as i64, i32::MIN as i64);
+            if step > 0 {
+                let x = match bound { Operand::Const(x) => x as i64, Operand::Value(_) => max };
+                let upper = match relation { Relation::Lt => x - 1, Relation::Le => x, _ => return false };
+                upper + step <= max
+            } else {
+                let x = match bound { Operand::Const(x) => x as i64, Operand::Value(_) => min };
+                let lower = match relation { Relation::Gt => x + 1, Relation::Ge => x, _ => return false };
+                lower + step >= min
             }
         };
 
@@ -850,104 +882,164 @@ impl TraceCanonicalization {
             let p = trace.canonical_value(phi.value);
             let Some(backedge) = phi.backedge.map(|value| trace.canonical_value(value)) else { continue };
 
-            // Backedge: P + 1.0 (either operand order).
-            let Some((add_node, TraceInst::F64Binary { op: F64BinOp::Add, lhs, rhs })) =
-                Self::producer(trace, backedge)
-            else {
+            // Backedge: P + c, c + P or P - c with an integral constant c != 0.
+            let Some((add_node, TraceInst::F64Binary { op, lhs, rhs })) = Self::producer(trace, backedge) else {
                 continue;
             };
-            let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
-            let step = if lhs == p { rhs } else if rhs == p { lhs } else { continue };
-            if !is_f64_one(trace, step) || preheader.contains(&add_node) {
+            if preheader.contains(&add_node) {
                 continue;
             }
+            let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
+            let (int_op, constant) = match op {
+                F64BinOp::Add if lhs == p => (IntBinOp::Add, integral_constant(trace, rhs)),
+                F64BinOp::Add if rhs == p => (IntBinOp::Add, integral_constant(trace, lhs)),
+                F64BinOp::Sub if lhs == p => (IntBinOp::Sub, integral_constant(trace, rhs)),
+                _ => continue,
+            };
+            let Some(constant) = constant.filter(|c| *c != 0 && c.abs() <= MAX_STEP) else { continue };
+            let step = if int_op == IntBinOp::Add { constant } else { -constant };
 
-            // A body guard `P < X` (or `X > P`) that precedes the increment.
-            let mut guard = None;
+            // A body guard on P preceding the step that bounds it tightly enough.
+            let mut proven = false;
             for node in &trace.nodes[..add_node] {
                 if preheader.contains(&node.id) {
                     continue;
                 }
-                let TraceInst::GuardSwitch { tag, observed: TraceSwitchGuard::Case(1), .. } = &node.kind else {
-                    continue;
-                };
-                let Some((compare_node, TraceInst::F64Compare { op, lhs, rhs })) = Self::producer(trace, *tag)
+                let TraceInst::GuardSwitch { tag, observed: TraceSwitchGuard::Case(case @ (0 | 1)), .. } = &node.kind
                 else {
                     continue;
                 };
+                let Some((_, TraceInst::F64Compare { op, lhs, rhs })) = Self::producer(trace, *tag) else { continue };
                 let (lhs, rhs) = (trace.canonical_value(lhs), trace.canonical_value(rhs));
-                let bound = match op {
-                    CmpKind::Lt if lhs == p && rhs != p => int32_bound(trace, rhs),
-                    CmpKind::Gt if rhs == p && lhs != p => int32_bound(trace, lhs),
-                    _ => None,
+                let (relation, other) = match (op, lhs == p, rhs == p) {
+                    (CmpKind::Lt, true, false) => (Relation::Lt, rhs),
+                    (CmpKind::Le, true, false) => (Relation::Le, rhs),
+                    (CmpKind::Gt, true, false) => (Relation::Gt, rhs),
+                    (CmpKind::Ge, true, false) => (Relation::Ge, rhs),
+                    // `X op P` == `P flipped(op) X`.
+                    (CmpKind::Lt, false, true) => (Relation::Gt, lhs),
+                    (CmpKind::Le, false, true) => (Relation::Ge, lhs),
+                    (CmpKind::Gt, false, true) => (Relation::Lt, lhs),
+                    (CmpKind::Ge, false, true) => (Relation::Le, lhs),
+                    _ => continue,
                 };
-                if let Some(bound) = bound {
-                    guard = Some((compare_node, op, bound));
+                // Case(0) continues when the comparison is false. Neither side
+                // can be NaN (P is an exact integer, X an integer bound), so the
+                // negation is exact.
+                let relation = if *case == 1 {
+                    relation
+                } else {
+                    match relation {
+                        Relation::Lt => Relation::Ge,
+                        Relation::Le => Relation::Gt,
+                        Relation::Gt => Relation::Le,
+                        Relation::Ge => Relation::Lt,
+                    }
+                };
+                if int_operand(trace, other).is_some_and(|bound| step_is_safe(relation, bound, step)) {
+                    proven = true;
                     break;
                 }
             }
-            let Some((compare_node, compare_op, bound)) = guard else { continue };
+            if !proven {
+                continue;
+            }
 
-            // Every hot-path use of P and of the incremented value must be one we
-            // rewrite; anything else keeps the F64 phi.
+            // Every hot-path use of P and of the stepped value must be one we
+            // rewrite exactly; anything else keeps the F64 phi.
+            let is_iv = |trace: &Trace, value: TraceValueId| {
+                let value = trace.canonical_value(value);
+                value == p || value == backedge
+            };
+            // Any other body use of P itself (`a[i] * i`, `a[i + 1]`, ...) only
+            // needs P's f64 value, which `Int32ToF64(P)` reproduces exactly; it
+            // is materialized in a recycled body slot that runs before all of
+            // them (see below). The stepped value has no such slot after the
+            // step, so its uses must all be rewritable.
             let mut integer_uses = 0usize;
             let mut compatible = true;
+            let mut float_uses = Vec::new();
             for node in &trace.nodes {
-                if node.id == compare_node || node.id == add_node || matches!(node.kind, TraceInst::Nop) {
+                if node.id == add_node || matches!(node.kind, TraceInst::Nop) {
                     continue;
                 }
-                let mut uses_p = false;
-                let mut uses_next = false;
+                let (mut uses_p, mut uses_backedge) = (false, false);
                 let mut operands = node.kind.clone();
                 operands.visit_operands(|operand| {
                     let operand = trace.canonical_value(*operand);
                     uses_p |= operand == p;
-                    uses_next |= operand == backedge;
+                    uses_backedge |= operand == backedge;
                 });
-                if !uses_p && !uses_next {
+                if !uses_p && !uses_backedge {
                     continue;
                 }
-                match &node.kind {
-                    TraceInst::F64ToInt32 { .. } => integer_uses += uses_p as usize,
-                    TraceInst::BoxF64 { .. } => {}
-                    _ => {
+                let rewritable = match &node.kind {
+                    TraceInst::F64ToInt32 { .. } => {
+                        integer_uses += 1;
+                        true
+                    }
+                    TraceInst::BoxF64 { .. } => true,
+                    TraceInst::F64Compare { lhs, rhs, .. } => [*lhs, *rhs]
+                        .into_iter()
+                        .all(|operand| is_iv(trace, operand) || int_operand(trace, operand).is_some()),
+                    _ => false,
+                };
+                if !rewritable {
+                    if uses_backedge || preheader.contains(&node.id) {
                         compatible = false;
                         break;
                     }
+                    float_uses.push(node.id);
                 }
             }
             for (index, other) in trace.loop_phis.iter().enumerate() {
-                if index == phi_index {
-                    continue;
-                }
-                let refers = |value: TraceValueId| {
-                    let value = trace.canonical_value(value);
-                    value == p || value == backedge
-                };
-                if refers(other.initial) || other.backedge.is_some_and(refers) {
+                if index != phi_index && (is_iv(trace, other.initial) || other.backedge.is_some_and(|value| is_iv(trace, value))) {
                     compatible = false;
                 }
             }
             if !compatible || integer_uses == 0 {
                 continue;
             }
+            // Slot for `Int32ToF64(P)`: a body node before the first f64 use
+            // that is (or is about to become, `F64ToInt32` of the IV) a Nop.
+            // Body order is node order, so it dominates every such use.
+            let float_slot = match float_uses.first() {
+                None => None,
+                Some(&first) => {
+                    let slot = (0..first).rev().find(|&index| {
+                        !preheader.contains(&index)
+                            && index != add_node
+                            && match trace.nodes[index].kind {
+                                // No stale result may still name this node.
+                                TraceInst::Nop => trace.nodes[index].results.iter().all(|&result| {
+                                    matches!(trace.value(result).map(|value| &value.origin),
+                                        Some(TraceValueOrigin::Alias(_)))
+                                }),
+                                TraceInst::F64ToInt32 { value, .. } => is_iv(trace, value),
+                                _ => false,
+                            }
+                    });
+                    match slot {
+                        Some(slot) => Some(slot),
+                        None => continue,
+                    }
+                }
+            };
 
             // Rewrite.
-            let mut new_constant = |trace: &mut Trace, value: i32| {
-                let id = TraceValueId(trace.values.len() as u32);
-                trace.values.push(TraceValue {
-                    id,
-                    ty: TraceType::Int32,
-                    rep: TraceRep::Int32,
-                    origin: TraceValueOrigin::Constant(TraceConstant::Int32(value)),
-                });
-                id
+            let mut constants = HashMap::<i32, TraceValueId>::default();
+            let mut constant_value = |trace: &mut Trace, value: i32| {
+                *constants.entry(value).or_insert_with(|| {
+                    let id = TraceValueId(trace.values.len() as u32);
+                    trace.values.push(TraceValue {
+                        id,
+                        ty: TraceType::Int32,
+                        rep: TraceRep::Int32,
+                        origin: TraceValueOrigin::Constant(TraceConstant::Int32(value)),
+                    });
+                    id
+                })
             };
-            let bound = match bound {
-                Bound::Value(value) => value,
-                Bound::Const(value) => new_constant(trace, value),
-            };
-            let one = new_constant(trace, 1);
 
             trace.loop_phis[phi_index].rep = TraceRep::Int32;
             for value in [p, backedge] {
@@ -956,30 +1048,67 @@ impl TraceCanonicalization {
                     value.ty = TraceType::Int32;
                 }
             }
-            trace.nodes[compare_node].kind = match compare_op {
-                CmpKind::Lt => TraceInst::IntCompare { op: CmpKind::Lt, lhs: p, rhs: bound },
-                _ => TraceInst::IntCompare { op: CmpKind::Gt, lhs: bound, rhs: p },
-            };
-            trace.nodes[add_node].kind = TraceInst::IntBinary { op: IntBinOp::Add, lhs: p, rhs: one };
+            let step_value = constant_value(trace, constant as i32);
+            trace.nodes[add_node].kind = TraceInst::IntBinary { op: int_op, lhs: p, rhs: step_value };
+            trace.no_signed_wrap.push(add_node);
+
+            if let Some(slot) = float_slot {
+                if let TraceInst::F64ToInt32 { .. } = trace.nodes[slot].kind {
+                    if let Some(result) = trace.nodes[slot].results.first().copied() {
+                        alias_value(trace, result, p);
+                    }
+                    trace.stats.eliminated_guards += 1;
+                }
+                let float = TraceValueId(trace.values.len() as u32);
+                trace.values.push(TraceValue {
+                    id: float,
+                    ty: TraceType::F64,
+                    rep: TraceRep::F64,
+                    origin: TraceValueOrigin::InstResult { node: slot },
+                });
+                trace.nodes[slot].kind = TraceInst::Int32ToF64 { value: p };
+                trace.nodes[slot].results = smallvec::smallvec![float];
+                for &index in &float_uses {
+                    let mut kind = trace.nodes[index].kind.clone();
+                    kind.visit_operands(|operand| {
+                        if trace.canonical_value(*operand) == p {
+                            *operand = float;
+                        }
+                    });
+                    trace.nodes[index].kind = kind;
+                }
+            }
 
             for index in 0..trace.nodes.len() {
+                if index == add_node {
+                    continue;
+                }
                 let kind = trace.nodes[index].kind.clone();
                 match kind {
-                    TraceInst::F64ToInt32 { value, .. } => {
+                    TraceInst::F64ToInt32 { value, .. } if is_iv(trace, value) => {
                         let value = trace.canonical_value(value);
-                        if value == p || value == backedge {
-                            if let Some(result) = trace.nodes[index].results.first().copied() {
-                                alias_value(trace, result, value);
-                            }
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_guards += 1;
+                        if let Some(result) = trace.nodes[index].results.first().copied() {
+                            alias_value(trace, result, value);
                         }
+                        trace.nodes[index].kind = TraceInst::Nop;
+                        trace.stats.eliminated_guards += 1;
                     }
-                    TraceInst::BoxF64 { value } => {
-                        let value = trace.canonical_value(value);
-                        if value == p || value == backedge {
-                            trace.nodes[index].kind = TraceInst::BoxInt32 { value };
-                        }
+                    TraceInst::BoxF64 { value } if is_iv(trace, value) => {
+                        trace.nodes[index].kind = TraceInst::BoxInt32 { value: trace.canonical_value(value) };
+                    }
+                    TraceInst::F64Compare { op, lhs, rhs } if is_iv(trace, lhs) || is_iv(trace, rhs) => {
+                        let mut map = |trace: &mut Trace, operand: TraceValueId| {
+                            if is_iv(trace, operand) {
+                                return trace.canonical_value(operand);
+                            }
+                            match int_operand(trace, operand) {
+                                Some(Operand::Value(value)) => value,
+                                Some(Operand::Const(value)) => constant_value(trace, value),
+                                None => unreachable!("compatibility check accepted only integer bounds"),
+                            }
+                        };
+                        let (lhs, rhs) = (map(trace, lhs), map(trace, rhs));
+                        trace.nodes[index].kind = TraceInst::IntCompare { op, lhs, rhs };
                     }
                     _ => {}
                 }

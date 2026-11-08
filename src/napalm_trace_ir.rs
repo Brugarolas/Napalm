@@ -513,6 +513,11 @@ pub struct Trace {
     /// at the trace anchor with the end-of-iteration architectural state.
     pub native_budget_exit: Option<SideExitId>,
     pub terminator: TraceTerminator, pub stats: TraceStats,
+    /// Nodes whose `IntBinary` Add/Sub was proven never to overflow i32 on any
+    /// execution reaching it (induction increments bounded by a dominating
+    /// guard). Backends may emit no-signed-wrap arithmetic for them; LLVM
+    /// re-validates the node shape before emitting `nsw`.
+    pub no_signed_wrap: Vec<usize>,
 }
 impl Trace {
     pub fn value(&self, v: TraceValueId) -> Option<&TraceValue> { self.values.get(v.0 as usize) }
@@ -551,7 +556,8 @@ pub struct TraceBuilder {
 impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
-            loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
+            loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default(),
+            no_signed_wrap: Vec::new() },
             slots: HashMap::default(), proven_types: HashMap::default(), entry_types: HashMap::default(),
             boundary_types: HashMap::default(), pending_reloads: Vec::new(), boundary_open: false,
             dirty: vec![], dirty_set: HashSet::default(), memory_epoch: false }

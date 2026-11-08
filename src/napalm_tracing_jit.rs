@@ -13865,14 +13865,83 @@ mod tests {
     /// including -0, fractional, NaN, out-of-range and non-number entries.
     #[test]
     fn f64_induction_with_integer_index_use_promotes_and_matches_native() {
+        let up = InductionShape { cmp: CmpKind::Lt, iv_left: true, case: 1, bound: Some(10.0), op: F64BinOp::Add, step: 1.0, step_left: false, float_use: false };
         // Constant bound: `i < 10`.
-        check_induction_promotion(false, &[0, 10]);
+        check_induction_promotion(up, true, &[0]);
         // Int32 register bound (`i < list.length` shape), including the i32::MAX
         // edge that proves the integer increment never overflows.
-        check_induction_promotion(true, &[0, 10, i32::MAX, i32::MIN, -5]);
+        check_induction_promotion(InductionShape { bound: None, ..up }, true, &[0, 10, i32::MAX, i32::MIN, -5]);
+        // `1 + i` and `10 > i` are the same induction.
+        check_induction_promotion(InductionShape { step_left: true, ..up }, true, &[0]);
+        check_induction_promotion(InductionShape { cmp: CmpKind::Gt, iv_left: false, ..up }, true, &[0]);
+        // Case(0): the loop continues while `i >= 10` is false.
+        check_induction_promotion(InductionShape { cmp: CmpKind::Ge, case: 0, ..up }, true, &[0]);
     }
 
-    fn check_induction_promotion(register_bound: bool, bounds: &[i32]) {
+    /// Decreasing loops, `<=`/`>=` and steps != 1: promoted exactly when the
+    /// dominating guard proves the step stays inside i32, and never otherwise.
+    #[test]
+    fn integer_induction_generalizations_match_native_and_respect_overflow_proofs() {
+        let down = InductionShape { cmp: CmpKind::Gt, iv_left: true, case: 1, bound: Some(0.0), op: F64BinOp::Sub, step: 1.0, step_left: false, float_use: false };
+        let registers: &[i32] = &[0, 10, -5, i32::MAX, i32::MIN, i32::MIN + 1];
+        // `for (i = n; i > 0; i--)`, also against a register bound (i > MIN).
+        check_induction_promotion(down, true, &[0]);
+        check_induction_promotion(InductionShape { bound: None, ..down }, true, registers);
+        // `for (i = n - 1; i >= 0; i--)`, and `0 <= i` / `i + -1` spellings.
+        let ge = InductionShape { cmp: CmpKind::Ge, ..down };
+        check_induction_promotion(ge, true, &[0]);
+        check_induction_promotion(InductionShape { cmp: CmpKind::Le, iv_left: false, ..ge }, true, &[0]);
+        check_induction_promotion(InductionShape { op: F64BinOp::Add, step: -1.0, ..ge }, true, &[0]);
+        // `i >= n` with a register n may sit at i32::MIN: `i - 1` could wrap.
+        check_induction_promotion(InductionShape { bound: None, ..ge }, false, registers);
+        // `i >= MIN` with a constant bound overflows too; `i >= MIN + 1` doesn't.
+        check_induction_promotion(InductionShape { bound: Some(i32::MIN as f64), ..ge }, false, &[0]);
+        check_induction_promotion(InductionShape { bound: Some(i32::MIN as f64 + 1.0), ..ge }, true, &[0]);
+
+        let le = InductionShape { cmp: CmpKind::Le, iv_left: true, case: 1, bound: Some(100.0), op: F64BinOp::Add, step: 1.0, step_left: false, float_use: false };
+        // `i <= 100`, up to the last bound that still leaves room for `+1`.
+        check_induction_promotion(le, true, &[0]);
+        check_induction_promotion(InductionShape { bound: Some(i32::MAX as f64 - 1.0), ..le }, true, &[0]);
+        check_induction_promotion(InductionShape { bound: Some(i32::MAX as f64), ..le }, false, &[0]);
+        check_induction_promotion(InductionShape { bound: None, ..le }, false, registers);
+
+        // Steps != 1.
+        let lt = InductionShape { cmp: CmpKind::Lt, ..le };
+        check_induction_promotion(InductionShape { step: 2.0, bound: Some(10.0), ..lt }, true, &[0]);
+        // `i < MAX - 3` -> i <= MAX - 4 -> i + 4 <= MAX; one more and it wraps.
+        check_induction_promotion(InductionShape { step: 4.0, bound: Some(i32::MAX as f64 - 3.0), ..lt }, true, &[0]);
+        check_induction_promotion(InductionShape { step: 4.0, bound: Some(i32::MAX as f64 - 2.0), ..lt }, false, &[0]);
+        check_induction_promotion(InductionShape { step: 3.0, op: F64BinOp::Sub, cmp: CmpKind::Ge, bound: Some(0.0), ..lt }, true, &[0]);
+        // A register bound only proves `+1`: `i < n; i += 2` must stay F64.
+        check_induction_promotion(InductionShape { step: 2.0, bound: None, ..lt }, false, registers);
+        // Non-integral steps are never integer inductions.
+        check_induction_promotion(InductionShape { step: 0.5, bound: Some(10.0), ..lt }, false, &[0]);
+
+        // Plain numeric uses of `i` read a materialized `Int32ToF64(i)`.
+        check_induction_promotion(InductionShape { float_use: true, bound: Some(10.0), ..lt }, true, &[0]);
+        check_induction_promotion(InductionShape { float_use: true, bound: None, ..lt }, true, registers);
+        check_induction_promotion(InductionShape { float_use: true, ..down }, true, &[0]);
+        check_induction_promotion(InductionShape { float_use: true, bound: None, ..ge }, false, registers);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct InductionShape {
+        cmp: CmpKind,
+        /// `i cmp bound` (true) or `bound cmp i` (false).
+        iv_left: bool,
+        /// GuardSwitch case the loop continues on.
+        case: i64,
+        /// Constant F64 bound, or `None` for an Int32 register (Reg(2)).
+        bound: Option<f64>,
+        op: F64BinOp,
+        step: f64,
+        /// `step op i` instead of `i op step`.
+        step_left: bool,
+        /// Also uses `i` as a plain number (`Reg(3) = i * 3.5`).
+        float_use: bool,
+    }
+
+    fn check_induction_promotion(shape: InductionShape, expect_integer: bool, bounds: &[i32]) {
         let mut b = crate::napalm_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor {
             kind: TraceKind::Loop,
             location: TraceLocation::new(FuncId(0), BytecodePc(0)),
@@ -13880,22 +13949,31 @@ mod tests {
         let slot = FrameSlot::General(Reg(0));
         let start = b.read_slot(slot, TraceType::Any, TraceRep::Tagged);
         let phi = b.add_loop_phi(slot, start, TraceType::Any, TraceRep::Tagged);
-        let limit = if register_bound {
-            let length = b.read_slot(FrameSlot::General(Reg(2)), TraceType::Int32, TraceRep::Int32);
-            b.emit1(TraceInst::Int32ToF64 { value: length }, TraceType::F64, TraceRep::F64)
-        } else {
-            b.constant(TraceConstant::F64Bits(10.0f64.to_bits()))
+        let limit = match shape.bound {
+            None => {
+                let length = b.read_slot(FrameSlot::General(Reg(2)), TraceType::Int32, TraceRep::Int32);
+                b.emit1(TraceInst::Int32ToF64 { value: length }, TraceType::F64, TraceRep::F64)
+            }
+            Some(bound) => b.constant(TraceConstant::F64Bits(bound.to_bits())),
         };
         let number = b.add_side_exit(ExitReason::GuardNumber, BytecodePc(0));
         let i = b.emit1(TraceInst::GuardF64 { value: phi, exit: number }, TraceType::F64, TraceRep::F64);
-        let more = b.emit1(TraceInst::F64Compare { op: CmpKind::Lt, lhs: i, rhs: limit }, TraceType::Bool, TraceRep::Bool);
+        let (lhs, rhs) = if shape.iv_left { (i, limit) } else { (limit, i) };
+        let more = b.emit1(TraceInst::F64Compare { op: shape.cmp, lhs, rhs }, TraceType::Bool, TraceRep::Bool);
         let done = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
-        b.emit0(TraceInst::GuardSwitch { tag: more, observed: TraceSwitchGuard::Case(1), exit: done });
+        b.emit0(TraceInst::GuardSwitch { tag: more, observed: TraceSwitchGuard::Case(shape.case), exit: done });
         let integer = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
         let index = b.emit1(TraceInst::GuardInt32 { value: phi, exit: integer }, TraceType::Int32, TraceRep::Int32);
         b.write_slot(FrameSlot::General(Reg(1)), index);
-        let one = b.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
-        let next = b.emit1(TraceInst::F64Binary { op: F64BinOp::Add, lhs: i, rhs: one }, TraceType::F64, TraceRep::F64);
+        if shape.float_use {
+            let scale = b.constant(TraceConstant::F64Bits(3.5f64.to_bits()));
+            let scaled = b.emit1(TraceInst::F64Binary { op: F64BinOp::Mul, lhs: i, rhs: scale }, TraceType::F64, TraceRep::F64);
+            let boxed = b.emit1(TraceInst::BoxF64 { value: scaled }, TraceType::Num, TraceRep::Tagged);
+            b.write_slot(FrameSlot::General(Reg(3)), boxed);
+        }
+        let step = b.constant(TraceConstant::F64Bits(shape.step.to_bits()));
+        let (lhs, rhs) = if shape.step_left { (step, i) } else { (i, step) };
+        let next = b.emit1(TraceInst::F64Binary { op: shape.op, lhs, rhs }, TraceType::F64, TraceRep::F64);
         let boxed = b.emit1(TraceInst::BoxF64 { value: next }, TraceType::Num, TraceRep::Tagged);
         b.write_slot(slot, boxed);
         b.set_loop_backedge(phi, boxed).unwrap();
@@ -13906,27 +13984,32 @@ mod tests {
         crate::napalm_trace_ir_optimizing::optimization_passes().optimize_trace(&mut optimized).unwrap();
         // Tagged -> F64 (with the index use) -> Int32 induction variable.
         assert_eq!(optimized.stats.promoted_f64_loop_phis, 1, "{:?}", optimized.stats);
-        assert_eq!(optimized.stats.promoted_i32_loop_phis, 1, "{:?}", optimized.stats);
-        assert!(optimized.loop_phis.iter().any(|phi| phi.rep == TraceRep::Int32));
-        assert!(!optimized.nodes.iter().any(|node| matches!(
-            node.kind,
-            TraceInst::F64ToInt32 { .. } | TraceInst::F64Compare { .. } | TraceInst::GuardInt32 { .. }
-        )), "{:?}", optimized.nodes);
+        assert_eq!(optimized.stats.promoted_i32_loop_phis, expect_integer as usize, "{shape:?} {:?}", optimized.stats);
+        assert_eq!(optimized.loop_phis.iter().any(|phi| phi.rep == TraceRep::Int32), expect_integer);
+        assert_eq!(optimized.no_signed_wrap.len(), expect_integer as usize);
+        if expect_integer {
+            assert!(!optimized.nodes.iter().any(|node| matches!(
+                node.kind,
+                TraceInst::F64ToInt32 { .. } | TraceInst::F64Compare { .. } | TraceInst::GuardInt32 { .. }
+            )), "{:?}", optimized.nodes);
+            let materialized = optimized.nodes.iter().filter(|node| matches!(node.kind, TraceInst::Int32ToF64 { .. })).count();
+            assert_eq!(materialized > 0, shape.float_use, "{shape:?} {:?}", optimized.nodes);
+        }
 
-        let near_max = |delta: i32| RegisterWord(((i32::MAX - delta) as f64).to_bits());
+        let word = |value: f64| RegisterWord(value.to_bits());
         let inputs = [
-            RegisterWord(0.0f64.to_bits()), RegisterWord(3.0f64.to_bits()), RegisterWord(9.0f64.to_bits()),
-            RegisterWord(10.0f64.to_bits()), RegisterWord((-1.0f64).to_bits()), RegisterWord((-0.0f64).to_bits()),
-            RegisterWord(2.5f64.to_bits()), RegisterWord(CANONICAL_NAN), RegisterWord((-3e9f64).to_bits()),
-            RegisterWord((i32::MIN as f64).to_bits()), near_max(2), near_max(0),
-            RegisterWord(((i32::MAX as f64) + 1.0).to_bits()), RegisterWord(TAG_NULL), RegisterWord(TAG_TRUE),
+            word(0.0), word(1.0), word(3.0), word(9.0), word(10.0), word(-1.0), word(-0.0), word(2.5),
+            RegisterWord(CANONICAL_NAN), word(-3e9), word(3e9), word(i32::MIN as f64), word(i32::MIN as f64 + 1.0),
+            word(i32::MIN as f64 + 3.0), word(i32::MAX as f64 - 3.0), word(i32::MAX as f64 - 2.0),
+            word(i32::MAX as f64), word(i32::MAX as f64 + 1.0), word(i32::MIN as f64 - 1.0),
+            RegisterWord(TAG_NULL), RegisterWord(TAG_TRUE),
         ];
         for &bound in bounds {
             for input in inputs {
                 for budget in [1, 3, 64] {
                     // Exit ids differ (promotion adds an entry exit resuming at
                     // the same header PC); architectural register state must not.
-                    let mut baseline = [input, RegisterWord(77), RegisterWord(bound as u32 as u64)];
+                    let mut baseline = [input, RegisterWord(77), RegisterWord(bound as u32 as u64), RegisterWord(55)];
                     let mut actual = baseline;
                     run_scalar_trace(&original, &mut baseline, 0, budget);
                     run_scalar_trace(&optimized, &mut actual, 0, budget);
