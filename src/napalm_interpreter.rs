@@ -22440,6 +22440,65 @@ var result = total;
     }
 
     #[test]
+    fn out_of_line_ternary_arm_is_if_converted() {
+        // The bytecode optimizer lays the cold `: 1` arm of `cost` out of line
+        // (after the return, jumping back). It must still become a Select:
+        // one side exit per character match would dominate the loop.
+        let source = r#"
+function lev(a, b) {
+  const m = a.length;
+  const n = b.length;
+  let prev = [];
+  let cur = [];
+  for (let j = 0; j <= n; j++) { prev.push(j); cur.push(0); }
+  for (let i = 1; i <= m; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] == b[j - 1] ? 0 : 1;
+      let best = prev[j] + 1;
+      if (cur[j - 1] + 1 < best) { best = cur[j - 1] + 1; }
+      if (prev[j - 1] + cost < best) { best = prev[j - 1] + cost; }
+      cur[j] = best;
+    }
+    const t = prev; prev = cur; cur = t;
+  }
+  return prev[n];
+}
+let a = "";
+let b = "";
+for (let k = 0; k < 6; k++) { a = a + "kitten sat "; b = b + "sitting on "; }
+let total = 0;
+for (let r = 0; r < 12; r++) { total = total + lev(a, b) * 100 + lev(b, a); }
+var result = total;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut results = Vec::new();
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            results.push(source_result(&vm).to_bits());
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                // As a guard, `cost` = 0 (a character match) leaves the root
+                // trace and grows side traces for the rest of the iteration
+                // (~5 side traces, ~210 exits here). As a Select it stays in
+                // the root trace (~1 side trace, ~80 exits: loop ends).
+                assert!(stats.native_entries > 0, "{stats:?}");
+                assert!(stats.side_exits < 150, "{stats:?}");
+                assert!(stats.side_traces_compiled <= 2, "{stats:?}");
+            }
+        }
+        assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));
+    }
+
+    #[test]
     fn direct_ordinary_invoke_unwinds_into_caller_catch() {
         let source = r#"
 class Box {

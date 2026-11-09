@@ -645,14 +645,154 @@ fn same_value(trace: &Trace, lhs: TraceValueId, rhs: TraceValueId) -> bool {
     trace.canonical_value(lhs) == trace.canonical_value(rhs)
 }
 
+/// `value` as `base + offset` through 32-bit integer add/sub of constants
+/// (`base` is `None` for a constant). Two's-complement addition is a group, so
+/// the decomposition is exact for wrapping arithmetic and for checked
+/// arithmetic on its successful path alike.
+pub(super) fn affine(trace: &Trace, value: TraceValueId) -> (Option<TraceValueId>, i32) {
+    let mut value = trace.canonical_value(value);
+    let mut offset = 0i32;
+    for _ in 0..8 {
+        if let Some(n) = constant(trace, value).and_then(integer) {
+            return (None, offset.wrapping_add(n));
+        }
+        let Some((_, kind)) = TraceCanonicalization::producer(trace, value) else { break };
+        let (op, lhs, rhs) = match kind {
+            TraceInst::IntBinary { op, lhs, rhs } | TraceInst::IntBinaryChecked { op, lhs, rhs, .. } => (op, lhs, rhs),
+            _ => break,
+        };
+        let int = |v| constant(trace, v).and_then(integer);
+        match (op, int(lhs), int(rhs)) {
+            (IntBinOp::Add, _, Some(c)) => { offset = offset.wrapping_add(c); value = trace.canonical_value(lhs); }
+            (IntBinOp::Add, Some(c), _) => { offset = offset.wrapping_add(c); value = trace.canonical_value(rhs); }
+            (IntBinOp::Sub, _, Some(c)) => { offset = offset.wrapping_sub(c); value = trace.canonical_value(lhs); }
+            _ => break,
+        }
+    }
+    (Some(value), offset)
+}
+
+/// Same 32-bit word with different offsets from one base (or two different
+/// constants): different bit patterns are different numbers in any of the
+/// integer representations, so the two locations cannot be the same element.
 fn indices_proven_distinct(trace: &Trace, lhs: TraceValueId, rhs: TraceValueId) -> bool {
     if same_value(trace, lhs, rhs) {
         return false;
     }
-    match (constant(trace, lhs).and_then(integer), constant(trace, rhs).and_then(integer)) {
-        (Some(lhs), Some(rhs)) => lhs != rhs,
-        _ => false,
+    let ((a, x), (b, y)) = (affine(trace, lhs), affine(trace, rhs));
+    a == b && x != y
+}
+
+/// A loop phi `P` with an Int32 backedge `P + step` (small nonzero step).
+fn affine_induction(trace: &Trace, phi: TraceValueId) -> Option<(usize, i32)> {
+    let phi = trace.canonical_value(phi);
+    let index = trace.loop_phis.iter().position(|candidate| trace.canonical_value(candidate.value) == phi)?;
+    let candidate = &trace.loop_phis[index];
+    if candidate.rep != TraceRep::Int32 {
+        return None;
     }
+    let (base, step) = affine(trace, candidate.backedge?);
+    (base == Some(phi) && step != 0 && step.unsigned_abs() <= MAX_CARRIED_OFFSET).then_some((index, step))
+}
+
+/// Offsets that loop-carried reuse reasons about. Small enough that no chain
+/// of reuses can wrap around to the original location (which would need
+/// 2^32 / offset links).
+const MAX_CARRIED_OFFSET: u32 = 1 << 16;
+
+/// `value` as `P + offset` for an Int32 affine induction `P` (with its phi
+/// index and step) — the shape of a loop-carried index such as `j - 1`.
+fn induction_offset(trace: &Trace, value: TraceValueId) -> Option<(TraceValueId, usize, i32, i32)> {
+    if trace.value(trace.canonical_value(value))?.rep != TraceRep::Int32 {
+        return None;
+    }
+    let (Some(base), offset) = affine(trace, value) else { return None };
+    if offset.unsigned_abs() > MAX_CARRIED_OFFSET {
+        return None;
+    }
+    let (phi, step) = affine_induction(trace, base)?;
+    Some((base, phi, step, offset))
+}
+
+/// Whether `value` is exactly the Int32 `base + offset`.
+fn is_induction_at(trace: &Trace, value: TraceValueId, base: TraceValueId, offset: i32) -> bool {
+    trace.value(trace.canonical_value(value)).is_some_and(|info| info.rep == TraceRep::Int32)
+        && affine(trace, value) == (Some(base), offset)
+}
+
+/// The Int32 value of induction `phi` on the entry edge, plus `offset`,
+/// computed in the preheader. A promoted induction reads the Int32 view of its
+/// tagged entry word (reusing its entry check); overflow of the addition
+/// leaves through a fresh anchor exit, before any architectural effect.
+fn preheader_induction_value(trace: &mut Trace, phi: usize, offset: i32, source: TraceLocation) -> Option<TraceValueId> {
+    let LoopPhi { initial, entry_exit, .. } = trace.loop_phis[phi].clone();
+    let initial = trace.canonical_value(initial);
+    let start = match entry_exit {
+        None => {
+            let info = trace.value(initial)?;
+            if info.rep != TraceRep::Int32 || !preheader_values(trace).contains(&initial) {
+                return None;
+            }
+            initial
+        }
+        Some(exit) => {
+            if !trace.exits.get(exit.0 as usize).is_some_and(|exit| exit.frames.iter().all(|frame| frame.writes.is_empty())) {
+                return None;
+            }
+            let existing = trace.values.iter().find(|value| value.rep == TraceRep::Int32
+                && matches!(value.origin, TraceValueOrigin::GuardedEntry { value: other, .. }
+                    if trace.canonical_value(other) == initial));
+            match existing {
+                Some(value) => value.id,
+                None => {
+                    let id = TraceValueId(trace.values.len() as u32);
+                    trace.values.push(TraceValue { id, ty: TraceType::Int32, rep: TraceRep::Int32,
+                        origin: TraceValueOrigin::GuardedEntry { value: initial, exit } });
+                    id
+                }
+            }
+        }
+    };
+    if offset == 0 {
+        return Some(start);
+    }
+    let rhs = intern(trace, TraceConstant::Int32(offset), TraceType::Int32, TraceRep::Int32);
+    let exit = anchor_exit(trace);
+    let node = trace.nodes.len();
+    let value = TraceValueId(trace.values.len() as u32);
+    trace.values.push(TraceValue { id: value, ty: TraceType::Int32, rep: TraceRep::Int32, origin: TraceValueOrigin::InstResult { node } });
+    trace.nodes.push(TraceNode { id: node, kind: TraceInst::IntBinaryChecked { op: IntBinOp::Add, lhs: start, rhs, exit },
+        results: smallvec::smallvec![value], source });
+    trace.preheader.push(node);
+    Some(value)
+}
+
+/// Memory facts that survive the loop header: a fact established once (in the
+/// preheader) holds at the top of every iteration only if no store of the
+/// body — which runs *after* the consumer on the previous iteration, where a
+/// linear walk cannot see it — can change the location.
+fn body_memory_kills(trace: &Trace) -> Option<(bool, Vec<Memory>)> {
+    if trace.preheader.is_empty() || !matches!(trace.terminator, TraceTerminator::LoopBack) {
+        return None;
+    }
+    let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+    let mut barrier = false;
+    let mut stores = Vec::new();
+    for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
+        barrier |= matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. });
+        if let Some((memory, _)) = store(&node.kind, trace) {
+            stores.push(memory);
+        }
+    }
+    Some((barrier, stores))
+}
+
+fn survives_body(trace: &Trace, kills: &(bool, Vec<Memory>), fact: &Memory) -> bool {
+    let (barrier, stores) = kills;
+    !barrier && !stores.iter().any(|store| match (store, fact) {
+        (Memory::Frame(slot, _), Memory::Frame(fact_slot, _)) => slot == fact_slot,
+        _ => memory_store_clobbers(trace, store, fact),
+    })
 }
 
 /// Whether a successful store can change the value represented by `cached`.
@@ -759,6 +899,102 @@ impl TraceOptimization for LoopInvariantLoadHoisting {
     }
 }
 
+/// See LoadStorePRE: for a body `list[P + c]` (invariant list, Int32 affine
+/// induction `P += s`), the end-of-iteration value of `list[P + c + s]`, which
+/// is what the read returns on the next iteration, with P's phi and `c`.
+fn carried_list_read(
+    trace: &Trace,
+    kind: &TraceInst,
+    invariant: &HashSet<TraceValueId>,
+    available: &HashMap<Memory, TraceValueId>,
+    rep: TraceRep,
+) -> Option<(TraceValueId, usize, i32)> {
+    let TraceInst::HeapListGet { list, index, .. } = kind else { return None };
+    if !invariant.contains(&trace.canonical_value(*list)) {
+        return None;
+    }
+    let (base, phi, step, offset) = induction_offset(trace, *index)?;
+    let shifted = offset.wrapping_add(step);
+    available.iter().find_map(|(memory, &value)| match memory {
+        Memory::List(other, other_index) if same_value(trace, *other, *list)
+            && is_induction_at(trace, *other_index, base, shifted)
+            && trace.value(value).is_some_and(|info| info.rep == rep) => Some(value),
+        _ => None,
+    }).map(|value| (value, phi, offset))
+}
+
+/// Loop-carried guard reuse. A body `GuardBounds(P + c, n)` with invariant `n`
+/// and an Int32 affine induction `P += s` checks, on iteration k + 1, exactly
+/// what a body `GuardBounds(P + c + s, n)` already checked on iteration k
+/// (every body node runs on an iteration that reaches the backedge, and only
+/// the root preheader or the backedge enter the loop header). Only the first
+/// iteration still needs the check: it moves to the preheader with P's entry
+/// value and an anchor exit. A guard that serves as a provider is never itself
+/// removed, so reuse cannot become circular; nor is one that still guards a
+/// body access of its own list (it is that access's cheap index proof).
+#[derive(Default)]
+pub struct LoopCarriedGuardElimination;
+impl TraceOptimization for LoopCarriedGuardElimination {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        if !native_loop(trace) {
+            return false;
+        }
+        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let invariant = preheader_values(trace);
+        let guards: Vec<(usize, TraceValueId, TraceValueId)> = (0..trace.nodes.len())
+            .filter(|id| !preheader.contains(id))
+            .filter_map(|id| match trace.nodes[id].kind {
+                TraceInst::GuardBounds { index, length, .. } => {
+                    Some((id, trace.canonical_value(index), trace.canonical_value(length)))
+                }
+                _ => None,
+            })
+            .collect();
+        // A list's own bounds guard also hands the backends the normalized
+        // index for the access it precedes (see RangeAnalysis); without it the
+        // access redoes the costlier negative-index check every iteration.
+        let serves_access = |trace: &Trace, index: TraceValueId, length: TraceValueId| {
+            let Some((_, TraceInst::HeapListLen { list, .. })) = TraceCanonicalization::producer(trace, length) else {
+                return false;
+            };
+            let list = trace.canonical_value(list);
+            trace.nodes.iter().filter(|node| !preheader.contains(&node.id)).any(|node| match node.kind {
+                TraceInst::HeapListGet { list: other, index: other_index, .. }
+                | TraceInst::HeapListSet { list: other, index: other_index, .. } => {
+                    trace.canonical_value(other) == list && trace.canonical_value(other_index) == index
+                }
+                _ => false,
+            })
+        };
+        let mut providers = HashSet::default();
+        let mut removed = HashSet::default();
+        let mut changed = false;
+        for &(id, index, length) in &guards {
+            if providers.contains(&id) || !invariant.contains(&length) || serves_access(trace, index, length) {
+                continue;
+            }
+            let Some((base, phi, step, offset)) = induction_offset(trace, index) else { continue };
+            let shifted = offset.wrapping_add(step);
+            let Some(&(provider, ..)) = guards.iter().find(|&&(other, other_index, other_length)| {
+                other != id && !removed.contains(&other) && other_length == length
+                    && is_induction_at(trace, other_index, base, shifted)
+            }) else {
+                continue;
+            };
+            let source = trace.nodes[id].source;
+            let Some(start) = preheader_induction_value(trace, phi, offset, source) else { continue };
+            let exit = anchor_exit(trace);
+            trace.nodes[id].kind = TraceInst::GuardBounds { index: start, length, exit };
+            trace.preheader.push(id);
+            providers.insert(provider);
+            removed.insert(id);
+            trace.stats.eliminated_bounds_checks += 1;
+            changed = true;
+        }
+        changed
+    }
+}
+
 /// Memory value numbering and store-to-load forwarding. Different SSA object
 /// references may alias, but validated heap families, field slots and proven-distinct
 /// constant indices provide useful disambiguation. Runtime/barrier boundaries kill
@@ -770,7 +1006,17 @@ impl TraceOptimization for LoadStorePRE {
         let mut available: HashMap<Memory, TraceValueId> = HashMap::default();
         let mut validated_stores = HashSet::default();
         let mut changed = false;
+        let kills = body_memory_kills(trace);
+        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let mut in_body = preheader.is_empty();
         for id in order(trace) {
+            if !in_body && !preheader.contains(&id) {
+                in_body = true;
+                if let Some(kills) = &kills {
+                    available.retain(|fact, _| survives_body(trace, kills, fact));
+                    validated_stores.retain(|fact| survives_body(trace, kills, fact));
+                }
+            }
             let kind = trace.nodes[id].kind.clone();
             if matches!(kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }) {
                 available.clear(); validated_stores.clear(); continue;
@@ -838,8 +1084,34 @@ impl TraceOptimization for LoadStorePRE {
                 }
                 let mut inputs_available = true;
                 kind.clone().visit_operands(|v| inputs_available &= invariant.contains(v));
-                if !inputs_available { continue; }
                 let ty = trace.value(result).unwrap().ty;
+                if !inputs_available {
+                    // `list[P + c]` with an invariant list and an affine
+                    // induction `P += s` reads, on iteration k + 1, the element
+                    // `list[P_k + s + c]` — the value the last store or load
+                    // of iteration k left for that index (no store before the
+                    // read can change it: checked above).
+                    if let Some(carried) = carried_list_read(trace, &kind, &invariant, &available, rep) {
+                        let (next, phi, offset) = carried;
+                        let source = trace.nodes[id].source;
+                        let Some(index) = preheader_induction_value(trace, phi, offset, source) else { continue };
+                        let TraceInst::HeapListGet { list, .. } = kind else { unreachable!() };
+                        let exit = anchor_exit(trace);
+                        let node = trace.nodes.len();
+                        let start = TraceValueId(trace.values.len() as u32);
+                        trace.values.push(TraceValue { id: start, ty, rep, origin: TraceValueOrigin::InstResult { node } });
+                        trace.nodes.push(TraceNode { id: node, kind: TraceInst::HeapListGet { list, index, exit },
+                            results: smallvec::smallvec![start], source });
+                        trace.preheader.push(node);
+                        let value = TraceValueId(trace.values.len() as u32);
+                        trace.values.push(TraceValue { id: value, ty, rep, origin: TraceValueOrigin::LoopTemporary });
+                        trace.loop_phis.push(LoopPhi { value, initial: start, backedge: Some(next), rep, entry_exit: None });
+                        replace(trace, id, value);
+                        trace.stats.loop_loads_reused += 1;
+                        changed = true;
+                    }
+                    continue;
+                }
                 let Some(&next) = available.get(&key) else { continue };
                 if trace.value(next).unwrap().rep != rep { continue; }
                 let exit = anchor_exit(trace);
@@ -2062,6 +2334,128 @@ mod tests {
         assert_eq!(trace.loop_phis[0].backedge, Some(value));
         assert_eq!(trace.canonical_value(loaded), trace.loop_phis[0].value);
         assert!(trace.nodes[trace.preheader[0]].kind.is_heap_read());
+    }
+
+    #[test]
+    fn memory_pre_never_forwards_preheader_facts_the_body_overwrites() {
+        // Preheader `load cell` (a hoisted read), body: reload, then store.
+        // The reload sees the previous iteration's store from iteration 2 on.
+        let mut b = builder(TraceKind::Loop);
+        let cell = input(&mut b, 0, TraceRep::Tagged);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let hoisted = b.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged);
+        let reload = b.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged);
+        let guarded = b.emit1(TraceInst::GuardF64 { value: reload, exit }, TraceType::F64, TraceRep::F64);
+        let one = b.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
+        let sum = b.emit1(TraceInst::F64Binary { op: F64BinOp::Add, lhs: guarded, rhs: one }, TraceType::F64, TraceRep::F64);
+        let boxed = b.emit1(TraceInst::BoxF64 { value: sum }, TraceType::Num, TraceRep::Tagged);
+        b.emit0(TraceInst::HeapStoreCell { cell, value: boxed, exit });
+        b.write_slot(FrameSlot::General(Reg(1)), hoisted);
+        let mut trace = finish(b);
+        let hoisted_node = trace.nodes.iter().position(|node| node.results.first() == Some(&hoisted)).unwrap();
+        trace.preheader.push(hoisted_node);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_ne!(trace.canonical_value(reload), hoisted, "stale preheader value reached the body");
+        // It may instead become a loop-carried phi whose backedge is the store.
+        if let Some(phi) = trace.loop_phis.iter().find(|phi| phi.value == trace.canonical_value(reload)) {
+            assert_eq!(phi.backedge.map(|value| trace.canonical_value(value)), Some(boxed));
+        }
+    }
+
+    #[test]
+    fn memory_pre_separates_affine_indices_of_one_base() {
+        let mut b = builder(TraceKind::Side);
+        let list = input(&mut b, 0, TraceRep::Tagged);
+        let other = input(&mut b, 1, TraceRep::Tagged);
+        let i = input(&mut b, 2, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let previous = binary(&mut b, IntBinOp::Sub, i, one);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let first = b.emit1(TraceInst::HeapListGet { list, index: previous, exit }, TraceType::Any, TraceRep::Tagged);
+        let value = b.constant(TraceConstant::NumBits(7.0f64.to_bits()));
+        // Even through a possibly aliasing list, element i is not element i - 1.
+        b.emit0(TraceInst::HeapListSet { list: other, index: i, value, exit, numeric: false });
+        let again = b.emit1(TraceInst::HeapListGet { list, index: previous, exit }, TraceType::Any, TraceRep::Tagged);
+        // ... but element i - 1 + 1 is element i.
+        let same = binary(&mut b, IntBinOp::Add, previous, one);
+        b.emit0(TraceInst::HeapListSet { list: other, index: same, value, exit, numeric: false });
+        let clobbered = b.emit1(TraceInst::HeapListGet { list, index: i, exit }, TraceType::Any, TraceRep::Tagged);
+        b.write_slot(FrameSlot::General(Reg(3)), again);
+        b.write_slot(FrameSlot::General(Reg(4)), clobbered);
+        let mut trace = finish(b);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.canonical_value(again), first);
+        assert_eq!(trace.canonical_value(clobbered), clobbered);
+    }
+
+    /// `for j: x = cur[j - 1]; cur[j] = f(x)` — the read is last iteration's store.
+    fn carried_list_loop(store_offset: i32) -> (Trace, TraceValueId, TraceValueId) {
+        let mut b = builder(TraceKind::Loop);
+        let list = input(&mut b, 0, TraceRep::Tagged);
+        let start = input(&mut b, 1, TraceRep::Int32);
+        let j = b.add_loop_phi(FrameSlot::General(Reg(1)), start, TraceType::Int32, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let previous = binary(&mut b, IntBinOp::Sub, j, one);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let read = b.emit1(TraceInst::HeapListGet { list, index: previous, exit }, TraceType::Any, TraceRep::Tagged);
+        let x = b.emit1(TraceInst::GuardF64 { value: read, exit }, TraceType::F64, TraceRep::F64);
+        let two = b.constant(TraceConstant::F64Bits(2.0f64.to_bits()));
+        let y = b.emit1(TraceInst::F64Binary { op: F64BinOp::Mul, lhs: x, rhs: two }, TraceType::F64, TraceRep::F64);
+        let boxed = b.emit1(TraceInst::BoxF64 { value: y }, TraceType::Num, TraceRep::Tagged);
+        let offset = int(&mut b, store_offset);
+        let store_index = binary(&mut b, IntBinOp::Add, j, offset);
+        b.emit0(TraceInst::HeapListSet { list, index: store_index, value: boxed, exit, numeric: false });
+        let next = binary(&mut b, IntBinOp::Add, j, one);
+        b.set_loop_backedge(j, next).unwrap();
+        (finish(b), read, boxed)
+    }
+
+    #[test]
+    fn memory_pre_carries_shifted_list_stores_over_the_backedge() {
+        let (mut trace, read, stored) = carried_list_loop(0);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        let phi = trace.loop_phis.iter().find(|phi| phi.value == trace.canonical_value(read)).expect("carried phi");
+        assert_eq!(phi.backedge, Some(stored));
+        // The first iteration reads `list[start - 1]` in the preheader.
+        let TraceValueOrigin::InstResult { node } = trace.value(phi.initial).unwrap().origin else { panic!() };
+        assert!(trace.preheader.contains(&node));
+        let TraceInst::HeapListGet { index, .. } = trace.nodes[node].kind else { panic!("{:?}", trace.nodes[node].kind) };
+        let (_, TraceInst::IntBinaryChecked { op: IntBinOp::Add, rhs, .. }) = TraceCanonicalization::producer(&trace, index).unwrap() else { panic!() };
+        assert_eq!(constant(&trace, rhs), Some(TraceConstant::Int32(-1)));
+
+        // Storing `list[j + 1]` instead does not feed `list[j - 1]` next time.
+        let (mut trace, read, _) = carried_list_loop(1);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.canonical_value(read), read);
+    }
+
+    #[test]
+    fn loop_carried_bounds_checks_run_once_at_entry() {
+        let mut b = builder(TraceKind::Loop);
+        let length = input(&mut b, 0, TraceRep::Int32);
+        let start = input(&mut b, 1, TraceRep::Int32);
+        let j = b.add_loop_phi(FrameSlot::General(Reg(1)), start, TraceType::Int32, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let previous = binary(&mut b, IntBinOp::Sub, j, one);
+        let exit = b.add_side_exit(ExitReason::GuardBounds, BytecodePc(0));
+        b.emit0(TraceInst::GuardBounds { index: previous, length, exit });
+        b.emit0(TraceInst::GuardBounds { index: j, length, exit });
+        let next = binary(&mut b, IntBinOp::Add, j, one);
+        b.set_loop_backedge(j, next).unwrap();
+        let mut trace = finish(b);
+        Optimize::new().with_pass(LoopCarriedGuardElimination).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.stats.eliminated_bounds_checks, 1);
+        let body_guards: Vec<_> = trace.nodes.iter()
+            .filter(|node| !trace.preheader.contains(&node.id))
+            .filter_map(|node| match node.kind { TraceInst::GuardBounds { index, .. } => Some(index), _ => None })
+            .collect();
+        assert_eq!(body_guards, vec![j]);
+        let entry = trace.preheader.iter().find_map(|&id| match trace.nodes[id].kind {
+            TraceInst::GuardBounds { index, exit, .. } => Some((index, exit)), _ => None,
+        }).expect("entry check");
+        assert_ne!(entry.1, exit);
+        let (_, TraceInst::IntBinaryChecked { lhs, .. }) = TraceCanonicalization::producer(&trace, entry.0).unwrap() else { panic!() };
+        assert_eq!(trace.canonical_value(lhs), start);
     }
 
     #[test]

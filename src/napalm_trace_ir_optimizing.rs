@@ -100,6 +100,20 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         .with_pass(GuardCoalescing)
         .with_pass(RedundantGuardElimination)
         .with_pass(GlobalValueNumbering)
+        // Late memory round: GVN has just merged index computations that only
+        // became equal once RangeAnalysis dropped their overflow checks (e.g.
+        // two `j - 1`), so repeated reads now share one key, and loop-carried
+        // reuse (`cur[j - 1]` = last iteration's `cur[j]`) is visible.
+        .with_pass(RedundantLoadElimination)
+        .with_pass(LoopCarriedGuardElimination)
+        // Unbox the loop-carried memory phis it introduced (same rules as the
+        // first canonicalization; nothing else is new to it).
+        .with_pass(TraceCanonicalization {
+            promote_loop_representations,
+            promote_integer_induction: false,
+        })
+        .with_pass(RedundantGuardElimination)
+        .with_pass(GlobalValueNumbering)
         .with_pass(SparseConditionalConstantPropagation)
         .with_pass(SnapshotConstantPropagation)
         .with_pass(DeadCodeElimination)

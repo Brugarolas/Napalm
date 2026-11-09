@@ -1066,54 +1066,68 @@ impl TraceRecorder<'_> {
 
     /// If-conversion of a short diamond (`c ? a : b`, `if/else`) or one-armed
     /// `if (c) { ... }`: both arms are evaluated and merged with Select.
+    ///
+    /// Arms are found on the control-flow graph, not by position: each
+    /// successor of the branch is followed through unconditional jumps, and the
+    /// join is the first instruction both straight-line paths reach. The
+    /// bytecode optimizer lays cold arms out of line (the `else` of
+    /// `c ? 0 : 1` after the function's return, jumping back), which a
+    /// "fallthrough arm, jump, second arm, join" scan would never match.
     pub(super) fn inline_numeric_diamond<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, function: &BytecodeFunction,
         branch: &RecordedOp, condition: TraceValueId,
         builder: &mut crate::napalm_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
+        const MAX_ARM_OPS: usize = 8;
+        const MAX_WALK: usize = 3 * MAX_ARM_OPS;
         let alternate = relative_target(branch.next_pc, branch.x);
-        if alternate.0 <= branch.next_pc.0 { return Err(RecordingAbort::UnsupportedCall); }
-        let mut arms = [Vec::new(), Vec::new()];
-        let mut pc = branch.next_pc;
-        let mut join = None;
-        for _ in 0..8 {
-            // One-armed `if (c) { ... }`: the fallthrough arm reaches the branch
-            // target, which is the join; the other arm is empty.
-            if pc == alternate { join = Some(alternate); break; }
-            if pc.0 > alternate.0 { break; }
-            let op = decode_at(program, TraceLocation::new(function.id, pc))
-                .map_err(|_| RecordingAbort::UnsupportedCall)?;
-            if op.opcode == Opcode::Jump {
-                join = Some(relative_target(op.next_pc, op.x));
-                break;
+        // Straight-line path from `start`: through arm-eligible ops and
+        // unconditional jumps; the first other instruction (which may be the
+        // join itself) ends it.
+        let walk = |start: BytecodePc| {
+            let mut path: Vec<(BytecodePc, RecordedOp)> = Vec::new();
+            let mut pc = start;
+            while path.len() < MAX_WALK && !path.iter().any(|(seen, _)| *seen == pc) {
+                let Ok(op) = decode_at(program, TraceLocation::new(function.id, pc)) else { break };
+                let next = match op.opcode {
+                    Opcode::Jump => Some(relative_target(op.next_pc, op.x)),
+                    Opcode::Move | Opcode::LoadConst | Opcode::LoadNull | Opcode::LoadFalse
+                    | Opcode::LoadTrue | Opcode::BindInterface | Opcode::Invoke => Some(op.next_pc),
+                    _ => None,
+                };
+                path.push((pc, op));
+                match next {
+                    Some(next) => pc = next,
+                    None => break,
+                }
             }
-            pc = op.next_pc;
-            arms[0].push(op);
+            path
+        };
+        let first = walk(branch.next_pc);
+        let second = walk(alternate);
+        let (second_len, join, first_len) = second
+            .iter()
+            .enumerate()
+            .find_map(|(index, (pc, _))| {
+                first.iter().position(|(other, _)| other == pc).map(|position| (index, *pc, position))
+            })
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        // Forward joins only: a merge at or above the branch is a loop edge.
+        if join.0 <= branch.location.pc.0 { return Err(RecordingAbort::UnsupportedCall); }        let arm = |path: Vec<(BytecodePc, RecordedOp)>, len: usize| -> Vec<RecordedOp> {
+            path.into_iter().take(len).map(|(_, op)| op).filter(|op| op.opcode != Opcode::Jump).collect()
+        };
+        let arms = [arm(first, first_len), arm(second, second_len)];
+        if arms.iter().all(Vec::is_empty) || arms.iter().any(|arm| arm.len() > MAX_ARM_OPS) {
+            return Err(RecordingAbort::UnsupportedCall);
         }
-        let join = join.filter(|pc| pc.0 >= alternate.0).ok_or(RecordingAbort::UnsupportedCall)?;
-        if arms[0].is_empty() { return Err(RecordingAbort::UnsupportedCall); }
         // A one-armed `if` pays for its arm on every iteration once converted,
         // and a Select on a loop-carried value lengthens the recurrence. That
         // only wins when the branch is unpredictable, typically when it tests
         // data loaded in this iteration (`if (a[i] < lo) lo = a[i]`), not a
         // counter or accumulator (`if (acc > limit) ...`, rarely taken).
-        if join == alternate && !condition_reads_heap(builder.trace(), condition) {
+        if arms.iter().any(Vec::is_empty) && !condition_reads_heap(builder.trace(), condition) {
             return Err(RecordingAbort::UnsupportedCall);
         }
-        pc = alternate;
-        for _ in 0..8 {
-            if pc == join { break; }
-            if pc.0 > join.0 { return Err(RecordingAbort::UnsupportedCall); }
-            let op = decode_at(program, TraceLocation::new(function.id, pc))
-                .map_err(|_| RecordingAbort::UnsupportedCall)?;
-            if op.opcode == Opcode::Jump {
-                pc = relative_target(op.next_pc, op.x);
-                break;
-            }
-            pc = op.next_pc;
-            arms[1].push(op);
-        }
-        if pc != join { return Err(RecordingAbort::UnsupportedCall); }
 
         let mut registers = [None; 256];
         for op in arms.iter().flatten() {
@@ -1205,7 +1219,8 @@ impl TraceRecorder<'_> {
         }
         Ok(ExpectedStep::Region {
             next: TraceLocation::new(function.id, join),
-            max_steps: arms[0].len() + arms[1].len() + 3,
+            // Either path, jumps included, plus the branch itself.
+            max_steps: first_len + second_len + 3,
         })
     }
 }

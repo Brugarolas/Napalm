@@ -203,8 +203,7 @@ impl TraceOptimization for RedundantGuardElimination {
             // GuardClass facts are owned (and narrowed) by ClassTypePropagation.
             if !kind.is_entry_guard() || matches!(kind, TraceInst::GuardClass { .. }) {
                 continue;
-            }
-            let mut key = kind;
+            }            let mut key = kind;
             key.visit_operands(|v| *v = trace.canonical_value(*v));
             key.set_exit(SideExitId(0));
             let result = trace.nodes[id].results.first().copied();

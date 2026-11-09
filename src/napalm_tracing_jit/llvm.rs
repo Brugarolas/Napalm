@@ -3875,6 +3875,14 @@ impl LlvmLowering<'_> {
         }) {
             self.invalidate_heap_proofs();
         }
+        // Forwarded *contents* are facts of the preheader's single execution:
+        // a body store executed on the previous iteration (it follows the
+        // consumer in program order, so the linear cache never saw it) may have
+        // changed them, and in a region a linked side trace may have too.
+        // Kind/address/identity proofs stay valid. LLVM's own alias analysis
+        // still hoists a body reload that really is invariant.
+        self.forwarded_heap_loads.clear();
+        self.forwarded_absolute_loads.clear();
 
         for (phi, (slot, ty)) in trace.loop_phis.iter().zip(phi_slots.iter()) {
             let value = self.def(*ty, &format!("load {}, ptr {slot}, align {}", ty.ir(), ty.align()));

@@ -8032,6 +8032,12 @@ impl<'a> CraneliftTraceCompiler<'a> {
             {
                 state.invalidate_heap_proofs();
             }
+            // Forwarded *contents* are facts of the preheader's single execution:
+            // a body store executed on the previous iteration (it follows the
+            // consumer in program order, so the linear cache never saw it) may
+            // have changed them. Kind/address proofs above stay valid.
+            state.forwarded_heap_loads.clear();
+            state.forwarded_absolute_loads.clear();
 
             for (phi, variable) in self.trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
                 let value = state.builder.use_var(variable);
