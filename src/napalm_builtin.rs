@@ -2449,7 +2449,7 @@ fn execute_primitive(
         }
         StringEq | StringNe => {
             let rhs = argument(args, 0)?;
-            let equal = context.string_bytes(this).zip(context.string_bytes(rhs)).is_some_and(|(a,b)| a == b);
+            let equal = context.strings_equal(this, rhs).unwrap_or(false);
             Ok(Value::from_bool(if matches!(op, StringEq) { equal } else { !equal }))
         }
         StringSubscript => {

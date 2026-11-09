@@ -48,6 +48,7 @@ pub mod napalm_bytecode_optimizer;
 pub mod napalm_front;
 pub mod napalm_front_main;
 pub mod napalm_gc;
+pub mod napalm_interner;
 pub mod napalm_ir;
 pub mod napalm_lowerer;
 pub mod napalm_modules;

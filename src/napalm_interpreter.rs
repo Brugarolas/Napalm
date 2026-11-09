@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use crate::napalm_collections::{HashMap, HashSet, SmallSet16};
+use crate::napalm_interner::Name;
 use std::collections::VecDeque;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -977,7 +978,7 @@ type FastSet<K> = HashSet<K>;
 static STRING_HASH_BUILDER: OnceLock<AesBuildHasher> = OnceLock::new();
 
 #[inline]
-fn fast_hash_bytes(bytes: &[u8]) -> u64 {
+pub(crate) fn fast_hash_bytes(bytes: &[u8]) -> u64 {
     let builder = STRING_HASH_BUILDER.get_or_init(AesBuildHasher::new);
     let mut hasher = builder.build_hasher();
     hasher.write(bytes);
@@ -1026,11 +1027,18 @@ mod aes_hash_integration_tests {
 /// Immutable Napalm string payload with its content hash computed once. Strings are
 /// immutable, so dictionary lookups can reuse this hash instead of rescanning UTF-8
 /// bytes on every Map access.
+///
+/// Strings that come from the script source (literals, property, class,
+/// method and variable names) and strings used as hidden-class object keys
+/// carry their interned [`Name`]. Runtime-built strings (concatenation, fetch,
+/// loops, temporaries) never do; if one is used as an object key, the shape
+/// stores an interned copy of the key instead.
 #[derive(Clone, Debug)]
 pub struct NapalmString {
     bytes: Arc<[u8]>,
     hash: u64,
     code_points: usize,
+    name: Option<Name>,
 }
 
 impl NapalmString {
@@ -1038,8 +1046,70 @@ impl NapalmString {
     fn new(bytes: Arc<[u8]>) -> Self {
         let hash = fast_hash_bytes(bytes.as_ref());
         let code_points = napalm_code_point_count(bytes.as_ref());
-        Self { bytes, hash, code_points }
+        Self { bytes, hash, code_points, name: None }
     }
+
+    /// A String for script text: reuses the interned content hash.
+    #[inline]
+    fn interned(name: Name) -> Self {
+        let bytes = name.as_bytes();
+        Self {
+            bytes: Arc::from(bytes),
+            hash: name.content_hash(),
+            code_points: napalm_code_point_count(bytes),
+            name: Some(name),
+        }
+    }
+
+    #[inline(always)]
+    fn name(&self) -> Option<Name> { self.name }
+
+    #[inline(always)]
+    fn probe(&self) -> StrProbe<'_> {
+        StrProbe { bytes: self.bytes.as_ref(), hash: key_hash(self.hash), name: self.name() }
+    }
+}
+
+/// Map/shape keys keep the low 32 bits of the content hash, so that hash plus
+/// interned name fit the 8 bytes a full hash used to take (`MapKey` stays 32
+/// bytes, a dictionary entry 40). Hash tables re-mix it through the AesHasher,
+/// and equality is always confirmed by name or bytes: a 32-bit collision only
+/// costs one extra byte compare.
+#[inline(always)]
+fn key_hash(content_hash: u64) -> u32 { content_hash as u32 }
+
+/// Borrowed view of a String key for shape/PIC/dictionary lookups.
+#[derive(Clone, Copy, Debug)]
+struct StrProbe<'a> {
+    bytes: &'a [u8],
+    hash: u32,
+    name: Option<Name>,
+}
+
+impl<'a> StrProbe<'a> {
+    /// A key whose interned name (if any) is unknown: compared by hash + bytes.
+    #[inline(always)]
+    fn bytes(bytes: &'a [u8], content_hash: u64) -> Self {
+        Self { bytes, hash: key_hash(content_hash), name: None }
+    }
+
+    #[inline(always)]
+    fn named(name: Name) -> StrProbe<'static> {
+        StrProbe { bytes: name.as_bytes(), hash: key_hash(name.content_hash()), name: Some(name) }
+    }
+}
+
+/// String-key equality. Interning is canonical, so two interned keys are
+/// equal iff their names are; otherwise compare the cached hash, then bytes.
+#[inline(always)]
+fn same_string_key(
+    left_name: Option<Name>, left_hash: u32, left: &[u8],
+    right_name: Option<Name>, right_hash: u32, right: &[u8],
+) -> bool {
+    if let (Some(a), Some(b)) = (left_name, right_name) {
+        return a == b;
+    }
+    left_hash == right_hash && left == right
 }
 
 impl std::ops::Deref for NapalmString {
@@ -1056,19 +1126,48 @@ impl AsRef<[u8]> for NapalmString {
 #[derive(Clone, Debug)]
 struct MapStringKey {
     bytes: Arc<[u8]>,
-    hash: u64,
+    /// `key_hash` of the content hash.
+    hash: u32,
+    /// Interned name. Always present for UTF-8 hidden-class shape keys.
+    name: Option<Name>,
 }
 
 impl MapStringKey {
     #[inline]
     fn new(bytes: Arc<[u8]>) -> Self {
-        let hash = fast_hash_bytes(bytes.as_ref());
-        Self { bytes, hash }
+        let hash = key_hash(fast_hash_bytes(bytes.as_ref()));
+        Self { bytes, hash, name: None }
     }
 
     #[inline]
     fn from_napalm(value: &NapalmString) -> Self {
-        Self { bytes: value.bytes.clone(), hash: value.hash }
+        Self { bytes: value.bytes.clone(), hash: key_hash(value.hash), name: value.name() }
+    }
+
+    /// Key for a script-level name (property, field, method...).
+    #[inline]
+    fn interned(name: Name) -> Self {
+        Self { bytes: Arc::from(name.as_bytes()), hash: key_hash(name.content_hash()), name: Some(name) }
+    }
+
+    /// Intern before becoming a shape key. Shape keys are bounded (by size,
+    /// slot count and the shape table cap), so interning them cannot grow the
+    /// never-freed interner without limit.
+    #[inline]
+    fn ensure_interned(&mut self) {
+        if self.name.is_none() {
+            self.name = Name::from_bytes(self.bytes.as_ref());
+        }
+    }
+
+    #[inline(always)]
+    fn probe(&self) -> StrProbe<'_> {
+        StrProbe { bytes: self.bytes.as_ref(), hash: self.hash, name: self.name }
+    }
+
+    #[inline(always)]
+    fn matches(&self, probe: StrProbe<'_>) -> bool {
+        same_string_key(self.name, self.hash, self.bytes.as_ref(), probe.name, probe.hash, probe.bytes)
     }
 }
 
@@ -1080,13 +1179,13 @@ impl AsRef<[u8]> for MapStringKey {
 impl PartialEq for MapStringKey {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.bytes.as_ref() == other.bytes.as_ref()
+        self.matches(other.probe())
     }
 }
 impl Eq for MapStringKey {}
 impl Hash for MapStringKey {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) { state.write_u64(self.hash); }
+    fn hash<H: Hasher>(&self, state: &mut H) { state.write_u32(self.hash); }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1105,7 +1204,7 @@ impl Hash for MapKey {
             Self::Null => state.write_u8(0),
             Self::Bool(value) => { state.write_u8(1); state.write_u8(*value as u8); }
             Self::Num(bits) => { state.write_u8(2); state.write_u64(*bits); }
-            Self::String(value) => { state.write_u8(3); state.write_u64(value.hash); }
+            Self::String(value) => { state.write_u8(3); state.write_u32(value.hash); }
             Self::Object(handle) => { state.write_u8(4); state.write_u32(*handle); }
         }
     }
@@ -1120,7 +1219,7 @@ enum MapKeyRef<'a> {
     Null,
     Bool(bool),
     Num(u64),
-    String { bytes: &'a [u8], hash: u64 },
+    String(StrProbe<'a>),
     Object(u32),
 }
 
@@ -1131,7 +1230,7 @@ impl<'a> MapKeyRef<'a> {
             MapKey::Null => Self::Null,
             MapKey::Bool(value) => Self::Bool(*value),
             MapKey::Num(bits) => Self::Num(*bits),
-            MapKey::String(string) => Self::String { bytes: string.bytes.as_ref(), hash: string.hash },
+            MapKey::String(string) => Self::String(string.probe()),
             MapKey::Object(handle) => Self::Object(*handle),
         }
     }
@@ -1140,7 +1239,13 @@ impl<'a> MapKeyRef<'a> {
     /// by `MapStringKey::new` and `NapalmString::new`.
     #[inline]
     fn name(bytes: &'a [u8]) -> Self {
-        Self::String { bytes, hash: fast_hash_bytes(bytes) }
+        Self::String(StrProbe::bytes(bytes, fast_hash_bytes(bytes)))
+    }
+
+    /// An interned script name: no hashing, and shape probes compare ids.
+    #[inline]
+    fn interned(name: Name) -> MapKeyRef<'static> {
+        MapKeyRef::String(StrProbe::named(name))
     }
 }
 
@@ -1152,7 +1257,7 @@ impl Hash for MapKeyRef<'_> {
             Self::Null => state.write_u8(0),
             Self::Bool(value) => { state.write_u8(1); state.write_u8(value as u8); }
             Self::Num(bits) => { state.write_u8(2); state.write_u64(bits); }
-            Self::String { hash, .. } => { state.write_u8(3); state.write_u64(hash); }
+            Self::String(probe) => { state.write_u8(3); state.write_u32(probe.hash); }
             Self::Object(handle) => { state.write_u8(4); state.write_u32(handle); }
         }
     }
@@ -1165,9 +1270,7 @@ impl hashbrown::Equivalent<MapKey> for MapKeyRef<'_> {
             (Self::Null, MapKey::Null) => true,
             (Self::Bool(left), MapKey::Bool(right)) => left == *right,
             (Self::Num(left), MapKey::Num(right)) => left == *right,
-            (Self::String { bytes, hash }, MapKey::String(right)) => {
-                hash == right.hash && bytes == right.bytes.as_ref()
-            }
+            (Self::String(probe), MapKey::String(right)) => right.matches(probe),
             (Self::Object(left), MapKey::Object(right)) => left == *right,
             _ => false,
         }
@@ -1252,14 +1355,26 @@ struct MapShape {
 
 impl MapShape {
     #[inline(always)]
-    fn slot_hashed(&self, hash: u64, key: &[u8]) -> Option<u16> {
+    fn slot(&self, probe: StrProbe<'_>) -> Option<u16> {
         // Shaped maps are deliberately tiny. Keep the miss scan as a simple
         // counted loop so the compiler can eliminate iterator bookkeeping and
-        // bounds checks; hash mismatches avoid touching the string bytes.
+        // bounds checks.
         let mut slot = 0usize;
+        if let Some(name) = probe.name {
+            // Every UTF-8 shape key is interned and a named probe is UTF-8, so
+            // a name mismatch is a definitive miss: one u32 compare per slot.
+            while slot < self.keys.len() {
+                if unsafe { self.keys.get_unchecked(slot) }.name == Some(name) {
+                    return Some(slot as u16);
+                }
+                slot += 1;
+            }
+            return None;
+        }
+        // Runtime-built probe: hash mismatches avoid touching the bytes.
         while slot < self.keys.len() {
             let candidate = unsafe { self.keys.get_unchecked(slot) };
-            if candidate.hash == hash && candidate.as_ref() == key {
+            if candidate.hash == probe.hash && candidate.as_ref() == probe.bytes {
                 return Some(slot as u16);
             }
             slot += 1;
@@ -1400,8 +1515,14 @@ impl MapShapeTable {
     }
 
     #[inline(always)]
+    fn slot(&self, shape: u32, probe: StrProbe<'_>) -> Option<u16> {
+        self.shape(shape).slot(probe)
+    }
+
+    /// Lookup with bytes whose interned name (if any) is unknown.
+    #[inline(always)]
     fn slot_hashed(&self, shape: u32, hash: u64, key: &[u8]) -> Option<u16> {
-        self.shape(shape).slot_hashed(hash, key)
+        self.shape(shape).slot(StrProbe::bytes(key, hash))
     }
 
     #[inline(always)]
@@ -1435,14 +1556,13 @@ impl MapShapeTable {
         contract: ShapeSlotContract,
     ) -> Option<(u32, u16)> {
         let parent = self.shape(shape);
-        if let Some(slot) = parent.slot_hashed(key.hash, key.as_ref()) {
+        if let Some(slot) = parent.slot(key.probe()) {
             return Some((shape, slot));
         }
         let slot = parent.keys.len();
         if key.as_ref().len() > MAX_SHAPED_MAP_KEY_BYTES || slot >= MAX_SHAPED_MAP_SLOTS {
             return None;
         }
-
         // The parent shape already captures every fact about existing slots. The
         // new slot contract is therefore the only additional transition identity.
         // Caching `(key, contract)` keeps typed optional-field growth shared across
@@ -1457,6 +1577,15 @@ impl MapShapeTable {
         if let Some(&child) = self.transitions.pin().get(&transition_key) {
             return Some((child, slot as u16));
         }
+        // Invariant relied on by `MapShape::slot`: every UTF-8 shape key is
+        // interned. A key enters a shape only here (root and typed variants
+        // reuse parent keys), so dynamic object keys are interned once, when
+        // their shape is published, bounded by MAX_SHAPED_MAP_KEY_BYTES,
+        // MAX_SHAPED_MAP_SLOTS and MAX_MAP_SHAPES. Cached transitions above
+        // never touch the interner; their equality falls back to hash + bytes.
+        let (shape_id, mut key, contract) = transition_key;
+        key.ensure_interned();
+        let transition_key = (shape_id, key, contract);
         let (_, key, contract) = &transition_key;
         let mut keys = parent.keys.to_vec();
         let mut slots = parent.slots.to_vec();
@@ -1467,12 +1596,7 @@ impl MapShapeTable {
             let meta = self.meta.read();
             for membership in &mut child_families {
                 let Some(family) = meta.families.get(membership.family as usize) else { continue };
-                if let Some(logical) = family
-                    .keys
-                    .iter()
-                    .position(|candidate| candidate.hash == key.hash
-                        && candidate.as_ref() == key.as_ref())
-                {
+                if let Some(logical) = family.keys.iter().position(|candidate| candidate == key) {
                     if logical < membership.physical_slots.len()
                         && membership.physical_slots[logical] == u16::MAX
                     {
@@ -1501,7 +1625,7 @@ impl MapShapeTable {
         let family = meta.families.len() as u32;
         let keys = fields
             .iter()
-            .map(|field| MapStringKey::new(Arc::from(field.name.as_bytes())))
+            .map(|field| MapStringKey::interned(Name::new(&field.name)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         meta.families.push(ShapeFamily { contract: contract.clone(), keys });
@@ -2132,8 +2256,8 @@ impl NapalmMap {
     #[inline]
     fn get_ref(&self, shapes: &MapShapeTable, key: MapKeyRef<'_>) -> Option<Value> {
         match (&self.storage, key) {
-            (NapalmMapStorage::Shaped { shape, values }, MapKeyRef::String { bytes, hash }) => {
-                let slot = shapes.slot_hashed(*shape, hash, bytes)? as usize;
+            (NapalmMapStorage::Shaped { shape, values }, MapKeyRef::String(probe)) => {
+                let slot = shapes.slot(*shape, probe)? as usize;
                 debug_assert!(slot < values.len());
                 Some(unsafe { *values.get_unchecked(slot) })
             }
@@ -2154,7 +2278,7 @@ impl NapalmMap {
     ) -> Option<u16> {
         if let NapalmMapStorage::Shaped { shape, values } = &mut self.storage {
             if let MapKey::String(bytes) = &key {
-                if let Some(slot) = shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()) {
+                if let Some(slot) = shapes.slot(*shape, bytes.probe()) {
                     unsafe { *values.get_unchecked_mut(slot as usize) = value; }
                     return Some(slot);
                 }
@@ -4513,7 +4637,7 @@ impl Heap {
         }
         if let Some(handle) = value.heap_handle() {
             if let Some(HeapObject::String(string)) = self.get(value) {
-                return Ok(MapKeyRef::String { bytes: string.bytes.as_ref(), hash: string.hash });
+                return Ok(MapKeyRef::String(string.probe()));
             }
             return Ok(MapKeyRef::Object(handle));
         }
@@ -4564,10 +4688,10 @@ impl Heap {
                 Some(HeapObject::String(bytes)) => bytes,
                 _ => return Ok(Value::NULL),
             };
-            if let Some(slot) = cache.probe(&self.map_shapes, shape, bytes.hash, bytes.as_ref()) {
+            if let Some(slot) = cache.probe(&self.map_shapes, shape, bytes.probe()) {
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
-            if let Some(slot) = self.map_shapes.slot_hashed(shape, bytes.hash, bytes.as_ref()) {
+            if let Some(slot) = self.map_shapes.slot(shape, bytes.probe()) {
                 cache.insert(shape, slot);
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
@@ -4581,13 +4705,13 @@ impl Heap {
     }
 
     /// Property-name fast path used by quickened dynamic Map getters. The method
-    /// symbol already fixes the UTF-8 key, so shaped-map hits need neither a
-    /// temporary managed String nor an Arc clone/hash computation.
+    /// symbol already fixes the interned key, so shaped-map hits need neither a
+    /// temporary managed String nor an Arc clone/hash computation, and misses
+    /// compare interned ids.
     fn map_get_named_with_pic(
         &self,
         map_value: Value,
-        key: &[u8],
-        hash: u64,
+        key: Name,
         cache: &mut MapInlineCacheState,
     ) -> Result<Value, RuntimeError> {
         let map = match self.get(map_value) {
@@ -4603,7 +4727,7 @@ impl Heap {
             if let Some(slot) = cache.probe_property(shape) {
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
-            if let Some(slot) = self.map_shapes.slot_hashed(shape, hash, key) {
+            if let Some(slot) = self.map_shapes.slot(shape, StrProbe::named(key)) {
                 cache.insert(shape, slot);
                 return Ok(unsafe { *values.get_unchecked(slot as usize) });
             }
@@ -4611,7 +4735,7 @@ impl Heap {
         }
 
         // Dictionary mode probes with a borrowed key: no Arc allocation/copy.
-        Ok(map.get_ref(&self.map_shapes, MapKeyRef::String { bytes: key, hash }).unwrap_or(Value::NULL))
+        Ok(map.get_ref(&self.map_shapes, MapKeyRef::interned(key)).unwrap_or(Value::NULL))
     }
 
     fn alloc_map_from_pairs<const N: usize>(
@@ -4875,7 +4999,7 @@ impl Heap {
                 };
                 let (shape, _) = map.shaped()?;
                 self.map_shapes
-                    .slot_hashed(shape, bytes.hash, bytes.as_ref())
+                    .slot(shape, bytes.probe())
                     .map(|slot| (shape, slot, bytes.clone()))
             }),
             _ => None,
@@ -4907,8 +5031,8 @@ impl Heap {
             if let MapKey::String(bytes) = &key {
                 let cached = cache
                     .as_deref()
-                    .and_then(|cache| cache.probe(&self.map_shapes, *shape, bytes.hash, bytes.as_ref()));
-                let slot = cached.or_else(|| self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()));
+                    .and_then(|cache| cache.probe(&self.map_shapes, *shape, bytes.probe()));
+                let slot = cached.or_else(|| self.map_shapes.slot(*shape, bytes.probe()));
                 if let Some(slot) = slot {
                     unsafe { *values.get_unchecked_mut(slot as usize) = item; }
                     if cached.is_none() {
@@ -4999,7 +5123,7 @@ impl Heap {
                 };
                 let (shape, _) = map.shaped()?;
                 self.map_shapes
-                    .slot_hashed(shape, bytes.hash, bytes.as_ref())
+                    .slot(shape, bytes.probe())
                     .map(|slot| (shape, slot, MapStringKey::from_napalm(bytes)))
             })
         });
@@ -5038,11 +5162,11 @@ impl Heap {
                 // operation occurs in this method, and a String cannot alias the
                 // Map payload currently borrowed mutably.
                 let bytes = unsafe { &*string_key };
-                if let Some(slot) = cache.probe(&self.map_shapes, *shape, bytes.hash, bytes.as_ref()) {
+                if let Some(slot) = cache.probe(&self.map_shapes, *shape, bytes.probe()) {
                     unsafe { *values.get_unchecked_mut(slot as usize) = item; }
                     return Ok(false);
                 }
-                if let Some(slot) = self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()) {
+                if let Some(slot) = self.map_shapes.slot(*shape, bytes.probe()) {
                     cache.insert(*shape, slot);
                     unsafe { *values.get_unchecked_mut(slot as usize) = item; }
                     return Ok(false);
@@ -5106,7 +5230,7 @@ impl Heap {
 
         if let NapalmMapStorage::Shaped { shape, .. } = &map.storage {
             let exists = match key {
-                MapKey::String(bytes) => self.map_shapes.slot_hashed(*shape, bytes.hash, bytes.as_ref()).is_some(),
+                MapKey::String(bytes) => self.map_shapes.slot(*shape, bytes.probe()).is_some(),
                 _ => false,
             };
             if !exists {
@@ -5183,7 +5307,7 @@ impl Heap {
         };
         let slot = self
             .map_shapes
-            .slot_hashed(shape, runtime_key.hash, runtime_key.as_ref())?;
+            .slot(shape, runtime_key.probe())?;
         let canonical = self.map_shapes.key_at(shape, slot);
         Some((shape, slot, canonical.as_ref().to_vec()))
     }
@@ -5377,6 +5501,22 @@ impl HostContext<'_> {
     pub fn string_bytes(&self, value: Value) -> Option<&[u8]> {
         match self.heap.get(value) {
             Some(HeapObject::String(string)) => Some(string.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// String content equality; `None` unless both values are Strings. Two
+    /// interned Strings (script text, object keys) compare by id; otherwise the
+    /// cached hashes reject most mismatches before the bytes are touched.
+    pub fn strings_equal(&self, left: Value, right: Value) -> Option<bool> {
+        if left.raw_bits() == right.raw_bits() {
+            return matches!(self.heap.get(left), Some(HeapObject::String(_))).then_some(true);
+        }
+        match (self.heap.get(left), self.heap.get(right)) {
+            (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => Some(match (a.name(), b.name()) {
+                (Some(x), Some(y)) => x == y,
+                _ => a.hash == b.hash && a.as_ref() == b.as_ref(),
+            }),
             _ => None,
         }
     }
@@ -7603,7 +7743,7 @@ impl Default for MapInlineCacheState {
 
 impl MapInlineCacheState {
     #[inline(always)]
-    fn probe(&self, shapes: &MapShapeTable, shape: u32, hash: u64, key: &[u8]) -> Option<u16> {
+    fn probe(&self, shapes: &MapShapeTable, shape: u32, key: StrProbe<'_>) -> Option<u16> {
         // A cache entry needs only shape+slot. Comparing the runtime key against
         // the canonical shape key supports equal-but-not-identical String objects
         // without storing an Arc or rehashing the key on a hit.
@@ -7612,7 +7752,7 @@ impl MapInlineCacheState {
             if likely(entry.shape == shape)
                 && {
                     let candidate = shapes.key_at(shape, entry.slot);
-                    candidate.hash == hash && candidate.as_ref() == key
+                    candidate.matches(key)
                 }
             { return Some(entry.slot); }
         }
@@ -7621,7 +7761,7 @@ impl MapInlineCacheState {
             if entry.shape == shape
                 && {
                     let candidate = shapes.key_at(shape, entry.slot);
-                    candidate.hash == hash && candidate.as_ref() == key
+                    candidate.matches(key)
                 }
             { return Some(entry.slot); }
         }
@@ -7630,7 +7770,7 @@ impl MapInlineCacheState {
             if entry.shape == shape
                 && {
                     let candidate = shapes.key_at(shape, entry.slot);
-                    candidate.hash == hash && candidate.as_ref() == key
+                    candidate.matches(key)
                 }
             { return Some(entry.slot); }
         }
@@ -7639,7 +7779,7 @@ impl MapInlineCacheState {
             if entry.shape == shape
                 && {
                     let candidate = shapes.key_at(shape, entry.slot);
-                    candidate.hash == hash && candidate.as_ref() == key
+                    candidate.matches(key)
                 }
             { return Some(entry.slot); }
         }
@@ -7727,19 +7867,14 @@ impl Default for SmallMapAllocationSite {
 #[derive(Clone, Copy, Debug)]
 struct MapPropertyQuickState {
     cache: MapInlineCacheState,
-    key_hash: u64,
-    /// Cache the immutable property symbol itself so the hot path skips method
-    /// lookup and hashing while keeping PreparedFunction trivially movable.
-    key_string: StringId,
+    /// Interned property name: the hot path skips method/metadata lookup and
+    /// hashing, and shape/dictionary probes compare ids.
+    key: Option<Name>,
 }
 
 impl Default for MapPropertyQuickState {
     fn default() -> Self {
-        Self {
-            cache: MapInlineCacheState::default(),
-            key_hash: 0,
-            key_string: StringId(0),
-        }
+        Self { cache: MapInlineCacheState::default(), key: None }
     }
 }
 
@@ -8158,6 +8293,9 @@ pub struct Interpreter<'p> {
     classes: Vec<RuntimeClass>,
     modules: Vec<RuntimeModule>,
     strings: Vec<Value>,
+    /// Interned name of each program string, indexed by `StringId` like
+    /// `strings`: script names resolve to a 4-byte id with no metadata lookup.
+    string_names: Box<[Name]>,
     builtin_values: Vec<Value>,
     builtin_static_methods: Vec<Vec<Option<CallTarget>>>,
     instance_protocol: Vec<(MethodSymbol, NativeBuiltin)>,
@@ -8454,9 +8592,12 @@ impl<'p> Interpreter<'p> {
         let init_roots = Arc::new(HandleRootSet::default());
         let persistent_root_registration = heap.register_roots(init_roots.clone());
 
+        // Every program string comes from script text: literals and the names of
+        // properties, fields, methods, classes, interfaces and variables.
+        let string_names: Box<[Name]> = program.metadata.strings.iter().map(|string| Name::new(string)).collect();
         let mut strings = Vec::with_capacity(program.metadata.strings.len());
-        for string in &program.metadata.strings {
-            let value = heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(string.as_bytes()))));
+        for &name in &string_names {
+            let value = heap.alloc(HeapObject::String(NapalmString::interned(name)));
             init_roots.push(value);
             strings.push(value);
         }
@@ -8719,6 +8860,7 @@ impl<'p> Interpreter<'p> {
             classes,
             modules,
             strings,
+            string_names,
             builtin_values,
             builtin_static_methods: vec![vec![None; program.metadata.methods.len()]; BuiltinId::COUNT],
             instance_protocol,
@@ -14837,11 +14979,7 @@ impl Interpreter<'_> {
                 .program
                 .metadata
                 .method(method)
-                .and_then(|signature| {
-                    self.program.metadata.string(signature.name).map(|name| {
-                        (fast_hash_bytes(name.as_bytes()), signature.name)
-                    })
-                }),
+                .and_then(|signature| self.string_names.get(signature.name.0 as usize).copied()),
             _ => None,
         };
 
@@ -14850,10 +14988,9 @@ impl Interpreter<'_> {
         if function.ops[index].flags != 0 { return; }
 
         function.quick_invokes[index] = QuickInvokeSite { class, target, hits: 0 };
-        let handler = if let Some((key_hash, key_string)) = map_property_key.filter(|_| function.ops[index].c == 0) {
+        let handler = if let Some(key) = map_property_key.filter(|_| function.ops[index].c == 0) {
             let property = &mut function.quick_map_properties[index];
-            property.key_hash = key_hash;
-            property.key_string = key_string;
+            property.key = Some(key);
             h_invoke_mono_map_property_get
         } else {
             match target {
@@ -15743,8 +15880,8 @@ impl Interpreter<'_> {
                     self.fail_at(op, "Proxy property method metadata is missing");
                     return;
                 };
-                let name = self.program.metadata.string(signature.name).unwrap_or("");
-                let value = match self.heap.map_get_ref(target, MapKeyRef::name(name.as_bytes())) {
+                let name = self.string_names[signature.name.0 as usize];
+                let value = match self.heap.map_get_ref(target, MapKeyRef::interned(name)) {
                     Ok(value) => value,
                     Err(error) => { self.fail_at(op, error.message); return; }
                 };
@@ -15755,15 +15892,14 @@ impl Interpreter<'_> {
                 self.enter_bytecode_call(op, function, None, args, Some(value));
             }
             NativeBuiltin::MapPropertyGet(method) | NativeBuiltin::MapPropertySet(method) | NativeBuiltin::MapPropertyCall(method) => {
-                let program = self.program;
-                let signature = &program.metadata.methods[method.0 as usize];
-                let name = program.metadata.string(signature.name).unwrap_or("").as_bytes();
+                let signature = &self.program.metadata.methods[method.0 as usize];
+                let name = self.string_names[signature.name.0 as usize];
                 let map = Value::from_word(receiver);
                 let result = if matches!(native, NativeBuiltin::MapPropertySet(_)) {
                     let item = arg(0);
                     self.heap.remember_if_reference(map, item);
                     // Only writes need an owned key; reads/calls probe borrowed.
-                    let key = MapKey::String(MapStringKey::new(Arc::from(name)));
+                    let key = MapKey::String(MapStringKey::interned(name));
                     self.heap.map_set_encoded(map, key, item, None).map(|structural| {
                         if structural {
                             if let Some(bytes) = self.heap.map_external_bytes(map) {
@@ -15773,7 +15909,7 @@ impl Interpreter<'_> {
                         }
                         item
                     })
-                } else { self.heap.map_get_ref(map, MapKeyRef::name(name)) };
+                } else { self.heap.map_get_ref(map, MapKeyRef::interned(name)) };
                 match result {
                     Ok(value) if matches!(native, NativeBuiltin::MapPropertyCall(_)) => {
                         let function = match self.heap.get(value) {
@@ -18239,17 +18375,12 @@ unsafe fn h_invoke_mono_map_property_get(vm: &mut Interpreter, ptr: *const Prepa
             .as_mut_ptr()
             .add(vm.hot_pc as usize)
     };
-    let Some(name) = vm.program.metadata.string(unsafe { (*state).key_string }) else {
+    let Some(name) = (unsafe { (*state).key }) else {
         vm.disable_current_monomorphic_invoke();
         unsafe { h_invoke(vm, ptr) };
         return;
     };
-    match vm.heap.map_get_named_with_pic(
-        map,
-        name.as_bytes(),
-        unsafe { (*state).key_hash },
-        unsafe { &mut (*state).cache },
-    ) {
+    match vm.heap.map_get_named_with_pic(map, name, unsafe { &mut (*state).cache }) {
         Ok(value) => unsafe {
             vm.set_reg(op.a, value.word());
             vm.advance(&op);
@@ -18835,9 +18966,13 @@ fn allocate_named_object(
     }
     let mut map = NapalmMap::default();
     for (&name, &value) in names.iter().zip(values) {
-        let text = vm.program.metadata.string(name)
-            .ok_or_else(|| RuntimeError::new("invalid object property name"))?;
-        let key = MapKey::String(MapStringKey::new(Arc::from(text.as_bytes())));
+        // Property names are interned program strings: share the String's
+        // bytes (one refcount increment) and its name instead of allocating,
+        // copying and hashing a fresh key per object.
+        let key = match vm.strings.get(name.0 as usize).and_then(|&string| vm.heap.get(string)) {
+            Some(HeapObject::String(string)) => MapKey::String(MapStringKey::from_napalm(string)),
+            _ => return Err(RuntimeError::new("invalid object property name")),
+        };
         map.insert_unpublished(&mut vm.heap.map_shapes, key, value);
     }
     let result = vm.heap.alloc(HeapObject::Map(map));
@@ -20990,9 +21125,9 @@ impl TraceRuntime for Interpreter<'_> {
             _ => return None,
         };
         let (shape, _) = map.shaped()?;
-        let key = self.program.metadata.string(signature.name)?.as_bytes();
-        let hash = fast_hash_bytes(key);
-        let slot = self.heap.map_shapes.slot_hashed(shape, hash, key)?;
+        let name = *self.string_names.get(signature.name.0 as usize)?;
+        let key = name.as_bytes();
+        let slot = self.heap.map_shapes.slot(shape, StrProbe::named(name))?;
         let contract = self.heap.map_shapes.slot_contract(shape, slot);
         Some(crate::napalm_tracing_jit::ShapedMapAccess {
             shape,
@@ -23128,6 +23263,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_auto_memo_tests.rs");
     include!("tests/napalm_static_type_tests.rs");
     include!("tests/napalm_generator_tests.rs");
+    include!("tests/napalm_interning_tests.rs");
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
     include!("tests/napalm_contract_tests.rs");
