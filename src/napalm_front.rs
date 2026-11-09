@@ -1415,6 +1415,14 @@ pub enum ExprKind {
     },
     /// NapalmJIT extension: suspend the current async execution until a Promise settles.
     Await(Box<Expr>),
+    /// Suspend a synchronous generator. Delegation is expanded by the surface
+    /// parser into a closure that returns the same [completion, value] packet.
+    GeneratorYield {
+        value: Box<Expr>,
+        delegated: bool,
+        yield_type: Option<TypeAnnotation>,
+        next_type: Option<TypeAnnotation>,
+    },
     /// `typeof value`: a String naming the runtime kind of the value (or
     /// "Interface"/"Type" for a bare contract name).
     TypeOf(Box<Expr>),
@@ -1541,6 +1549,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             ExprKind::TypedCollection { expression: inner, .. }
             | ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
+            | ExprKind::GeneratorYield { value: inner, .. }
             | ExprKind::Await(inner)
             | ExprKind::TypeOf(inner)
             | ExprKind::Launch(inner)

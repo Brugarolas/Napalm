@@ -340,6 +340,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
+        BuiltinClass::Generator,
         BuiltinClass::Promise,
         BuiltinClass::MapEntry,
         BuiltinClass::MapKeys,
@@ -1007,6 +1008,16 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // deliberately bypass the Host primitive ABI.
     manifest.register_native(program, static_(BuiltinId::Fiber), "current", MethodKind::Getter, 0, NativeBuiltin::FiberCurrent);
     manifest.register_native(program, static_(BuiltinId::Fiber), "new", MethodKind::Method, 1, NativeBuiltin::FiberNew);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__close", MethodKind::Method, 1, NativeBuiltin::GeneratorClose);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__is", MethodKind::Method, 1, NativeBuiltin::GeneratorIs);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__new", MethodKind::Method, 1, NativeBuiltin::GeneratorNew);
+    for arity in 0..=1 {
+        for (name, native) in [("next", NativeBuiltin::GeneratorNext), ("return", NativeBuiltin::GeneratorReturn), ("throw", NativeBuiltin::GeneratorThrow)] {
+            manifest.register_native(program, instance(BuiltinClass::Generator), name, MethodKind::Method, arity, native);
+        }
+    }
+    manifest.register_native(program, instance(BuiltinClass::Generator), "iterate", MethodKind::Method, 1, NativeBuiltin::GeneratorIterate);
+    manifest.register_native(program, instance(BuiltinClass::Generator), "iteratorValue", MethodKind::Method, 1, NativeBuiltin::GeneratorIteratorValue);
     manifest.register_native(program, instance(BuiltinClass::Fiber), "error", MethodKind::Getter, 0, NativeBuiltin::FiberError);
     manifest.register_native(program, instance(BuiltinClass::Fiber), "isDone", MethodKind::Getter, 0, NativeBuiltin::FiberIsDone);
     for arity in 0..=1u8 {

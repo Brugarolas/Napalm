@@ -39,7 +39,7 @@ presented as existing features.
 19. [Exceptions and Cleanup](#19-exceptions-and-cleanup)
 20. [Async, Promise, and Timers](#20-async-promise-and-timers)
 21. [Concurrency with launch](#21-concurrency-with-launch)
-22. [Fibers](#22-fibers)
+22. [Fibers and Generators](#22-fibers-and-generators)
 23. [Modules, Imports, and Exports](#23-modules-imports-and-exports)
 24. [Strings](#24-strings)
 25. [Numbers and Randomness](#25-numbers-and-randomness)
@@ -309,7 +309,7 @@ carry generic or contract information include it:
 | Promise; pending `Timer.delay`/`Timer.every` | `Promise`; `Timer` |
 | `new Emitter<number>()`, its `.event` | `Emitter<Number>`, `Event<Number>` |
 | Channel / Receiver | `Channel`, `Receiver` (with `<T>` when typed) |
-| Date, Proxy, Range, Fiber, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Module` |
+| Date, Proxy, Range, Fiber, Generator, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Generator`, `Module` |
 | native decorator | `NativeDecorator` |
 
 A settled timer Promise reports `Promise`. User decorators are ordinary
@@ -663,6 +663,8 @@ for (const entry of record) {
 - Destructuring patterns are supported in the binding.
 - `for...in` does not implement prototype enumeration or array indices.
   The receiver must provide a `keys` getter.
+- Leaving a `for...of` over a generator early (`break`, `return`, or an
+  exception) closes the generator ([section 22.2](#222-generators)).
 
 There is no `switch` or `for await...of` in this version.
 
@@ -1375,8 +1377,9 @@ for (const n of new Countdown(2)) {
 ```
 
 The cursor `0` is valid because it is truthy in Napalm.
-`Symbol.iterator`, `{done, value}` objects, and generators are not used.
-Lists, strings, ranges, Maps, key views, and Sets implement the protocol.
+`Symbol.iterator` and `{done, value}` objects are not part of this protocol.
+Lists, strings, ranges, Maps, key views, Sets, and generators
+([section 22.2](#222-generators)) implement it.
 List and call spread also use it.
 
 ## 12. Destructuring, Rest, and Spread
@@ -2513,7 +2516,9 @@ The worker boundary copies supported values into an isolated Interpreter; a
 future cross-worker channel requires transport in the concurrent runtime rather
 than sharing VM heap handles.
 
-## 22. Fibers
+## 22. Fibers and Generators
+
+### 22.1 Fibers
 
 Fibers are explicit-transfer coroutines. They are not threads or Promises.
 
@@ -2560,6 +2565,108 @@ executable, a final module suspension is a runtime error.
 Fiber control operations are unavailable inside async tasks. Do not mix the
 two models as if they were equivalent.
 Fatal contracts do not become recoverable with `fiber.try()` either.
+
+### 22.2 Generators
+
+A generator function is declared with `function*` (or `*name()` for a class
+method). Calling it does **not** run the body: it returns a `Generator` whose
+body runs lazily, suspending at each `yield` until the consumer asks for the
+next value.
+
+```napalm
+function* conversation(): Generator<string, string, number> {
+    const age = yield "How old are you?";
+    yield `In ten years you will be ${age + 10}`;
+    return "bye";
+}
+
+const talk = conversation();          // nothing has run yet
+System.print(talk.next().value);      // How old are you?
+System.print(talk.next(30).value);    // In ten years you will be 40
+const last = talk.next(0);
+System.print([last.value, last.done]);  // [bye, true]
+System.print(talk.next(0).done);        // true (value is null)
+```
+
+`next()`, `return()` and `throw()` return an object `{value, done}`. The
+argument of the first `next()` is ignored; each later argument becomes the
+result of the `yield` expression where the body is suspended.
+
+| Form or API | Effect |
+| --- | --- |
+| `function* f() {}`, `const f = function* () {}` | Generator function declaration or expression. |
+| `*name() {}` in a class | Generator method; `this` is the receiver as usual. |
+| `yield value`, `yield` | Suspends and produces `value` (or `null`). Evaluates to the next `next()` argument. |
+| `yield* sequence` | Delegates to another generator, forwarding values, `next()` arguments, `return()` and `throw()`; evaluates to the delegate's return value. Any other iterable (list, range, Map...) is also accepted; then it evaluates to `null`. |
+| `gen.next(value?)` | Resumes the body. |
+| `gen.return(value?)` | Completes the generator as if `return value` ran at the suspended `yield`; `finally` blocks run. |
+| `gen.throw(error)` | Raises `error` at the suspended `yield`, where the body may catch it. |
+| `value instanceof Generator` | Whether the value is a generator. |
+
+Generators implement the iteration protocol (section 11.3), so `for...of`,
+list spread and call spread consume them. Leaving a `for...of` early with
+`break`, `return` or an exception **closes** the generator, running its
+pending `finally` blocks.
+
+```napalm
+function* fibonacci() {
+    let a = 0;
+    let b = 1;
+    while (true) {
+        yield a;
+        const next = a + b;
+        a = b;
+        b = next;
+    }
+}
+
+for (const n of fibonacci()) {
+    if (n > 20) break;          // closes the infinite generator
+    System.print(n);
+}
+
+class Tree {
+    constructor(public left: any, public value: number, public right: any) {}
+    *walk(): Generator<number> {
+        if (this.left) yield* this.left.walk();
+        yield this.value;
+        if (this.right) yield* this.right.walk();
+    }
+}
+const tree = new Tree(new Tree(null, 1, null), 2, new Tree(null, 3, null));
+System.print([...tree.walk()]); // [1, 2, 3]
+```
+
+Rules and semantics:
+
+- The annotation `Generator<Yield, Return, Next>` (one to three arguments) is
+  checked at runtime: every yielded value against `Yield`, every `return`
+  (including falling off the end) against `Return`, and every `next(value)`
+  argument against `Next`. `void`, `any` and omitted arguments leave that
+  channel unchecked. `next()` without an argument sends `null`, so after the
+  first call a generator with a non-nullable `Next` must be resumed with a
+  value. A violation is a fatal contract error. A generator
+  passed through `Generator<T>` keeps that contract even through `any` aliases.
+- An exception thrown by the body propagates to the caller of `next()`,
+  `return()` or `throw()`, and the generator is then done.
+- `return()` on a generator that has not started finishes it without running
+  the body; `throw()` on it rethrows the error to the caller.
+- If the generator is suspended inside `try...finally`, `return()` runs the
+  `finally` block. If that block yields, `return()` returns that value with
+  `done: false`, and the return completes on a later resumption.
+- Resuming a generator from inside its own body (directly or through another
+  generator) is a runtime error: "generator is already running".
+- `yield` is only valid directly in the generator's own body; it cannot appear
+  in a nested function or arrow function. Async, concurrent and
+  getter/setter/constructor generators are not supported.
+- `typeof gen` is `Generator`, and its text form is `<generator#N>`.
+- Array destructuring requires a List, so `const [a, b] = gen()` is rejected;
+  use `const [a, b] = [...gen()]` for a finite generator.
+
+Generators are built on Fibers: each one owns a separate resumable stack, and
+its hot loops are compiled by the JIT like any other code. A generator is not
+a `Fiber`, though: `call`, `transfer` and the other Fiber operations are not
+available on it.
 
 ## 23. Modules, Imports, and Exports
 
@@ -3385,8 +3492,11 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 
 Do not use the following as though they were available features:
 
-- `switch`, generators, `yield` as generator syntax, regex literals,
-  JSX, executable namespaces, and `const enum`.
+- `switch`, async generators and `for await...of`, regex literals,
+  JSX, executable namespaces, and `const enum`. (Synchronous generators are
+  supported; see [section 22.2](#222-generators).)
+- Generator methods in object literals (`{ *items() {} }`); object literals
+  do not have method shorthand at all.
 - `void` as an operator, and `>>>`.
 - Rest parameters and full default-initializer parameters.
 - The general comma operator and `matrix[x, y]` subscripts.
@@ -3531,6 +3641,7 @@ semantic specification nor a universal performance test.
 | [native_decorators.napalm](scripts/native_decorators.napalm) | Tests for caching, TTL, once, delay, debounce, and throttle. |
 | [destructuring_spread.napalm](scripts/destructuring_spread.napalm) | Patterns, defaults, rest, spread, and calls. |
 | [enums.napalm](scripts/enums.napalm) | Numeric and string enums, reverse mapping, and local enum. |
+| [generators.napalm](scripts/generators.napalm) | Self-checking tour of generators: laziness, `next(value)`, `yield*`, `return()`/`throw()`, cleanup, and `for...of` closing. |
 | [interfaces.napalm](scripts/interfaces.napalm) | Open contracts, aliases, and valid mutation. |
 | [types.napalm](scripts/types.napalm) | Classes implementing interfaces and types, instance `keys()`, and the `instanceof`/`implements`/`inherits` operators. |
 | [intrinsics.napalm](scripts/intrinsics.napalm) | Arrays, lambdas, Unicode, strings, nullish operations, and optional chaining. |
@@ -3579,6 +3690,7 @@ documents the available language and shows usable alternatives.
 | [napalm_collection_ops.rs](src/napalm_collection_ops.rs) | Collection copies and validation, destructuring, and spread. |
 | [napalm_modules.rs](src/napalm_modules.rs) | Actual resolution of extensions, namespaces, and exports. |
 | [napalm_native.rs](src/napalm_native.rs) | Native decorator semantics and validation. |
+| [napalm_generators.rs](src/napalm_generators.rs), [napalm_generator_runtime.rs](src/napalm_generator_runtime.rs) | Generator desugaring (`function*`, `yield`, `yield*`) and the `next`/`return`/`throw` runtime. |
 | [napalm_concurrent.rs](src/napalm_concurrent.rs) | Concurrent work boundary and cancellation. |
 | [napalm_fetch.rs](src/napalm_fetch.rs) | Client transport, redirects, and limits. |
 | [napalm_http.rs](src/napalm_http.rs), [napalm_http_vm.rs](src/napalm_http_vm.rs) | HTTP API and transport. |
@@ -3615,6 +3727,7 @@ cargo test napalm_decorators -- --test-threads=1
 cargo test native_decorators -- --test-threads=1
 cargo test napalm_collections -- --test-threads=1
 cargo test napalm_http -- --test-threads=1
+cargo test napalm_generators
 ```
 
 These commands are entry points to regression tests, not a claim that the
@@ -3628,7 +3741,7 @@ Current engine, as of 02-Nov-2026, shows an impressive performance that can comp
 
 | Test | Napalm Performance | Node Performance | Bun Performance |
 | --- | --- | --- | --- |
-| `jit` | 0.198551s | 0.187731s | 0.223191s |
+| `jit` | 0.172551s | 0.187731s | 0.223191s |
 | `jit_entries` | 0.002747s |  0.005001s | 0.004753s |
 | `lev` | 0.000217s | 0.000710s | 0.001525s |
 | `trees` | 0.004445s | 0.005114s | 0.003302s |

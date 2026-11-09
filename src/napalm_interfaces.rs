@@ -81,7 +81,7 @@ impl Heap {
                 | Type::GenericMap(_, _)
                 | Type::Set(Some(_))
                 | Type::Builtin(
-                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
+                    BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
                     Some(_),
                 )
         )
@@ -211,6 +211,13 @@ impl Heap {
                 }
 
                 plan.push((value, expected.clone()));
+                true
+            }
+            Type::Builtin(BuiltinId::Generator, element) => {
+                if !matches!(self.get(value), Some(HeapObject::FiberObject { generator: true, .. })) {
+                    return Err(mismatch(path, expected));
+                }
+                if element.is_some() { plan.push((value, expected.clone())); }
                 true
             }
             Type::Builtin(builtin @ (BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet), element) => {
@@ -356,7 +363,7 @@ impl Heap {
             // native sidecar state. This makes the contract capability-wide rather
             // than handle-local: an untyped alias cannot bypass a typed endpoint.
             if let Type::Builtin(
-                BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
+                BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
                 Some(element),
             ) = &ty
             {

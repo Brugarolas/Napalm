@@ -9,6 +9,9 @@ use smallvec::SmallVec;
 use compact_str::CompactString;
 use crate::napalm_collections::{HashMap, HashSet};
 
+#[path = "napalm_generators.rs"]
+mod generators;
+
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(skip r"[ \t\r]+")]
 #[logos(skip(r"//[^\r\n]*", allow_greedy = true))]
@@ -168,6 +171,7 @@ struct Parser<'a> {
     /// Direct `this.name` writes in the current constructor (including lexical closures).
     constructor_properties: Option<Vec<Ident>>,
     synthetic_span: usize,
+    generator: Option<generators::GeneratorSignature>,
     /// Module-level interfaces and type aliases, pre-scanned before parsing
     /// statements so a class may implement a contract declared after it.
     contracts: HashMap<String, ContractInfo>,
@@ -309,6 +313,8 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
     if let Some((base, args)) = split_generic_type(source) {
         let arguments = split_type_top_level(args, ',');
         return match base {
+            "Generator" => TypeAnnotation::new(K::BuiltinGeneric("Generator".into(),
+                arguments.first().map(|part| Box::new(classify_variable_type(part, span)))), span),
             "Array" | "ReadonlyArray" | "List" => {
                 let element = arguments
                     .first()
@@ -355,6 +361,7 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
         "boolean" | "bool" => K::Bool,
         "number" | "num" => K::Num,
         "string" => K::String,
+        "generator" => K::BuiltinGeneric("Generator".into(), None),
         "object" => K::Opaque(source.to_owned()),
         "function" | "fn" => K::Closure,
         "true" | "false" => K::Bool,
@@ -510,6 +517,7 @@ impl<'a> Parser<'a> {
             parameter_types: HashMap::default(),
             constructor_properties: None,
             synthetic_span: source.len() + 1,
+            generator: None,
             contracts: HashMap::default(),
             class_summaries: HashMap::default(),
             generic_classes: HashMap::default(),
@@ -1131,6 +1139,10 @@ impl<'a> Parser<'a> {
                 return self.error("a `concurrent` function is already asynchronous at its call boundary; use `launch` + `await` instead of `async concurrent`");
             }
             self.expect("function")?;
+            let generator = self.eat("*");
+            if generator && (async_ || concurrent_) {
+                return self.error("async and concurrent generators are not supported");
+            }
             let name = if default_export && self.at("(") {
                 Spanned::new("<default>".into(), self.peek().span)
             } else {
@@ -1147,7 +1159,11 @@ impl<'a> Parser<'a> {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            let body = self.function_body(params, return_type, start)?;
+            let body = if generator {
+                self.generator_body(params, return_type, start)?
+            } else {
+                self.function_body(params, return_type, start)?
+            };
             let initializer = Expr::new(
                 if concurrent_ {
                     ExprKind::ConcurrentClosure(body)
@@ -1962,6 +1978,13 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.expr(0)?)
                 };
+                let value = if let Some(returned) = self.generator.as_ref().and_then(|g| g.returned.clone()) {
+                    let span = self.end(start);
+                    Some(Expr::new(ExprKind::TypedCollection {
+                        expression: Box::new(value.unwrap_or_else(|| Expr::new(ExprKind::Null, span))),
+                        annotation: returned,
+                    }, span))
+                } else { value };
                 StmtKind::Return(value)
             } else if self.eat("throw") {
                 if self.peek().kind == Kind::Line {
@@ -2248,7 +2271,10 @@ impl<'a> Parser<'a> {
         start: usize,
     ) -> Result<FunctionBody> {
         self.lines();
-        let block = self.block()?;
+        let enclosing_generator = self.generator.take();
+        let block = self.block();
+        self.generator = enclosing_generator;
+        let block = block?;
         let StmtKind::Block(body_statements) = block.kind else {
             unreachable!()
         };
@@ -3211,6 +3237,10 @@ impl<'a> Parser<'a> {
         false
     }
     fn closure(&mut self, start: usize, async_: bool, function: bool) -> Result<Expr> {
+        let generator = function && self.eat("*");
+        if generator && async_ {
+            return self.error("async generators are not supported");
+        }
         if self.at("<") {
             self.type_parameters()?;
         }
@@ -3234,7 +3264,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = if function {
+        let body = if generator {
+            self.generator_body(params, return_type, start)?
+        } else if function {
             self.function_body(params, return_type, start)?
         } else {
             self.expect("=>")?;
@@ -3242,7 +3274,10 @@ impl<'a> Parser<'a> {
             if self.at("{") {
                 self.function_body(params, return_type, start)?
             } else {
-                let value = self.expr(1)?;
+                let enclosing_generator = self.generator.take();
+                let value = self.expr(1);
+                self.generator = enclosing_generator;
+                let value = value?;
                 let param_types = self.take_parameter_types(&params);
                 let mut statements = self.parameter_bindings(&params)?;
                 let kind = if statements.is_empty() { FunctionBodyKind::Expression(Box::new(value)) }
@@ -3298,7 +3333,10 @@ impl<'a> Parser<'a> {
         let body = if self.at("{") {
             self.function_body(params, None, start)?
         } else {
-            let value = self.expr(1)?;
+            let enclosing_generator = self.generator.take();
+            let value = self.expr(1);
+            self.generator = enclosing_generator;
+            let value = value?;
             let param_types = self.take_parameter_types(&params);
             FunctionBody {
                 params,
@@ -3319,6 +3357,9 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self) -> Result<Expr> {
+        if self.at("yield") {
+            return self.generator_yield();
+        }
         if self.listen_ahead() {
             return self.listen_expression();
         }
@@ -3780,6 +3821,7 @@ impl<'a> Parser<'a> {
                 let close = interpolation_end(bytes, i + 2, 1).ok_or(())?;
                 let mut nested = Parser::new(self.source, i + 2, close, self.arena);
                 nested.synthetic_span = self.synthetic_span;
+                nested.generator = self.generator.clone();
                 nested.constructor_properties = self.constructor_properties.take();
                 nested.contracts = std::mem::take(&mut self.contracts);
                 nested.class_summaries = std::mem::take(&mut self.class_summaries);
@@ -3999,6 +4041,10 @@ impl<'a> Parser<'a> {
             // `function` as a compatibility marker only; it does not change the
             // method ABI or AST representation.
             let explicit_function = self.eat("function");
+            let generator = self.eat("*");
+            if generator && async_ {
+                return self.error("async generators are not supported");
+            }
 
             // ES/TypeScript static initialization blocks map naturally to the
             // synthetic class initializer already used for static field values.
@@ -4175,6 +4221,9 @@ impl<'a> Parser<'a> {
                         params,
                     },
                 };
+                if generator && (is_constructor || access.is_some() || foreign || type_only_member) {
+                    return self.error("generators require an ordinary implemented method");
+                }
                 if is_constructor && (is_static || async_ || access.is_some()) {
                     return self.error("a constructor cannot be static, async or an accessor");
                 }
@@ -4224,7 +4273,11 @@ impl<'a> Parser<'a> {
                     // Constructors always yield the new instance; `async` methods
                     // declare `Promise<T>`. Neither annotation constrains `return`.
                     let return_type = return_type.filter(|_| !is_constructor && !async_);
-                    let body = self.function_body(body_params, return_type, member_start)?;
+                    let body = if generator {
+                        self.generator_body(body_params, return_type, member_start)?
+                    } else {
+                        self.function_body(body_params, return_type, member_start)?
+                    };
                     if is_constructor {
                         constructor_properties = self.constructor_properties.take().unwrap();
                     }
@@ -5147,6 +5200,7 @@ fn rewrite_enum_member_references(
         ExprKind::Unary { operand, .. }
         | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
+        | ExprKind::GeneratorYield { value: operand, .. }
         | ExprKind::Await(operand)
         | ExprKind::TypeOf(operand)
         | ExprKind::Launch(operand)
@@ -5916,6 +5970,7 @@ fn validate_bindings(
                 ExprKind::Unary { operand, .. }
                 | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
+                | ExprKind::GeneratorYield { value: operand, .. }
                 | ExprKind::Await(operand)
                 | ExprKind::TypeOf(operand)
                 | ExprKind::Launch(operand)

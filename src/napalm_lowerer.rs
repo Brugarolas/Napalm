@@ -270,6 +270,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         ExprKind::Map(_) => direct(K::Map),
         ExprKind::Closure(_) | ExprKind::AsyncClosure(_) | ExprKind::ConcurrentClosure(_) => direct(K::Closure),
         ExprKind::TypedCollection { annotation, .. } => Some(annotation.clone()),
+        ExprKind::GeneratorYield { next_type, .. } => next_type.clone(),
         ExprKind::Grouped(inner) => infer_surface_type_annotation(inner),
         ExprKind::Unary { operator, operand } => match operator {
             UnaryOp::Not => direct(K::Bool),
@@ -511,6 +512,7 @@ fn resolve_type_annotation_with(
                 "Channel" => Some(BuiltinId::Channel),
                 "Receiver" => Some(BuiltinId::Receiver),
                 "Promise" => Some(BuiltinId::Promise),
+                "Generator" => Some(BuiltinId::Generator),
                 _ => None,
             };
             builtin.map_or(Type::Top, |builtin| {
@@ -591,10 +593,22 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::GenericInstance { .. } => true,
         Type::Builtin(
-            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
             Some(_),
         ) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
+        _ => false,
+    }
+}
+
+/// Conservative: can a value of this static type be a Generator, so that an
+/// abrupt `for..of` exit must close it?
+fn may_be_generator(ty: &Type) -> bool {
+    match ty {
+        // `Fiber.current` inside a generator body observes the generator object.
+        Type::Top | Type::Fiber | Type::Builtin(BuiltinId::Generator, _) => true,
+        Type::Cell(inner) => may_be_generator(inner),
+        Type::Union(ts) => ts.iter().any(may_be_generator),
         _ => false,
     }
 }
@@ -1044,6 +1058,7 @@ impl<'ast> Analyzer<'ast> {
         }?;
         match annotation.kind {
             TypeAnnotationKind::List(Some(element)) => Some(*element),
+            TypeAnnotationKind::BuiltinGeneric(name, Some(element)) if name == "Generator" => Some(*element),
             _ => None,
         }
     }
@@ -1328,7 +1343,7 @@ impl<'ast> Analyzer<'ast> {
                     }
                 }
             }
-            ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => self.visit_expr(value),
+            ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => self.visit_expr(value),
             ExprKind::Closure(body) => self.visit_closure(body, false, false),
             ExprKind::AsyncClosure(body) => self.visit_closure(body, true, false),
             ExprKind::ConcurrentClosure(body) => self.visit_closure(body, false, true),
@@ -3050,6 +3065,10 @@ struct ExceptionRegionBuild {
 
 #[derive(Clone, Debug)]
 enum ExitAction {
+    IteratorClose {
+        sequence: ValueId,
+        region: ExceptionRegionId,
+    },
     Defer {
         body: Box<Stmt>,
         region: ExceptionRegionId,
@@ -3537,11 +3556,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if depth >= self.exit_actions.len() || self.current_terminated() {
             return;
         }
+        let saved_actions = self.exit_actions.clone();
         let actions = self.exit_actions[depth..].to_vec();
         let saved_suppressed = self.suppressed_regions.clone();
 
-        for action in actions.into_iter().rev() {
+        for (offset, action) in actions.into_iter().enumerate().rev() {
+            // A resumed return in cleanup must not execute that cleanup again.
+            self.exit_actions.truncate(depth + offset);
             match action {
+                ExitAction::IteratorClose { sequence, region } => {
+                    self.suppressed_regions.insert(region);
+                    self.split_cleanup_path();
+                    self.close_generator_iterator(sequence);
+                }
                 ExitAction::Defer {
                     body,
                     region,
@@ -3573,6 +3600,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
 
+        self.exit_actions = saved_actions;
         self.suppressed_regions = saved_suppressed;
     }
 
@@ -4268,6 +4296,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_for(&mut self, name: &Ident, iterable: &Expr, body: &Stmt) {
         let sequence = self.lower_expr(iterable);
+        let action_depth = self.exit_actions.len();
+        // Only a Generator needs IteratorClose. A protecting region disables
+        // deforestation/loop fusion for the whole body, so statically known
+        // Lists, Ranges, Maps... keep exactly the pre-generator lowering.
+        let close = may_be_generator(self.builder.value_type(sequence)).then(|| {
+            let handler = self.new_block(&[Type::Top]);
+            let error = self.builder.block_param(handler, 0);
+            let region = self.create_exception_region(handler, error);
+            self.active_regions.push(region);
+            self.exit_actions.push(ExitAction::IteratorClose { sequence, region });
+            (handler, error)
+        });
         let carried = self.loop_carried_bindings(iterable, body);
         let base_env = self.env.clone();
         let iterator_initial = self.builder.const_null();
@@ -4336,12 +4376,30 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.builder.jump(header, back);
         }
 
+        if let Some((handler, error)) = close {
+            self.exit_actions.truncate(action_depth);
+            self.active_regions.pop();
+            self.builder.position_at(handler);
+            self.close_generator_iterator(sequence);
+            self.builder.emit0(Inst::FiberAbort { error });
+        }
+
         self.builder.seal_block(exit);
         self.builder.position_at(exit);
+        if close.is_some() {
+            self.split_cleanup_path();
+            self.close_generator_iterator(sequence);
+        }
         self.env = base_env;
         for binding in &carried {
             self.env.insert(*binding, Storage::Value(exit_params[binding]));
         }
+    }
+
+    fn close_generator_iterator(&mut self, sequence: ValueId) {
+        let builtin = self.builder.intern_method("__close", MethodKind::Method, 1);
+        let generator = self.lower_name(&front::Spanned::new("Generator".into(), Span::empty(0)));
+        self.builder.invoke(generator, builtin, vec![sequence]);
     }
 
     fn lower_break(&mut self, span: Span) {
@@ -4534,9 +4592,51 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 self.bind_interface(settled, &settled_type)
             }
             ExprKind::Launch(call) => self.lower_launch(call, expr.span),
+            ExprKind::GeneratorYield { value, delegated, yield_type, next_type } => {
+                self.lower_generator_yield(value, *delegated, yield_type.as_ref(), next_type.as_ref(), expr.span)
+            }
             ExprKind::TypeOf(operand) => self.lower_typeof(operand),
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => self.lower_closure(body),
         }
+    }
+
+    fn lower_generator_yield(&mut self, expression: &Expr, delegated: bool,
+        yielded: Option<&TypeAnnotation>, resumed: Option<&TypeAnnotation>, span: Span) -> ValueId {
+        let value = self.lower_expr(expression);
+        let packet = if delegated { value } else {
+            let expected = yielded.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+                self.context.interface_types)).unwrap_or(Type::Top);
+            let value = self.bind_interface(value, &expected);
+            self.builder.emit1(Inst::FiberYield { value }, Type::List(None))
+        };
+        let subscript = self.builder.intern_method("[]", MethodKind::SubscriptGetter, 1);
+        let zero = self.builder.const_num(0.0);
+        let one = self.builder.const_num(1.0);
+        let mode = self.builder.invoke(packet, subscript, vec![zero]);
+        let value = self.builder.invoke(packet, subscript, vec![one]);
+        let returning = self.new_block(&[]);
+        let other = self.new_block(&[]);
+        let equal = self.builder.intern_method("==", MethodKind::Method, 1);
+        let is_return = self.builder.invoke(mode, equal, vec![one]);
+        self.builder.branch(is_return, returning, vec![], other, vec![]);
+        let env = self.env.clone();
+        self.builder.position_at(returning);
+        let value_return = self.check_return(value, span, true);
+        self.emit_exit_actions_from(0);
+        if !self.current_terminated() { self.builder.ret(value_return); }
+        self.env = env;
+        self.builder.position_at(other);
+        let throwing = self.new_block(&[]);
+        let next = self.new_block(&[]);
+        let two = self.builder.const_num(2.0);
+        let is_throw = self.builder.invoke(mode, equal, vec![two]);
+        self.builder.branch(is_throw, throwing, vec![], next, vec![]);
+        self.builder.position_at(throwing);
+        self.builder.emit0(Inst::FiberAbort { error: value });
+        self.builder.position_at(next);
+        let expected = resumed.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+            self.context.interface_types)).unwrap_or(Type::Top);
+        self.bind_interface(value, &expected)
     }
 
     fn lower_string_literal(&mut self, bytes: &[u8], span: Span) -> ValueId {
@@ -5244,6 +5344,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.lower_contract_check(value, layout, true);
         }
         if operator == BinaryOp::Is {
+            if matches!(&right.kind, ExprKind::Name(name) if name.value == "Generator") {
+                let value = self.lower_expr(left);
+                let generator = self.lower_expr(right);
+                let method = self.builder.intern_method("__is", MethodKind::Method, 1);
+                return self.builder.invoke(generator, method, vec![value]);
+            }
             if let Some(layout) = self.contract_layout_operand(right) {
                 let value = self.lower_expr(left);
                 return self.lower_contract_check(value, layout, false);
@@ -7302,7 +7408,7 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_fields_expr(value, instance, statics),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_fields_in_body(body, instance, statics),
         ExprKind::Super(super_expr) => {
             for arg in &super_expr.args {
@@ -7589,7 +7695,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(then_expr, out);
             collect_method_keys_expr(else_expr, out)
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_method_keys_expr(value, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_method_keys_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_method_keys_body(body, out),
         ExprKind::Name(name) => {
             out.insert(MethodKey {
@@ -7766,7 +7872,7 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_strings_expr(value, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_strings_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => match &body.kind {
             FunctionBodyKind::Expression(expr) => collect_strings_expr(expr, out),
             FunctionBodyKind::Statements(statements) => collect_strings_in_statements(statements, out),
@@ -7964,7 +8070,7 @@ fn collect_written_bindings_expr(
         }
         // Do not descend into closures: their writes happen when the closure is
         // invoked, and captured mutable bindings are cells already.
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::Closure(_)
         | ExprKind::AsyncClosure(_)
         | ExprKind::ConcurrentClosure(_)

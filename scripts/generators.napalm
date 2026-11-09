@@ -1,0 +1,156 @@
+// Run: cargo run -- scripts\generators.napalm
+// Synchronous generators: lazy bodies that suspend at `yield` and resume when
+// the consumer asks for the next value.
+let checks = 0;
+function check(actual, expected, label) {
+    if (actual !== expected) {
+        throw `${label}: expected ${expected}, got ${actual}`;
+    }
+    checks++;
+}
+
+// --- Laziness, next(value), and completion -------------------------------
+let started = 0;
+function* conversation(): Generator<string, string, number> {
+    started++;
+    const age = yield "How old are you?";
+    const year = yield `In ten years you will be ${age + 10}`;
+    return `Born around ${year - age}`;
+}
+const talk = conversation();
+check(started, 0, "calling a generator function does not run its body");
+const q1 = talk.next(999);                // the first next() argument is ignored
+check(q1.value, "How old are you?", "first yield");
+check(q1.done, false, "suspended generator is not done");
+check(talk.next(30).value, "In ten years you will be 40", "next(value) resumes the yield");
+const last = talk.next(2026);
+check(last.value, "Born around 1996", "return value travels with done = true");
+check(last.done, true, "return completes the generator");
+const after = talk.next(0);
+check(after.value, null, "a finished generator yields null");
+check(after.done, true, "a finished generator stays done");
+check(started, 1, "the body ran exactly once");
+
+// --- for...of, spread, and infinite sequences ----------------------------
+function* fibonacci() {
+    let a = 0;
+    let b = 1;
+    while (true) {
+        yield a;
+        const t = a + b;
+        a = b;
+        b = t;
+    }
+}
+let small = [];
+for (const n of fibonacci()) {
+    if (n > 50) break;
+    small.add(n);
+}
+check(small.toString(), "[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]", "break stops an infinite generator");
+
+function* countdown(from: number): Generator<number> {
+    for (let i = from; i >= 0; i--) yield i;
+}
+check([...countdown(3)].toString(), "[3, 2, 1, 0]", "spread drains a generator");
+const [x, y] = [...countdown(9)];
+check(x + y, 17, "destructure a generator through a spread list");
+
+// --- yield* delegation ---------------------------------------------------
+function* inner(): Generator<number, string, number> {
+    const got = yield 1;
+    yield got * 2;
+    return "inner done";
+}
+function* outer() {
+    const result = yield* inner();      // values and next() arguments pass through
+    yield result;
+    yield* [7, 8];                      // any Napalm sequence can be delegated to
+}
+const o = outer();
+check(o.next().value, 1, "delegated first value");
+check(o.next(21).value, 42, "next() argument reaches the delegate");
+// inner declares Next = number, so it must not be resumed with next() == next(null).
+check(o.next(0).value, "inner done", "yield* evaluates to the delegate's return");
+check([...o].toString(), "[7, 8]", "yield* over a list");
+
+class Tree {
+    constructor(public left: any, public value: number, public right: any) {}
+    *walk(): Generator<number> {
+        if (this.left) yield* this.left.walk();
+        yield this.value;
+        if (this.right) yield* this.right.walk();
+    }
+}
+const tree = new Tree(new Tree(null, 1, null), 2, new Tree(new Tree(null, 3, null), 4, null));
+check([...tree.walk()].toString(), "[1, 2, 3, 4]", "recursive in-order traversal");
+
+// --- return(), throw(), and cleanup --------------------------------------
+let cleaned = 0;
+function* guarded() {
+    try {
+        yield 1;
+        yield 2;
+    } catch (error) {
+        yield `recovered from ${error}`;
+    } finally {
+        cleaned++;
+    }
+}
+const t = guarded();
+t.next();
+check(t.throw("boom").value, "recovered from boom", "throw() is raised at the yield");
+const closed = t.return(5);
+check(closed.value, 5, "return(value) completes with that value");
+check(closed.done, true, "return() finishes the generator");
+check(cleaned, 1, "finally runs when the generator is closed");
+
+const fresh = guarded();
+check(fresh.return(3).done, true, "return() on an unstarted generator");
+check(cleaned, 1, "an unstarted generator has no finally to run");
+let thrown: any = null;
+try { guarded().throw("early"); } catch (error) { thrown = error; }
+check(thrown, "early", "throw() on an unstarted generator rethrows to the caller");
+
+function* failing() { yield 1; throw "inside"; }
+const f = failing();
+f.next();
+let caught: any = null;
+try { f.next(); } catch (error) { caught = error; }
+check(caught, "inside", "an exception in the body reaches the caller of next()");
+check(f.next().done, true, "a failed generator is done");
+
+// for...of closes the generator on break, return, and exceptions.
+cleaned = 0;
+for (const n of guarded()) break;
+function firstOf() { for (const n of guarded()) return n; }
+check(firstOf(), 1, "return inside for...of");
+try { for (const n of guarded()) throw "stop"; } catch (error) { }
+check(cleaned, 3, "abrupt for...of exits close the generator");
+
+// --- Expressions, reflection, and re-entrancy ----------------------------
+const pairs = function* (n) { for (let i = 0; i < n; i++) yield [i, i * i]; };
+let squares = 0;
+for (const [i, sq] of pairs(4)) squares += sq;
+check(squares, 14, "generator function expression with destructuring");
+
+const g = countdown(1);
+check(typeof g, "Generator", "typeof");
+check(g instanceof Generator, true, "instanceof Generator");
+check([1] instanceof Generator, false, "a list is not a Generator");
+check(`${g}`.startsWith("<generator#"), true, "text conversion");
+
+let self: any = null;
+function* reentrant() {
+    try { self.next(); } catch (error) { yield "already running"; }
+}
+self = reentrant();
+check(self.next().value, "already running", "a running generator cannot be resumed");
+
+// Typed generators check yielded values, next() arguments, and the return value
+// at runtime. As with every Napalm contract, a violation is fatal:
+//
+//   function* bad(): Generator<number> { yield "nope"; }
+//   bad().next();            // Structural type error
+
+System.print(`generators: ${checks} checks passed`);

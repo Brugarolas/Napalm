@@ -538,10 +538,11 @@ pub enum BuiltinId {
     Receiver = 36,
     ConcurrentMap = 37,
     ConcurrentSet = 38,
+    Generator = 39,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -552,6 +553,7 @@ impl BuiltinId {
         Self::SetTimeout, Self::Print,
         Self::Event, Self::Emitter, Self::Channel, Self::Receiver,
         Self::ConcurrentMap, Self::ConcurrentSet,
+        Self::Generator,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -587,6 +589,7 @@ impl BuiltinId {
             Self::Receiver => "Receiver",
             Self::ConcurrentMap => "ConcurrentMap",
             Self::ConcurrentSet => "ConcurrentSet",
+            Self::Generator => "Generator",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

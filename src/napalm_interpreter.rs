@@ -80,6 +80,8 @@ use self::shared_memo::{
 mod collection_ops;
 #[path = "napalm_interfaces.rs"]
 mod interfaces;
+#[path = "napalm_generator_runtime.rs"]
+mod generator_runtime;
 use self::interfaces::h_bind_interface;
 #[path = "napalm_native.rs"]
 mod native_decorators;
@@ -2841,6 +2843,7 @@ enum HeapObject {
         promise: Value,
     },
     FiberObject {
+        generator: bool,
         fiber: u32,
         state: Arc<FiberCell>,
         trace_metadata: Arc<FiberTraceMetadata>,
@@ -5915,6 +5918,7 @@ impl HostContext<'_> {
             Some(HeapObject::Response(response)) => write!(out, "<Response {}>", response.status),
             Some(HeapObject::Headers(_)) => out.write_str("<Headers>"),
             Some(HeapObject::AsyncTaskObject { task, .. }) => write!(out, "<async-task#{task}>"),
+            Some(HeapObject::FiberObject { fiber, generator: true, .. }) => write!(out, "<generator#{fiber}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => write!(out, "<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => write!(out, "<module#{module_slot}>"),
             Some(HeapObject::NativeDecorator(_)) => out.write_str("<decorator>"),
@@ -7186,6 +7190,14 @@ pub enum NativeBuiltin {
     FiberTransfer,
     FiberTransferError,
     FiberYield,
+    GeneratorNew,
+    GeneratorIs,
+    GeneratorClose,
+    GeneratorNext,
+    GeneratorReturn,
+    GeneratorThrow,
+    GeneratorIterate,
+    GeneratorIteratorValue,
     FiberSuspend,
     FiberAbort,
     FiberError,
@@ -7316,9 +7328,10 @@ pub enum BuiltinClass {
     Emitter,
     Channel,
     Receiver,
+    Generator,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 27;
+const BUILTIN_CLASS_COUNT: usize = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7372,6 +7385,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Headers as u64),
         HeapObject::ModuleObject { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Module as u64),
+        HeapObject::FiberObject { generator: true, .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Generator as u64),
         HeapObject::FiberObject { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Fiber as u64),
         HeapObject::ClassObject { class_slot } =>
@@ -7814,6 +7829,8 @@ struct FiberLink {
     caller_object: Value,
     dst: Reg,
     catch_error: bool,
+    /// Generator resumption site, and whether the caller uses Napalm iteration.
+    generator: Option<(u32, bool)>,
 }
 
 /// Architectural banks are kept out of `Frame`. A Frame is pushed/popped on
@@ -8617,6 +8634,7 @@ impl<'p> Interpreter<'p> {
         main_state.registers.reserve(4096);
         let main = Arc::new(FiberCell::new(main_state));
         let main_object = heap.alloc(HeapObject::FiberObject {
+            generator: false,
             fiber: 0,
             state: main.clone(),
             trace_metadata: fiber_trace_metadata.clone(),
@@ -14364,6 +14382,11 @@ impl<'p> Interpreter<'p> {
             self.switch_current_fiber(link.caller);
             let caller = self.fiber_mut(link.caller);
             caller.status = FiberStatus::Running;
+            if link.generator.is_some() {
+                self.refresh_hot_frame();
+                self.deliver_generator_completion(link, value);
+                return;
+            }
             if let Some(frame) = caller.frames.last() {
                 let index = frame.reg_base as usize + link.dst.index();
                 caller.registers[index] = value.word();
@@ -15860,6 +15883,29 @@ impl Interpreter<'_> {
                 }
             }
             NativeBuiltin::FiberCall => self.activate_fiber(op, Value::from_word(receiver), arg(0), true, false),
+            NativeBuiltin::GeneratorClose => self.close_generator(op, arg(0)),
+            NativeBuiltin::GeneratorIs => {
+                let result = matches!(self.heap.get(arg(0)), Some(HeapObject::FiberObject { generator: true, .. }));
+                unsafe { self.set_reg(op.a, Value::from_bool(result).word()); self.advance(op); }
+            }
+            NativeBuiltin::GeneratorNew => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.allocate_fiber_kind(arg(0), true) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::GeneratorNext | NativeBuiltin::GeneratorReturn | NativeBuiltin::GeneratorThrow | NativeBuiltin::GeneratorIterate => {
+                let mode = match native { NativeBuiltin::GeneratorReturn => 1, NativeBuiltin::GeneratorThrow => 2, _ => 0 };
+                self.resume_generator(op, Value::from_word(receiver), arg(0), mode, matches!(native, NativeBuiltin::GeneratorIterate));
+            }
+            NativeBuiltin::GeneratorIteratorValue => {
+                match self.heap.map_get_ref(arg(0), MapKeyRef::name(b"value")) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
             NativeBuiltin::FiberTry => self.activate_fiber(op, Value::from_word(receiver), arg(0), true, true),
             NativeBuiltin::FiberTransfer => self.activate_fiber(op, Value::from_word(receiver), arg(0), false, false),
             NativeBuiltin::FiberTransferError => self.transfer_error_to_fiber(op, Value::from_word(receiver), arg(0)),
@@ -16722,6 +16768,7 @@ impl Interpreter<'_> {
                         element.as_ref().map_or(true, |expected| unsafe { state.get() }.payload_type.as_ref() == Some(expected.as_ref()))
                     }
                     (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => true,
+                    (BuiltinId::Generator, Some(HeapObject::FiberObject { generator: true, .. })) => element.is_none() || self.heap.interface_matches(value, expected),
                     _ => false,
                 }
             }
@@ -17018,6 +17065,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Response(_)) => "Response".to_owned(),
             Some(HeapObject::Headers(_)) => "Headers".to_owned(),
             Some(HeapObject::AsyncTaskObject { .. }) => "AsyncTask".to_owned(),
+            Some(HeapObject::FiberObject { generator: true, .. }) => "Generator".to_owned(),
             Some(HeapObject::FiberObject { .. }) => "Fiber".to_owned(),
             Some(HeapObject::ModuleObject { .. }) => "Module".to_owned(),
             Some(HeapObject::NativeDecorator(_)) => "NativeDecorator".to_owned(),
@@ -17194,6 +17242,10 @@ impl Interpreter<'_> {
     }
 
     fn allocate_fiber(&mut self, closure: Value) -> Result<Value, RuntimeError> {
+        self.allocate_fiber_kind(closure, false)
+    }
+
+    fn allocate_fiber_kind(&mut self, closure: Value, generator: bool) -> Result<Value, RuntimeError> {
         let function_index = match self.heap.get(closure) {
             Some(HeapObject::Closure { function_index, .. }) => *function_index,
             _ => return Err(RuntimeError::new("Fiber.new requires a closure")),
@@ -17224,6 +17276,7 @@ impl Interpreter<'_> {
         state.starter = Some(closure);
         let fiber = Arc::new(FiberCell::new(state));
         let object = self.heap.alloc(HeapObject::FiberObject {
+            generator,
             fiber: id,
             state: fiber.clone(),
             trace_metadata: self.fiber_trace_metadata.clone(),
@@ -17301,6 +17354,7 @@ impl Interpreter<'_> {
                 caller_object,
                 dst: Reg(op.a),
                 catch_error,
+                generator: None,
             });
         } else {
             // The transfer expression in the source only obtains a value if
@@ -17431,6 +17485,11 @@ impl Interpreter<'_> {
         if let Some(link) = link {
             self.switch_current_fiber(link.caller);
             self.fiber_mut(link.caller).status = FiberStatus::Running;
+            if link.generator.is_some() {
+                self.refresh_hot_frame();
+                self.deliver_generator_yield(link, value, current);
+                return;
+            }
             let caller = self.fiber_mut(link.caller);
             if let Some(frame) = caller.frames.last() {
                 let index = frame.reg_base as usize + link.dst.index();
@@ -23068,6 +23127,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_shared_literal_tests.rs");
     include!("tests/napalm_auto_memo_tests.rs");
     include!("tests/napalm_static_type_tests.rs");
+    include!("tests/napalm_generator_tests.rs");
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
     include!("tests/napalm_contract_tests.rs");
