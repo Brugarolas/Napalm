@@ -5,7 +5,7 @@
 //! registers but preserve unaffected SSA values across the call. Runtime-written result
 //! slots are explicitly reloaded afterwards.
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallSet};
 use crate::napalm_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg, MAX_NAPALM_ARITY};
 use crate::napalm_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId, Type};
 
@@ -574,32 +574,32 @@ impl Trace {
 
 #[derive(Clone)]
 pub struct TraceBuilder {
-    trace: Trace, source: TraceLocation, slots: HashMap<FrameSlot, TraceValueId>,
+    trace: Trace, source: TraceLocation, slots: SmallMap<FrameSlot, TraceValueId>,
     /// Recorder-only semantic proofs. They intentionally stay out of TraceValue
     /// so optimizer submodules do not need to know about source-level typing.
     proven_types: HashMap<TraceValueId, Type>,
     /// Static (WIR) types of registers at the trace anchor. Napalm types are
     /// enforced contracts, so they are facts about every trace-entry value.
-    entry_types: HashMap<FrameSlot, Type>,
+    entry_types: SmallMap<FrameSlot, Type>,
     /// Static types of registers at the resume PC of the latest runtime
     /// boundary. Cleared by every boundary and reinstalled by the recorder once
     /// it knows where the boundary resumes (`set_boundary_types`).
-    boundary_types: HashMap<FrameSlot, Type>,
+    boundary_types: SmallMap<FrameSlot, Type>,
     /// Registers reloaded after a boundary whose resume types are not yet known.
     pending_reloads: Vec<(FrameSlot, TraceValueId)>,
     boundary_open: bool,
     /// Ordered dirty slots for deterministic snapshots plus O(1) membership for
     /// the recorder's very hot write/reload paths.
-    dirty: Vec<FrameSlot>, dirty_set: HashSet<FrameSlot>, memory_epoch: bool,
+    dirty: Vec<FrameSlot>, dirty_set: SmallSet<FrameSlot>, memory_epoch: bool,
 }
 impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default(),
             no_signed_wrap: Vec::new() },
-            slots: HashMap::default(), proven_types: HashMap::default(), entry_types: HashMap::default(),
-            boundary_types: HashMap::default(), pending_reloads: Vec::new(), boundary_open: false,
-            dirty: vec![], dirty_set: HashSet::default(), memory_epoch: false }
+            slots: SmallMap::default(), proven_types: HashMap::default(), entry_types: SmallMap::default(),
+            boundary_types: SmallMap::default(), pending_reloads: Vec::new(), boundary_open: false,
+            dirty: vec![], dirty_set: SmallSet::default(), memory_epoch: false }
     }
 
     /// Install the statically guaranteed register types at the trace anchor.
@@ -666,10 +666,8 @@ impl TraceBuilder {
         self.trace.values.reserve(steps.saturating_mul(2));
         self.trace.exits.reserve((steps / 8).max(8));
         self.trace.preheader.reserve((steps / 16).max(8));
-        self.slots.reserve(64);
         self.proven_types.reserve(64);
         self.dirty.reserve(64);
-        self.dirty_set.reserve(64);
     }
     pub fn trace(&self) -> &Trace { &self.trace }
     pub fn trace_mut(&mut self) -> &mut Trace { &mut self.trace }

@@ -17,7 +17,6 @@ smallvec = "1.16.5" # Fast hash map
 ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 papaya = "0.2.5" # Concurrent hash map
-#small-map = "0.1.5" # Small map optimization
 smallbox = "0.8.9" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
 compact_str = "0.10.0" # String drop-in replacement
@@ -44,6 +43,7 @@ simd-json = { version = "0.19.0", default-features = false, features = ["runtime
 
 cranelift = { path = "./crates/wasmtime/cranelift/umbrella", features = ["jit", "module", "native"] } # JIT compiler back-end framework for Rust
 mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
+small_map = { path = "./crates/small_map" } # Small map optimization
 
 # Safe Rust bindings to the LLVM C API (LLVM trace tier).
 # Windows: the official LLVM release libraries use the static CRT (/MT) plus

@@ -5,7 +5,7 @@ use crate::napalm_ir::{CmpKind, F64BinOp, F64UnaryOp};
 use std::collections::VecDeque;
 
 pub(super) fn order(trace: &Trace) -> Vec<usize> {
-    let pre: HashSet<_> = trace.preheader.iter().copied().collect();
+    let pre = PreheaderMask::new(trace);
     trace.preheader.iter().copied()
         .chain((0..trace.nodes.len()).filter(|id| !pre.contains(id))).collect()
 }
@@ -488,7 +488,7 @@ impl TraceOptimization for RangeAnalysis {
                 .or_else(|| (trace.value(source).map(|value| value.rep) == Some(TraceRep::Int32)).then_some(source));
             monotone.push((trace.canonical_value(phi.value), start, increasing));
         }
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let mut body_started = false;
         let mut less_than = HashSet::default();
         let mut changed = false;
@@ -788,7 +788,7 @@ fn body_memory_kills(trace: &Trace) -> Option<(bool, Vec<Memory>)> {
     if trace.preheader.is_empty() || !matches!(trace.terminator, TraceTerminator::LoopBack) {
         return None;
     }
-    let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+    let preheader = PreheaderMask::new(trace);
     let mut barrier = false;
     let mut stores = Vec::new();
     for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
@@ -833,7 +833,7 @@ fn speculate_distinct_lists(trace: &mut Trace) -> Vec<(TraceValueId, TraceValueI
         return Vec::new();
     }
     let invariant = preheader_values(trace);
-    let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+    let preheader = PreheaderMask::new(trace);
     let (mut reads, mut stores) = (Vec::new(), Vec::new());
     for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
         let (list, index, is_store) = match node.kind {
@@ -980,7 +980,8 @@ impl TraceOptimization for LoopInvariantLoadHoisting {
         if !native_loop(trace) || trace.nodes.iter().any(|n| matches!(n.kind, TraceInst::ReadBarrier { .. })) {
             return false;
         }
-        let body: Vec<usize> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
+        let pre = PreheaderMask::new(trace);
+        let body: Vec<usize> = (0..trace.nodes.len()).filter(|id| !pre.contains(id)).collect();
         let stores: Vec<Memory> = body.iter()
             .filter_map(|&id| write_effect(&trace.nodes[id].kind, trace))
             .filter(|memory| !matches!(memory, Memory::Frame(..)))
@@ -1050,7 +1051,7 @@ impl TraceOptimization for LoopCarriedGuardElimination {
         if !native_loop(trace) {
             return false;
         }
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let invariant = preheader_values(trace);
         let guards: Vec<(usize, TraceValueId, TraceValueId)> = (0..trace.nodes.len())
             .filter(|id| !preheader.contains(id))
@@ -1119,7 +1120,7 @@ impl TraceOptimization for LoadStorePRE {
         let distinct = speculate_distinct_lists(trace);
         let mut changed = false;
         let kills = body_memory_kills(trace);
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let mut in_body = preheader.is_empty();
         for id in order(trace) {
             if !in_body && !preheader.contains(&id) {
@@ -1182,7 +1183,8 @@ impl TraceOptimization for LoadStorePRE {
         if native_loop(trace) && !trace.nodes.iter().any(|n| matches!(n.kind, TraceInst::ReadBarrier { .. })) {
             let mut invariant = preheader_values(trace);
             let mut stores_seen = Vec::<Memory>::new();
-            let body: Vec<_> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
+            let pre = PreheaderMask::new(trace);
+            let body: Vec<_> = (0..trace.nodes.len()).filter(|id| !pre.contains(id)).collect();
             for id in body {
                 let kind = trace.nodes[id].kind.clone();
                 if let Some(memory) = write_effect(&kind, trace) {

@@ -36,7 +36,7 @@
 
 #![allow(dead_code)]
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap16};
 use smallvec::SmallVec;
 
 use crate::napalm_ir::{
@@ -1490,8 +1490,10 @@ impl VarLayout {
 
 /// On-the-fly SSA construction for scalarized fields (Braun et al.).
 struct SsaBuilder {
-    defs: Vec<HashMap<usize, ValueId>>,
-    entry: Vec<HashMap<usize, ValueId>>,
+    /// Per-block scalar-variable tables. A block defines only a few of the
+    /// scalarized fields, so each table is inline (no per-block allocation).
+    defs: Vec<SmallMap16<usize, ValueId>>,
+    entry: Vec<SmallMap16<usize, ValueId>>,
     processed: Vec<bool>,
     /// (block, var, param) phis whose incoming values still need filling.
     pending: Vec<(usize, usize, ValueId)>,
@@ -1503,8 +1505,8 @@ struct SsaBuilder {
 impl SsaBuilder {
     fn new(blocks: usize, var_types: Vec<Option<Type>>) -> Self {
         Self {
-            defs: vec![HashMap::default(); blocks],
-            entry: vec![HashMap::default(); blocks],
+            defs: vec![SmallMap16::default(); blocks],
+            entry: vec![SmallMap16::default(); blocks],
             processed: vec![false; blocks],
             pending: Vec::new(),
             new_params: vec![Vec::new(); blocks],

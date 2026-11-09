@@ -48,7 +48,7 @@ use rclite::Rc;
 pub(in crate::napalm_tracing_jit) struct RegionMemberJob {
     pub(in crate::napalm_tracing_jit) trace: Trace,
     pub(in crate::napalm_tracing_jit) exits: Vec<CompiledExitPlan>,
-    pub(in crate::napalm_tracing_jit) binding_slots: HashMap<VmBindingKey, u32>,
+    pub(in crate::napalm_tracing_jit) binding_slots: VmBindingSlots,
     pub(in crate::napalm_tracing_jit) profile: Option<TraceProfile>,
 }
 

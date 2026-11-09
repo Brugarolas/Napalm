@@ -177,6 +177,38 @@ fn preheader_values(trace: &Trace) -> HashSet<TraceValueId> {
     available
 }
 
+/// Snapshot membership test for `trace.preheader`. Node ids are dense arena
+/// indices, so a byte mask replaces the hashed set the passes used to build:
+/// one zeroed allocation and a single load per query. Like a collected set it
+/// is a snapshot: nodes appended afterwards (including new preheader nodes)
+/// read as absent.
+pub(crate) struct PreheaderMask {
+    bits: Vec<bool>,
+    empty: bool,
+}
+
+impl PreheaderMask {
+    pub(crate) fn new(trace: &Trace) -> Self {
+        let mut bits = vec![false; trace.nodes.len()];
+        for &id in &trace.preheader {
+            if let Some(bit) = bits.get_mut(id) {
+                *bit = true;
+            }
+        }
+        Self { bits, empty: trace.preheader.is_empty() }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, id: &usize) -> bool {
+        self.bits.get(*id).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.empty
+    }
+}
+
 fn native_loop(trace: &Trace) -> bool {
     matches!(trace.anchor.kind, TraceKind::Loop)
         && matches!(trace.terminator, TraceTerminator::LoopBack)
@@ -215,7 +247,7 @@ impl TraceOptimization for GlobalValueNumbering {
                 constants.insert(key, value.id);
             }
         }
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let order: Vec<_> = trace
             .preheader
             .iter()
@@ -257,7 +289,7 @@ impl TraceOptimization for LoopInvariantCodeMotion {
             return false;
         }
         let mut available = preheader_values(trace);
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let mut changed = false;
         for id in 0..trace.nodes.len() {
             if preheader.contains(&id) {
@@ -292,17 +324,21 @@ impl TraceOptimization for PartialRedundancyElimination {
             return false;
         }
         let mut changed = false;
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let body: Vec<_> = (0..trace.nodes.len())
             .filter(|id| !preheader.contains(id))
             .collect();
+        // `preheader_values` scans every value. It depends only on the trace,
+        // which changes solely at the end of a successful elimination below,
+        // so recompute it lazily after a change instead of once per body node.
+        let mut available_cache = None;
         // Bounded to the original nodes. Newly introduced phis may enable a
         // later pipeline pass, but cannot grow this pass's candidate set.
         for &id in &body {
             let Some(key) = expression(trace, id) else {
                 continue;
             };
-            let available = preheader_values(trace);
+            let available = &*available_cache.get_or_insert_with(|| preheader_values(trace));
             let mut initial = key.clone();
             let mut backedge = key.clone();
             let mut has_phi = false;
@@ -356,6 +392,7 @@ impl TraceOptimization for PartialRedundancyElimination {
             };
             let next = trace.nodes[redundant].results[0];
             let source = trace.nodes[id].source;
+            available_cache = None;
             for phi in guarded_inputs {
                 let exit = phi.entry_exit.unwrap();
                 let value = TraceValueId(trace.values.len() as u32);
@@ -650,7 +687,7 @@ impl TraceCanonicalization {
             boxed: bool,
         }
 
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let mut candidates = Vec::new();
         for (phi_index, phi) in trace.loop_phis.iter().enumerate() {
             if phi.rep != TraceRep::Tagged || phi.entry_exit.is_some() {
@@ -930,7 +967,7 @@ impl TraceCanonicalization {
             id
         }
 
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let integral_constant = |trace: &Trace, value: TraceValueId| -> Option<i64> {
             match &trace.value(trace.canonical_value(value))?.origin {
                 TraceValueOrigin::Constant(TraceConstant::F64Bits(bits)) => {
@@ -1399,27 +1436,35 @@ impl TraceCanonicalization {
         }
     }
 
-    fn used_values(trace: &Trace) -> HashSet<TraceValueId> {
-        let mut used = HashSet::default();
+    /// Dense used-value mask indexed by canonical value id. It grows on demand
+    /// so a malformed out-of-range reference still counts as a use (the
+    /// verifier reports it) exactly as the former hashed set did.
+    fn used_values(trace: &Trace) -> Vec<bool> {
+        let mut used = vec![false; trace.values.len()];
+        let mut mark = |value: TraceValueId| {
+            let index = trace.canonical_value(value).0 as usize;
+            if index >= used.len() {
+                used.resize(index + 1, false);
+            }
+            used[index] = true;
+        };
         for node in &trace.nodes {
             let mut kind = node.kind.clone();
-            kind.visit_operands(|value| {
-                used.insert(trace.canonical_value(*value));
-            });
+            kind.visit_operands(|value| mark(*value));
         }
         for exit in &trace.exits {
             for frame in &exit.frames {
                 for write in &frame.writes {
                     if let SnapshotValue::Value(value) = write.value {
-                        used.insert(trace.canonical_value(value));
+                        mark(value);
                     }
                 }
             }
         }
         for phi in &trace.loop_phis {
-            used.insert(trace.canonical_value(phi.initial));
+            mark(phi.initial);
             if let Some(backedge) = phi.backedge {
-                used.insert(trace.canonical_value(backedge));
+                mark(backedge);
             }
         }
         used
@@ -1427,6 +1472,7 @@ impl TraceCanonicalization {
 
     fn remove_dead_box_nodes(&self, trace: &mut Trace) {
         let used = Self::used_values(trace);
+        let is_used = |value: TraceValueId| used.get(value.0 as usize).copied().unwrap_or(false);
         let canonical_values: Vec<_> = (0..trace.values.len())
             .map(|index| trace.canonical_value(TraceValueId(index as u32)))
             .collect();
@@ -1435,7 +1481,7 @@ impl TraceCanonicalization {
             let Some(result) = node.results.first().copied() else {
                 continue;
             };
-            if used.contains(&canonical_values[result.0 as usize]) {
+            if is_used(canonical_values[result.0 as usize]) {
                 continue;
             }
             if matches!(

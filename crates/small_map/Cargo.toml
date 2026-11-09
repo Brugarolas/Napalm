@@ -1,0 +1,64 @@
+[package]
+name = "small_map"
+version = "0.2.0"
+edition = "2024"
+
+authors = ["Andres Brugarolas <brugarolas.92@gmail.com>"]
+categories = ["data-structures"]
+description = "An inline SIMD accelerated hashmap designed for small amount of data."
+keywords = ["smallmap", "hashmap", "map", "simd", "smallvec"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/brugarolas/Napalm/crates/small_map/"
+
+[dependencies]
+hashbrown = { version = "0.17.1", features = [
+    "equivalent",
+    "inline-more",
+], default-features = false }
+
+serde = { version = "1", default-features = false, optional = true }
+ahash = { version = "0.8", default-features = false, optional = true }
+rustc-hash = { version = "2", default-features = false, optional = true }
+rapidhash = { version = "4", default-features = false, optional = true }
+
+[dev-dependencies]
+rand = { version = "0.10.3" }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+micromap = "0.3.0"
+tinymap = "0.4"
+litemap = "0.8.1"
+rustc-hash = { version = "2", features = ["std"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+pprof = { version = "0.15", features = ["flamegraph"] }
+
+[features]
+default = ["ahash", "inline-more"]
+
+hashes = ["ahash", "fxhash", "rapidhash"]
+ahash = ["dep:ahash"]
+fxhash = ["dep:rustc-hash"]
+rapidhash = ["dep:rapidhash"]
+serde = ["dep:serde", "hashbrown/serde"]
+nightly = []
+inline-more = ["hashbrown/inline-more"]
+
+[[bench]]
+name = "simple"
+harness = false
+path = "benches/simple.rs"
+required-features = ["fxhash"]
+
+[profile.release]
+opt-level = 3
+overflow-checks = false
+panic = "abort"
+lto = true
+
+[profile.bench]
+opt-level = 3
+overflow-checks = false
+panic = "abort"
+lto = true

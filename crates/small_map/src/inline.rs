@@ -1,0 +1,680 @@
+use core::{
+    hash::{BuildHasher, Hash},
+    iter::FusedIterator,
+    mem::{self, transmute, ManuallyDrop, MaybeUninit},
+    ptr::NonNull,
+};
+
+use crate::{
+    raw::{
+        h2,
+        util::{
+            equivalent_key, likely, make_hash, unlikely, Bucket, InsertSlot, SizedTypeProperties,
+        },
+        Group,
+    },
+    Equivalent,
+};
+
+/// Lazy hash computation - computes hash only when needed and caches the result.
+enum HashValue<F> {
+    Pending(F),
+    Computed(u64),
+}
+
+impl<F: FnOnce() -> u64> HashValue<F> {
+    #[inline]
+    fn new(f: F) -> Self {
+        Self::Pending(f)
+    }
+
+    #[inline]
+    fn get(&mut self) -> u64 {
+        match self {
+            Self::Pending(_) => {
+                let f = match core::mem::replace(self, Self::Computed(0)) {
+                    Self::Pending(f) => f,
+                    Self::Computed(_) => unsafe { core::hint::unreachable_unchecked() },
+                };
+                let hash = f();
+                *self = Self::Computed(hash);
+                hash
+            }
+            Self::Computed(hash) => *hash,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Inline<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize = 16> {
+    raw: RawInline<N, (K, V), LINEAR_THRESHOLD>,
+    // Option is for take, S always exists before drop.
+    inline_hasher: Option<SI>,
+    heap_hasher: Option<SH>,
+}
+
+struct RawInline<const N: usize, T, const LINEAR_THRESHOLD: usize = 16> {
+    aligned_groups: AlignedGroups<N>,
+    len: usize,
+    data: [MaybeUninit<T>; N],
+}
+
+impl<const N: usize, T: Clone, const LINEAR_THRESHOLD: usize> Clone
+    for RawInline<N, T, LINEAR_THRESHOLD>
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        struct DropGuard<'a, T> {
+            data: &'a mut [MaybeUninit<T>],
+            len: usize,
+        }
+
+        impl<'a, T> Drop for DropGuard<'a, T> {
+            fn drop(&mut self) {
+                // SAFETY: data[0..len] are initialized
+                for i in 0..self.len {
+                    unsafe {
+                        core::ptr::drop_in_place(self.data[i].as_mut_ptr());
+                    }
+                }
+            }
+        }
+
+        // SAFETY: MaybeUninit doesn't require initialization
+        let mut aligned_groups: AlignedGroups<N> = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut data: [MaybeUninit<T>; N] = unsafe { MaybeUninit::uninit().assume_init() };
+
+        let mut guard = DropGuard {
+            data: &mut data,
+            len: 0,
+        };
+
+        // Only 0..len is valid
+        for (i, group) in self.aligned_groups.groups.iter().take(self.len).enumerate() {
+            aligned_groups.groups[i] = *group;
+            // If T::clone panics, guard will drop everything cloned so far
+            guard.data[i] = MaybeUninit::new(unsafe { self.data[i].assume_init_ref().clone() });
+            guard.len += 1;
+        }
+
+        mem::forget(guard);
+
+        Self {
+            aligned_groups,
+            len: self.len,
+            data,
+        }
+    }
+}
+
+/// Compact control bytes. All SIMD backends use unaligned loads.
+///
+/// A partial final group is copied into a fully initialized scratch buffer
+/// before scanning, so no per-map alignment or permanent padding is required.
+#[derive(Clone, Copy)]
+pub(crate) struct AlignedGroups<const N: usize> {
+    groups: [MaybeUninit<u8>; N],
+}
+
+impl<const N: usize> AlignedGroups<N> {
+    #[inline]
+    unsafe fn ctrl(&self, index: usize) -> *mut u8 { unsafe {
+        (self.groups.as_ptr() as *const u8).add(index).cast_mut()
+    }}
+}
+
+impl<const N: usize, T, const LINEAR_THRESHOLD: usize> Drop for RawInline<N, T, LINEAR_THRESHOLD> {
+    #[inline]
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_THRESHOLD> {
+    /// Minimum len threshold for linear search.
+    /// Always at least 2 to ensure len=1 skips hash computation.
+    const MIN_LINEAR_LEN: usize = if LINEAR_THRESHOLD > 2 {
+        LINEAR_THRESHOLD
+    } else {
+        2
+    };
+
+    /// Drops initialized entries while keeping the logical length valid even
+    /// if an element destructor panics.
+    #[inline]
+    fn clear(&mut self) {
+        if T::NEEDS_DROP {
+            while self.len != 0 {
+                self.len -= 1;
+                // SAFETY: The decremented index was initialized and is no
+                // longer part of the live prefix after the length update.
+                let value = unsafe { self.data.get_unchecked(self.len).assume_init_read() };
+                drop(value);
+            }
+        } else {
+            self.len = 0;
+        }
+    }
+
+    /// Searches for an element. Uses linear search for small N/len, SIMD otherwise.
+    /// Hash is computed lazily only when SIMD path is taken.
+    #[inline]
+    fn find<F: FnOnce() -> u64>(
+        &self,
+        hash: &mut HashValue<F>,
+        mut eq: impl FnMut(&T) -> bool,
+    ) -> Option<Bucket<T>> {
+        if N < LINEAR_THRESHOLD || self.len < Self::MIN_LINEAR_LEN {
+            // Linear search - no hash needed
+            for i in 0..self.len {
+                if eq(unsafe { self.data.get_unchecked(i).assume_init_ref() }) {
+                    return Some(unsafe { self.bucket(i) });
+                }
+            }
+            None
+        } else {
+            // SIMD search based on len
+            unsafe {
+                let h2_hash = h2(hash.get());
+                let full_groups = self.len / Group::WIDTH;
+                let mut probe_pos = 0;
+
+                for _ in 0..full_groups {
+                    let group = Group::load(self.aligned_groups.ctrl(probe_pos));
+                    for bit in group.match_byte(h2_hash) {
+                        let index = probe_pos + bit;
+                        let item: &T = self.data.get_unchecked(index).assume_init_ref();
+                        if likely(eq(item)) {
+                            return Some(self.bucket(index));
+                        }
+                    }
+                    probe_pos += Group::WIDTH;
+                }
+
+                let tail_len = self.len % Group::WIDTH;
+                if tail_len != 0 {
+                    // SIMD loads require a full group of readable, initialized
+                    // bytes. Never read beyond the live control-byte prefix.
+                    let mut tail = [0u8; Group::WIDTH];
+                    core::ptr::copy_nonoverlapping(
+                        self.aligned_groups.ctrl(probe_pos),
+                        tail.as_mut_ptr(),
+                        tail_len,
+                    );
+                    let group = Group::load(tail.as_ptr());
+                    for bit in group.match_byte(h2_hash).and(Group::LOWEST_MASK[tail_len]) {
+                        let index = probe_pos + bit;
+                        let item: &T = self.data.get_unchecked(index).assume_init_ref();
+                        if likely(eq(item)) {
+                            return Some(self.bucket(index));
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Inserts a new element into the table in the given slot, and returns its
+    /// raw bucket.
+    #[inline]
+    unsafe fn insert_in_slot(&mut self, hash: u64, slot: InsertSlot, value: T) -> Bucket<T> { unsafe {
+        // SAFETY: The caller must uphold the safety rules for the [`RawTableInner::set_ctrl_h2`]
+        let bucket = self.bucket(slot.index);
+        bucket.write(value);
+        *self.aligned_groups.ctrl(slot.index) = h2(hash);
+        self.len += 1;
+        bucket
+    }}
+
+    /// Finds and removes an element from the table.
+    #[inline]
+    fn remove_entry<F: FnOnce() -> u64>(
+        &mut self,
+        hash: &mut HashValue<F>,
+        eq: impl FnMut(&T) -> bool,
+    ) -> Option<T> {
+        match self.find(hash, eq) {
+            Some(bucket) => Some(unsafe { self.remove(bucket).0 }),
+            None => None,
+        }
+    }
+
+    /// Removes an element from the table, returning it.
+    /// Uses swap-delete: swaps with last element to maintain contiguity.
+    #[inline]
+    #[allow(clippy::needless_pass_by_value)]
+    unsafe fn remove(&mut self, item: Bucket<T>) -> (T, InsertSlot) { unsafe {
+        let index = self.bucket_index(&item);
+        // Read value before swap-delete
+        let value = item.read();
+        self.erase(index);
+        (value, InsertSlot { index })
+    }}
+
+    /// Returns the index of a bucket from a `Bucket`.
+    #[inline]
+    unsafe fn bucket_index(&self, bucket: &Bucket<T>) -> usize { unsafe {
+        bucket.to_base_index(NonNull::new_unchecked(self.data.as_ptr() as _))
+    }}
+
+    /// Erases the element at index using swap-delete.
+    /// Copies the last element to index position to maintain contiguous storage.
+    /// Caller must ensure the value at index has been moved out or dropped.
+    #[inline]
+    unsafe fn erase(&mut self, index: usize) { unsafe {
+        let last = self.len - 1;
+        if index != last {
+            core::ptr::copy_nonoverlapping(
+                self.data[last].as_ptr(),
+                self.data[index].as_mut_ptr(),
+                1,
+            );
+            self.aligned_groups.groups[index] = self.aligned_groups.groups[last];
+        }
+        self.len -= 1;
+    }}
+
+    /// Returns a pointer to an element in the table.
+    #[inline]
+    unsafe fn bucket(&self, index: usize) -> Bucket<T> { unsafe {
+        Bucket::from_base_index(
+            NonNull::new_unchecked(transmute::<*mut MaybeUninit<T>, *mut T>(
+                self.data.as_ptr().cast_mut(),
+            )),
+            index,
+        )
+    }}
+}
+
+impl<const N: usize, K, V, const LINEAR_THRESHOLD: usize> RawInline<N, (K, V), LINEAR_THRESHOLD> {
+    /// Retains only elements where f returns true.
+    /// Uses swap-delete to maintain contiguous storage.
+    #[inline]
+    fn retain<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        let mut i = 0;
+        while i < self.len {
+            let (k, v) = unsafe { self.data[i].assume_init_mut() };
+            if f(k, v) {
+                i += 1;
+            } else {
+                unsafe {
+                    // Read the rejected element out first, fix up the structure
+                    // via `erase`, and only then drop it. If the destructor
+                    // panics, the container is already consistent, so the slot
+                    // is not dropped again.
+                    let removed = core::ptr::read(self.data[i].as_ptr());
+                    self.erase(i);
+                    drop(removed);
+                }
+                // Don't increment i, check the swapped element
+            }
+        }
+    }
+}
+
+/// Iterator over references to key-value pairs.
+pub struct Iter<'a, const N: usize, K, V> {
+    data: &'a [MaybeUninit<(K, V)>; N],
+    index: usize,
+    len: usize,
+}
+
+impl<'a, const N: usize, K, V> Iterator for Iter<'a, N, K, V> {
+    type Item = (&'a K, &'a V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.len {
+            let kv = unsafe { self.data[self.index].assume_init_ref() };
+            self.index += 1;
+            Some((&kv.0, &kv.1))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, const N: usize, K, V> ExactSizeIterator for Iter<'a, N, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len - self.index
+    }
+}
+
+impl<'a, const N: usize, K, V> FusedIterator for Iter<'a, N, K, V> {}
+
+impl<'a, const N: usize, K, V> Clone for Iter<'a, N, K, V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data,
+            index: self.index,
+            len: self.len,
+        }
+    }
+}
+
+/// Owning iterator over key-value pairs.
+pub struct IntoIter<const N: usize, K, V> {
+    data: [MaybeUninit<(K, V)>; N],
+    index: usize,
+    len: usize,
+}
+
+impl<const N: usize, K, V> Iterator for IntoIter<N, K, V> {
+    type Item = (K, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.len {
+            let kv = unsafe { self.data[self.index].as_ptr().read() };
+            self.index += 1;
+            Some(kv)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<const N: usize, K, V> ExactSizeIterator for IntoIter<N, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len - self.index
+    }
+}
+
+impl<const N: usize, K, V> FusedIterator for IntoIter<N, K, V> {}
+
+impl<const N: usize, K, V> Drop for IntoIter<N, K, V> {
+    fn drop(&mut self) {
+        // Update the index before running any element destructor.
+        // A panicking destructor must never leave the same entry live.
+        while let Some(value) = self.next() {
+            drop(value);
+        }
+    }
+}
+
+impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize> IntoIterator
+    for Inline<N, K, V, SH, SI, LINEAR_THRESHOLD>
+{
+    type Item = (K, V);
+    type IntoIter = IntoIter<N, K, V>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        // Use ManuallyDrop to take ownership of the data while still dropping hashers.
+        let this = ManuallyDrop::new(self);
+        let data = unsafe { core::ptr::read(&this.raw.data) };
+        let len = this.raw.len;
+
+        // Create the owning iterator *before* dropping either hasher.
+        // If a custom hasher's Drop panics, Rust unwinding still drops the
+        // iterator and its remaining entries instead of leaking them.
+        let iter = IntoIter {
+            data,
+            index: 0,
+            len,
+        };
+        // SAFETY: `this` is ManuallyDrop and each hasher field is moved once.
+        let inline_hasher = unsafe { core::ptr::read(&this.inline_hasher) };
+        let heap_hasher = unsafe { core::ptr::read(&this.heap_hasher) };
+        drop(inline_hasher);
+        drop(heap_hasher);
+        iter
+    }
+}
+
+impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize>
+    Inline<N, K, V, SH, SI, LINEAR_THRESHOLD>
+{
+    #[inline]
+    pub(crate) fn iter(&self) -> Iter<'_, N, K, V> {
+        Iter {
+            data: &self.raw.data,
+            index: 0,
+            len: self.raw.len,
+        }
+    }
+
+    // This constant assertion ensures that N is not zero at compile time.
+    // The evaluation of this constant will trigger a compile-time error if N is 0.
+    const VALIDNESS_CHECK: () = assert!(N != 0, "SmallMap cannot be initialized with zero size.");
+
+    #[inline]
+    pub(crate) const fn new(hash_builder: SI, heap_hasher: SH) -> Self {
+        // Trigger compile-time check
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::VALIDNESS_CHECK;
+
+        Self {
+            raw: RawInline {
+                // SAFETY: MaybeUninit doesn't require initialization, len tracks validity
+                aligned_groups: unsafe { MaybeUninit::uninit().assume_init() },
+                len: 0,
+                data: unsafe { MaybeUninit::uninit().assume_init() },
+            },
+            inline_hasher: Some(hash_builder),
+            heap_hasher: Some(heap_hasher),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.raw.len == 0
+    }
+
+    #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        self.raw.len == N
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.raw.len
+    }
+
+    /// Clears inline storage without moving or replacing either hasher.
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.raw.clear();
+    }
+
+    // # Safety
+    // Hasher must exist.
+    #[inline]
+    pub(crate) unsafe fn take_inline_hasher(&mut self) -> SI { unsafe {
+        self.inline_hasher.take().unwrap_unchecked()
+    }}
+
+    // # Safety
+    // Hasher must exist.
+    #[inline]
+    pub(crate) unsafe fn take_heap_hasher(&mut self) -> SH { unsafe {
+        self.heap_hasher.take().unwrap_unchecked()
+    }}
+
+    #[inline]
+    fn inline_hasher(&self) -> &SI {
+        self.inline_hasher.as_ref().unwrap()
+    }
+}
+
+impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize>
+    Inline<N, K, V, SH, SI, LINEAR_THRESHOLD>
+where
+    K: Eq + Hash,
+    SI: BuildHasher,
+{
+    /// Returns a reference to the value corresponding to the key.
+    #[inline]
+    pub(crate) fn get<Q>(&self, k: &Q) -> Option<&V>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        // Avoid `Option::map` because it bloats LLVM IR.
+        match self.get_inner(k) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    #[inline]
+    pub(crate) fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        // Avoid `Option::map` because it bloats LLVM IR.
+        match self.get_inner_mut(k) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
+    /// Returns the key-value pair corresponding to the supplied key.
+    #[inline]
+    pub(crate) fn get_key_value<Q>(&self, k: &Q) -> Option<(&K, &V)>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        // Avoid `Option::map` because it bloats LLVM IR.
+        match self.get_inner(k) {
+            Some((key, value)) => Some((key, value)),
+            None => None,
+        }
+    }
+
+    /// Inserts a key-value pair into the map.
+    #[inline]
+    pub(crate) fn insert(&mut self, k: K, v: V) -> Option<V> {
+        if N < LINEAR_THRESHOLD {
+            // Small N: use linear search, no hash needed
+            let len = self.raw.len;
+            for i in 0..len {
+                let item = unsafe { self.raw.data[i].assume_init_mut() };
+                if k.equivalent(&item.0) {
+                    return Some(mem::replace(&mut item.1, v));
+                }
+            }
+            self.raw.data[len].write((k, v));
+            self.raw.len = len + 1;
+            None
+        } else {
+            let hash_builder = self.inline_hasher.as_ref().unwrap();
+            let mut hash = HashValue::new(|| make_hash::<K, SI>(hash_builder, &k));
+            match self.raw.find(&mut hash, equivalent_key(&k)) {
+                Some(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                None => {
+                    let slot = InsertSlot {
+                        index: self.raw.len,
+                    };
+                    unsafe { self.raw.insert_in_slot(hash.get(), slot, (k, v)) };
+                    None
+                }
+            }
+        }
+    }
+
+    /// Inserts a key-value pair into the map without checking if the key already exists.
+    ///
+    /// # Safety
+    /// The caller must ensure that the key does not already exist in the map.
+    #[inline]
+    pub(crate) unsafe fn insert_unique_unchecked(&mut self, k: K, v: V) -> (&K, &mut V) { unsafe {
+        let len = self.raw.len;
+        if N < LINEAR_THRESHOLD {
+            self.raw.data[len].write((k, v));
+            self.raw.len = len + 1;
+            let item = self.raw.data[len].assume_init_mut();
+            (&item.0, &mut item.1)
+        } else {
+            let hash_builder = self.inline_hasher.as_ref().unwrap();
+            let hash = make_hash::<K, SI>(hash_builder, &k);
+            let slot = InsertSlot { index: len };
+            let bucket = self.raw.insert_in_slot(hash, slot, (k, v));
+            let (k, v) = bucket.as_mut();
+            (k, v)
+        }
+    }}
+
+    /// Replaces the stored key in-place if an equivalent key exists.
+    ///
+    /// Equal keys must have equal hashes, so the fingerprint remains valid.
+    /// Returns the incoming key when no matching entry exists.
+    #[inline]
+    pub(crate) fn replace_key(&mut self, incoming: K) -> Result<K, K> {
+        match self.get_inner_mut(&incoming) {
+            Some((stored_key, _)) => Ok(mem::replace(stored_key, incoming)),
+            None => Err(incoming),
+        }
+    }
+
+    /// Removes a key from the map, returning the stored key and value if the
+    /// key was previously in the map. Keeps the allocated memory for reuse.
+    #[inline]
+    pub(crate) fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        let hash_builder = self.inline_hasher.as_ref().unwrap();
+        let mut hash = HashValue::new(|| make_hash::<Q, SI>(hash_builder, k));
+        self.raw.remove_entry(&mut hash, equivalent_key(k))
+    }
+
+    /// Retains only the elements specified by the predicate.
+    #[inline]
+    pub(crate) fn retain<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        self.raw.retain(f);
+    }
+
+    #[inline]
+    fn get_inner<Q>(&self, k: &Q) -> Option<&(K, V)>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        if unlikely(self.is_empty()) {
+            return None;
+        }
+        let mut hash = HashValue::new(|| make_hash::<Q, SI>(self.inline_hasher(), k));
+        match self.raw.find(&mut hash, equivalent_key(k)) {
+            Some(bucket) => Some(unsafe { bucket.as_ref() }),
+            None => None,
+        }
+    }
+
+    #[inline]
+    fn get_inner_mut<Q>(&mut self, k: &Q) -> Option<&mut (K, V)>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+    {
+        if unlikely(self.is_empty()) {
+            return None;
+        }
+        let hash_builder = self.inline_hasher.as_ref().unwrap();
+        let mut hash = HashValue::new(|| make_hash::<Q, SI>(hash_builder, k));
+        match self.raw.find(&mut hash, equivalent_key(k)) {
+            Some(bucket) => Some(unsafe { bucket.as_mut() }),
+            None => None,
+        }
+    }
+}

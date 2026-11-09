@@ -44,7 +44,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(dead_code)]
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallMap16, SmallSet, SmallSet16};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -1658,7 +1658,7 @@ struct TraceRecorder<'a> {
     /// of a native RuntimeCall run in the interpreter with the tracing manager
     /// checked out, so their own loops could never enter native code again.
     /// `false` means the loop has no profile yet (decide on a later attempt).
-    native_loop_functions: HashMap<FuncId, bool>,
+    native_loop_functions: SmallMap<FuncId, bool>,
     /// Root loops: the PCs of the natural loop (see `static_loop_body`).
     loop_body: Option<HashSet<u32>>,
 }
@@ -1680,7 +1680,7 @@ impl<'a> TraceRecorder<'a> {
             options,
             trace_id,
             anchor,
-            native_loop_functions: HashMap::default(),
+            native_loop_functions: SmallMap::default(),
             loop_body: None,
         }
     }
@@ -1690,7 +1690,7 @@ impl<'a> TraceRecorder<'a> {
         self
     }
 
-    fn with_native_loop_functions(mut self, functions: HashMap<FuncId, bool>) -> Self {
+    fn with_native_loop_functions(mut self, functions: SmallMap<FuncId, bool>) -> Self {
         self.native_loop_functions = functions;
         self
     }
@@ -7075,6 +7075,12 @@ struct VmBindingKey {
     raw: u64,
 }
 
+/// Per-trace VM-binding slot table. It holds one entry per distinct binding a
+/// trace references (usually a handful) and is cloned into every lowering
+/// member and LLVM job, so an inline map avoids both the allocation and the
+/// keyed-hash probe.
+type VmBindingSlots = SmallMap<VmBindingKey, u32>;
+
 impl VmBindingKey {
     #[inline]
     const fn new(kind: VmBindingKind, raw: u64) -> Self {
@@ -7199,7 +7205,7 @@ struct CraneliftBackend {
     function_context: FunctionBuilderContext,
     dispatcher: NativeDispatcherFn,
     /// Directly imported scalar helpers keyed by their native address.
-    scalar_helpers: HashMap<usize, ClifFuncId>,
+    scalar_helpers: SmallMap16<usize, ClifFuncId>,
 }
 
 impl CraneliftBackend {
@@ -7260,7 +7266,7 @@ impl CraneliftBackend {
         binary_signature.params.push(AbiParam::new(types::F64));
         binary_signature.returns.push(AbiParam::new(types::F64));
 
-        let mut scalar_helpers = HashMap::with_capacity_and_hasher(scalar_symbols.len(), Default::default());
+        let mut scalar_helpers = SmallMap16::new();
         for &(name, address) in &scalar_symbols {
             let signature = if address == native_frem as usize {
                 &binary_signature
@@ -7566,7 +7572,7 @@ struct CraneliftLoweringState<'a, 'p> {
     /// `TraceActivation::list_push`: (runtime, list, value) -> status.
     list_push_signature: codegen::ir::SigRef,
     /// Direct CLIF references to JITModule-imported scalar helpers.
-    scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
+    scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef>,
     values: &'p mut [Option<Value>],
     /// Current moving-object address for a GuardHeapObject result. Valid only
     /// until the next full runtime/GC epoch. This is a backend-local lowering
@@ -7574,49 +7580,49 @@ struct CraneliftLoweringState<'a, 'p> {
     heap_addresses: &'p mut [Option<Value>],
     /// Dominating kind/liveness proofs for tagged operands within a GC epoch.
     /// Metadata is reloaded separately because promise state can change.
-    heap_entries: HashMap<(TraceValueId, u32), (Value, Value)>,
+    heap_entries: SmallMap<(TraceValueId, u32), (Value, Value)>,
     /// Generic epoch-local proof that a tagged TraceValue is a live heap handle.
     /// This sits below kind-specific proofs so GuardClass/IsInstance/GuardHeapObject
     /// can share the expensive tag -> handle -> chunk -> entry -> liveness chain.
-    heap_live_entries: HashMap<TraceValueId, (Value, Value)>,
+    heap_live_entries: SmallMap<TraceValueId, (Value, Value)>,
     /// Epoch-local sidecar field cache. These fields are immutable for native
     /// operations that do not cross a full runtime boundary; list/map structural
     /// mutations go through Runtime and therefore invalidate the cache.
-    heap_data: HashMap<Value, Value>,
-    heap_len: HashMap<Value, Value>,
-    heap_metadata: HashMap<Value, Value>,
-    heap_receiver_class: HashMap<Value, Value>,
+    heap_data: SmallMap<Value, Value>,
+    heap_len: SmallMap<Value, Value>,
+    heap_metadata: SmallMap<Value, Value>,
+    heap_receiver_class: SmallMap<Value, Value>,
     /// Successful normalized list indices. Native element stores preserve length;
     /// all runtime calls invalidate these facts, including non-GC leaf calls.
-    list_indices: HashMap<(TraceValueId, TraceValueId), Value>,
-    list_lengths: HashMap<TraceValueId, TraceValueId>,
+    list_indices: SmallMap<(TraceValueId, TraceValueId), Value>,
+    list_lengths: SmallMap<TraceValueId, TraceValueId>,
     /// Pure numeric bounds facts already proven in this trace. These are keyed by
     /// canonical SSA values, so duplicate GuardBounds nodes can disappear even if
     /// an earlier Trace IR pass failed to CSE them.
     bounds_proofs: HashSet<(TraceValueId, TraceValueId)>,
     /// Constant-index bounds facts over one epoch-local length SSA value.
     /// Repeated fixed field/shape slot accesses therefore pay the guard once.
-    constant_index_proofs: HashSet<(Value, u32)>,
+    constant_index_proofs: SmallSet16<(Value, u32)>,
     /// Typed shape proofs are valid until a runtime/GC epoch boundary. Native
     /// shaped stores update existing slots only, so they preserve the shape.
-    map_shape_proofs: HashSet<(TraceValueId, u32)>,
+    map_shape_proofs: SmallSet16<(TraceValueId, u32)>,
     /// Canonical property-key content proofs. This is intentionally keyed by SSA
     /// value plus bytes, not by the recyclable heap handle.
-    string_key_proofs: HashSet<(TraceValueId, Vec<u8>)>,
+    string_key_proofs: SmallSet16<(TraceValueId, Vec<u8>)>,
     /// Shared cold stubs for exits whose snapshots contain no dynamic SSA values.
     /// The current watchdog SSA value is part of the key so preheader and loop-body
     /// exits never accidentally share different native-iteration accounting.
     shared_constant_exit_blocks: HashMap<(u32, Option<Value>), Block>,
     /// Alias-safe load forwarding. Every heap store kills all old heap load facts
     /// before publishing its own exact location.
-    forwarded_heap_loads: HashMap<ForwardedHeapLocation, Value>,
+    forwarded_heap_loads: SmallMap<ForwardedHeapLocation, Value>,
     /// Absolute VM slots have stable, exact addresses and can therefore be
     /// forwarded precisely until a full runtime boundary.
-    forwarded_absolute_loads: HashMap<u64, Value>,
+    forwarded_absolute_loads: SmallMap<u64, Value>,
     /// Dense compile-time map from a VM-local raw word to the slot that the
     /// dispatcher will expose through TraceActivation::vm_bindings.
-    vm_binding_slots: HashMap<VmBindingKey, u32>,
-    vm_binding_values: HashMap<u32, Value>,
+    vm_binding_slots: VmBindingSlots,
+    vm_binding_values: SmallMap<u32, Value>,
     vm_bindings_base: Option<Value>,
     /// TraceActivation fields that are invariant for one native entry. Caching
     /// them explicitly keeps indirect-call and sidecar plumbing out of hot loops
@@ -7694,7 +7700,7 @@ fn trace_exit_available_in_preheader(
 fn push_vm_binding(
     words: &mut Vec<u64>,
     keys: &mut Vec<VmBindingKey>,
-    slots: &mut HashMap<VmBindingKey, u32>,
+    slots: &mut VmBindingSlots,
     key: VmBindingKey,
 ) {
     if slots.contains_key(&key) {
@@ -7712,10 +7718,10 @@ fn push_vm_binding(
 /// raw word; future per-VM rebinding is allowed to resolve them differently.
 fn collect_vm_bindings(
     trace: &Trace,
-) -> (Box<[u64]>, Box<[VmBindingKey]>, HashMap<VmBindingKey, u32>) {
+) -> (Box<[u64]>, Box<[VmBindingKey]>, VmBindingSlots) {
     let mut words = Vec::new();
     let mut keys = Vec::new();
-    let mut slots = HashMap::default();
+    let mut slots = VmBindingSlots::default();
     let mut add = |kind: VmBindingKind, raw: u64| {
         push_vm_binding(
             &mut words,
@@ -7877,7 +7883,7 @@ struct CraneliftFunctionMember<'p> {
     trace: &'p Trace,
     exit_plans: &'p [CompiledExitPlan],
     /// Must match the member's installed VM-binding table slot for slot.
-    vm_binding_slots: HashMap<VmBindingKey, u32>,
+    vm_binding_slots: VmBindingSlots,
 }
 
 /// Region context of the member being lowered.
@@ -8136,7 +8142,7 @@ fn compile_trace_function(
         let factory_commit_signature = builder.import_signature(factory_commit_signature);
         let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
         let list_push_signature = builder.import_signature(list_push_signature);
-        let scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef> = scalar_helpers
+        let scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef> = scalar_helpers
             .iter()
             .map(|(&address, &id)| (address, module.declare_func_in_func(id, builder.func)))
             .collect();
@@ -8354,7 +8360,7 @@ struct CraneliftFunctionShared {
     factory_commit_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
     list_push_signature: codegen::ir::SigRef,
-    scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
+    scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef>,
 }
 
 /// A fresh lowering state for `member` (all caches empty).
@@ -8381,23 +8387,23 @@ fn new_lowering_state<'a, 'p>(
         scalar_helper_refs: shared.scalar_helper_refs.clone(),
         values: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
         heap_addresses: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
-        heap_entries: HashMap::default(),
-        heap_live_entries: HashMap::default(),
-        heap_data: HashMap::default(),
-        heap_len: HashMap::default(),
-        heap_metadata: HashMap::default(),
-        heap_receiver_class: HashMap::default(),
-        list_indices: HashMap::default(),
-        list_lengths: HashMap::default(),
+        heap_entries: Default::default(),
+        heap_live_entries: Default::default(),
+        heap_data: Default::default(),
+        heap_len: Default::default(),
+        heap_metadata: Default::default(),
+        heap_receiver_class: Default::default(),
+        list_indices: Default::default(),
+        list_lengths: Default::default(),
         bounds_proofs: HashSet::default(),
-        constant_index_proofs: HashSet::default(),
-        map_shape_proofs: HashSet::default(),
-        string_key_proofs: HashSet::default(),
+        constant_index_proofs: Default::default(),
+        map_shape_proofs: Default::default(),
+        string_key_proofs: Default::default(),
         shared_constant_exit_blocks: HashMap::default(),
-        forwarded_heap_loads: HashMap::default(),
-        forwarded_absolute_loads: HashMap::default(),
+        forwarded_heap_loads: Default::default(),
+        forwarded_absolute_loads: Default::default(),
         vm_binding_slots: member.vm_binding_slots.clone(),
-        vm_binding_values: HashMap::default(),
+        vm_binding_values: Default::default(),
         vm_bindings_base: None,
         runtime_context: None,
         execute_callee: None,
@@ -13553,7 +13559,7 @@ impl TracingJit {
     /// LLVM code must address the relocation table already installed for the
     /// trace, slot for slot.
     #[cfg(feature = "llvm-jit")]
-    fn llvm_binding_slots(compiled: &CompiledTrace) -> Result<HashMap<VmBindingKey, u32>, String> {
+    fn llvm_binding_slots(compiled: &CompiledTrace) -> Result<VmBindingSlots, String> {
         let (_, keys, slots) = collect_vm_bindings(&compiled.trace);
         if keys.len() != compiled.vm_binding_keys.len()
             || keys
@@ -14196,14 +14202,14 @@ impl TracingJit {
     /// the interpreter, so tracing their callers around a direct call pays.
     /// Loops still compiling, or with fewer than `MIN_PROFILE_ENTRIES` entries,
     /// are reported as warming so the caller retries instead of guessing.
-    fn native_loop_functions(&self) -> HashMap<FuncId, bool> {
+    fn native_loop_functions(&self) -> SmallMap<FuncId, bool> {
         // A `while (j < 4)` helper loop averages 3 native iterations per entry
         // (its first iteration runs in the interpreter); a loop with frequent
         // data-dependent side exits still averages more and gains far more
         // from native code than the caller loses.
         const LONG_NATIVE_LOOP_ITERATIONS: u64 = 4;
         const MIN_PROFILE_ENTRIES: u64 = 2;
-        let mut functions = HashMap::<FuncId, bool>::default();
+        let mut functions = SmallMap::<FuncId, bool>::default();
         for (key, state) in &self.loops {
             let verdict = match state.trace.and_then(|trace| self.compiled(trace)) {
                 Some(compiled) => {
@@ -14226,8 +14232,12 @@ impl TracingJit {
                 None => None,
             };
             if let Some(verdict) = verdict {
-                let entry = functions.entry(key.location.function).or_insert(verdict);
-                *entry |= verdict;
+                match functions.get_mut(&key.location.function) {
+                    Some(entry) => *entry |= verdict,
+                    None => {
+                        functions.insert(key.location.function, verdict);
+                    }
+                }
             }
         }
         functions
@@ -16351,7 +16361,7 @@ mod tests {
     fn phase2_binding_categories_do_not_alias_equal_raw_words() {
         let mut words = Vec::new();
         let mut keys = Vec::new();
-        let mut slots = HashMap::default();
+        let mut slots = VmBindingSlots::default();
         push_vm_binding(
             &mut words,
             &mut keys,

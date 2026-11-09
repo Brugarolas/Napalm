@@ -17,7 +17,7 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallSet16};
 use std::collections::VecDeque;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -5817,96 +5817,119 @@ impl HostContext<'_> {
     }
 
     pub fn format_value(&self, value: Value) -> String {
-        let mut seen = FastSet::default();
-        self.format_value_inner(value, &mut seen)
+        let mut out = String::new();
+        let mut seen = SmallSet16::default();
+        self.format_value_into(value, &mut seen, &mut out);
+        out
     }
 
-    fn format_value_inner(&self, value: Value, seen: &mut FastSet<u32>) -> String {
-        if value.is_null() { return "null".to_owned(); }
-        if let Some(value) = value.as_bool() { return value.to_string(); }
+    /// Appends the display form of `value` to `out`. `seen` is the current
+    /// container recursion stack (cycle detection), so it stays shallow and
+    /// inline; one output buffer replaces a String + Vec + join per level.
+    fn format_value_into(&self, value: Value, seen: &mut SmallSet16<u32>, out: &mut String) {
+        use std::fmt::Write as _;
+        if value.is_null() { out.push_str("null"); return; }
+        if let Some(value) = value.as_bool() { out.push_str(if value { "true" } else { "false" }); return; }
         if let Some(value) = value.as_num() {
-            if value.fract() == 0.0 && value.is_finite() { return format!("{value:.0}"); }
-            return value.to_string();
+            if value.fract() == 0.0 && value.is_finite() { let _ = write!(out, "{value:.0}"); return; }
+            let _ = write!(out, "{value}");
+            return;
         }
-        let Some(handle) = value.heap_handle() else { return format!("{value:?}"); };
-        match self.heap.get(value) {
-            Some(HeapObject::Random { .. }) => "<random>".to_owned(),
-            Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes.as_ref()).into_owned(),
-            Some(HeapObject::Proxy { .. }) => "<proxy>".to_owned(),
+        let Some(handle) = value.heap_handle() else { let _ = write!(out, "{value:?}"); return; };
+        // Writing into a String cannot fail.
+        let _ = match self.heap.get(value) {
+            Some(HeapObject::Random { .. }) => out.write_str("<random>"),
+            Some(HeapObject::String(bytes)) => out.write_str(&String::from_utf8_lossy(bytes.as_ref())),
+            Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
-                if !seen.insert(handle) { return "[...]".to_owned(); }
-                let text = values.iter().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
+                if !seen.insert(handle) { out.push_str("[...]"); return; }
+                out.push('[');
+                for (index, item) in values.iter().enumerate() {
+                    if index != 0 { out.push_str(", "); }
+                    self.format_value_into(*item, seen, out);
+                }
+                out.push(']');
                 seen.remove(&handle);
-                format!("[{text}]")
+                Ok(())
             }
             Some(HeapObject::Map(map)) => {
-                if !seen.insert(handle) { return "{...}".to_owned(); }
-                let text = (0..map.len())
-                    .filter_map(|index| map.nth_value(index))
-                    .map(|value| self.format_value_inner(value, seen))
-                    .collect::<Vec<_>>()
-                    .join(", " );
+                if !seen.insert(handle) { out.push_str("{...}"); return; }
+                out.push('{');
+                self.format_map_values_into(map, seen, out);
+                out.push('}');
                 seen.remove(&handle);
-                format!("{{{text}}}")
+                Ok(())
             }
             Some(HeapObject::Range { from, to, inclusive }) => {
                 let op = if *inclusive { ".." } else { "..." };
-                format!("{from}{op}{to}")
+                write!(out, "{from}{op}{to}")
             }
             Some(HeapObject::Date { millis }) => {
-                if millis.is_finite() { format!("<date:{millis:.0}>") } else { "Invalid Date".to_owned() }
+                if millis.is_finite() { write!(out, "<date:{millis:.0}>") } else { out.write_str("Invalid Date") }
             }
             Some(HeapObject::MapEntry { key, value }) => {
-                if !seen.insert(handle) { return "<map entry ...>".to_owned(); }
-                let text = format!("{}: {}", self.format_value_inner(*key, seen), self.format_value_inner(*value, seen));
+                if !seen.insert(handle) { out.push_str("<map entry ...>"); return; }
+                self.format_value_into(*key, seen, out);
+                out.push_str(": ");
+                self.format_value_into(*value, seen, out);
                 seen.remove(&handle);
-                text
+                Ok(())
             }
             Some(HeapObject::Set { map }) => {
-                if !seen.insert(handle) { return "Set {...}".to_owned(); }
-                let text = match self.heap.get(*map) {
-                    Some(HeapObject::Map(map)) => (0..map.len()).filter_map(|i| map.nth_value(i))
-                        .map(|item| self.format_value_inner(item, seen)).collect::<Vec<_>>().join(", "),
-                    _ => String::new(),
-                };
+                if !seen.insert(handle) { out.push_str("Set {...}"); return; }
+                out.push_str("Set {");
+                if let Some(HeapObject::Map(map)) = self.heap.get(*map) {
+                    self.format_map_values_into(map, seen, out);
+                }
+                out.push('}');
                 seen.remove(&handle);
-                format!("Set {{{text}}}")
+                Ok(())
             }
-            Some(HeapObject::MapKeys { .. }) => "<map keys>".to_owned(),
-            Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
-            Some(HeapObject::ClassObject { class_slot }) => format!("<class#{class_slot}>"),
-            Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
-            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => format!("<instance class#{class_slot}>"),
-            Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
-            Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
-            Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
-            Some(HeapObject::FfiPointer { address }) => format!("<ffi-pointer:0x{address:x}>"),
-            Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
-                PromiseState::Pending { .. } => "<promise:pending>".to_owned(),
-                PromiseState::Fulfilled(_) => "<promise:fulfilled>".to_owned(),
-                PromiseState::Rejected(_) => "<promise:rejected>".to_owned(),
-                PromiseState::Cancelled(_) => "<promise:cancelled>".to_owned(),
-            },
+            Some(HeapObject::MapKeys { .. }) => out.write_str("<map keys>"),
+            Some(HeapObject::Closure { .. }) => out.write_str("<fn>"),
+            Some(HeapObject::ClassObject { class_slot }) => write!(out, "<class#{class_slot}>"),
+            Some(HeapObject::BuiltinClass { builtin }) => out.write_str(builtin.name()),
+            Some(HeapObject::Instance(InstanceObject { class_slot, .. })) => write!(out, "<instance class#{class_slot}>"),
+            Some(HeapObject::Foreign { class_slot, .. }) => write!(out, "<foreign class#{class_slot}>"),
+            Some(HeapObject::FfiLibrary { library }) => write!(out, "<ffi-library:{}>", library.name()),
+            Some(HeapObject::FfiFunction { function }) => write!(out, "<ffi-function:{}>", function.symbol()),
+            Some(HeapObject::FfiPointer { address }) => write!(out, "<ffi-pointer:0x{address:x}>"),
+            Some(HeapObject::Promise { state }) => out.write_str(match unsafe { state.get() } {
+                PromiseState::Pending { .. } => "<promise:pending>",
+                PromiseState::Fulfilled(_) => "<promise:fulfilled>",
+                PromiseState::Rejected(_) => "<promise:rejected>",
+                PromiseState::Cancelled(_) => "<promise:cancelled>",
+            }),
             Some(HeapObject::Event { state }) => {
-                format!("<Event listeners={}>", unsafe { state.get() }.listeners.len())
+                write!(out, "<Event listeners={}>", unsafe { state.get() }.listeners.len())
             }
             Some(HeapObject::Emitter { state, .. }) => {
-                format!("<Emitter listeners={}>", unsafe { state.get() }.listeners.len())
+                write!(out, "<Emitter listeners={}>", unsafe { state.get() }.listeners.len())
             }
             Some(HeapObject::Channel { state, .. }) => {
-                format!("<Channel queued={}>", unsafe { state.get() }.queue.len())
+                write!(out, "<Channel queued={}>", unsafe { state.get() }.queue.len())
             }
             Some(HeapObject::Receiver { state }) => {
-                format!("<Receiver queued={}>", unsafe { state.get() }.queue.len())
+                write!(out, "<Receiver queued={}>", unsafe { state.get() }.queue.len())
             }
-            Some(HeapObject::Response(response)) => format!("<Response {}>", response.status),
-            Some(HeapObject::Headers(_)) => "<Headers>".to_owned(),
-            Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
-            Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
-            Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
-            Some(HeapObject::NativeDecorator(_)) => "<decorator>".into(),
-            Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
-            None => "<dead object>".to_owned(),
+            Some(HeapObject::Response(response)) => write!(out, "<Response {}>", response.status),
+            Some(HeapObject::Headers(_)) => out.write_str("<Headers>"),
+            Some(HeapObject::AsyncTaskObject { task, .. }) => write!(out, "<async-task#{task}>"),
+            Some(HeapObject::FiberObject { fiber, .. }) => write!(out, "<fiber#{fiber}>"),
+            Some(HeapObject::ModuleObject { module_slot }) => write!(out, "<module#{module_slot}>"),
+            Some(HeapObject::NativeDecorator(_)) => out.write_str("<decorator>"),
+            Some(HeapObject::Cell(_)) => out.write_str("<cell>"),
+            None => out.write_str("<dead object>"),
+        };
+    }
+
+    /// `", "`-separated display of a map's values in iteration order.
+    fn format_map_values_into(&self, map: &NapalmMap, seen: &mut SmallSet16<u32>, out: &mut String) {
+        let mut first = true;
+        for item in (0..map.len()).filter_map(|index| map.nth_value(index)) {
+            if !first { out.push_str(", "); }
+            first = false;
+            self.format_value_into(item, seen, out);
         }
     }
 }
@@ -11658,7 +11681,7 @@ impl<'p> Interpreter<'p> {
 
     fn serialize_fetch_json(&self, value: Value) -> Result<Vec<u8>, RuntimeError> {
         let mut out = Vec::with_capacity(256);
-        let mut seen = FastSet::default();
+        let mut seen = SmallSet16::default();
         self.serialize_fetch_json_value(value, &mut out, &mut seen, 0)?;
         Ok(out)
     }
@@ -11667,7 +11690,7 @@ impl<'p> Interpreter<'p> {
         &self,
         value: Value,
         out: &mut Vec<u8>,
-        seen: &mut FastSet<u32>,
+        seen: &mut SmallSet16<u32>,
         depth: usize,
     ) -> Result<(), RuntimeError> {
         const MAX_JSON_DEPTH: usize = 256;
@@ -12149,14 +12172,14 @@ impl<'p> Interpreter<'p> {
 
 
     pub(crate) fn snapshot_concurrent_value(&self, value: Value) -> Result<ConcurrentValue, RuntimeError> {
-        let mut visiting = HashSet::default();
+        let mut visiting = SmallSet16::default();
         let mut memo = FastMap::default();
         let mut next_id = 1u32;
         self.snapshot_concurrent_value_inner(value, 0, &mut visiting, &mut memo, &mut next_id)
     }
 
     fn snapshot_concurrent_arguments(&self, values: &[Value]) -> Result<Vec<ConcurrentValue>, RuntimeError> {
-        let mut visiting = HashSet::default();
+        let mut visiting = SmallSet16::default();
         let mut memo = FastMap::default();
         let mut next_id = 1u32;
         let mut snapshots = Vec::with_capacity(values.len());
@@ -12176,7 +12199,7 @@ impl<'p> Interpreter<'p> {
         &self,
         value: Value,
         depth: usize,
-        visiting: &mut HashSet<u32>,
+        visiting: &mut SmallSet16<u32>,
         memo: &mut FastMap<u32, ConcurrentValue>,
         next_id: &mut u32,
     ) -> Result<ConcurrentValue, RuntimeError> {

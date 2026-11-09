@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallMap16};
 use bumpalo::{Bump, collections::Vec as BumpVec};
 use smallvec::SmallVec;
 
@@ -1647,21 +1647,21 @@ impl FunctionOptimization for FastLocalSimplify {
                 continue;
             }
 
-            let mut pure_values: HashMap<PureKey, ValueId> = HashMap::default();
-            let mut guards: HashMap<GuardKey, Option<ValueId>> = HashMap::default();
+            let mut pure_values: SmallMap<PureKey, ValueId> = SmallMap::default();
+            let mut guards: SmallMap16<GuardKey, Option<ValueId>> = SmallMap16::default();
 
-            let mut field_values: HashMap<FieldKey, ValueId> = HashMap::default();
-            let mut static_values: HashMap<StaticFieldKey, ValueId> = HashMap::default();
-            let mut cell_values: HashMap<ValueId, ValueId> = HashMap::default();
-            let mut module_values: HashMap<ModuleKey, ValueId> = HashMap::default();
-            let mut list_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
-            let mut map_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
-            let mut string_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
+            let mut field_values: SmallMap<FieldKey, ValueId> = SmallMap::default();
+            let mut static_values: SmallMap<StaticFieldKey, ValueId> = SmallMap::default();
+            let mut cell_values: SmallMap<ValueId, ValueId> = SmallMap::default();
+            let mut module_values: SmallMap<ModuleKey, ValueId> = SmallMap::default();
+            let mut list_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
+            let mut map_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
+            let mut string_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
 
-            let mut last_field_store: HashMap<FieldKey, InstId> = HashMap::default();
-            let mut last_static_store: HashMap<StaticFieldKey, InstId> = HashMap::default();
-            let mut last_cell_store: HashMap<ValueId, InstId> = HashMap::default();
-            let mut last_module_store: HashMap<ModuleKey, InstId> = HashMap::default();
+            let mut last_field_store: SmallMap<FieldKey, InstId> = SmallMap::default();
+            let mut last_static_store: SmallMap<StaticFieldKey, InstId> = SmallMap::default();
+            let mut last_cell_store: SmallMap<ValueId, InstId> = SmallMap::default();
+            let mut last_module_store: SmallMap<ModuleKey, InstId> = SmallMap::default();
 
             let mut effect_shape_changed = false;
 
@@ -1700,7 +1700,9 @@ impl FunctionOptimization for FastLocalSimplify {
                 }
 
                 if let Some((key, result)) = guard_fact(function, id, &kind) {
-                    guards.entry(key).or_insert(result);
+                    if !guards.contains_key(&key) {
+                        guards.insert(key, result);
+                    }
                 }
 
                 kind = function.nodes[id.0 as usize].kind.clone();
@@ -2017,7 +2019,7 @@ fn redundant_guard_replacement(
     function: &Function,
     _id: InstId,
     kind: &Inst,
-    guards: &HashMap<GuardKey, Option<ValueId>>,
+    guards: &SmallMap16<GuardKey, Option<ValueId>>,
 ) -> Option<GuardReplacement> {
     let key = match kind {
         Inst::GuardType { value, expected, .. } => {
@@ -2201,7 +2203,7 @@ fn cse_read(
     function: &mut Function,
     id: InstId,
     key: SeqReadKey,
-    values: &mut HashMap<SeqReadKey, ValueId>,
+    values: &mut SmallMap<SeqReadKey, ValueId>,
     changed: &mut bool,
     effect_shape_changed: &mut bool,
 ) {
@@ -2215,12 +2217,12 @@ fn cse_read(
 }
 
 fn invalidate_memory_values(
-    fields: &mut HashMap<FieldKey, ValueId>,
-    statics: &mut HashMap<StaticFieldKey, ValueId>,
-    cells: &mut HashMap<ValueId, ValueId>,
-    modules: &mut HashMap<ModuleKey, ValueId>,
-    lists: &mut HashMap<SeqReadKey, ValueId>,
-    maps: &mut HashMap<SeqReadKey, ValueId>,
+    fields: &mut SmallMap<FieldKey, ValueId>,
+    statics: &mut SmallMap<StaticFieldKey, ValueId>,
+    cells: &mut SmallMap<ValueId, ValueId>,
+    modules: &mut SmallMap<ModuleKey, ValueId>,
+    lists: &mut SmallMap<SeqReadKey, ValueId>,
+    maps: &mut SmallMap<SeqReadKey, ValueId>,
 ) {
     fields.clear();
     statics.clear();
@@ -2231,10 +2233,10 @@ fn invalidate_memory_values(
 }
 
 fn clear_last_stores(
-    fields: &mut HashMap<FieldKey, InstId>,
-    statics: &mut HashMap<StaticFieldKey, InstId>,
-    cells: &mut HashMap<ValueId, InstId>,
-    modules: &mut HashMap<ModuleKey, InstId>,
+    fields: &mut SmallMap<FieldKey, InstId>,
+    statics: &mut SmallMap<StaticFieldKey, InstId>,
+    cells: &mut SmallMap<ValueId, InstId>,
+    modules: &mut SmallMap<ModuleKey, InstId>,
 ) {
     fields.clear();
     statics.clear();

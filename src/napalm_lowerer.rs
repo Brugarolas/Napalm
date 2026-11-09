@@ -33,7 +33,7 @@ use crate::napalm_ir::{
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallMap16};
 use smallvec::SmallVec;
 use compact_str::{CompactString, ToCompactString};
 use bumpalo::{Bump, collections::Vec as BumpVec};
@@ -888,7 +888,9 @@ impl<'a> BindingTypes<'a> {
 
 struct Analyzer<'ast> {
     analysis: RootAnalysis<'ast>,
-    scopes: Vec<HashMap<CompactString, BindingId>>,
+    /// Lexical scope stack. Block scopes hold a handful of names, so each
+    /// push is an inline table instead of a fresh hashed allocation.
+    scopes: Vec<SmallMap16<CompactString, BindingId>>,
     current_function: FunctionNodeId,
     function_stack: Vec<FunctionNodeId>,
     module_root: bool,
@@ -913,7 +915,7 @@ impl<'ast> Analyzer<'ast> {
         };
         let mut analyzer = Self {
             analysis: RootAnalysis::new(root),
-            scopes: vec![HashMap::default()],
+            scopes: vec![SmallMap16::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: true,
@@ -948,7 +950,7 @@ impl<'ast> Analyzer<'ast> {
         };
         let mut analyzer = Self {
             analysis: RootAnalysis::new(root),
-            scopes: vec![HashMap::default()],
+            scopes: vec![SmallMap16::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: false,
@@ -1092,7 +1094,7 @@ impl<'ast> Analyzer<'ast> {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::default());
+        self.scopes.push(SmallMap16::default());
     }
 
     fn pop_scope(&mut self) {
@@ -2886,7 +2888,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
 
         // Captures must be declared before *any* emitted instruction.
-        let mut capture_values = HashMap::default();
+        let mut capture_values = Env::default();
         for binding in &node.captures {
             let info = analysis.binding(*binding);
             let mode = if info.mutated && !info.shared {
@@ -3015,6 +3017,12 @@ struct MethodContext<'a> {
     static_field_types: &'a HashMap<CompactString, Type>,
 }
 
+/// Lowering environment: binding -> current storage. Cloned at every branch
+/// and join, and usually holds a function's few live locals, so it is inline.
+/// Inline iteration follows insertion order, which keeps join block-parameter
+/// order deterministic for typical functions.
+type Env = SmallMap<BindingId, Storage>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Storage {
     Value(ValueId),
@@ -3103,7 +3111,7 @@ struct FunctionCompiler<'p, 'a, 'd> {
     builder: Builder<'p>,
     context: FunctionCompilerContext<'a>,
     diagnostics: &'d mut Vec<Diagnostic>,
-    env: HashMap<BindingId, Storage>,
+    env: Env,
     binding_types: BindingTypes<'a>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
@@ -3120,7 +3128,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         builder: Builder<'p>,
         context: FunctionCompilerContext<'a>,
         diagnostics: &'d mut Vec<Diagnostic>,
-        env: HashMap<BindingId, Storage>,
+        env: Env,
         shared_binding_types: &'a HashMap<BindingId, StaticBindingType>,
     ) -> Self {
         Self {
@@ -3187,7 +3195,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn binding_flow_type(
         &self,
         binding: BindingId,
-        env: &HashMap<BindingId, Storage>,
+        env: &Env,
     ) -> Type {
         match env.get(&binding).copied() {
             // Captured mutable bindings carry the Cell itself through CFG edges;
@@ -4028,8 +4036,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn join_predecessors(
         &mut self,
-        predecessors: Vec<(ir::BlockId, HashMap<BindingId, Storage>)>,
-        fallback: HashMap<BindingId, Storage>,
+        predecessors: Vec<(ir::BlockId, Env)>,
+        fallback: Env,
     ) {
         match predecessors.len() {
             0 => {
@@ -4104,7 +4112,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let header = self.new_block(&[]);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(header, ty);
@@ -4122,7 +4130,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             })
             .collect();
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(exit, ty);
@@ -4182,14 +4190,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let body_block = self.new_block(&[]);
-        let mut body_params = HashMap::default();
+        let mut body_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             body_params.insert(*binding, self.builder.add_block_param(body_block, ty));
         }
 
         let condition_block = self.new_block(&[]);
-        let mut condition_params = HashMap::default();
+        let mut condition_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             condition_params.insert(
@@ -4199,7 +4207,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
 
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -4266,14 +4274,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             header_params.insert(*binding, self.builder.add_block_param(header, ty));
         }
         let body_block = self.new_block(&[]);
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -4426,7 +4434,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn values_for_bindings(
         &self,
         bindings: &[BindingId],
-        env: &HashMap<BindingId, Storage>,
+        env: &Env,
     ) -> Vec<ValueId> {
         bindings
             .iter()
@@ -4855,7 +4863,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             header_params.insert(*binding, self.builder.add_block_param(header, ty));
@@ -4863,7 +4871,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let body = self.new_block(&[]);
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -6709,7 +6717,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let base_value = self.lower_expr(base);
         let join = self.new_block(&[]);
         let result_param = self.builder.add_block_param(join, Type::Top);
-        let mut exits: Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)> = Vec::new();
+        let mut exits: Vec<(BlockId, ValueId, Env)> = Vec::new();
 
         self.lower_optional_chain_path(base_value, segments, 0, span, &mut exits);
 
@@ -6787,7 +6795,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         segments: &[front::OptionalChainSegment],
         index: usize,
         span: Span,
-        exits: &mut Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)>,
+        exits: &mut Vec<(BlockId, ValueId, Env)>,
     ) {
         if index == segments.len() {
             exits.push((self.builder.current_block(), current, self.env.clone()));

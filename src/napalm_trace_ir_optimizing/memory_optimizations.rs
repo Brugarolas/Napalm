@@ -5,10 +5,10 @@
 //! are much simpler and therefore permit stronger forwarding.
 
 use super::*;
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{SmallMap, SmallSet};
 
 fn execution_order(trace: &Trace) -> Vec<usize> {
-    let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+    let preheader = PreheaderMask::new(trace);
     trace
         .preheader
         .iter()
@@ -40,8 +40,8 @@ pub struct ArchitecturalLoadForwarding;
 
 impl TraceOptimization for ArchitecturalLoadForwarding {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut frames = HashMap::<(FrameSlot, TraceRep), TraceValueId>::default();
-        let mut absolute = HashMap::<u64, TraceValueId>::default();
+        let mut frames = SmallMap::<(FrameSlot, TraceRep), TraceValueId>::default();
+        let mut absolute = SmallMap::<u64, TraceValueId>::default();
         let mut changed = false;
 
         // A preheader fact reaches the top of every iteration only if the
@@ -49,11 +49,11 @@ impl TraceOptimization for ArchitecturalLoadForwarding {
         // consumers in this linear order but precede them on the next
         // iteration. (The verifier keeps frame/absolute accesses out of the
         // preheader today; this keeps the walk correct if that changes.)
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let looping = !preheader.is_empty() && matches!(trace.terminator, TraceTerminator::LoopBack);
         let mut body_barrier = false;
-        let mut body_slots = HashSet::<FrameSlot>::default();
-        let mut body_addresses = HashSet::<u64>::default();
+        let mut body_slots = SmallSet::<FrameSlot>::default();
+        let mut body_addresses = SmallSet::<u64>::default();
         if looping {
             for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
                 match &node.kind {
@@ -163,7 +163,7 @@ pub struct DeadStoreElimination;
 
 impl TraceOptimization for DeadStoreElimination {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut pending = HashMap::<DeadStoreKey, usize>::default();
+        let mut pending = SmallMap::<DeadStoreKey, usize>::default();
         let mut changed = false;
 
         for id in execution_order(trace) {
