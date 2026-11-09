@@ -20807,6 +20807,7 @@ impl TraceRuntime for Interpreter<'_> {
             factory_alignment: fast.as_ref().map_or(0, |info| info.alignment),
             factory_probe: trace_native_factory_probe,
             factory_commit: trace_native_factory_commit,
+            list_push: trace_list_push,
         })
     }
 
@@ -21023,6 +21024,31 @@ unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, ob
     let vm = unsafe { &mut *(runtime as *mut Interpreter<'_>) };
     let object = unsafe { GcObject::from_address(object) };
     unsafe { vm.heap.mutator.probable_write(object) };
+}
+
+/// `list.push(item)` for native traces (`TraceInst::HeapListPush`): exactly the
+/// stock builtin (`Interpreter::list_push`: contract check, post barrier,
+/// growth accounting, sidecar refresh). Neither step allocates in the GC heap
+/// or safepoints; a Vec growth only reallocates the Rust-owned element buffer,
+/// which the refreshed sidecar republishes. Returns nonzero with nothing
+/// changed when the baseline Invoke must run instead: not a List, a shared
+/// List (mutated under its VM mutex by the interpreter only), or a contract
+/// violation (the Invoke reports it).
+unsafe extern "C" fn trace_list_push(runtime: *mut std::ffi::c_void, list: u64, item: u64) -> u32 {
+    let vm = unsafe { &mut *(runtime as *mut Interpreter<'_>) };
+    let list = Value::from_word(RegisterWord(list));
+    let item = Value::from_word(RegisterWord(item));
+    let shared = list
+        .heap_handle()
+        .and_then(|handle| vm.heap.handle_table.existing_entry(handle))
+        .is_none_or(|entry| entry.sync.load(Ordering::Relaxed) & SYNC_SHARED != 0);
+    if shared || !matches!(vm.heap.get(list), Some(HeapObject::List(_))) {
+        return 1;
+    }
+    match (HostContext { heap: &mut vm.heap }).list_push(list, item) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
 }
 
 impl Interpreter<'_> {
@@ -22437,6 +22463,87 @@ var result = total;
             }
         }
         assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));
+    }
+
+    #[test]
+    fn native_list_push_matches_interpreter_while_the_buffer_moves() {
+        // Every iteration reads the list (element and length) and pushes to it
+        // twice, so its element buffer reallocates many times inside the trace:
+        // no cached data pointer or length may survive a push. The second push
+        // uses its result (the new length).
+        let source = r#"
+function grow(n) {
+  let a = [1];
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    s = s + a[i] + a.length;
+    a.push((a[i] * 2) % 1000 + i);
+    const len = a.push(i);
+    s = s + len;
+  }
+  return s + a.length * 1000000;
+}
+let total = 0;
+for (let r = 0; r < 40; r++) { total = total + grow(150 + r); }
+var result = total;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut results = Vec::new();
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+                panic!("expected return")
+            };
+            results.push(source_result(&vm).to_bits());
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.native_entries > 0, "{stats:?}");
+            }
+        }
+        assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));
+    }
+
+    #[test]
+    fn native_list_push_replays_contract_violations() {
+        // `xs: number[]` carries an element contract; the native helper declines
+        // the String push without changing anything, and the replayed Invoke
+        // raises exactly the baseline error after the same number of pushes.
+        let source = r#"
+function fill(xs: number[], n, v) {
+  for (let i = 0; i < n; i++) {
+    xs.push(i < n - 1 ? i : v);
+  }
+  return xs.length;
+}
+let ok = 0;
+for (let r = 0; r < 30; r++) { ok = ok + fill([], 50, 7); }
+const xs: number[] = [];
+let failed = 0;
+try {
+  fill(xs, 50, "seven");
+} catch (error) {
+  failed = 1;
+}
+var result = ok * 1000 + failed * 100 + xs.length;
+"#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut results = Vec::new();
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 0,
+                ..Default::default()
+            }));
+            let outcome = vm.run_module(entry).map(|_| source_result(&vm).to_bits()).map_err(|error| error.to_string());
+            results.push(outcome);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     #[test]

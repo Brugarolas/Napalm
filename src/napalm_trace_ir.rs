@@ -228,6 +228,12 @@ pub enum TraceInst {
     /// contract is `List<Num>`) and `value` is already proven a Number; when
     /// false the list must carry no contract at all.
     HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId, numeric: bool },
+    /// `list.push(value)` (the stock builtin) through `TraceActivation::list_push`,
+    /// without a runtime boundary. `exit` (taken before any effect) replays the
+    /// Invoke for anything but a plain List the helper accepts. A push changes
+    /// the List's length and may move its element buffer: it clobbers every
+    /// List length/element fact and every backend cache of List data/length.
+    HeapListPush { list: TraceValueId, value: TraceValueId, exit: SideExitId },
     HeapMapLen { map: TraceValueId, exit: SideExitId },
     /// Direct access to the dense value array of a shape-backed Map. Dynamic
     /// keys are guarded by exact UTF-8 content, never by recyclable heap handle.
@@ -306,6 +312,7 @@ impl TraceInst {
             | HeapStoreField { object: lhs, value: rhs, .. }
             | HeapStoreCell { cell: lhs, value: rhs, .. }
             | HeapWriteBarrier { object: lhs, value: rhs, .. }
+            | HeapListPush { list: lhs, value: rhs, .. }
             | HeapListGet { list: lhs, index: rhs, .. }
             | HeapMapGetShaped { map: lhs, key: rhs, .. }
             | HeapMapGetPic { map: lhs, key: rhs, .. }
@@ -348,6 +355,7 @@ impl TraceInst {
             | GuardClosure { exit, .. } | ClosureCapture { exit, .. }
             | HeapWriteBarrier { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
+            | HeapListPush { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
             | HeapStringAsciiCodePointAt { exit, .. }

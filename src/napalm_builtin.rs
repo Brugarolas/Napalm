@@ -1515,6 +1515,7 @@ impl Host for BuiltinHost {
             (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
             (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
             (Some(ListSubscriptSet), "[]=", 2) => Some(TraceListMethod::SubscriptSet),
+            (Some(ListPush), "push", 1) => Some(TraceListMethod::Push),
             _ => None,
         }
     }

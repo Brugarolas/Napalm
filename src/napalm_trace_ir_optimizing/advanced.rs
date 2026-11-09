@@ -610,6 +610,19 @@ enum Memory {
     StringChar(TraceValueId, TraceValueId, bool),
     /// Immutable closure capture array slot.
     Capture(TraceValueId, u16),
+    /// The effect of a `list.push` (never a cached fact): any List may have
+    /// grown, which changes its length and the element a negative or
+    /// length-relative index names.
+    ListGrow,
+}
+
+/// The memory effect of a body node for clobber checks: a keyed store, or a
+/// List growth.
+fn write_effect(kind: &TraceInst, trace: &Trace) -> Option<Memory> {
+    match kind {
+        TraceInst::HeapListPush { .. } => Some(Memory::ListGrow),
+        _ => store(kind, trace).map(|(memory, _)| memory),
+    }
 }
 fn load(kind: &TraceInst, rep: TraceRep) -> Option<Memory> {
     Some(match kind {
@@ -780,7 +793,7 @@ fn body_memory_kills(trace: &Trace) -> Option<(bool, Vec<Memory>)> {
     let mut stores = Vec::new();
     for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
         barrier |= matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. });
-        if let Some((memory, _)) = store(&node.kind, trace) {
+        if let Some(memory) = write_effect(&node.kind, trace) {
             stores.push(memory);
         }
     }
@@ -894,6 +907,10 @@ fn speculate_distinct_lists(trace: &mut Trace) -> Vec<(TraceValueId, TraceValueI
 /// the backend validates their heap kind before every access.
 fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool {
     match (store, cached) {
+        // The constant VM-internal tables (see below) are never pushed to.
+        (Memory::ListGrow, Memory::List(list, _) | Memory::ListLen(list)) => constant(trace, *list).is_none(),
+        (Memory::ListGrow, _) => false,
+        (_, Memory::ListGrow) => false,
         (Memory::Frame(lhs, _), Memory::Frame(rhs, _)) => lhs == rhs,
         (Memory::Frame(..), _) | (_, Memory::Frame(..)) => false,
         // Capture arrays are immutable after closure creation, Strings always.
@@ -965,7 +982,7 @@ impl TraceOptimization for LoopInvariantLoadHoisting {
         }
         let body: Vec<usize> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
         let stores: Vec<Memory> = body.iter()
-            .filter_map(|&id| store(&trace.nodes[id].kind, trace).map(|(memory, _)| memory))
+            .filter_map(|&id| write_effect(&trace.nodes[id].kind, trace))
             .filter(|memory| !matches!(memory, Memory::Frame(..)))
             .collect();
         let mut invariant = preheader_values(trace);
@@ -1116,6 +1133,12 @@ impl TraceOptimization for LoadStorePRE {
             if matches!(kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }) {
                 available.clear(); validated_stores.clear(); continue;
             }
+            if matches!(kind, TraceInst::HeapListPush { .. }) {
+                // Never redundant (every push appends); kills List facts.
+                available.retain(|fact, _| !memory_store_clobbers(trace, &Memory::ListGrow, fact));
+                validated_stores.retain(|fact| !memory_store_clobbers(trace, &Memory::ListGrow, fact));
+                continue;
+            }
             if let Some((key, value)) = store(&kind, trace) {
                 // A previous identical store already validated this address and
                 // executed the post barrier in the same GC/memory epoch.
@@ -1162,7 +1185,7 @@ impl TraceOptimization for LoadStorePRE {
             let body: Vec<_> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
             for id in body {
                 let kind = trace.nodes[id].kind.clone();
-                if let Some((memory, _)) = store(&kind, trace) {
+                if let Some(memory) = write_effect(&kind, trace) {
                     if !matches!(memory, Memory::Frame(..)) {
                         stores_seen.push(memory);
                     }
@@ -2556,6 +2579,49 @@ mod tests {
         let checks = trace.nodes.iter().filter(|node| matches!(node.kind, TraceInst::RefEq { .. })).count();
         Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
         assert_eq!(trace.nodes.iter().filter(|node| matches!(node.kind, TraceInst::RefEq { .. })).count(), checks);
+    }
+
+    #[test]
+    fn list_push_kills_length_and_element_facts() {
+        // Straight line: the length read after a push is a new value.
+        let mut b = builder(TraceKind::Side);
+        let list = input(&mut b, 0, TraceRep::Tagged);
+        let value = input(&mut b, 1, TraceRep::Tagged);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let before = b.emit1(TraceInst::HeapListLen { list, exit }, TraceType::Int32, TraceRep::Int32);
+        b.emit0(TraceInst::HeapListPush { list, value, exit });
+        b.emit0(TraceInst::HeapListPush { list, value, exit });
+        let after = b.emit1(TraceInst::HeapListLen { list, exit }, TraceType::Int32, TraceRep::Int32);
+        b.write_slot(FrameSlot::General(Reg(2)), before);
+        b.write_slot(FrameSlot::General(Reg(3)), after);
+        let mut trace = finish(b);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.canonical_value(after), after);
+        // Both pushes stay: identical pushes are not redundant stores.
+        assert_eq!(trace.nodes.iter().filter(|node| matches!(node.kind, TraceInst::HeapListPush { .. })).count(), 2);
+
+        // Loop: neither the length nor an element read leaves a loop that pushes.
+        let mut b = builder(TraceKind::Loop);
+        let list = input(&mut b, 0, TraceRep::Tagged);
+        let value = input(&mut b, 1, TraceRep::Tagged);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let length = b.emit1(TraceInst::HeapListLen { list, exit }, TraceType::Int32, TraceRep::Int32);
+        let zero = int(&mut b, 0);
+        let first = b.emit1(TraceInst::HeapListGet { list, index: zero, exit }, TraceType::Any, TraceRep::Tagged);
+        b.emit0(TraceInst::HeapListPush { list, value, exit });
+        b.write_slot(FrameSlot::General(Reg(2)), length);
+        b.write_slot(FrameSlot::General(Reg(3)), first);
+        let mut trace = finish(b);
+        Optimize::new()
+            .with_pass(LoadStorePRE)
+            .with_pass(LoopInvariantLoadHoisting)
+            .verify_after_each_pass(true)
+            .optimize_trace(&mut trace)
+            .unwrap();
+        assert!(trace.preheader.iter().all(|&id| !matches!(trace.nodes[id].kind, TraceInst::HeapListLen { .. })));
+        assert!(trace.loop_phis.is_empty(), "no loop-carried reuse across a push: {:?}", trace.loop_phis);
+        assert_eq!(trace.canonical_value(length), length);
+        let _ = first;
     }
 
     #[test]

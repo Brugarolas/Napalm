@@ -905,6 +905,7 @@ struct LlvmLowering<'p> {
     runtime_context: Option<V>,
     execute_callee: Option<V>,
     heap_barrier_callee: Option<V>,
+    list_push_callee: Option<V>,
     method_epoch_value: Option<V>,
     native_budget_remaining: Option<V>,
     native_budget_initial: u32,
@@ -947,10 +948,13 @@ const PGO_METADATA_BASE: u32 = 900_000;
 /// shape, capacity or sidecar identity. GC post-barriers are intentionally NOT
 /// classified as memory(none) calls: the collector's metadata writes are not
 /// modeled here.
+/// Whether sidecar words of `trace` may change while it runs: a runtime/GC
+/// boundary, or a native `list.push` (List length and element buffer).
 fn trace_has_heap_epoch_boundary(trace: &Trace) -> bool {
     trace.nodes.iter().any(|node| matches!(
         node.kind,
         TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }
+            | TraceInst::HeapListPush { .. }
     ))
 }
 
@@ -1038,6 +1042,7 @@ impl<'p> LlvmLowering<'p> {
         runtime_context: None,
         execute_callee: None,
         heap_barrier_callee: None,
+        list_push_callee: None,
         method_epoch_value: None,
         native_budget_remaining: None,
         native_budget_initial: native_budget,
@@ -1735,6 +1740,15 @@ impl LlvmLowering<'_> {
         }
         let value = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, heap_write_barrier));
         self.heap_barrier_callee = Some(value.clone());
+        value
+    }
+
+    fn list_push_callee(&mut self) -> V {
+        if let Some(value) = &self.list_push_callee {
+            return value.clone();
+        }
+        let value = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, list_push));
+        self.list_push_callee = Some(value.clone());
         value
     }
 
@@ -3569,6 +3583,26 @@ impl LlvmLowering<'_> {
                 self.publish_heap_store(Fwd::Indexed { entry, index }, tagged);
             }
 
+            HeapListPush { list, value, exit } => {
+                let tagged_list = self.lower_value(*list)?;
+                let tagged_value = self.lower_value(*value)?;
+                // Plain-List proof (shared Lists publish an invalid kind).
+                self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
+                let callee = self.list_push_callee();
+                let runtime = self.runtime_context();
+                // Ordinary memory effects: the helper writes the List, its
+                // sidecar and GC metadata.
+                let status = self.def(Ty::I32, &format!(
+                    "call i32 {}(ptr {}, i64 {}, i64 {}) #3",
+                    callee.op, runtime.op, tagged_list.op, tagged_value.op
+                ));
+                // Nonzero: nothing happened; the exit replays the Invoke.
+                let failed = self.icmp("ne", &status, &V::i32(0));
+                self.emit_side_exit(*exit, &failed)?;
+                // List buffers may have moved and lengths changed.
+                self.invalidate_heap_proofs();
+            }
+
             HeapMapLen { map, exit } => {
                 let (entry, _) = self.heap_entry_for_value(*map, TraceHeapKind::Map, *exit)?;
                 let len = self.heap_entry_len(&entry);
@@ -3870,9 +3904,7 @@ impl LlvmLowering<'_> {
         self.begin(&loop_label);
         self.in_preheader = false;
 
-        if trace.nodes.iter().any(|node| {
-            matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. })
-        }) {
+        if trace_has_heap_epoch_boundary(trace) {
             self.invalidate_heap_proofs();
         }
         // Forwarded *contents* are facts of the preheader's single execution:

@@ -203,6 +203,9 @@ unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize) {}
 unsafe extern "C" fn test_factory_probe(_: *mut TraceActivation, _: u32, _: u32) -> u32 { 0 }
 #[cfg(test)]
 unsafe extern "C" fn test_factory_commit(_: *mut TraceActivation, _: u32, _: u32, _: u32, _: u64) -> u32 { 1 }
+/// Test harness `list_push`: always declines (the trace takes its exit).
+#[cfg(test)]
+unsafe extern "C" fn test_list_push(_: *mut c_void, _: u64, _: u64) -> u32 { 1 }
 
 
 // =============================================================================
@@ -447,6 +450,10 @@ pub struct TraceActivation {
     /// Side-effect-free specialization probe, followed by non-safepoint commit.
     pub factory_probe: NativeFactoryProbeFn,
     pub factory_commit: NativeFactoryCommitFn,
+    /// `list.push(value)` without a runtime boundary (see `TraceInst::HeapListPush`).
+    /// Returns 0 once pushed; nonzero, with nothing changed, when the push needs
+    /// the baseline Invoke (not a plain List, contract violation, shared list).
+    pub list_push: NativeListPushFn,
 }
 
 /// Default `tier_up_pending` target when no upgraded tier exists.
@@ -488,6 +495,7 @@ impl TraceActivation {
             factory_alignment: inputs.factory_alignment,
             factory_probe: inputs.factory_probe,
             factory_commit: inputs.factory_commit,
+            list_push: inputs.list_push,
         }
     }
 
@@ -515,6 +523,7 @@ pub struct TraceActivationInputs {
     pub factory_alignment: usize,
     pub factory_probe: NativeFactoryProbeFn,
     pub factory_commit: NativeFactoryCommitFn,
+    pub list_push: NativeListPushFn,
 }
 
 pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation, *const u32) -> u32;
@@ -522,6 +531,8 @@ pub type NativeDispatcherFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
 pub type RuntimeTraceFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32) -> u32;
 pub type NativeFactoryProbeFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32) -> u32;
 pub type NativeFactoryCommitFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32, u64) -> u32;
+/// `(runtime, list word, value word) -> status`, see `TraceActivation::list_push`.
+pub type NativeListPushFn = unsafe extern "C" fn(*mut c_void, u64, u64) -> u32;
 
 /// For executables: call once at startup. Background LLVM compiler workers are
 /// then detached (not joined) when a VM is dropped, so program exit never waits
@@ -635,6 +646,9 @@ pub enum TraceListMethod {
     /// contract or a numbers-only (`number[]`) contract with a Number value.
     /// Growth, other indices and other contracts replay the original Invoke.
     SubscriptSet,
+    /// `list.push(value)` through the native helper (`HeapListPush`); shared
+    /// Lists and contract violations replay the original Invoke.
+    Push,
 }
 
 /// Stock Map subscript methods whose existing-key fast path a trace replays
@@ -2589,7 +2603,7 @@ impl<'a> TraceRecorder<'a> {
         };
         let arity = match method {
             TraceListMethod::Length => 0,
-            TraceListMethod::Subscript => 1,
+            TraceListMethod::Subscript | TraceListMethod::Push => 1,
             TraceListMethod::SubscriptSet => 2,
         };
         if op.c as usize != arity || op.args.len() != arity {
@@ -2701,6 +2715,27 @@ impl<'a> TraceRecorder<'a> {
                 builder.emit0(TraceInst::HeapListSet { list, index, value, exit, numeric: numeric_store });
                 // `list[i] = value` evaluates to the stored value.
                 value
+            }
+            TraceListMethod::Push => {
+                let value = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                builder.emit0(TraceInst::HeapListPush { list, value, exit });
+                // `push` evaluates to the new length. Usually it is discarded
+                // (`a.push(x)` as a statement): then read nothing. (The read
+                // after the push cannot fail: `list` was just proven a List.)
+                let result_live = runtime
+                    .trace_program()
+                    .function(op.location.function)
+                    .and_then(|function| function.chunk.live_registers_at(op.next_pc))
+                    .is_none_or(|live| live.general_is_live(Reg(op.a)));
+                if !result_live {
+                    return Ok(true);
+                }
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit1(TraceInst::BoxInt32 { value: length }, TraceType::Num, TraceRep::Tagged)
             }
         };
         self.write_gpr(builder, op.a, result);
@@ -7528,6 +7563,8 @@ struct CraneliftLoweringState<'a, 'p> {
     factory_probe_signature: codegen::ir::SigRef,
     factory_commit_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
+    /// `TraceActivation::list_push`: (runtime, list, value) -> status.
+    list_push_signature: codegen::ir::SigRef,
     /// Direct CLIF references to JITModule-imported scalar helpers.
     scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
     values: &'p mut [Option<Value>],
@@ -7589,6 +7626,7 @@ struct CraneliftLoweringState<'a, 'p> {
     runtime_context: Option<Value>,
     execute_callee: Option<Value>,
     heap_barrier_callee: Option<Value>,
+    list_push_callee: Option<Value>,
     heap_chunks_base: Option<Value>,
     method_epoch_value: Option<Value>,
     exit_plans: &'p [CompiledExitPlan],
@@ -8074,6 +8112,12 @@ fn compile_trace_function(
     heap_barrier_signature.params.push(AbiParam::new(pointer_type));
     heap_barrier_signature.params.push(AbiParam::new(pointer_type));
 
+    let mut list_push_signature = module.make_signature();
+    list_push_signature.params.push(AbiParam::new(pointer_type));
+    list_push_signature.params.push(AbiParam::new(types::I64));
+    list_push_signature.params.push(AbiParam::new(types::I64));
+    list_push_signature.returns.push(AbiParam::new(types::I32));
+
     context.func.signature = signature;
     context.func.name = UserFuncName::user(0, function.as_u32());
     context.set_disasm(options.cranelift_dump_disassembly);
@@ -8091,6 +8135,7 @@ fn compile_trace_function(
         let factory_probe_signature = builder.import_signature(factory_probe_signature);
         let factory_commit_signature = builder.import_signature(factory_commit_signature);
         let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
+        let list_push_signature = builder.import_signature(list_push_signature);
         let scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef> = scalar_helpers
             .iter()
             .map(|(&address, &id)| (address, module.declare_func_in_func(id, builder.func)))
@@ -8201,6 +8246,7 @@ fn compile_trace_function(
             factory_probe_signature,
             factory_commit_signature,
             heap_barrier_signature,
+            list_push_signature,
             scalar_helper_refs,
         };
         let mut builder = Some(builder);
@@ -8307,6 +8353,7 @@ struct CraneliftFunctionShared {
     factory_probe_signature: codegen::ir::SigRef,
     factory_commit_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
+    list_push_signature: codegen::ir::SigRef,
     scalar_helper_refs: HashMap<usize, codegen::ir::FuncRef>,
 }
 
@@ -8330,6 +8377,7 @@ fn new_lowering_state<'a, 'p>(
         factory_probe_signature: shared.factory_probe_signature,
         factory_commit_signature: shared.factory_commit_signature,
         heap_barrier_signature: shared.heap_barrier_signature,
+        list_push_signature: shared.list_push_signature,
         scalar_helper_refs: shared.scalar_helper_refs.clone(),
         values: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
         heap_addresses: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
@@ -8354,6 +8402,7 @@ fn new_lowering_state<'a, 'p>(
         runtime_context: None,
         execute_callee: None,
         heap_barrier_callee: None,
+        list_push_callee: None,
         heap_chunks_base: None,
         method_epoch_value: None,
         exit_plans: member.exit_plans,
@@ -8525,6 +8574,11 @@ fn lower_trace_member(
     // have changed them. Kind/address proofs above stay valid.
     state.forwarded_heap_loads.clear();
     state.forwarded_absolute_loads.clear();
+    // A body `list.push` of the previous iteration may have moved element
+    // buffers and changed lengths that the preheader cached.
+    if trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::HeapListPush { .. })) {
+        state.invalidate_list_views();
+    }
 
     for (phi, variable) in trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
         let value = state.builder.use_var(variable);
@@ -8758,6 +8812,28 @@ impl CraneliftLoweringState<'_, '_> {
         value
     }
 
+    fn list_push_callee(&mut self) -> Value {
+        if let Some(value) = self.list_push_callee {
+            return value;
+        }
+        let value = self.cached_activation_pointer(
+            self.list_push_callee,
+            offset_of!(TraceActivation, list_push) as i32,
+        );
+        self.list_push_callee = Some(value);
+        value
+    }
+
+    /// After a native `list.push`: List element buffers may have moved and
+    /// lengths changed, so every cached data pointer, length and normalized
+    /// index is stale. Kind/liveness proofs and element values stay valid.
+    fn invalidate_list_views(&mut self) {
+        self.heap_data.clear();
+        self.heap_len.clear();
+        self.list_indices.clear();
+        self.list_lengths.clear();
+    }
+
     #[inline(always)]
     fn heap_chunks_base(&mut self) -> Value {
         if let Some(value) = self.heap_chunks_base {
@@ -8806,6 +8882,10 @@ impl CraneliftLoweringState<'_, '_> {
         for node in &trace.nodes {
             match node.kind {
                 TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => runtime = true,
+                TraceInst::HeapListPush { .. } => {
+                    self.runtime_context();
+                    self.list_push_callee();
+                }
                 TraceInst::HeapStoreField { .. }
                 | TraceInst::HeapStoreCell { .. }
                 | TraceInst::HeapListSet { .. }
@@ -11791,6 +11871,24 @@ impl CraneliftLoweringState<'_, '_> {
                     ForwardedHeapLocation::Indexed { entry, index },
                     tagged_value,
                 );
+            }
+
+            HeapListPush { list, value, exit } => {
+                let tagged_list = self.lower_value(*list)?;
+                let tagged_value = self.lower_value(*value)?;
+                // Plain-List proof (shared Lists publish an invalid kind).
+                self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
+                let callee = self.list_push_callee();
+                let runtime = self.runtime_context();
+                let call = self.builder.ins().call_indirect(
+                    self.list_push_signature,
+                    callee,
+                    &[runtime, tagged_list, tagged_value],
+                );
+                let status = self.builder.inst_results(call)[0];
+                // Nonzero: nothing happened; the exit replays the Invoke.
+                self.emit_side_exit(*exit, status)?;
+                self.invalidate_list_views();
             }
 
             HeapMapLen { map, exit } => {
@@ -15178,7 +15276,7 @@ mod tests {
             heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
         activation.method_epoch = epoch;
@@ -15533,7 +15631,7 @@ mod tests {
                     heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
                 });
                 activation.current_links = compiled.native_links.as_ptr();
                 for initial in [42.0f64, -10.0] {
@@ -15622,7 +15720,7 @@ mod tests {
                     heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
                 });
                 activation.current_links = compiled.native_links.as_ptr();
                 assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -15682,7 +15780,7 @@ mod tests {
                         heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
                         factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
                         factory_bytes: 0, factory_alignment: 0,
-                        factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+                        factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -15749,7 +15847,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     assert_eq!(unsafe { invoke_native_trace(&compiled, &mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -15796,7 +15894,7 @@ mod tests {
                         heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     if tagged {
@@ -15968,7 +16066,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -16041,7 +16139,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -16131,7 +16229,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -16230,7 +16328,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -16312,7 +16410,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 
@@ -16386,7 +16484,7 @@ mod tests {
             heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
 

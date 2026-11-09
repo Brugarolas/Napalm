@@ -61,7 +61,7 @@ fn runtime_invalidates_list_length_and_negative_index_proofs() {
             execute: mutate, heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
         });
         activation.current_links = compiled.native_links.as_ptr();
         // Enter like the dispatcher does (it also installs the VM-binding table).
@@ -109,7 +109,7 @@ fn preheader_list_proofs_do_not_survive_runtime_on_the_backedge() {
         execute: empty_list, heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
             factory_cursor: std::ptr::null_mut(), factory_limit: std::ptr::null_mut(),
             factory_bytes: 0, factory_alignment: 0,
-            factory_probe: test_factory_probe, factory_commit: test_factory_commit,
+            factory_probe: test_factory_probe, factory_commit: test_factory_commit, list_push: test_list_push,
     });
     activation.current_links = compiled.native_links.as_ptr();
     // Enter like the dispatcher does (it also installs the VM-binding table).
