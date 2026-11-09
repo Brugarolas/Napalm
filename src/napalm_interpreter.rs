@@ -22943,6 +22943,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_contract_tests.rs");
     include!("tests/napalm_string_tests.rs");
     include!("tests/napalm_llvm_region_tests.rs");
+    include!("tests/napalm_cranelift_region_tests.rs");
 
     #[test]
     fn shaped_maps_share_shapes_use_pic_and_promote_for_general_keys() {

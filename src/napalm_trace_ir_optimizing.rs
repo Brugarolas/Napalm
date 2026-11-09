@@ -644,8 +644,13 @@ impl TraceCanonicalization {
             boxed_backedge: TraceValueId,
             raw_backedge: TraceValueId,
             rep: TraceRep,
+            /// The backedge is a Box of `raw_backedge` (exits may then box the
+            /// raw value themselves); otherwise it is a tagged value that a
+            /// body guard unboxed to `raw_backedge`.
+            boxed: bool,
         }
 
+        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
         let mut candidates = Vec::new();
         for (phi_index, phi) in trace.loop_phis.iter().enumerate() {
             if phi.rep != TraceRep::Tagged || phi.entry_exit.is_some() {
@@ -654,14 +659,30 @@ impl TraceCanonicalization {
             let Some(backedge) = phi.backedge.map(|v| trace.canonical_value(v)) else {
                 continue;
             };
-            let Some((_, producer)) = Self::producer(trace, backedge) else {
-                continue;
+            let boxed_raw = match Self::producer(trace, backedge) {
+                Some((_, TraceInst::BoxF64 { value })) => Some((trace.canonical_value(value), TraceRep::F64)),
+                Some((_, TraceInst::BoxInt32 { value })) => Some((trace.canonical_value(value), TraceRep::Int32)),
+                Some((_, TraceInst::BoxUInt32 { value })) => Some((trace.canonical_value(value), TraceRep::UInt32)),
+                _ => None,
             };
-            let (raw_backedge, rep) = match producer {
-                TraceInst::BoxF64 { value } => (trace.canonical_value(value), TraceRep::F64),
-                TraceInst::BoxInt32 { value } => (trace.canonical_value(value), TraceRep::Int32),
-                TraceInst::BoxUInt32 { value } => (trace.canonical_value(value), TraceRep::UInt32),
-                _ => continue,
+            // A tagged backedge (e.g. a loop-carried memory phi whose next
+            // value is a heap read) that a body guard unboxes: every body node
+            // runs before the backedge, so that guard's raw result is the
+            // backedge's value on every iteration that reaches it.
+            let guarded_raw = || trace.nodes.iter().find_map(|node| {
+                if preheader.contains(&node.id) {
+                    return None;
+                }
+                let rep = match node.kind {
+                    TraceInst::GuardF64 { value, .. } if trace.canonical_value(value) == backedge => TraceRep::F64,
+                    TraceInst::GuardInt32 { value, .. } if trace.canonical_value(value) == backedge => TraceRep::Int32,
+                    _ => return None,
+                };
+                node.results.first().map(|&result| (trace.canonical_value(result), rep))
+            });
+            let boxed = boxed_raw.is_some();
+            let Some((raw_backedge, rep)) = boxed_raw.or_else(guarded_raw) else {
+                continue;
             };
             if trace.value(raw_backedge).map(|v| v.rep) != Some(rep) {
                 continue;
@@ -716,6 +737,7 @@ impl TraceCanonicalization {
                 boxed_backedge: backedge,
                 raw_backedge,
                 rep,
+                boxed,
             });
         }
 
@@ -789,7 +811,16 @@ impl TraceCanonicalization {
             }
 
             // Any exit that used the boxed backedge can materialize the raw value
-            // directly into its original Tagged target representation.
+            // directly into its original Tagged target representation. (A
+            // guarded tagged backedge keeps its exact word in exits.)
+            if !candidate.boxed {
+                match candidate.rep {
+                    TraceRep::F64 => trace.stats.promoted_f64_loop_phis += 1,
+                    TraceRep::Int32 => trace.stats.promoted_i32_loop_phis += 1,
+                    _ => {}
+                }
+                continue;
+            }
             let canonical_values: Vec<_> = (0..trace.values.len())
                 .map(|index| trace.canonical_value(TraceValueId(index as u32)))
                 .collect();

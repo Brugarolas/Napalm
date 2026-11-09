@@ -787,12 +787,106 @@ fn body_memory_kills(trace: &Trace) -> Option<(bool, Vec<Memory>)> {
     Some((barrier, stores))
 }
 
-fn survives_body(trace: &Trace, kills: &(bool, Vec<Memory>), fact: &Memory) -> bool {
+fn survives_body(trace: &Trace, distinct: &[(TraceValueId, TraceValueId)], kills: &(bool, Vec<Memory>), fact: &Memory) -> bool {
     let (barrier, stores) = kills;
     !barrier && !stores.iter().any(|store| match (store, fact) {
         (Memory::Frame(slot, _), Memory::Frame(fact_slot, _)) => slot == fact_slot,
-        _ => memory_store_clobbers(trace, store, fact),
+        _ => clobbers_with(trace, distinct, store, fact),
     })
+}
+
+/// `memory_store_clobbers` that also knows Lists proven distinct at loop entry.
+fn clobbers_with(trace: &Trace, distinct: &[(TraceValueId, TraceValueId)], store: &Memory, cached: &Memory) -> bool {
+    if let (Memory::List(a, _), Memory::List(b, _)) = (store, cached) {
+        let (a, b) = (trace.canonical_value(*a), trace.canonical_value(*b));
+        if distinct.iter().any(|&pair| pair == (a, b) || pair == (b, a)) {
+            return false;
+        }
+    }
+    memory_store_clobbers(trace, store, cached)
+}
+
+/// Speculative List disambiguation for loop-carried reads. A body read
+/// `L[P + c]` whose previous-iteration element `L[P + c + s]` the body also
+/// reads or writes could reuse that value (see LoadStorePRE), but only if no
+/// body store to another List `S` can be the same element; with unrelated
+/// indices that needs `L` and `S` to be different objects. Both are loop
+/// invariant, so one identity check at entry (`RefEq` + `Case(0)`, an anchor
+/// exit) proves it for the whole loop: e.g. Levenshtein's `prev` and `cur` rows.
+/// Returns the proven pairs (at most `MAX_SPECULATED_PAIRS`).
+fn speculate_distinct_lists(trace: &mut Trace) -> Vec<(TraceValueId, TraceValueId)> {
+    const MAX_SPECULATED_PAIRS: usize = 4;
+    if !native_loop(trace) || trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::ReadBarrier { .. })) {
+        return Vec::new();
+    }
+    let invariant = preheader_values(trace);
+    let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+    let (mut reads, mut stores) = (Vec::new(), Vec::new());
+    for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
+        let (list, index, is_store) = match node.kind {
+            TraceInst::HeapListGet { list, index, .. } => (list, index, false),
+            TraceInst::HeapListSet { list, index, .. } => (list, index, true),
+            _ => continue,
+        };
+        let list = trace.canonical_value(list);
+        if !invariant.contains(&list) || constant(trace, list).is_some() {
+            continue;
+        }
+        let access = (list, trace.canonical_value(index));
+        if is_store { stores.push(access) } else { reads.push(access) }
+    }
+    let mut pairs: Vec<(TraceValueId, TraceValueId)> = Vec::new();
+    for &(list, index) in &reads {
+        let Some((base, _, step, offset)) = induction_offset(trace, index) else { continue };
+        let shifted = offset.wrapping_add(step);
+        // The element the read needs survives to the next iteration unless a
+        // store to another List can hit the provider's element (or the read's
+        // own, for stores that precede it).
+        let Some(&(_, provider)) = reads.iter().chain(&stores)
+            .find(|&&(other, other_index)| other == list && is_induction_at(trace, other_index, base, shifted))
+        else {
+            continue;
+        };
+        for &(store_list, store_index) in &stores {
+            if store_list == list
+                || (indices_proven_distinct(trace, store_index, provider)
+                    && indices_proven_distinct(trace, store_index, index))
+            {
+                continue;
+            }
+            let pair = if list.0 <= store_list.0 { (list, store_list) } else { (store_list, list) };
+            if !pairs.contains(&pair) && pairs.len() < MAX_SPECULATED_PAIRS {
+                pairs.push(pair);
+            }
+        }
+    }
+    for &(a, b) in &pairs {
+        // An earlier run of the pass may already have installed this check.
+        let present = trace.preheader.iter().any(|&id| match trace.nodes[id].kind {
+            TraceInst::GuardSwitch { tag, observed: TraceSwitchGuard::Case(0), .. } => matches!(
+                TraceCanonicalization::producer(trace, tag),
+                Some((_, TraceInst::RefEq { lhs, rhs }))
+                    if (trace.canonical_value(lhs), trace.canonical_value(rhs)) == (a, b)
+                        || (trace.canonical_value(lhs), trace.canonical_value(rhs)) == (b, a)
+            ),
+            _ => false,
+        });
+        if present {
+            continue;
+        }
+        let source = trace.anchor.location;
+        let same = append_preheader(trace, TraceInst::RefEq { lhs: a, rhs: b }, TraceType::Bool, TraceRep::Bool, source);
+        let exit = anchor_exit(trace);
+        let node = trace.nodes.len();
+        trace.nodes.push(TraceNode {
+            id: node,
+            kind: TraceInst::GuardSwitch { tag: same, observed: TraceSwitchGuard::Case(0), exit },
+            results: smallvec::smallvec![],
+            source,
+        });
+        trace.preheader.push(node);
+    }
+    pairs
 }
 
 /// Whether a successful store can change the value represented by `cached`.
@@ -1005,6 +1099,7 @@ impl TraceOptimization for LoadStorePRE {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
         let mut available: HashMap<Memory, TraceValueId> = HashMap::default();
         let mut validated_stores = HashSet::default();
+        let distinct = speculate_distinct_lists(trace);
         let mut changed = false;
         let kills = body_memory_kills(trace);
         let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
@@ -1013,8 +1108,8 @@ impl TraceOptimization for LoadStorePRE {
             if !in_body && !preheader.contains(&id) {
                 in_body = true;
                 if let Some(kills) = &kills {
-                    available.retain(|fact, _| survives_body(trace, kills, fact));
-                    validated_stores.retain(|fact| survives_body(trace, kills, fact));
+                    available.retain(|fact, _| survives_body(trace, &distinct, kills, fact));
+                    validated_stores.retain(|fact| survives_body(trace, &distinct, kills, fact));
                 }
             }
             let kind = trace.nodes[id].kind.clone();
@@ -1042,8 +1137,8 @@ impl TraceOptimization for LoadStorePRE {
                         });
                     }
                     _ => {
-                        available.retain(|cached, _| !memory_store_clobbers(trace, &key, cached));
-                        validated_stores.retain(|cached| !memory_store_clobbers(trace, &key, cached));
+                        available.retain(|cached, _| !clobbers_with(trace, &distinct, &key, cached));
+                        validated_stores.retain(|cached| !clobbers_with(trace, &distinct, &key, cached));
                     }
                 }
                 validated_stores.insert(key.clone());
@@ -1079,7 +1174,7 @@ impl TraceOptimization for LoadStorePRE {
                 // Heap reads without a memory model (e.g. String code points)
                 // are simply not candidates for loop-carried reuse.
                 let Some(key) = load(&kind, rep) else { continue };
-                if stores_seen.iter().any(|store| memory_store_clobbers(trace, store, &key)) {
+                if stores_seen.iter().any(|store| clobbers_with(trace, &distinct, store, &key)) {
                     continue;
                 }
                 let mut inputs_available = true;
@@ -2427,6 +2522,40 @@ mod tests {
         let (mut trace, read, _) = carried_list_loop(1);
         Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
         assert_eq!(trace.canonical_value(read), read);
+    }
+
+    #[test]
+    fn memory_pre_speculates_distinct_rows_for_carried_reads() {
+        // for j: a = prev[j]; b = prev[j - 1]; cur[j] = a — b is last iteration's
+        // a unless cur and prev are the same List (then cur[j] overwrote it).
+        let mut b = builder(TraceKind::Loop);
+        let prev = input(&mut b, 0, TraceRep::Tagged);
+        let cur = input(&mut b, 1, TraceRep::Tagged);
+        let start = input(&mut b, 2, TraceRep::Int32);
+        let j = b.add_loop_phi(FrameSlot::General(Reg(2)), start, TraceType::Int32, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let here = b.emit1(TraceInst::HeapListGet { list: prev, index: j, exit }, TraceType::Any, TraceRep::Tagged);
+        let previous = binary(&mut b, IntBinOp::Sub, j, one);
+        let before = b.emit1(TraceInst::HeapListGet { list: prev, index: previous, exit }, TraceType::Any, TraceRep::Tagged);
+        b.write_slot(FrameSlot::General(Reg(3)), before);
+        b.emit0(TraceInst::HeapListSet { list: cur, index: j, value: here, exit, numeric: false });
+        let next = binary(&mut b, IntBinOp::Add, j, one);
+        b.set_loop_backedge(j, next).unwrap();
+        let mut trace = finish(b);
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        let phi = trace.loop_phis.iter().find(|phi| phi.value == trace.canonical_value(before)).expect("carried phi");
+        assert_eq!(phi.backedge.map(|value| trace.canonical_value(value)), Some(here));
+        let guarded = trace.preheader.iter().any(|&id| match trace.nodes[id].kind {
+            TraceInst::GuardSwitch { tag, observed: TraceSwitchGuard::Case(0), .. } => matches!(
+                TraceCanonicalization::producer(&trace, tag), Some((_, TraceInst::RefEq { .. }))),
+            _ => false,
+        });
+        assert!(guarded, "the reuse must be protected by an entry identity check");
+        // Running the pass again neither duplicates the check nor undoes the reuse.
+        let checks = trace.nodes.iter().filter(|node| matches!(node.kind, TraceInst::RefEq { .. })).count();
+        Optimize::new().with_pass(LoadStorePRE).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+        assert_eq!(trace.nodes.iter().filter(|node| matches!(node.kind, TraceInst::RefEq { .. })).count(), checks);
     }
 
     #[test]
