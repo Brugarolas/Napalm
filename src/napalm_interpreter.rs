@@ -5378,6 +5378,15 @@ impl HostContext<'_> {
         }
     }
 
+    /// The bytes of a String whose code points are all ASCII, in O(1): the
+    /// cached code-point count equals the byte length exactly then.
+    pub fn ascii_string_bytes(&self, value: Value) -> Option<&[u8]> {
+        match self.heap.get(value) {
+            Some(HeapObject::String(string)) if string.code_points == string.as_ref().len() => Some(string.as_ref()),
+            _ => None,
+        }
+    }
+
     pub fn string_utf8(&self, value: Value) -> Option<&str> {
         std::str::from_utf8(self.string_bytes(value)?).ok()
     }

@@ -207,18 +207,20 @@ fn native_decorators_validate_durations_options_and_targets() {
 
 #[test]
 fn native_decorators_debounce_throttle_edges_and_async_adoption() {
+    // Bursts must fit inside each window even on a loaded machine (timers may
+    // fire late, never early), so windows are 100 ms and waits 250 ms.
     run_napalm(r#"
         let calls = 0;
-        @debounce(15, {leading: true, trailing: true})
+        @debounce(100, {leading: true, trailing: true})
         function single(value) { calls++; return value; }
         const first = single(1);
         await first;
-        await Timer.delay(50);
+        await Timer.delay(250);
         const singleCalls = calls;
         const next = [single(2), single(3), single(4)];
         const both = await Promise.all(next);
-        await Timer.delay(50);
-        @throttle(15, {leading: false})
+        await Timer.delay(250);
+        @throttle(100, {leading: false})
         async function trailing(value) {
             await Timer.delay(1);
             return value * 2;
@@ -235,15 +237,18 @@ fn native_decorators_debounce_throttle_edges_and_async_adoption() {
 
 #[test]
 fn native_decorators_expiry_is_per_key_and_does_not_refresh_on_hit() {
+    // Timers may fire late (loaded machine, parallel tests) but never early.
+    // Each wait (250 ms) stays far below the expiry (400 ms) while both together
+    // (>= 500 ms) always exceed it: up to 150 ms of lateness per wait is safe.
     run_napalm(r#"
         let calls = 0;
-        @memoizeExpiring(200)
+        @memoizeExpiring(400)
         function value(key) { calls++; return calls; }
         const first = value("a");
-        await Timer.delay(100);
+        await Timer.delay(250);
         const second = value("a");
         const other = value("b");
-        await Timer.delay(130);
+        await Timer.delay(250);
         const expired = value("a");
         const stillLive = value("b");
         const result = [first, second, other, expired, stillLive, calls];

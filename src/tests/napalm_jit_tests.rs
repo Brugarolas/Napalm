@@ -537,16 +537,26 @@ fn native_class_guards_cover_class_sets_deopt_and_moving_gc() {
         assert!(trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::GuardClass { .. })));
         assert!(!trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::Runtime { .. })));
 
+        // Root every object as soon as it is allocated: the collector is shared
+        // by every VM in the process, so any later allocation may park this
+        // thread for a collection requested by another (parallel) test, and an
+        // unrooted object would be reclaimed (its handle then reads as dead).
         let mut values = Vec::new();
+        let mut rooted = |vm: &mut Interpreter<'_>, object: HeapObject, matches: bool| {
+            let value = vm.heap.alloc(object);
+            vm.add_root(value);
+            values.push((value, matches));
+        };
         for slot in 0..2 {
-            values.push((vm.heap.alloc(HeapObject::Instance(InstanceObject::from_values(slot, &[Value::TRUE]))), slot == 0 || mode != 0));
+            rooted(&mut vm, HeapObject::Instance(InstanceObject::from_values(slot, &[Value::TRUE])), slot == 0 || mode != 0);
+            rooted(&mut vm, HeapObject::Foreign { class_slot: slot, bytes: vec![] }, slot == 0 || mode != 0);
+        }
+        rooted(&mut vm, HeapObject::List(vec![]), false);
+        for slot in 0..2 {
             values.push((vm.classes[slot as usize].class_value, slot == 0 || mode != 0));
-            values.push((vm.heap.alloc(HeapObject::Foreign { class_slot: slot, bytes: vec![] }), slot == 0 || mode != 0));
         }
         values.extend([(Value::NULL, false), (Value::FALSE, false), (Value::from_num(3.0), false),
-            (vm.strings[1], false), (vm.heap.alloc(HeapObject::List(vec![])), false),
-            (vm.builtin_value(crate::napalm_ir::BuiltinId::Num), false)]);
-        for &(value, _) in &values { vm.add_root(value); }
+            (vm.strings[1], false), (vm.builtin_value(crate::napalm_ir::BuiltinId::Num), false)]);
         for _ in 0..3 {
             vm.collect_garbage();
             for &(value, matches) in &values {

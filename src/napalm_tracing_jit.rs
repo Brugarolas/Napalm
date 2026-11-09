@@ -1320,6 +1320,8 @@ pub enum RecordingAbort {
     LeftFunction,
     PathDidNotClose,
     EnclosingLoop,
+    /// The recording iteration left the loop body (its last iteration).
+    LeftLoop,
     NestedCycle(TraceLocation),
     /// A callee's loop trace has no profile yet; decide later (not a failure).
     CalleeLoopWarming(FuncId),
@@ -1339,6 +1341,7 @@ impl fmt::Display for RecordingAbort {
             Self::LeftFunction => f.write_str("recorded path left the root function"),
             Self::PathDidNotClose => f.write_str("recorded path did not return to trace head"),
             Self::EnclosingLoop => f.write_str("recorded path took an enclosing loop backedge"),
+            Self::LeftLoop => f.write_str("recorded path left the loop body (final iteration)"),
             Self::NestedCycle(location) => write!(
                 f,
                 "recording encountered nested/re-entrant cycle at {:?}:{} before returning to trace head",
@@ -1508,6 +1511,69 @@ fn decode_at(
     })
 }
 
+/// The natural loop headed at `header`, as bytecode PCs: every instruction
+/// reachable from the header (without passing through it again) from which
+/// the header is reachable. Optimized bytecode lays loop blocks out of line
+/// (e.g. a ternary arm after the backedge that jumps back into the body), so
+/// the body is not a PC range. None when the CFG cannot be decoded exactly
+/// (tables, oversized functions): no loop-exit check then.
+fn static_loop_body(program: &BytecodeProgram, header: TraceLocation) -> Option<HashSet<u32>> {
+    const MAX_OPS: usize = 1 << 15;
+    let mut successors = HashMap::<u32, smallvec::SmallVec<[u32; 2]>>::default();
+    let mut pc = BytecodePc(0);
+    while successors.len() < MAX_OPS {
+        let Ok(op) = decode_at(program, TraceLocation::new(header.function, pc)) else { break };
+        let next = op.next_pc.0;
+        let succ: smallvec::SmallVec<[u32; 2]> = match op.opcode {
+            Opcode::Jump => smallvec::smallvec![relative_target(op.next_pc, op.x).0],
+            Opcode::JumpIfFalse | Opcode::JumpIfTrue => smallvec::smallvec![next, relative_target(op.next_pc, op.x).0],
+            Opcode::Return | Opcode::Return2 | Opcode::Trap | Opcode::Bailout => smallvec::SmallVec::new(),
+            Opcode::Switch => return None,
+            _ => smallvec::smallvec![next],
+        };
+        successors.insert(pc.0, succ);
+        if next <= pc.0 {
+            break;
+        }
+        pc = op.next_pc;
+    }
+    if successors.len() >= MAX_OPS || !successors.contains_key(&header.pc.0) {
+        return None;
+    }
+    // Forward: reachable from the header without re-entering it.
+    let mut forward = HashSet::<u32>::default();
+    let mut pending = vec![header.pc.0];
+    while let Some(pc) = pending.pop() {
+        if !forward.insert(pc) {
+            continue;
+        }
+        for &next in successors.get(&pc).into_iter().flatten() {
+            if next != header.pc.0 {
+                pending.push(next);
+            }
+        }
+    }
+    // Backward from the backedges, within the forward set.
+    let mut predecessors = HashMap::<u32, smallvec::SmallVec<[u32; 2]>>::default();
+    for (&pc, succ) in &successors {
+        if forward.contains(&pc) {
+            for &next in succ {
+                predecessors.entry(next).or_default().push(pc);
+            }
+        }
+    }
+    let mut body = HashSet::<u32>::default();
+    body.insert(header.pc.0);
+    let mut pending: Vec<u32> = predecessors.get(&header.pc.0).map(|p| p.to_vec()).unwrap_or_default();
+    while let Some(pc) = pending.pop() {
+        if !body.insert(pc) {
+            continue;
+        }
+        pending.extend(predecessors.get(&pc).into_iter().flatten().copied());
+    }
+    Some(body)
+}
+
 #[inline]
 fn relative_target(next: BytecodePc, encoded_delta: u32) -> BytecodePc {
     let delta = encoded_delta as i32 as i64;
@@ -1575,6 +1641,8 @@ struct TraceRecorder<'a> {
     /// checked out, so their own loops could never enter native code again.
     /// `false` means the loop has no profile yet (decide on a later attempt).
     native_loop_functions: HashMap<FuncId, bool>,
+    /// Root loops: the PCs of the natural loop (see `static_loop_body`).
+    loop_body: Option<HashSet<u32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1595,7 +1663,13 @@ impl<'a> TraceRecorder<'a> {
             trace_id,
             anchor,
             native_loop_functions: HashMap::default(),
+            loop_body: None,
         }
+    }
+
+    fn with_loop_body(mut self, loop_body: Option<HashSet<u32>>) -> Self {
+        self.loop_body = loop_body;
+        self
     }
 
     fn with_native_loop_functions(mut self, functions: HashMap<FuncId, bool>) -> Self {
@@ -6381,6 +6455,15 @@ impl<'a> TraceRecorder<'a> {
             let location = runtime.trace_current_location();
             if location.function != self.anchor.function {
                 return Err(RecordOutcome::Abort(RecordingAbort::LeftFunction));
+            }
+            // A root loop recorded on its final iteration would otherwise keep
+            // "recording" the rest of the function (calls run as single runtime
+            // steps, with the tracing manager checked out) until some later
+            // abort: stop as soon as the path leaves the loop body.
+            if matches!(mode, RecordingMode::RootLoop)
+                && self.loop_body.as_ref().is_some_and(|body| !body.contains(&location.pc.0))
+            {
+                return Err(RecordOutcome::Abort(RecordingAbort::LeftLoop));
             }
 
             if matches!(mode, RecordingMode::Entry) && runtime.trace_is_loop_header(location) {
@@ -13182,8 +13265,10 @@ impl TracingJit {
         self.next_trace_id = self.next_trace_id.wrapping_add(1);
         self.stats.recordings_started += 1;
 
+        let loop_body = static_loop_body(runtime.trace_program(), location);
         let recorder = TraceRecorder::new(&self.options, trace_id, location)
-            .with_native_loop_functions(self.native_loop_functions());
+            .with_native_loop_functions(self.native_loop_functions())
+            .with_loop_body(loop_body);
         let trace = match recorder.record(runtime) {
             Ok(trace) => trace,
             Err(RecordOutcome::Abort(reason)) => {
@@ -13199,7 +13284,7 @@ impl TracingJit {
                     );
                 }
                 let state = self.loops.get_mut(&key).unwrap();
-                if matches!(reason, RecordingAbort::EnclosingLoop | RecordingAbort::CalleeLoopWarming(_)) {
+                if matches!(reason, RecordingAbort::EnclosingLoop | RecordingAbort::LeftLoop | RecordingAbort::CalleeLoopWarming(_)) {
                     // This path may be short only for the current invocation
                     // (e.g. Mandelbrot's early pixels). Retry less often, but do
                     // not permanently disable a loop that can become hot later.
@@ -13402,6 +13487,7 @@ impl TracingJit {
         if from.function != to.function || to.pc.0 >= from.pc.0 {
             return Ok(JitAction::Interpreted);
         }
+
         if runtime.trace_current_location() != to {
             return Err(TracingJitError::Activation(
                 "on_backedge must be called after setting the interpreter PC to target".to_owned(),

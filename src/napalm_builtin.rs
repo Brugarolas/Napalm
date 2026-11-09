@@ -2444,12 +2444,11 @@ fn execute_primitive(
             let raw = integer(argument(args, 0)?, "index")?;
             // ASCII receivers index bytes directly, and one-character ASCII
             // results reuse the VM's shared Strings instead of allocating.
-            let ascii = context.string_utf8(this)
-                .filter(|text| text.is_ascii())
-                .map(|text| {
-                    let len = text.len() as i64;
+            let ascii = context.ascii_string_bytes(this)
+                .map(|bytes| {
+                    let len = bytes.len() as i64;
                     let index = if raw < 0 { len + raw } else { raw };
-                    (0..len).contains(&index).then(|| text.as_bytes()[index as usize])
+                    (0..len).contains(&index).then(|| bytes[index as usize])
                 });
             if let Some(byte) = ascii {
                 return Ok(match byte {

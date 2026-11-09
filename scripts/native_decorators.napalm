@@ -66,15 +66,18 @@ check(retry(), 42, "successful retry is cached");
 check(attempts, 2, "once retries after a synchronous exception");
 check(rejected, 1, "original synchronous error propagates");
 
+// Timing windows are generous (200 ms) so bursts of back-to-back calls stay
+// inside them even on a loaded machine; waits that must outlast a window use
+// twice its length. Timers may fire late but never early.
 let expiringCalls = 0;
-@memoizeExpiring(30)
+@memoizeExpiring(200)
 function expiring(value) {
     expiringCalls++;
     return value * expiringCalls;
 }
 check(expiring(4), 4, "expiring first result");
 check(expiring(4), 4, "unexpired cache hit");
-await Timer.delay(80);
+await Timer.delay(400);
 check(expiring(4), 8, "TTL is measured in milliseconds");
 
 let delayedCalls = 0;
@@ -92,7 +95,7 @@ check((await Promise.all([delayedFirst, delayedSecond])).toString(), "[6, 8]",
 check(delayedCalls, 2, "delay invocation count");
 
 let debouncedCalls = 0;
-@debounce(20)
+@debounce(200)
 function save(value) {
     debouncedCalls++;
     return value * 10;
@@ -106,7 +109,7 @@ check((await Promise.all([saveFirst, saveSecond, saveThird])).toString(), "[30, 
 check(debouncedCalls, 1, "debounce coalesces a burst");
 
 let leadingCalls = 0;
-@debounce(30, {leading: true, trailing: false})
+@debounce(200, {leading: true, trailing: false})
 function leading(value) {
     leadingCalls++;
     return value;
@@ -116,11 +119,11 @@ const leadingSecond = leading(2);
 check((await Promise.all([leadingFirst, leadingSecond])).toString(), "[1, 1]",
     "leading-only debounce shares its leading result");
 check(leadingCalls, 1, "leading-only debounce suppresses repeats");
-await Timer.delay(80);
+await Timer.delay(400);
 check(await leading(3), 3, "a new burst can invoke the leading edge again");
 
 let throttledCalls = 0;
-@throttle(30)
+@throttle(200)
 function update(value) {
     throttledCalls++;
     return value;
@@ -146,7 +149,7 @@ class Counter {
     @once
     initial(amount) { return this.value + amount; }
 
-    @debounce(20)
+    @debounce(200)
     save(amount) { return this.value + amount; }
 }
 const first = new Counter(10);

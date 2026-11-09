@@ -606,6 +606,8 @@ enum Memory {
     Map(TraceValueId, TraceValueId, Vec<u8>, u32, u32),
     MapPic(TraceValueId, TraceValueId, Vec<u8>, Vec<TraceShapeSlot>),
     StringLen(TraceValueId),
+    /// One code point of a String: Strings are immutable, nothing clobbers it.
+    StringChar(TraceValueId, TraceValueId, bool),
     /// Immutable closure capture array slot.
     Capture(TraceValueId, u16),
 }
@@ -621,6 +623,8 @@ fn load(kind: &TraceInst, rep: TraceRep) -> Option<Memory> {
         TraceInst::HeapMapGetShaped { map, key, expected_key, shape, slot, .. } => Memory::Map(*map, *key, expected_key.clone(), *shape, *slot),
         TraceInst::HeapMapGetPic { map, key, expected_key, entries, .. } => Memory::MapPic(*map, *key, expected_key.clone(), entries.clone()),
         TraceInst::HeapStringLen { string, .. } => Memory::StringLen(*string),
+        TraceInst::HeapStringAsciiCodePointAt { string, index, .. } => Memory::StringChar(*string, *index, true),
+        TraceInst::HeapStringCodePointAt { string, index, .. } => Memory::StringChar(*string, *index, false),
         _ => return None,
     })
 }
@@ -658,8 +662,11 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
     match (store, cached) {
         (Memory::Frame(lhs, _), Memory::Frame(rhs, _)) => lhs == rhs,
         (Memory::Frame(..), _) | (_, Memory::Frame(..)) => false,
-        // Capture arrays are immutable after closure creation.
-        (_, Memory::Capture(..)) => false,
+        // Capture arrays are immutable after closure creation, Strings always.
+        (_, Memory::Capture(..)) | (_, Memory::StringChar(..)) => false,
+        // A List that is a trace constant is a VM-internal immutable table
+        // (the one-character String table): no program store can reach it.
+        (Memory::List(..), Memory::List(list, _)) if constant(trace, *list).is_some() => false,
 
         (Memory::Field(_, store_slot), Memory::Field(_, slot)) => {
             // Distinct SSA object values are not a no-alias proof: two values may
@@ -702,7 +709,53 @@ fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool
         | (Memory::MapLen(_), _)
         | (Memory::MapPic(..), _)
         | (Memory::StringLen(_), _)
+        | (Memory::StringChar(..), _)
         | (Memory::Capture(..), _) => false,
+    }
+}
+
+/// Loop-invariant heap reads only: a body read whose operands are preheader
+/// values and whose memory no store of the loop body can clobber (before or
+/// after it in the iteration) returns the same value on every iteration, so it
+/// moves to the preheader with an entry exit. Unlike LoadStorePRE it performs
+/// no linear forwarding, so it is safe after guard hoisting has put more nodes
+/// into the preheader (a linear walk over preheader + body would forward a
+/// preheader value into a body load the body itself overwrites every
+/// iteration).
+#[derive(Default)]
+pub struct LoopInvariantLoadHoisting;
+impl TraceOptimization for LoopInvariantLoadHoisting {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        if !native_loop(trace) || trace.nodes.iter().any(|n| matches!(n.kind, TraceInst::ReadBarrier { .. })) {
+            return false;
+        }
+        let body: Vec<usize> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
+        let stores: Vec<Memory> = body.iter()
+            .filter_map(|&id| store(&trace.nodes[id].kind, trace).map(|(memory, _)| memory))
+            .filter(|memory| !matches!(memory, Memory::Frame(..)))
+            .collect();
+        let mut invariant = preheader_values(trace);
+        let mut changed = false;
+        for id in body {
+            let kind = trace.nodes[id].kind.clone();
+            if !kind.is_heap_read() { continue; }
+            let Some(&result) = trace.nodes[id].results.first() else { continue };
+            let rep = trace.value(result).unwrap().rep;
+            let Some(key) = load(&kind, rep) else { continue };
+            if stores.iter().any(|store| memory_store_clobbers(trace, store, &key)) { continue; }
+            let mut inputs_available = true;
+            kind.clone().visit_operands(|v| inputs_available &= invariant.contains(v));
+            if !inputs_available { continue; }
+            let exit = anchor_exit(trace);
+            let mut entry_kind = kind;
+            entry_kind.set_exit(exit);
+            trace.nodes[id].kind = entry_kind;
+            trace.preheader.push(id);
+            invariant.insert(result);
+            trace.stats.loop_loads_reused += 1;
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -763,7 +816,7 @@ impl TraceOptimization for LoadStorePRE {
             }
         }
         if native_loop(trace) && !trace.nodes.iter().any(|n| matches!(n.kind, TraceInst::ReadBarrier { .. })) {
-            let invariant = preheader_values(trace);
+            let mut invariant = preheader_values(trace);
             let mut stores_seen = Vec::<Memory>::new();
             let body: Vec<_> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
             for id in body {
@@ -793,9 +846,12 @@ impl TraceOptimization for LoadStorePRE {
                 let mut entry_kind = kind;
                 entry_kind.set_exit(exit);
                 if next == result {
-                    // No intervening aliasing write: the read is invariant.
+                    // No intervening aliasing write: the read is invariant, and
+                    // so is everything computed from it (a dependent read can
+                    // follow it out of the loop in this same pass).
                     trace.nodes[id].kind = entry_kind;
                     trace.preheader.push(id);
+                    invariant.insert(result);
                 } else {
                     // The entry edge performs the missing read. Subsequent
                     // iterations receive the validated last store/load value.

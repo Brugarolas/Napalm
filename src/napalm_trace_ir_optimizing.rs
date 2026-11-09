@@ -82,6 +82,9 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         .with_pass(LoopInvariantGuardHoisting)
         .with_pass(LoopUnswitching)
         .with_pass(LoopInvariantCodeMotion)
+        // Reads whose operands only became invariant through guard hoisting
+        // (e.g. `s[i - 1]` inside a loop over j) can now leave the loop too.
+        .with_pass(LoopInvariantLoadHoisting)
         // Late fixed-point cleanup after the structural loop transforms.
         .with_pass(ConversionSimplification)
         .with_pass(TraceCanonicalization {

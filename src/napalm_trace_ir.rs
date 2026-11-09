@@ -365,7 +365,9 @@ impl TraceInst {
             | Self::GuardBounds { .. } | Self::GuardEq { .. } | Self::GuardSwitch { .. }
             | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. }
             | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. }
-            | Self::GuardClosure { .. })
+            | Self::GuardClosure { .. }
+            // A pure range/exactness check of an f64 (no memory, no effect).
+            | Self::F64ToInt32 { .. })
     }
 
     pub fn is_heap_read(&self) -> bool {
@@ -392,7 +394,7 @@ impl TraceInst {
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
-            | HeapStringCodePointAt { exit, .. } => *exit = new,
+            | HeapStringCodePointAt { exit, .. } | F64ToInt32 { exit, .. } => *exit = new,
             _ => panic!("instruction does not support entry exit replacement"),
         }
     }

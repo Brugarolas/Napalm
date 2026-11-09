@@ -914,6 +914,11 @@ struct LlvmLowering<'p> {
     /// LLVM's loop-carried scratch allocations do not escape the generated
     /// function. Lifetime markers complement O3's mem2reg/SROA promotion.
     nonescaping_stack_slots: Vec<(String, usize)>,
+    /// Single-trace functions funnel every return through one `trace_ret`
+    /// block: `(predecessor block, result code)`. Side exits are most of a
+    /// trace's IR; one shared epilogue (lifetime ends + ret) instead of one per
+    /// exit shrinks both the IR LLVM optimizes and the machine code.
+    common_returns: Vec<(String, u32)>,
     /// Preserve IEEE arithmetic unless the application explicitly accepts
     /// the different rounding that contracting multiply-add can introduce.
     allow_fp_contract: bool,
@@ -1038,6 +1043,7 @@ impl<'p> LlvmLowering<'p> {
         native_budget_initial: native_budget,
         epoch_free_trace,
         nonescaping_stack_slots: Vec::new(),
+        common_returns: Vec::new(),
         allow_fp_contract: std::env::var("NAPALM_LLVM_ALLOW_FMA").ok().as_deref() == Some("1"),
         profile,
         in_preheader: true,
@@ -1128,6 +1134,12 @@ impl LlvmLowering<'_> {
     }
 
     fn ret(&mut self, code: u32) {
+        if self.region.is_none() {
+            let block = self.current.clone();
+            self.common_returns.push((block, code));
+            self.br("trace_ret");
+            return;
+        }
         // With deferred frame slots every return goes through the region's
         // single `region_exit` block, which flushes them to the frame.
         let region_exit = self.region.as_ref().and_then(|region| region.record_return(&self.current, code));
@@ -3924,7 +3936,33 @@ impl LlvmLowering<'_> {
             TraceTerminator::Link => return Err(self.error("direct native trace links are installed after compilation")),
             TraceTerminator::Unreachable => return Err(self.error("trace has unreachable terminator")),
         }
+        self.emit_common_return();
         Ok(())
+    }
+
+    /// The shared epilogue of a single-trace function (see `common_returns`).
+    /// No stack-slot address ever leaves the function, so every slot's
+    /// lifetime ends here, on the way out of every native return.
+    fn emit_common_return(&mut self) {
+        if self.region.is_some() || self.common_returns.is_empty() {
+            return;
+        }
+        let returns = std::mem::take(&mut self.common_returns);
+        self.begin("trace_ret");
+        let code = if returns.iter().all(|(_, code)| *code == returns[0].1) {
+            V::i32(returns[0].1 as i32)
+        } else {
+            let incoming = returns
+                .iter()
+                .map(|(block, code)| format!("[ {}, %{block} ]", *code as i32))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.def(Ty::I32, &format!("phi i32 {incoming}"))
+        };
+        for (slot, size) in &self.nonescaping_stack_slots {
+            self.body.push_str(&format!("  call void @llvm.lifetime.end.p0(i64 {size}, ptr {slot})\n"));
+        }
+        self.line(&format!("ret i32 {}", code.op));
     }
 
     /// Representation coercion for loop-carried slots.
