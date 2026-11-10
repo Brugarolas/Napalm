@@ -1,0 +1,53 @@
+// End-to-end native JSON.parse and JSON.stringify tests.
+// Run: cargo run --release -- scripts/json_smoke.napalm
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+// Scalar JSON types, number representation, and whitespace.
+expect(JSON.parse("null") === null, "parse null");
+expect(JSON.parse("true") === true, "parse true");
+expect(JSON.parse("false") === false, "parse false");
+expect(JSON.parse("  -12.5e2 \n") === -1250, "parse scientific number");
+expect(JSON.parse('"A😀é"') === "A😀é", "UTF-8 decode");
+expect(JSON.stringify(null) === "null", "stringify null");
+expect(JSON.stringify(true) === "true", "stringify true");
+expect(JSON.stringify(12.5) === "12.5", "stringify number");
+expect(JSON.stringify(-0) === "0", "stringify negative zero");
+expect(JSON.stringify("a\n\"b\"") === '"a\\n\\"b\\""', "JSON escaping");
+
+// Native Maps, nested Lists, and ordered object properties.
+const value = JSON.parse('{"name":"Napalm","version":6,"ready":true,"nested":{"value":42},"list":[1,null,"x"]}');
+expect(value["name"] === "Napalm", "read Map field");
+expect(value["version"] === 6 && value["ready"] === true, "Map primitive fields");
+expect(value["nested"]["value"] === 42, "nested Map field");
+expect(value["list"][0] === 1, "nested List first item");
+expect(value["list"][1] === null && value["list"][2] === "x", "nested List remaining items");
+expect(JSON.stringify(value) === '{"name":"Napalm","version":6,"ready":true,"nested":{"value":42},"list":[1,null,"x"]}', "ordered JSON round-trip");
+
+// JSON object duplicate keys: last value wins, original position stays stable.
+const duplicated = JSON.parse('{"x":1,"y":2,"x":3}');
+expect(duplicated["x"] === 3, "duplicate key value");
+expect(JSON.stringify(duplicated) === '{"x":3,"y":2}', "duplicate key order");
+
+// Parsing a binary frame must not consume or modify the source storage.
+const encoded = Bytes.fromUtf8('{"ok":true}');
+expect(JSON.parse(encoded)["ok"] === true, "parse Bytes");
+expect(encoded.toUtf8() === '{"ok":true}', "Bytes remain immutable");
+const frame = new ByteBuffer();
+frame.append('{"id":7}');
+expect(JSON.parse(frame)["id"] === 7, "parse ByteBuffer");
+expect(frame.toUtf8() === '{"id":7}', "ByteBuffer remains unchanged");
+
+// Shared subobjects are legal; only actual back-edges are cycles.
+const sharedObject  = JSON.parse('{"id":5}');
+const repeated = [sharedObject, sharedObject];
+expect(JSON.stringify(repeated) === '[{"id":5},{"id":5}]', "sharedObject object is not a cycle");
+
+// Force collection between parsing and serialization to exercise GC roots.
+const retained = JSON.parse('{"object":{"message":"alive"},"array":[1,2,3]}');
+System.gc();
+expect(retained["object"]["message"] === "alive", "JSON survives GC");
+expect(JSON.stringify(retained) === '{"object":{"message":"alive"},"array":[1,2,3]}', "serialize after GC");
+
+System.print("JSON integration tests passed");

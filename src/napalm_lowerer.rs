@@ -6585,7 +6585,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 _ => None,
             }
         });
-        let builtin_constructor_type = invoke.receiver.as_deref().and_then(|receiver| {
+        let builtin_result_type = invoke.receiver.as_deref().and_then(|receiver| {
             let ExprKind::Name(name) = &receiver.kind else { return None; };
             if invoke.syntax != InvokeSyntax::Method {
                 return None;
@@ -6593,6 +6593,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             match (name.value.as_str(), invoke.name.value.as_str()) {
                 ("Bytes", "empty" | "alloc" | "fromUtf8" | "fromArray") => Some(Type::Builtin(BuiltinId::Bytes, None)),
                 ("ByteBuffer", "new") => Some(Type::Builtin(BuiltinId::ByteBuffer, None)),
+                ("JSON", "stringify") => Some(Type::String),
                 ("ConcurrentMap", "new") => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
                 ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
                 ("Map", "new") => Some(Type::Map),
@@ -6666,7 +6667,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         ) {
             return value;
         }
-        if let Some(result_type) = builtin_constructor_type.or(sized_array_type) {
+        if let Some(result_type) = builtin_result_type.or(sized_array_type) {
             if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
                 return self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span);
             }
@@ -8126,6 +8127,28 @@ mod tests {
             assert_eq!(bindings.len(), 1, "missing or duplicate {builtin:?} binding");
             assert!(bindings[0].slot.0 < info.variable_count);
         }
+    }
+
+    #[test]
+    fn json_is_bound_and_stringify_has_string_result_type() {
+        let source = r#"
+            const document = JSON.parse("{\"ok\":true}");
+            const serialized: String = JSON.stringify(document);
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("json-globals.napalm", source, "json-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "JSON must be present as an implicit global: {:#?}",
+            output.diagnostics,
+        );
+        let lowered = output.lowered.expect("lowered JSON module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        let bindings = info.builtin_bindings.iter()
+            .filter(|binding| binding.builtin == BuiltinId::JSON)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].slot.0 < info.variable_count);
     }
 
     #[test]

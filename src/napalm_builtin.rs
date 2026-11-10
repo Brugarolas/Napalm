@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -497,6 +497,25 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let result = string_right_add.emit1(Inst::StringConcat { left, right }, Type::String);
     string_right_add.ret(result);
     manifest.string_right_add = Some(string_right_add.finish());
+
+    // JSON is a global static utility. Parsing reuses simd-json's tape conversion
+    // and stringification reuses the existing fetch JSON serializer.
+    manifest.register_native(
+        program,
+        static_(BuiltinId::JSON),
+        "parse",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::Json(JsonNative::Parse),
+    );
+    manifest.register_native(
+        program,
+        static_(BuiltinId::JSON),
+        "stringify",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::Json(JsonNative::Stringify),
+    );
 
     // Native immutable Bytes and mutable ByteBuffer. These are ordinary
     // runtime calls so both JIT tiers use the established GC-safe call ABI.

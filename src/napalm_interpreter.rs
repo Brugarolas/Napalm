@@ -92,6 +92,8 @@ use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
 use self::collection_ops::*;
 #[path = "napalm_bytes_vm.rs"]
 mod bytes_vm;
+#[path = "napalm_json_vm.rs"]
+mod json_vm;
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -7310,6 +7312,7 @@ enum CallTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeBuiltin {
     Bytes(BytesNative),
+    Json(JsonNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7448,6 +7451,12 @@ pub enum NativeBuiltin {
     DecoratorRun,
     DecoratorStore,
     DecoratorStoreList,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonNative {
+    Parse,
+    Stringify,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11912,7 +11921,7 @@ impl<'p> Interpreter<'p> {
     ) -> Result<(), RuntimeError> {
         const MAX_JSON_DEPTH: usize = 256;
         if depth > MAX_JSON_DEPTH {
-            return Err(RuntimeError::new("fetch JSON body exceeds maximum nesting depth"));
+            return Err(RuntimeError::new("JSON value exceeds maximum nesting depth"));
         }
         if value.is_null() {
             out.extend_from_slice(b"null");
@@ -11939,13 +11948,13 @@ impl<'p> Interpreter<'p> {
         match self.heap.get(value) {
             Some(HeapObject::String(string)) => {
                 let text = std::str::from_utf8(string.as_ref())
-                    .map_err(|_| RuntimeError::new("fetch JSON strings must be UTF-8"))?;
+                    .map_err(|_| RuntimeError::new("JSON strings must be UTF-8"))?;
                 Self::push_json_string(out, text);
                 Ok(())
             }
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) {
-                    return Err(RuntimeError::new("fetch JSON body contains a cycle"));
+                    return Err(RuntimeError::new("JSON value contains a cycle"));
                 }
                 out.push(b'[');
                 for (index, value) in values.iter().copied().enumerate() {
@@ -11960,7 +11969,7 @@ impl<'p> Interpreter<'p> {
             }
             Some(HeapObject::Map(map)) => {
                 if !seen.insert(handle) {
-                    return Err(RuntimeError::new("fetch JSON body contains a cycle"));
+                    return Err(RuntimeError::new("JSON value contains a cycle"));
                 }
                 let len = map.len();
                 out.push(b'{');
@@ -11980,13 +11989,13 @@ impl<'p> Interpreter<'p> {
                     match key {
                         MapKey::String(key) => {
                             let key = std::str::from_utf8(key.as_ref()).map_err(|_| {
-                                RuntimeError::new("fetch JSON object keys must be UTF-8 Strings")
+                                RuntimeError::new("JSON object keys must be UTF-8 Strings")
                             })?;
                             Self::push_json_string(out, key);
                         }
                         _ => {
                             return Err(RuntimeError::new(
-                                "fetch JSON object keys must be Strings",
+                                "JSON object keys must be Strings",
                             ));
                         }
                     }
@@ -11998,7 +12007,7 @@ impl<'p> Interpreter<'p> {
                 Ok(())
             }
             _ => Err(RuntimeError::new(
-                "fetch JSON body supports only null, Bool, Num, String, List, and Map values",
+                "JSON.stringify supports only null, Bool, Num, String, List, and Map values",
             )),
         }
     }
@@ -12282,7 +12291,7 @@ impl<'p> Interpreter<'p> {
         // identical JSON layouts through the same property order maximizes hidden-
         // shape sharing and keeps property PICs monomorphic.
         let tape = simd_json::to_tape(body.as_mut_slice())
-            .map_err(|error| RuntimeError::new(format!("SyntaxError: invalid JSON response body: {error}")))?;
+            .map_err(|error| RuntimeError::new(format!("SyntaxError: invalid JSON: {error}")))?;
         self.json_tape_to_napalm(tape.as_value(), 0)
     }
 
@@ -12293,7 +12302,7 @@ impl<'p> Interpreter<'p> {
     ) -> Result<Value, RuntimeError> {
         const MAX_JSON_DEPTH: usize = 256;
         if depth > MAX_JSON_DEPTH {
-            return Err(RuntimeError::new("JSON response exceeds maximum nesting depth"));
+            return Err(RuntimeError::new("JSON value exceeds maximum nesting depth"));
         }
 
         use simd_json::ValueType;
@@ -15724,6 +15733,7 @@ impl Interpreter<'_> {
         }
         match native {
             NativeBuiltin::Bytes(native) => self.execute_bytes_native(op, native, receiver, args),
+            NativeBuiltin::Json(native) => self.execute_json_native(op, native, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -22205,6 +22215,31 @@ mod tests {
 
         let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"id"[..])));
         assert_eq!(vm.heap.map_get_encoded(value, &key).unwrap().as_num(), Some(1.0));
+    }
+
+    #[test]
+    fn json_native_roundtrip_executes_through_compiler_and_vm() {
+        let source = r#"
+            const obj = JSON.parse('{"x":1,"values":[true,null,"hi"]}');
+            if (obj["x"] !== 1 || obj["values"][0] !== true) {
+                throw "JSON.parse did not produce native Maps and Lists";
+            }
+            const encoded: String = JSON.stringify(obj);
+            if (encoded !== '{"x":1,"values":[true,null,"hi"]}') {
+                throw "JSON.stringify did not preserve structure and order";
+            }
+            const raw = Bytes.fromUtf8(encoded);
+            if (JSON.parse(raw)["values"][2] !== "hi") {
+                throw "JSON.parse(Bytes) failed";
+            }
+        "#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        assert!(
+            matches!(vm.run_module(entry), Ok(ExecutionResult::Returned(_))),
+            "JSON integration should finish successfully",
+        );
     }
 
     #[test]
