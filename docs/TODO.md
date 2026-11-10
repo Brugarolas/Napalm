@@ -46,9 +46,5 @@ fusiona en preparación (`install_superinstructions`).
 - [ ] Instancias con campos inline en el objeto gestionado (hoy `Box<[Value]>`:
       cada `new` hace un malloc; es el coste dominante restante de `NewClassInstance`).
 - [ ] Reenvío store→load en trazas (constructor inlineado seguido de lecturas).
-- [ ] `len2(p)` con `p` instancia de una clase `implements V`: el bind estructural
-      no se puede demostrar no-op en la traza.
-- [ ] WFJIT rechaza funciones que usan `this` (métodos y constructores).
-- [ ] Tests que fallan intermitentemente: `shared_memo_first_publisher_wins_and_is_visible_across_threads`, `napalm_collections_shared_objects_are_locked_per_operation` y `napalm_collections_contended_shared_lock_parks_tasks`. El tercero tambien ha fallado antes de la implementacion de `MapLookupOrInsert`. De los otros dos, no se sabe nada, si fallaban antes o solo desde la implementacion de `MapLookupOrInsert`.
-
+- [ ] `len2(p)` con `p` instancia de una clase `implements V`: el bind estructural no se puede demostrar no-op en la traza.
 - [ ] Desbloquear Loop Fusion y Deforestation en todos los loops, no como ahora que estan bloqueados en algunas situaciones

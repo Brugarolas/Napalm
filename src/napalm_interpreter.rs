@@ -11041,6 +11041,27 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    /// Interpreter dispatch of a bytecode method (`this` = receiver). Enters it
+    /// like any call and, when the whole-function tier has (or now compiles)
+    /// native code for it, runs the pushed frame natively.
+    #[inline(always)]
+    fn enter_method_bytecode_call(
+        &mut self,
+        op: &PreparedOp,
+        function: u32,
+        receiver: RegisterWord,
+        args: &[RegisterWord],
+    ) {
+        if !self.whole_function_jit.as_ref().is_some_and(|jit| jit.may_enter(function)) {
+            self.enter_bytecode_call(op, function, Some(receiver), args, None);
+            return;
+        }
+        let caller_fiber = self.current_fiber;
+        let caller_depth = self.fiber(caller_fiber).frames.len();
+        self.enter_bytecode_call(op, function, Some(receiver), args, None);
+        unsafe { function_jit::try_run_pushed_call(self, function, caller_fiber, caller_depth) };
+    }
+
     #[inline(always)]
     fn enter_direct_bytecode_call(
         &mut self,
@@ -15214,7 +15235,7 @@ impl Interpreter<'_> {
 
         match target {
             CallTarget::Bytecode(function) => {
-                self.enter_bytecode_call(op, function, Some(receiver), args, None);
+                self.enter_method_bytecode_call(op, function, receiver, args);
             }
             CallTarget::Primitive(primitive) => {
                 // Stock numeric primitives are pure, non-allocating operations.
@@ -18419,7 +18440,7 @@ unsafe fn h_invoke_mono_bytecode_small<const N: usize>(vm:&mut Interpreter, ptr:
     };
     vm.note_monomorphic_bytecode_hit();
     let args=vm.gather_call_words_const::<N>(&op);
-    vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
+    vm.enter_method_bytecode_call(&op,function,receiver,&args[..N]);
 }
 
 unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -18461,7 +18482,7 @@ unsafe fn h_invoke_direct_profiled_small<const N: usize>(vm:&mut Interpreter, pt
         return;
     };
     let args=vm.gather_call_words_const::<N>(&op);
-    vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
+    vm.enter_method_bytecode_call(&op,function,receiver,&args[..N]);
 }
 
 unsafe fn h_invoke_direct_profiled(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -18491,11 +18512,11 @@ unsafe fn h_invoke_bytecode_target(vm:&mut Interpreter, op:&PreparedOp, function
     if likely(op.c <= 4) {
         let mut args=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(&op,&mut args);
-        vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
+        vm.enter_method_bytecode_call(&op,function,receiver,&args[..count]);
     } else {
         let mut args=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(&op,&mut args);
-        vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
+        vm.enter_method_bytecode_call(&op,function,receiver,&args[..count]);
     }
 }
 
@@ -19138,8 +19159,15 @@ unsafe fn h_new_class_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
         }
         // No result register: the destination keeps the instance, whatever the
         // constructor returns. Constructors are never memoized (verifier).
+        let caller_fiber = vm.current_fiber;
+        let caller_depth = vm.fiber(caller_fiber).frames.len();
         match vm.push_frame(op.cache, Some(instance.word()), &explicit[..op.c as usize], None, None) {
-            Ok(()) => vm.current_frame_mut().caller_pc = caller_pc,
+            Ok(()) => {
+                vm.current_frame_mut().caller_pc = caller_pc;
+                // Hot constructors run in the whole-function tier like any
+                // other method-like callee.
+                unsafe { function_jit::try_run_pushed_call(vm, op.cache, caller_fiber, caller_depth) };
+            }
             Err(error) => vm.fail_at_raw_pc(caller_pc, error.message),
         }
     } else {
@@ -23264,6 +23292,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_static_type_tests.rs");
     include!("tests/napalm_generator_tests.rs");
     include!("tests/napalm_interning_tests.rs");
+    include!("tests/napalm_wfjit_this_tests.rs");
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
     include!("tests/napalm_contract_tests.rs");

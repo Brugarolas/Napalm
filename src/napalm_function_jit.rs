@@ -43,6 +43,10 @@ pub(crate) struct WholeFunctionJitStats {
     /// Bounded self-call sites expanded in the generated function body.
     pub inlined_recursive_sites: u64,
     pub baseline_direct_calls: u64,
+    /// Native entries that handed control back to the interpreter mid-body.
+    pub bailouts: u64,
+    /// Compiled functions dropped because they kept bailing out.
+    pub deoptimized_functions: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,11 +61,17 @@ struct FunctionSlot {
     profile_retries: u8,
     state: FunctionState,
     entry: Option<WholeFunctionEntry>,
+    /// Native entries / bailouts since compilation (bailout feedback).
+    native_entries: u32,
+    bailouts: u32,
 }
 
 impl Default for FunctionSlot {
     fn default() -> Self {
-        Self { hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None }
+        Self {
+            hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None,
+            native_entries: 0, bailouts: 0,
+        }
     }
 }
 
@@ -309,6 +319,13 @@ impl WholeFunctionJit {
         self.slots.get(function as usize).and_then(|slot| slot.entry)
     }
 
+    /// Cheap pre-check for interpreter call hooks: a rejected function never
+    /// runs natively, so its callers can skip the depth bookkeeping entirely.
+    #[inline(always)]
+    pub(super) fn may_enter(&self, function: u32) -> bool {
+        self.slots.get(function as usize).is_some_and(|slot| slot.state != FunctionState::Rejected)
+    }
+
     #[inline]
     fn note_call(&mut self, function: u32) -> bool {
         self.stats.hot_calls = self.stats.hot_calls.saturating_add(1);
@@ -316,6 +333,15 @@ impl WholeFunctionJit {
         if slot.state != FunctionState::Cold { return false; }
         slot.hotness = slot.hotness.saturating_add(1);
         slot.hotness >= self.threshold
+    }
+
+    /// Bailout feedback for one native entry of `function`.
+    #[inline]
+    fn note_native_result(&mut self, function: u32, bailed_out: bool) {
+        if bailed_out { self.stats.bailouts = self.stats.bailouts.saturating_add(1); }
+        let Some(slot) = self.slots.get_mut(function as usize) else { return; };
+        slot.native_entries = slot.native_entries.saturating_add(1);
+        if bailed_out { slot.bailouts = slot.bailouts.saturating_add(1); }
     }
 
     fn reject(&mut self, function: u32) {
@@ -342,16 +368,25 @@ impl WholeFunctionJit {
         native_shape_write_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
+        // Methods and constructors (`uses_this`) are eligible: their frame is
+        // built by the interpreter before entry, so `this` already sits in its
+        // GPR (entry_this_dst) and in SpecialReg::This for GC and bailouts.
         if function.memoization.enabled()
             || function.is_async
             || function.is_concurrent
-            || function.uses_this
             || function.capture_count != 0
             || !function.exception_handlers.is_empty()
             || function.return_kind == RegisterKind::RawPtr
             || function.ops.is_empty()
             || function.ops.len() > MAX_WHOLE_FUNCTION_OPS
         {
+            if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
+                eprintln!(
+                    "[napalm-wfjit] rejected {:?}: memo={} async={} concurrent={} captures={} handlers={} ops={}",
+                    function.id, function.memoization.enabled(), function.is_async, function.is_concurrent,
+                    function.capture_count, function.exception_handlers.len(), function.ops.len(),
+                );
+            }
             self.reject(function_index);
             return Ok(());
         }
@@ -2665,15 +2700,53 @@ pub(super) unsafe fn try_direct_call(
     op: &PreparedOp,
     sources: &[RegisterWord],
 ) -> bool {
-    let target = op.x;
-    let Some(jit_ptr) = vm.whole_function_jit.as_mut().map(|jit| &mut **jit as *mut WholeFunctionJit) else {
-        return false;
-    };
+    let Some(entry) = (unsafe { compiled_entry(vm, op.x) }) else { return false; };
+    unsafe { execute_native_direct_call(vm, *op, sources, op.x, entry) };
+    true
+}
+
+/// The interpreter has just pushed the frame of `target` through an ordinary
+/// entry: a bytecode method dispatched by Invoke/InvokeMethodDirect, or the
+/// constructor of `new C(...)` (receiver = new instance, no result register).
+/// Run that frame natively when the target is compiled (or has just become
+/// hot). Nothing happens if no frame was pushed (async, memo hit, error). On a
+/// bailout the frame stays in place and baseline dispatch resumes it.
+pub(super) unsafe fn try_run_pushed_call(
+    vm: &mut Interpreter<'_>,
+    target: u32,
+    caller_fiber: u32,
+    caller_depth: usize,
+) {
+    if vm.run_state != RunState::Running
+        || vm.current_fiber != caller_fiber
+        || vm.fiber(caller_fiber).frames.len() != caller_depth + 1
+        || vm.hot_function_index != target
+    {
+        return;
+    }
+    let Some(entry) = (unsafe { compiled_entry(vm, target) }) else { return; };
+    unsafe { run_pushed_frame(vm, caller_fiber, caller_depth, target, entry) };
+}
+
+/// Count a call to `target`, compiling it once it becomes hot, and return its
+/// native entry if one is installed. Auto-memoized targets never compile.
+unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeFunctionEntry> {
+    let jit_ptr = vm.whole_function_jit.as_mut().map(|jit| &mut **jit as *mut WholeFunctionJit)?;
+    // Settled functions (the common case on hot paths) need one state check:
+    // rejected ones never compile again, compiled ones just return their entry.
+    let settled = unsafe { (*jit_ptr).slots.get(target as usize).map(|slot| (slot.state, slot.entry)) };
+    match settled {
+        None | Some((FunctionState::Rejected, _)) => return None,
+        Some((FunctionState::Compiled, entry)) => {
+            return if unsafe { (*jit_ptr).active_depth } < MAX_NATIVE_CALL_DEPTH { entry } else { None };
+        }
+        Some((FunctionState::Cold, _)) => {}
+    }
     if vm.prepared.functions[target as usize].memoization.enabled() {
-        return false;
+        return None;
     }
     if unsafe { (*jit_ptr).active_depth >= MAX_NATIVE_CALL_DEPTH } {
-        return false;
+        return None;
     }
 
     if unsafe { (*jit_ptr).note_call(target) } {
@@ -2776,9 +2849,7 @@ pub(super) unsafe fn try_direct_call(
         }
     }
 
-    let Some(entry) = (unsafe { (*jit_ptr).entry(target) }) else { return false; };
-    unsafe { execute_native_direct_call(vm, *op, sources, target, entry) };
-    true
+    unsafe { (*jit_ptr).entry(target) }
 }
 
 unsafe fn execute_native_direct_call(
@@ -2790,6 +2861,8 @@ unsafe fn execute_native_direct_call(
 ) {
     let caller_fiber = vm.current_fiber;
     let caller_depth = vm.fiber(caller_fiber).frames.len();
+    // Method-like targets take `sources[0]` as their receiver: the ordinary
+    // entry stores it in SpecialReg::This and in its GPR (entry_this_dst).
     vm.enter_direct_bytecode_call(&op, target, sources, None);
     if vm.run_state != RunState::Running { return; }
 
@@ -2800,7 +2873,19 @@ unsafe fn execute_native_direct_call(
         return;
     }
     if vm.hot_function_index != target { return; }
+    unsafe { run_pushed_frame(vm, caller_fiber, caller_depth, target, entry) };
+}
 
+/// Execute the already-pushed top frame of `target` natively. On success the
+/// frame returns through the ordinary path (honouring its return register, or
+/// none for constructors); on a bailout it is left for baseline dispatch.
+unsafe fn run_pushed_frame(
+    vm: &mut Interpreter<'_>,
+    caller_fiber: u32,
+    caller_depth: usize,
+    target: u32,
+    entry: WholeFunctionEntry,
+) {
     {
         let jit = vm.whole_function_jit.as_mut().unwrap();
         jit.stats.native_entries = jit.stats.native_entries.saturating_add(1);
@@ -2809,6 +2894,7 @@ unsafe fn execute_native_direct_call(
     let result = unsafe { entry(vm as *mut _ as *mut c_void, vm.hot_registers) };
     if let Some(jit) = vm.whole_function_jit.as_mut() {
         jit.active_depth = jit.active_depth.saturating_sub(1);
+        jit.note_native_result(target, result == WFJIT_BAILOUT);
     }
     if result == WFJIT_BAILOUT {
         // The native body deliberately handed control back to the interpreter at
@@ -3406,12 +3492,10 @@ unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) ->
         return vm.hot_registers;
     }
 
-    let native = vm.whole_function_jit.as_ref().and_then(|jit| {
-        (!vm.prepared.functions[target as usize].memoization.enabled()
-            && jit.active_depth < MAX_NATIVE_CALL_DEPTH)
-            .then(|| jit.entry(target))
-            .flatten()
-    });
+    // Native callers must contribute hotness too. Otherwise compiling the
+    // caller can strand a callee just below the compilation threshold forever.
+    // The ordinary entry above has already rooted its arguments and receiver.
+    let native = unsafe { compiled_entry(vm, target) };
     if let Some(entry) = native {
         if let Some(jit) = vm.whole_function_jit.as_mut() {
             jit.stats.native_direct_calls = jit.stats.native_direct_calls.saturating_add(1);
@@ -3421,6 +3505,7 @@ unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) ->
         let result = unsafe { entry(vm as *mut _ as *mut c_void, vm.hot_registers) };
         if let Some(jit) = vm.whole_function_jit.as_mut() {
             jit.active_depth = jit.active_depth.saturating_sub(1);
+            jit.note_native_result(target, result == WFJIT_BAILOUT);
         }
         if result == WFJIT_BAILOUT {
             // Finish this callee in baseline so the native caller can resume with
@@ -3516,12 +3601,9 @@ unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) 
         return vm.hot_registers;
     }
 
-    let native = vm.whole_function_jit.as_ref().and_then(|jit| {
-        (!vm.prepared.functions[target as usize].memoization.enabled()
-            && jit.active_depth < MAX_NATIVE_CALL_DEPTH)
-            .then(|| jit.entry(target))
-            .flatten()
-    });
+    // Keep tiering methods even when all their callers are already native.
+    // compiled_entry retains the memoization and native-depth guards.
+    let native = unsafe { compiled_entry(vm, target) };
     if let Some(entry) = native {
         if let Some(jit) = vm.whole_function_jit.as_mut() {
             jit.stats.native_direct_calls = jit.stats.native_direct_calls.saturating_add(1);
@@ -3531,6 +3613,7 @@ unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) 
         let result = unsafe { entry(vm as *mut _ as *mut c_void, vm.hot_registers) };
         if let Some(jit) = vm.whole_function_jit.as_mut() {
             jit.active_depth = jit.active_depth.saturating_sub(1);
+            jit.note_native_result(target, result == WFJIT_BAILOUT);
         }
         if result == WFJIT_BAILOUT {
             // Finish this callee in baseline so the native caller can resume with
