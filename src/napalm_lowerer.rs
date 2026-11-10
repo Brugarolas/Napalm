@@ -541,6 +541,8 @@ fn resolve_type_annotation_with(
             "Channel" => Type::Builtin(BuiltinId::Channel, None),
             "Receiver" => Type::Builtin(BuiltinId::Receiver, None),
             "Promise" => Type::Builtin(BuiltinId::Promise, None),
+            "Bytes" => Type::Builtin(BuiltinId::Bytes, None),
+            "ByteBuffer" => Type::Builtin(BuiltinId::ByteBuffer, None),
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
             "Set" => Type::Set(None),
@@ -4297,9 +4299,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_for(&mut self, name: &Ident, iterable: &Expr, body: &Stmt) {
         let sequence = self.lower_expr(iterable);
         let action_depth = self.exit_actions.len();
-        // Only a Generator needs IteratorClose. Avoid unnecessary cleanup and
-        // exceptional CFG edges for statically known Lists, Ranges, Maps...
-        // Total computations can still be optimized inside protected regions.
+        // Only a Generator needs IteratorClose. A protecting region disables
+        // deforestation/loop fusion for the whole body, so statically known
+        // Lists, Ranges, Maps... keep exactly the pre-generator lowering.
         let close = may_be_generator(self.builder.value_type(sequence)).then(|| {
             let handler = self.new_block(&[Type::Top]);
             let error = self.builder.block_param(handler, 0);
@@ -5118,10 +5120,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn append_iterable_to_list(&mut self, list: ValueId, sequence: ValueId) {
         // Lists use one bulk bytecode. Other iterables keep the language's
         // ordinary protocol, so custom iterators, strings and ranges still work.
-        if matches!(semantic_source_type(self.builder.value_type(sequence)), Type::List(_)) {
-            self.builder.emit1(Inst::ListSpread { list, source: sequence }, Type::Bool);
-            return;
-        }
         let saved_env = self.env.clone();
         let initial = self.builder.const_null();
         let header = self.new_block(&[]);
@@ -6589,16 +6587,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         });
         let builtin_constructor_type = invoke.receiver.as_deref().and_then(|receiver| {
             let ExprKind::Name(name) = &receiver.kind else { return None; };
-            if invoke.syntax != InvokeSyntax::Method || invoke.name.value != "new" {
+            if invoke.syntax != InvokeSyntax::Method {
                 return None;
             }
-            match name.value.as_str() {
-                "ConcurrentMap" => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
-                "ConcurrentSet" => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
-                "Map" => Some(Type::Map),
-                "Set" => Some(Type::Set(None)),
-                "Emitter" => Some(Type::Builtin(BuiltinId::Emitter, None)),
-                "Channel" => Some(Type::Builtin(BuiltinId::Channel, None)),
+            match (name.value.as_str(), invoke.name.value.as_str()) {
+                ("Bytes", "empty" | "alloc" | "fromUtf8" | "fromArray") => Some(Type::Builtin(BuiltinId::Bytes, None)),
+                ("ByteBuffer", "new") => Some(Type::Builtin(BuiltinId::ByteBuffer, None)),
+                ("ConcurrentMap", "new") => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
+                ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
+                ("Map", "new") => Some(Type::Map),
+                ("Set", "new") => Some(Type::Set(None)),
+                ("Emitter", "new") => Some(Type::Builtin(BuiltinId::Emitter, None)),
+                ("Channel", "new") => Some(Type::Builtin(BuiltinId::Channel, None)),
                 _ => None,
             }
         });
@@ -8096,6 +8096,37 @@ fn collect_written_bindings_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_and_bytebuffer_are_implicitly_bound_in_every_module() {
+        let source = r#"
+            const data: Bytes = Bytes.fromUtf8("Hello");
+            const zero: Bytes = Bytes.empty();
+            const buffer: ByteBuffer = new ByteBuffer(16);
+            buffer.append(data);
+            buffer.append(zero);
+            const result = buffer.length;
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("bytes-globals.napalm", source, "bytes-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "core binary types must be in the module's global scope: {:#?}",
+            output.diagnostics,
+        );
+
+        let lowered = output.lowered.expect("lowered module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        for builtin in [BuiltinId::Bytes, BuiltinId::ByteBuffer] {
+            assert_eq!(builtin.binding_name(), builtin.name());
+            assert!(BuiltinId::ALL.contains(&builtin));
+            let bindings = info.builtin_bindings.iter()
+                .filter(|binding| binding.builtin == builtin)
+                .collect::<Vec<_>>();
+            assert_eq!(bindings.len(), 1, "missing or duplicate {builtin:?} binding");
+            assert!(bindings[0].slot.0 < info.variable_count);
+        }
+    }
 
     #[test]
     fn lowers_pipeline_to_ordinary_invoke_without_pipeline_ir() {

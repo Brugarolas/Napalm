@@ -1,0 +1,97 @@
+// End-to-end native Bytes and ByteBuffer integration test.
+// Run: napalm scripts/bytes_smoke.napalm
+// The final line is printed only after every assertion passes.
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+// Immutable bytes, indexing, zero-copy slicing, and search.
+const hello: Bytes = Bytes.fromUtf8("Hello Napalm!");
+expect(typeof hello === "Bytes", "Bytes runtime type");
+expect(hello.length === 13, "UTF-8 ASCII length");
+expect(!hello.isEmpty, "nonempty Bytes");
+expect(hello[0] === 72 && hello[12] === 33, "immutable indexing");
+expect(hello.slice(6).toUtf8() === "Napalm!", "slice with implicit end");
+expect(hello.slice(0, 5).toUtf8() === "Hello", "slice with explicit end");
+expect(hello.clone().toUtf8() === "Hello Napalm!", "shared-storage clone");
+expect(hello.indexOf(Bytes.fromUtf8("Nap")) === 6, "substring search");
+expect(hello.indexOf(Bytes.fromUtf8("missing")) === -1, "missing pattern");
+expect(hello.indexOf(Bytes.empty()) === 0, "empty pattern");
+expect(Bytes.empty().isEmpty, "empty Bytes");
+expect(Bytes.alloc(3).toArray()[2] === 0, "zero-initialized allocation");
+
+// UTF-8 lengths count bytes, not Unicode scalar values.
+const unicode = Bytes.fromUtf8("A😀é");
+expect(unicode.length === 7, "Unicode UTF-8 byte count");
+expect(unicode.slice(1, 5).toUtf8() === "😀", "UTF-8 character slice");
+const retainedSlice = unicode.slice(1, 5);
+System.gc();
+expect(retainedSlice.toUtf8() === "😀", "slice survives garbage collection");
+
+const fromArray = Bytes.fromArray([0, 42, 255]);
+expect(fromArray.length === 3, "fromArray length");
+expect(fromArray[0] === 0 && fromArray.toArray()[2] === 255, "fromArray values");
+
+// Converting immutable Bytes to a mutable buffer must not mutate the source.
+const mutable: ByteBuffer = hello.toMutable();
+mutable[0] = 104;
+expect(mutable[0] === 104, "mutable indexed write");
+expect(hello[0] === 72, "immutable source remains unmodified");
+expect(mutable.freeze().toUtf8() === "hello Napalm!", "freeze contents");
+expect(mutable.length === 0, "freeze leaves buffer empty");
+
+// LSP-style Content-Length framing, including incomplete reads.
+const frame = new ByteBuffer(4);
+expect(typeof frame === "ByteBuffer", "ByteBuffer runtime type");
+frame.append("Content-");
+expect(frame.take(20) === null, "incomplete take returns null");
+expect(frame.length === 8, "incomplete take does not consume data");
+frame.append(Bytes.fromUtf8("Length: 2\r\n\r\n{}"));
+const boundary = Bytes.fromUtf8("\r\n\r\n");
+const headerEnd = frame.indexOf(boundary) + boundary.length;
+expect(headerEnd > boundary.length, "header terminator found");
+expect(frame.peek(headerEnd).toUtf8() === "Content-Length: 2\r\n\r\n", "peek without consuming");
+const header = frame.take(headerEnd);
+expect(header.toUtf8() === "Content-Length: 2\r\n\r\n", "take header");
+expect(frame.take(2).toUtf8() === "{}", "take JSON payload");
+expect(frame.isEmpty, "frame completely consumed");
+frame.append("reused");
+expect(header.toUtf8() === "Content-Length: 2\r\n\r\n", "taken slice survives reuse");
+expect(frame.freeze().toUtf8() === "reused", "reuse after splitting");
+
+// Buffer growth, reserve, fill, discard, and clear.
+const edit = new ByteBuffer();
+edit.reserve(16);
+expect(edit.capacity >= 16, "reserve capacity");
+edit.resize(4);
+expect(edit.length === 4 && edit[3] === 0, "resize zero fills");
+edit.fill(255);
+edit.discard(2);
+expect(edit.length === 2 && edit[0] === 255, "fill and discard");
+edit.append(edit);
+expect(edit.length === 4 && edit[3] === 255, "self append");
+edit.clear();
+expect(edit.isEmpty, "clear");
+
+// Fixed-width integer encoding must never depend on host endianness.
+const numbers = new ByteBuffer();
+numbers.writeUInt8(170);
+numbers.writeUInt16BE(4660);
+numbers.writeUInt16LE(4660);
+numbers.writeUInt32BE(305419896);
+numbers.writeUInt32LE(305419896);
+const encoded = numbers.freeze();
+expect(encoded.length === 13, "encoded width");
+expect(encoded[0] === 170 && encoded[1] === 18 && encoded[2] === 52, "UInt8 and UInt16BE");
+expect(encoded[3] === 52 && encoded[4] === 18, "UInt16LE");
+expect(encoded[5] === 18 && encoded[6] === 52 && encoded[7] === 86 && encoded[8] === 120, "UInt32BE");
+expect(encoded[9] === 120 && encoded[10] === 86 && encoded[11] === 52 && encoded[12] === 18, "UInt32LE");
+
+let sum = 0;
+for (const byte of encoded) {
+    sum += byte;
+}
+expect(sum === 170 + 18 + 52 + 52 + 18 + 18 + 52 + 86 + 120 + 120 + 86 + 52 + 18,
+    "byte iteration");
+
+System.print("Bytes and ByteBuffer integration tests passed");

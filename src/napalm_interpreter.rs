@@ -90,6 +90,9 @@ mod native_decorators;
 mod function_jit;
 use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
 use self::collection_ops::*;
+#[path = "napalm_bytes_vm.rs"]
+mod bytes_vm;
+use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
     TraceActivationInputs, TraceHeapEntry, TraceHeapKind, TraceRuntime, TraceStep, TracingJit,
@@ -2896,6 +2899,8 @@ impl std::fmt::Debug for InstanceObject {
 enum HeapObject {
     Random { state: u64 },
     String(NapalmString),
+    Bytes(NapalmBytes),
+    ByteBuffer(NapalmByteBuffer),
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
@@ -3891,6 +3896,8 @@ macro_rules! gc_descriptor {
 }
 
 gc_descriptor!(GC_STRING, "Napalm.String", GcTraceLayout::Leaf);
+gc_descriptor!(GC_BYTES, "Napalm.Bytes", GcTraceLayout::Leaf);
+gc_descriptor!(GC_BYTE_BUFFER, "Napalm.ByteBuffer", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
@@ -3924,6 +3931,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
     match object {
         HeapObject::Random { .. } => &GC_RANDOM,
         HeapObject::String(_) => &GC_STRING,
+        HeapObject::Bytes(_) => &GC_BYTES,
+        HeapObject::ByteBuffer(_) => &GC_BYTE_BUFFER,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::Proxy { .. } => &GC_PROXY,
@@ -3976,6 +3985,8 @@ fn promise_state_external_bytes(state: &PromiseState) -> usize {
 fn external_bytes_for(object: &HeapObject) -> usize {
     match object {
         HeapObject::String(bytes) => bytes.len(),
+        HeapObject::Bytes(bytes) => bytes.len(),
+        HeapObject::ByteBuffer(buffer) => buffer.capacity(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
@@ -4269,6 +4280,8 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
             collect_fiber_state_handles(unsafe { state.get() }, trace_metadata, roots);
         }
         HeapObject::String(_)
+        | HeapObject::Bytes(_)
+        | HeapObject::ByteBuffer(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::Date { .. }
@@ -5983,6 +5996,8 @@ impl HostContext<'_> {
         let _ = match self.heap.get(value) {
             Some(HeapObject::Random { .. }) => out.write_str("<random>"),
             Some(HeapObject::String(bytes)) => out.write_str(&String::from_utf8_lossy(bytes.as_ref())),
+            Some(HeapObject::Bytes(bytes)) => write!(out, "<Bytes length={}>", bytes.len()),
+            Some(HeapObject::ByteBuffer(bytes)) => write!(out, "<ByteBuffer length={}>", bytes.len()),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { out.push_str("[...]"); return; }
@@ -7294,6 +7309,7 @@ enum CallTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeBuiltin {
+    Bytes(BytesNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7434,6 +7450,20 @@ pub enum NativeBuiltin {
     DecoratorStoreList,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BytesNative {
+    BytesEmpty, BytesAlloc, BytesFromUtf8, BytesFromArray,
+    BytesLength, BytesIsEmpty, BytesIndex, BytesSlice, BytesClone,
+    BytesToUtf8, BytesToArray, BytesToMutable, BytesIndexOf, BytesToString,
+    BytesIterate, BytesIteratorValue,
+    BufferNew, BufferLength, BufferCapacity, BufferIsEmpty, BufferIndex,
+    BufferIndexSet, BufferAppend, BufferReserve, BufferResize,
+    BufferWriteU8, BufferWriteU16BE, BufferWriteU16LE,
+    BufferWriteU32BE, BufferWriteU32LE, BufferTake, BufferPeek,
+    BufferDiscard, BufferFreeze, BufferClear, BufferFill, BufferIndexOf,
+    BufferToUtf8, BufferToString, BufferIterate, BufferIteratorValue,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinClass {
     Null,
@@ -7469,9 +7499,11 @@ pub enum BuiltinClass {
     Channel,
     Receiver,
     Generator,
+    Bytes,
+    ByteBuffer,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 28;
+const BUILTIN_CLASS_COUNT: usize = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7489,6 +7521,10 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Random as u64),
         HeapObject::String(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::String as u64),
+        HeapObject::Bytes(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Bytes as u64),
+        HeapObject::ByteBuffer(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::ByteBuffer as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Set { .. } =>
@@ -12509,7 +12545,8 @@ impl<'p> Interpreter<'p> {
             Some(HeapObject::Cell(_)) => {
                 return Err(RuntimeError::new("captured mutable cells cannot cross a concurrent boundary"));
             }
-            Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
+            Some(HeapObject::Bytes(_)) | Some(HeapObject::ByteBuffer(_))
+            | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
             | Some(HeapObject::Set { .. })
             | Some(HeapObject::MapEntry { .. }) | Some(HeapObject::MapKeys { .. })
@@ -15686,6 +15723,7 @@ impl Interpreter<'_> {
             return;
         }
         match native {
+            NativeBuiltin::Bytes(native) => self.execute_bytes_native(op, native, receiver, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -16926,6 +16964,8 @@ impl Interpreter<'_> {
                     }
                     (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => true,
                     (BuiltinId::Generator, Some(HeapObject::FiberObject { generator: true, .. })) => element.is_none() || self.heap.interface_matches(value, expected),
+                    (BuiltinId::Bytes, Some(HeapObject::Bytes(_))) => true,
+                    (BuiltinId::ByteBuffer, Some(HeapObject::ByteBuffer(_))) => true,
                     _ => false,
                 }
             }
@@ -17154,6 +17194,8 @@ impl Interpreter<'_> {
         };
         match self.heap.get(value) {
             Some(HeapObject::String(_)) => "String".to_owned(),
+            Some(HeapObject::Bytes(_)) => "Bytes".to_owned(),
+            Some(HeapObject::ByteBuffer(_)) => "ByteBuffer".to_owned(),
             Some(HeapObject::List(_)) => {
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::List(Some(element)) => Some(&**element),
@@ -20202,6 +20244,8 @@ impl Interpreter<'_> {
         match self.heap.get(value) {
             Some(HeapObject::Random { .. }) => "<random>".into(),
             Some(HeapObject::String(string)) => String::from_utf8_lossy(string.as_ref()).into_owned(),
+            Some(HeapObject::Bytes(bytes)) => format!("<Bytes length={}>", bytes.len()),
+            Some(HeapObject::ByteBuffer(buffer)) => format!("<ByteBuffer length={}>", buffer.len()),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::Proxy { .. }) => "<proxy>".into(),

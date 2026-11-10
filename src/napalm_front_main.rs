@@ -4931,7 +4931,7 @@ fn erase_unknown_type_parameters(argument: &str, known: &HashSet<String>) -> Str
     const BUILTIN: &[&str] = &[
         "ConcurrentMap", "ConcurrentSet", "Number", "String", "Boolean", "Array", "List", "Map", "Set", "Promise", "Event",
         "Emitter", "Channel", "Receiver", "Date", "Function", "Fn", "Object", "Range", "Fiber",
-        "Record", "Proxy",
+        "Record", "Proxy", "Bytes", "ByteBuffer",
     ];
     let mut out = String::with_capacity(argument.len());
     let mut word = String::new();

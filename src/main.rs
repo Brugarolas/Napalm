@@ -41,6 +41,7 @@
 #![feature(hint_prefetch)]
 
 pub mod napalm_builtin;
+pub mod napalm_bytes;
 pub mod napalm_collections;
 pub mod napalm_bytecode;
 pub mod napalm_bytecodecompiler;

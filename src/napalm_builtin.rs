@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -333,6 +333,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Bool,
         BuiltinClass::Num,
         BuiltinClass::String,
+        BuiltinClass::Bytes,
+        BuiltinClass::ByteBuffer,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -495,6 +497,69 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let result = string_right_add.emit1(Inst::StringConcat { left, right }, Type::String);
     string_right_add.ret(result);
     manifest.string_right_add = Some(string_right_add.finish());
+
+    // Native immutable Bytes and mutable ByteBuffer. These are ordinary
+    // runtime calls so both JIT tiers use the established GC-safe call ABI.
+    let bytes_class = instance(BuiltinClass::Bytes);
+    let buffer_class = instance(BuiltinClass::ByteBuffer);
+    for (name, arity, native) in [
+        ("empty", 0, BytesNative::BytesEmpty),
+        ("alloc", 1, BytesNative::BytesAlloc),
+        ("fromUtf8", 1, BytesNative::BytesFromUtf8),
+        ("fromArray", 1, BytesNative::BytesFromArray),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Bytes), name, MethodKind::Method, arity, NativeBuiltin::Bytes(native));
+    }
+    for arity in [0, 1] {
+        manifest.register_native(program, static_(BuiltinId::ByteBuffer), "new", MethodKind::Method, arity, NativeBuiltin::Bytes(BytesNative::BufferNew));
+    }
+    for (name, kind, arity, native) in [
+        ("length", MethodKind::Getter, 0, BytesNative::BytesLength),
+        ("isEmpty", MethodKind::Getter, 0, BytesNative::BytesIsEmpty),
+        ("[]", MethodKind::SubscriptGetter, 1, BytesNative::BytesIndex),
+        ("slice", MethodKind::Method, 1, BytesNative::BytesSlice),
+        ("slice", MethodKind::Method, 2, BytesNative::BytesSlice),
+        ("clone", MethodKind::Method, 0, BytesNative::BytesClone),
+        ("toUtf8", MethodKind::Method, 0, BytesNative::BytesToUtf8),
+        ("toArray", MethodKind::Method, 0, BytesNative::BytesToArray),
+        ("toMutable", MethodKind::Method, 0, BytesNative::BytesToMutable),
+        ("indexOf", MethodKind::Method, 1, BytesNative::BytesIndexOf),
+        ("toString", MethodKind::Getter, 0, BytesNative::BytesToString),
+        ("toString", MethodKind::Method, 0, BytesNative::BytesToString),
+        ("iterate", MethodKind::Method, 1, BytesNative::BytesIterate),
+        ("iteratorValue", MethodKind::Method, 1, BytesNative::BytesIteratorValue),
+    ] {
+        manifest.register_native(program, bytes_class, name, kind, arity, NativeBuiltin::Bytes(native));
+    }
+    for (name, kind, arity, native) in [
+        ("length", MethodKind::Getter, 0, BytesNative::BufferLength),
+        ("capacity", MethodKind::Getter, 0, BytesNative::BufferCapacity),
+        ("isEmpty", MethodKind::Getter, 0, BytesNative::BufferIsEmpty),
+        ("[]", MethodKind::SubscriptGetter, 1, BytesNative::BufferIndex),
+        ("[]=", MethodKind::SubscriptSetter, 2, BytesNative::BufferIndexSet),
+        ("append", MethodKind::Method, 1, BytesNative::BufferAppend),
+        ("reserve", MethodKind::Method, 1, BytesNative::BufferReserve),
+        ("resize", MethodKind::Method, 1, BytesNative::BufferResize),
+        ("writeUInt8", MethodKind::Method, 1, BytesNative::BufferWriteU8),
+        ("writeUInt16BE", MethodKind::Method, 1, BytesNative::BufferWriteU16BE),
+        ("writeUInt16LE", MethodKind::Method, 1, BytesNative::BufferWriteU16LE),
+        ("writeUInt32BE", MethodKind::Method, 1, BytesNative::BufferWriteU32BE),
+        ("writeUInt32LE", MethodKind::Method, 1, BytesNative::BufferWriteU32LE),
+        ("take", MethodKind::Method, 1, BytesNative::BufferTake),
+        ("peek", MethodKind::Method, 1, BytesNative::BufferPeek),
+        ("discard", MethodKind::Method, 1, BytesNative::BufferDiscard),
+        ("freeze", MethodKind::Method, 0, BytesNative::BufferFreeze),
+        ("clear", MethodKind::Method, 0, BytesNative::BufferClear),
+        ("fill", MethodKind::Method, 1, BytesNative::BufferFill),
+        ("indexOf", MethodKind::Method, 1, BytesNative::BufferIndexOf),
+        ("toUtf8", MethodKind::Method, 0, BytesNative::BufferToUtf8),
+        ("toString", MethodKind::Getter, 0, BytesNative::BufferToString),
+        ("toString", MethodKind::Method, 0, BytesNative::BufferToString),
+        ("iterate", MethodKind::Method, 1, BytesNative::BufferIterate),
+        ("iteratorValue", MethodKind::Method, 1, BytesNative::BufferIteratorValue),
+    ] {
+        manifest.register_native(program, buffer_class, name, kind, arity, NativeBuiltin::Bytes(native));
+    }
 
     // List.
     let list = instance(BuiltinClass::List);

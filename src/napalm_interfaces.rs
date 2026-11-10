@@ -213,6 +213,15 @@ impl Heap {
                 plan.push((value, expected.clone()));
                 true
             }
+            // Binary builtins carry no generic payload or persistent contract.
+            // BindInterface still validates them when a value is assigned through
+            // an `any`-typed expression or a method with an unknown return type.
+            Type::Builtin(BuiltinId::Bytes, None) => {
+                matches!(self.get(value), Some(HeapObject::Bytes(_)))
+            }
+            Type::Builtin(BuiltinId::ByteBuffer, None) => {
+                matches!(self.get(value), Some(HeapObject::ByteBuffer(_)))
+            }
             Type::Builtin(BuiltinId::Generator, element) => {
                 if !matches!(self.get(value), Some(HeapObject::FiberObject { generator: true, .. })) {
                     return Err(mismatch(path, expected));
