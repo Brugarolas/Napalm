@@ -42,9 +42,6 @@ fusiona en preparación (`install_superinstructions`).
 
 ## Pendiente
 
-- [ ] `MapLookupOrInsert`: runtime + JITs (merge con master).
-- [ ] Instancias con campos inline en el objeto gestionado (hoy `Box<[Value]>`:
-      cada `new` hace un malloc; es el coste dominante restante de `NewClassInstance`).
 - [ ] Reenvío store→load en trazas (constructor inlineado seguido de lecturas).
 - [ ] `len2(p)` con `p` instancia de una clase `implements V`: el bind estructural no se puede demostrar no-op en la traza.
 - [ ] Desbloquear Loop Fusion y Deforestation en todos los loops, no como ahora que estan bloqueados en algunas situaciones

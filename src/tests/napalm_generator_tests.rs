@@ -179,8 +179,8 @@ fn napalm_generators_void_return_and_runtime_names() {
 
 #[test]
 fn napalm_generators_iterator_close_only_guards_possible_generators() {
-    // A protected region disables deforestation and loop fusion, so only an
-    // iterable that may be a Generator pays for IteratorClose.
+    // Only an iterable that may be a Generator needs IteratorClose and its
+    // exceptional control-flow edges.
     let regions = |source: &str| {
         let parsed = crate::napalm_front_main::parse("iterator_close.napalm", source);
         assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);

@@ -2,8 +2,8 @@
 //!
 //! Accepts two canonical single-body loops whose headers compare Int32
 //! induction parameters against an identical, loop-invariant bound, with the
-//! same initial index and +1 latch. The two loops must be adjacent through an
-//! empty fallthrough block and have no exceptional regions, observable effects,
+//! same initial index, comparison and constant nonzero stride. The loops must
+//! be adjacent and have no observable effects,
 //! calls, guards, deopts, safepoints, or external dependencies on the first loop.
 //!
 //! The second loop's side-effect-free body is moved into the first loop after
@@ -35,15 +35,12 @@ pub struct LoopFusion {
     pub stats: LoopFusionStats,
 }
 
-// Bound the combined live SSA state and native register pressure.
-const MAX_CARRIED_VALUES: usize = 12;
-const MAX_COMBINED_BODY_NODES: usize = 96;
-
 struct Plan {
     preheader: usize,
     first_header: usize,
     first_body: usize,
     gap: Option<usize>,
+    gap_preparation: Vec<InstId>,
     second_header: usize,
     second_body: usize,
     first_index: usize,
@@ -62,15 +59,20 @@ impl FunctionOptimization for LoopFusion {
             let preds = predecessors(function);
             for header in 0..function.blocks.len() {
                 if let Some(plan) = find_plan(function, header, &preds) {
-                    selected = Some(plan);
-                    break;
+                    let counts = (plan.moved.len(), plan.second_initial.len().saturating_sub(1));
+                    let mut candidate = function.clone();
+                    apply_plan(&mut candidate, plan);
+                    if crate::napalm_bytecodecompiler::check_register_allocation(&candidate).is_ok() {
+                        selected = Some((candidate, counts));
+                        break;
+                    }
                 }
             }
-            let Some(plan) = selected else { break };
+            let Some((candidate, (instructions, carried))) = selected else { break };
             self.stats.fused_pairs += 1;
-            self.stats.merged_body_instructions += plan.moved.len();
-            self.stats.merged_carried_values += plan.second_initial.len().saturating_sub(1);
-            apply_plan(function, plan);
+            self.stats.merged_body_instructions += instructions;
+            self.stats.merged_carried_values += carried;
+            *function = candidate;
             changed = true;
         }
         changed
@@ -89,13 +91,20 @@ fn predecessors(function: &Function) -> Vec<Vec<usize>> {
             }
         }
     }
+    for region in &function.exception_regions {
+        for block in &region.protected_blocks {
+            let entry = &mut preds[region.handler.0 as usize];
+            let source = block.0 as usize;
+            if !entry.contains(&source) { entry.push(source); }
+        }
+    }
     preds
 }
 
-fn protected(function: &Function, block: usize) -> bool {
+fn is_handler(function: &Function, block: usize) -> bool {
     let id = function.blocks[block].id;
     function.exception_regions.iter().any(|region| {
-        region.handler == id || region.protected_blocks.contains(&id)
+        region.handler == id
     })
 }
 
@@ -103,20 +112,20 @@ fn terminator(function: &Function, block: usize) -> Option<&Inst> {
     function.blocks[block].insts.last().and_then(|id| function.node(*id)).map(|node| &node.kind)
 }
 
-fn cmp_header(function: &Function, block: usize) -> Option<(ValueId, ValueId, Edge, Edge)> {
+fn cmp_header(function: &Function, block: usize) -> Option<(CmpKind, ValueId, ValueId, Edge, Edge)> {
     let ids = &function.blocks[block].insts;
     let &[cmp, branch] = ids.as_slice() else { return None };
-    let Inst::CmpInt { kind: CmpKind::Lt, left, right } = &function.node(cmp)?.kind else { return None };
+    let Inst::CmpInt { kind, left, right } = &function.node(cmp)?.kind else { return None };
     let [result] = function.node(cmp)?.results.as_slice() else { return None };
     let Inst::Branch { cond, then_edge, else_edge } = &function.node(branch)?.kind else { return None };
     if *result != *cond {
         return None;
     }
-    Some((*left, *right, then_edge.clone(), else_edge.clone()))
+    Some((*kind, *left, *right, then_edge.clone(), else_edge.clone()))
 }
 
-fn i32_literal(function: &Function, mut value: ValueId) -> Option<i32> {
-    for _ in 0..8 {
+pub(super) fn i32_literal(function: &Function, mut value: ValueId) -> Option<i32> {
+    for _ in 0..function.values.len() {
         let ValueDef::InstResult(id, 0) = function.value(value)?.def else { return None };
         match &function.node(id)?.kind {
             Inst::Const(Constant::Int32(x)) => return Some(*x),
@@ -133,51 +142,67 @@ fn equal_scalar(function: &Function, a: ValueId, b: ValueId) -> bool {
 
 fn available_at_preheader(function: &Function, value: ValueId, preheader: usize) -> bool {
     let Some(value) = function.value(value) else { return false };
-    match value.def {
-        ValueDef::CaptureParam(_) => true,
-        ValueDef::BlockParam(block, _) => block == function.entry || block.0 as usize == preheader,
-        ValueDef::InstResult(id, _) => {
-            function.blocks[preheader].insts.iter().any(|candidate| *candidate == id)
-        }
+    let (owner, instruction) = match value.def {
+        ValueDef::CaptureParam(_) => return true,
+        ValueDef::BlockParam(block, _) => (block.0 as usize, false),
+        ValueDef::InstResult(id, _) => match function.blocks.iter().position(|block| block.insts.contains(&id)) {
+            Some(owner) => (owner, true),
+            None => return false,
+        },
+    };
+    // Walk every incoming path, including exceptional control flow. An
+    // instruction in a protected block is not necessarily executed before
+    // that block throws into a handler; block parameters, however, are set.
+    let preds = predecessors(function);
+    let mut pending = vec![preheader];
+    let mut visited = vec![false; function.blocks.len()];
+    let mut reaches_owner = false;
+    while let Some(block) = pending.pop() {
+        if block == owner { reaches_owner = true; continue; }
+        if visited[block] { continue; }
+        visited[block] = true;
+        if block == function.entry.0 as usize || preds[block].is_empty() { return false; }
+        if instruction && function.exception_regions.iter().any(|region| {
+            region.handler.0 as usize == block
+                && region.protected_blocks.contains(&BlockId(owner as u32))
+        }) { return false; }
+        pending.extend_from_slice(&preds[block]);
     }
+    reaches_owner
 }
 
-fn incremented_by_one(function: &Function, index: ValueId, next: ValueId) -> bool {
+fn constant_stride(function: &Function, index: ValueId, next: ValueId) -> Option<i32> {
     let Some(Value { def: ValueDef::InstResult(id, 0), .. }) = function.value(next) else {
-        return false;
+        return None;
     };
     match function.node(*id).map(|node| &node.kind) {
         Some(Inst::IntBin { op: IntBinOp::Add, left, right }) => {
-            *left == index && i32_literal(function, *right) == Some(1)
+            if *left == index { i32_literal(function, *right) }
+            else if *right == index { i32_literal(function, *left) }
+            else { None }
         }
-        _ => false,
+        Some(Inst::IntBin { op: IntBinOp::Sub, left, right }) if *left == index => {
+            i32_literal(function, *right).map(i32::wrapping_neg)
+        }
+        _ => None,
     }
 }
 
 fn safe_body_instruction(
+    function: &Function,
     kind: &Inst,
-    result: Option<ValueId>,
-    index_update: ValueId,
     induction: ValueId,
     bounded_list: Option<ValueId>,
 ) -> bool {
     match kind {
-        Inst::Const(_) | Inst::Move(_) | Inst::CmpInt { .. } | Inst::CmpF64 { .. }
-        | Inst::RefEq { .. } | Inst::F64Bin { .. } | Inst::F64Unary { .. }
-        | Inst::Int32ToNum { .. } | Inst::F64ToNum { .. } => true,
         Inst::ListGet { list, index } => bounded_list == Some(*list) && *index == induction,
-        Inst::IntBin { op, .. } => {
-            matches!(op, IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor)
-                || (matches!(op, IntBinOp::Add) && result == Some(index_update))
-        }
-        _ => false,
+        _ => super::deforestation::movable_computation(function, kind),
     }
 }
 
 fn body_is_pure(
     function: &Function,
     block: usize,
-    index_update: ValueId,
     induction: ValueId,
     bounded_list: Option<ValueId>,
 ) -> bool {
@@ -185,7 +210,7 @@ fn body_is_pure(
     ids.len() > 1 && ids[..ids.len() - 1].iter().all(|&id| {
         let node = &function.nodes[id.0 as usize];
         safe_body_instruction(
-            &node.kind, node.results.first().copied(), index_update, induction, bounded_list,
+            function, &node.kind, induction, bounded_list,
         )
     })
 }
@@ -213,6 +238,7 @@ fn body_inputs_available(
     body: usize,
     second_header: usize,
     preheader: usize,
+    available: &[ValueId],
 ) -> bool {
     let mut seen = Vec::<ValueId>::new();
     // Include the backedge arguments: they become operands of the first loop
@@ -220,7 +246,7 @@ fn body_inputs_available(
     for &id in &function.blocks[body].insts {
         let node = &function.nodes[id.0 as usize];
         for operand in node.kind.operands() {
-            if seen.contains(&operand) {
+            if seen.contains(&operand) || available.contains(&operand) {
                 continue;
             }
             match function.value(operand).map(|value| value.def) {
@@ -255,7 +281,7 @@ fn body_results_do_not_escape(function: &Function, body: usize) -> bool {
 }
 
 fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> Option<Plan> {
-    let (i1, bound1, first_body_edge, first_exit_edge) = cmp_header(function, first_header)?;
+    let (cmp1, i1, bound1, first_body_edge, first_exit_edge) = cmp_header(function, first_header)?;
     let first_body = first_body_edge.target.0 as usize;
     let fallthrough = first_exit_edge.target.0 as usize;
     if first_body == fallthrough || first_body == first_header || fallthrough == first_header
@@ -265,9 +291,9 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
         return None;
     }
     // `ControlFlowCleanup` threads empty Jump blocks before this pass runs.
-    // Accept both the original pre-cleanup gap and a direct H1 -> H2 edge.
+    // Accept an empty gap, a gap containing independent total initialization,
+    // or a direct H1 -> H2 edge. Initialization is hoisted before both loops.
     let (gap, second_start) = if function.blocks.get(fallthrough)?.params.is_empty()
-        && function.blocks[fallthrough].insts.len() == 1
         && first_exit_edge.args.is_empty()
     {
         match terminator(function, fallthrough)? {
@@ -281,7 +307,7 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
     if second_header == first_header || second_header == first_body {
         return None;
     }
-    let (i2, bound2, second_body_edge, second_exit) = cmp_header(function, second_header)?;
+    let (cmp2, i2, bound2, second_body_edge, second_exit) = cmp_header(function, second_header)?;
     let second_body = second_body_edge.target.0 as usize;
     if second_body == second_header || Some(second_body) == gap
         || second_body == first_body || second_body == first_header
@@ -297,6 +323,7 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
     if !matches!(function.value(i1).map(|v| &v.ty), Some(Type::Int32))
         || !matches!(function.value(i2).map(|v| &v.ty), Some(Type::Int32))
         || !equal_scalar(function, bound1, bound2)
+        || cmp1 != cmp2
     {
         return None;
     }
@@ -307,9 +334,11 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
         || first_back.args.len() != first_params.len()
         || second_back.args.len() != second_params.len()
         || second_start.args.len() != second_params.len()
-        || !incremented_by_one(function, i1, first_back.args[first_index])
-        || !incremented_by_one(function, i2, second_back.args[second_index])
     {
+        return None;
+    }
+    let stride = constant_stride(function, i1, first_back.args[first_index])?;
+    if stride == 0 || constant_stride(function, i2, second_back.args[second_index]) != Some(stride) {
         return None;
     }
 
@@ -326,16 +355,27 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
         return None;
     }
     let Inst::Jump { edge: first_start } = terminator(function, preheader)? else { return None };
+    let gap_preparation = if let Some(gap) = gap {
+        let ids = &function.blocks[gap].insts;
+        if !ids[..ids.len() - 1].iter().all(|&id| {
+            super::deforestation::movable_computation(function, &function.nodes[id.0 as usize].kind)
+        }) || !body_inputs_available(function, gap, gap, preheader, &[]) {
+            return None;
+        }
+        ids[..ids.len() - 1].to_vec()
+    } else { Vec::new() };
+    let gap_values: Vec<_> = gap_preparation.iter()
+        .flat_map(|id| function.nodes[id.0 as usize].results.iter().copied()).collect();
     if first_start.target.0 as usize != first_header
         || first_start.args.len() != first_params.len()
         || !equal_scalar(function, first_start.args[first_index], second_start.args[second_index])
         || !available_at_preheader(function, bound1, preheader)
-        || !available_at_preheader(function, bound2, preheader)
+        || (!gap_values.contains(&bound2) && !available_at_preheader(function, bound2, preheader))
     {
         return None;
     }
-    if [Some(preheader), Some(first_header), Some(first_body), gap, Some(second_header), Some(second_body)]
-        .into_iter().flatten().any(|block| protected(function, block))
+    if [Some(first_header), Some(first_body), gap, Some(second_header), Some(second_body)]
+        .into_iter().flatten().any(|block| is_handler(function, block))
         || function.deopts.iter().any(|deopt| {
             // Moving a block can invalidate liveness/location at an OSR/deopt
             // point. Reject any snapshots until virtual-state remapping exists.
@@ -349,27 +389,24 @@ fn find_plan(function: &Function, first_header: usize, preds: &[Vec<usize>]) -> 
     {
         return None;
     }
-    if first_params.len() + second_params.len() > MAX_CARRIED_VALUES
-        || function.blocks[first_body].insts.len() + function.blocks[second_body].insts.len() > MAX_COMBINED_BODY_NODES
-    {
-        return None;
-    }
-    let read_list = bounded_list(function, bound1, first_start.args[first_index], preheader);
-    if !body_is_pure(function, first_body, first_back.args[first_index], i1, read_list)
-        || !body_is_pure(function, second_body, second_back.args[second_index], i2, read_list)
-        || !body_inputs_available(function, second_body, second_header, preheader)
+    let read_list = if cmp1 == CmpKind::Lt && stride == 1 {
+        bounded_list(function, bound1, first_start.args[first_index], preheader)
+    } else { None };
+    if !body_is_pure(function, first_body, i1, read_list)
+        || !body_is_pure(function, second_body, i2, read_list)
+        || !body_inputs_available(function, second_body, second_header, preheader, &gap_values)
         || !body_results_do_not_escape(function, second_body)
     {
         return None;
     }
     // Initial reduction values must be available before either loop, not a
     // result from the preceding loop. All remaining state is passed through SSA.
-    if second_start.args.iter().any(|arg| !available_at_preheader(function, *arg, preheader)) {
+    if second_start.args.iter().any(|arg| !gap_values.contains(arg) && !available_at_preheader(function, *arg, preheader)) {
         return None;
     }
     let moved = function.blocks[second_body].insts[..function.blocks[second_body].insts.len() - 1].to_vec();
     Some(Plan {
-        preheader, first_header, first_body, gap, second_header, second_body,
+        preheader, first_header, first_body, gap, gap_preparation, second_header, second_body,
         first_index, second_index,
         second_initial: second_start.args.clone(),
         second_next: second_back.args.clone(),
@@ -453,7 +490,10 @@ fn apply_plan(function: &mut Function, plan: Plan) {
     // state through the second header after the fallthrough redirect.
     if let Some(gap) = plan.gap {
         let old_gap_jump = *function.blocks[gap].insts.last().expect("gap jump");
+        function.blocks[gap].insts = vec![old_gap_jump];
         function.nodes[old_gap_jump.0 as usize].kind = Inst::Unreachable;
+        let insert_at = function.blocks[plan.preheader].insts.len() - 1;
+        function.blocks[plan.preheader].insts.splice(insert_at..insert_at, plan.gap_preparation);
     }
 
     for index in [Some(plan.preheader), Some(plan.first_header), Some(plan.first_body),
@@ -681,5 +721,159 @@ mod tests {
         }
         assert!(!LoopFusion::default().optimize_function(function));
         crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    fn integer_reductions(
+        carried: usize, work: usize, comparison: CmpKind,
+        start: i32, limit: i32, stride: i32, protected: bool, first_temporaries: usize,
+    ) -> (Program, crate::napalm_ir::FuncId) {
+        let mut program = Program::new();
+        let module = program.add_module("integer_fusion", 0);
+        let mut b = Builder::new(
+            &mut program, module, "integer_fusion", FunctionKind::ModuleBody, vec![], Type::Num,
+        );
+        let bound = b.const_i32(limit);
+        let initial = b.const_i32(start);
+        let zero = b.const_i32(0);
+        let one = b.const_i32(1);
+        let step = b.const_i32(stride.abs());
+        let first_carried = if first_temporaries == 0 { carried } else { 1 };
+        // Definitions are in an ancestor of the immediate preheader.
+        let preheader = b.new_block(&[]);
+        let h1 = b.new_block(&vec![Type::Int32; first_carried + 1]);
+        let b1 = b.new_block(&[]);
+        let gap = b.new_block(&[]);
+        let h2 = b.new_block(&vec![Type::Int32; carried + 1]);
+        let b2 = b.new_block(&[]);
+        let exit = b.new_block(&[]);
+        let handler = b.new_block(&[Type::Top]);
+        if protected {
+            let error = b.block_param(handler, 0);
+            b.add_exception_region(vec![BlockId(0), preheader, h1, b1, gap, h2, b2, exit], handler, error, 0);
+        }
+        b.jump(preheader, vec![]);
+        b.position_at(preheader);
+        let mut args = vec![zero; first_carried + 1];
+        args[0] = initial;
+        b.jump(h1, args);
+        let mut final_values = Vec::new();
+        for (header, body, next, count) in [(h1, b1, gap, first_carried), (h2, b2, exit, carried)] {
+            if header == h2 {
+                b.position_at(gap);
+                // Independent initialization between loops must be hoisted.
+                let second_zero = b.const_i32(0);
+                let second_initial = b.const_i32(start);
+                let mut args = vec![second_zero; count + 1];
+                args[0] = second_initial;
+                b.jump(h2, args);
+            }
+            b.position_at(header);
+            let index = b.block_param(header, 0);
+            let cond = b.emit1(Inst::CmpInt { kind: comparison, left: index, right: bound }, Type::Bool);
+            b.branch(cond, body, vec![], next, vec![]);
+            b.position_at(body);
+            let mut temporary_values = Vec::new();
+            if header == h1 {
+                for offset in 0..first_temporaries {
+                    let constant = b.const_i32(offset as i32);
+                    temporary_values.push(b.emit1(Inst::IntBin {
+                        op: IntBinOp::Add, left: index, right: constant,
+                    }, Type::Int32));
+                }
+            }
+            let mut values = Vec::new();
+            for accumulator in 1..=count {
+                let param = b.block_param(header, accumulator);
+                final_values.push(param);
+                let mut value = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: param, right: index }, Type::Int32);
+                for _ in 0..work {
+                    value = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: value, right: one }, Type::Int32);
+                }
+                for &temporary in &temporary_values {
+                    value = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: value, right: temporary }, Type::Int32);
+                }
+                values.push(value);
+            }
+            let next_index = b.emit1(Inst::IntBin {
+                op: if stride > 0 { IntBinOp::Add } else { IntBinOp::Sub }, left: index, right: step,
+            }, Type::Int32);
+            values.insert(0, next_index);
+            b.jump(header, values);
+        }
+        b.position_at(exit);
+        let mut sum = zero;
+        for value in final_values {
+            sum = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: sum, right: value }, Type::Int32);
+        }
+        let result = b.emit1(Inst::Int32ToNum { value: sum }, Type::Num);
+        b.ret(result);
+        b.position_at(handler);
+        let failed = b.const_num(-999.0);
+        b.ret(failed);
+        let entry = b.finish();
+        (program, entry)
+    }
+
+    #[test]
+    fn fuses_large_integer_loops_in_try_with_dominating_and_gap_initialization() {
+        let (mut program, entry) = integer_reductions(8, 8, CmpKind::Lt, 0, 5, 1, true, 0);
+        let before = run_module(&program, entry);
+        assert_eq!(before, 800.0);
+        let mut pass = LoopFusion::default();
+        assert!(pass.optimize_function(&mut program.functions[entry.0 as usize]));
+        assert_eq!(pass.stats.fused_pairs, 1);
+        assert_eq!(pass.stats.merged_carried_values, 8);
+        crate::napalm_ir::verify_function(&program.functions[entry.0 as usize]).unwrap();
+        assert_eq!(run_module(&program, entry), before);
+    }
+
+    #[test]
+    fn fuses_descending_inclusive_strided_and_empty_iteration_spaces() {
+        for (comparison, start, bound, stride, expected) in [
+            (CmpKind::Gt, 5, 0, -1, 40.0),
+            (CmpKind::Ge, 4, 0, -2, 18.0),
+            (CmpKind::Le, 0, 4, 2, 18.0),
+            (CmpKind::Ne, 0, 5, 1, 30.0),
+            (CmpKind::Lt, 5, 0, 1, 0.0),
+        ] {
+            let (mut program, entry) = integer_reductions(1, 1, comparison, start, bound, stride, false, 0);
+            assert_eq!(run_module(&program, entry), expected);
+            assert!(LoopFusion::default().optimize_function(&mut program.functions[entry.0 as usize]));
+            crate::napalm_ir::verify_function(&program.functions[entry.0 as usize]).unwrap();
+            assert_eq!(run_module(&program, entry), expected);
+        }
+    }
+
+    #[test]
+    fn retains_separate_loops_when_fusion_would_exhaust_bytecode_registers() {
+        let (mut program, entry) = integer_reductions(100, 1, CmpKind::Lt, 0, 5, 1, false, 180);
+        let before = run_module(&program, entry);
+        let function = &mut program.functions[entry.0 as usize];
+        // The transformation is semantically legal, but its simultaneous live
+        // values exceed the real backend limit. Keep the compilable original.
+        let plan = find_plan(function, 2, &predecessors(function)).expect("legal fusion candidate");
+        let mut candidate = function.clone();
+        apply_plan(&mut candidate, plan);
+        assert!(matches!(crate::napalm_bytecodecompiler::check_register_allocation(&candidate),
+            Err(crate::napalm_bytecodecompiler::CompileError::RegisterPressure { .. })));
+        assert!(!LoopFusion::default().optimize_function(function));
+        assert_eq!(run_module(&program, entry), before);
+    }
+
+    #[test]
+    fn exceptional_predecessor_does_not_make_late_instruction_available() {
+        let mut program = Program::new();
+        let module = program.add_module("availability", 0);
+        let mut b = Builder::new(&mut program, module, "availability", FunctionKind::Closure, vec![], Type::Int32);
+        let handler = b.new_block(&[Type::Top]);
+        let error = b.block_param(handler, 0);
+        let late = b.const_i32(42);
+        b.ret(late);
+        b.add_exception_region(vec![BlockId(0)], handler, error, 0);
+        b.position_at(handler);
+        let fallback = b.const_i32(0);
+        b.ret(fallback);
+        let entry = b.finish();
+        assert!(!available_at_preheader(&program.functions[entry.0 as usize], late, handler.0 as usize));
     }
 }

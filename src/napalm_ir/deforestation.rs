@@ -4,27 +4,24 @@
 //! even when the intermediate list is only used to append into another newly
 //! allocated list. This pass removes that intermediate allocation and its copy.
 //!
-//! Supported producers, in one basic block:
-//!   * `AllocList(None); ListAppend(tmp, value)*`
-//!   * `AllocList(None); ListSpread(tmp, known_list); ListAppend(tmp, value)*`
+//! Supported producers, in one basic block: a fresh `AllocList` followed by
+//! any mixture of `ListAppend(tmp, value)` and `ListSpread(tmp, known_list)`,
 //! followed by exactly one `ListSpread(dst, tmp)` consumer.
 //!
 //! The destination must be a different fresh, uncontracted list. Intermediate
 //! instructions must be total, effect-free computations; no invokes, guards,
-//! safepoints, handlers or observable aliases are permitted. All writes are
-//! delayed to the original consumer site, preserving evaluation-before-write
-//! ordering. The source's spread is emitted exactly once, before appended values.
+//! safepoints or observable aliases are permitted. Producer writes retain their
+//! positions and target the unobservable destination directly. This preserves
+//! spread snapshots and value lifetimes even for large builders and in handlers.
 //!
-//! The producer ListSpread result is replaced with `true` only when its source
-//! has a guaranteed List semantic type; an arbitrary iterable is never folded.
+//! The consumer ListSpread result is replaced with `true`; producer spreads
+//! require a guaranteed List semantic type. An arbitrary iterable is not folded.
 //! All other escape/alias patterns deliberately fall back to the original IR.
 
 use crate::napalm_ir::{
     Constant, Function, Inst, InstId, Type, ValueDef, ValueId,
 };
 use crate::napalm_ir_optimizer::{repair_effect_chain, FunctionOptimization};
-
-const MAX_APPENDS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeforestationStats {
@@ -42,7 +39,7 @@ pub struct Deforestation {
 struct Plan {
     block: usize,
     allocation: InstId,
-    producer_spread: Option<(InstId, ValueId)>,
+    spreads: Vec<InstId>,
     appends: Vec<InstId>,
     consumer: InstId,
     destination: ValueId,
@@ -70,12 +67,22 @@ impl FunctionOptimization for Deforestation {
 
 /// Only operations whose execution cannot throw, deoptimize, suspend, allocate,
 /// mutate state or invoke language code may be crossed by moved list writes.
-fn movable_computation(inst: &Inst) -> bool {
+pub(super) fn movable_computation(function: &Function, inst: &Inst) -> bool {
+    if let Inst::NumToF64 { value } = inst {
+        return matches!(function.value(*value).map(|value| &value.ty), Some(Type::Num));
+    }
     matches!(
         inst,
         Inst::Const(_)
             | Inst::Move(_)
-            | Inst::IntBin { op: crate::napalm_ir::IntBinOp::BitAnd
+            | Inst::IntUnary { .. }
+            | Inst::IntBin { op: crate::napalm_ir::IntBinOp::Add
+                | crate::napalm_ir::IntBinOp::Sub
+                | crate::napalm_ir::IntBinOp::Mul
+                | crate::napalm_ir::IntBinOp::Shl
+                | crate::napalm_ir::IntBinOp::ShrU
+                | crate::napalm_ir::IntBinOp::Sar
+                | crate::napalm_ir::IntBinOp::BitAnd
                 | crate::napalm_ir::IntBinOp::BitOr
                 | crate::napalm_ir::IntBinOp::BitXor, .. }
             | Inst::CmpInt { .. }
@@ -90,7 +97,7 @@ fn movable_computation(inst: &Inst) -> bool {
 
 fn is_fresh_list(function: &Function, value: ValueId, block: usize, before: usize) -> Option<usize> {
     let value_info = function.value(value)?;
-    if !matches!(&value_info.ty, Type::List(None)) {
+    if !matches!(&value_info.ty, Type::List(_)) {
         return None;
     }
     let ValueDef::InstResult(id, 0) = value_info.def else {
@@ -107,13 +114,16 @@ fn is_unaliased_external_list(function: &Function, source: ValueId, block: usize
     if !matches!(function.value(source).map(|value| &value.ty), Some(Type::List(_))) {
         return false;
     }
-    // A source allocated earlier in this same block could be the destination
-    // through aliases. Restrict this fast path to an SSA value that cannot be
-    // the destination newly allocated in this block.
+    // A value defined before the destination exists cannot alias it. Distinct
+    // allocations after it are also safe; arbitrary later aliases are not.
     match function.value(source).map(|value| value.def) {
         Some(ValueDef::CaptureParam(_)) | Some(ValueDef::BlockParam(_, _)) => true,
-        Some(ValueDef::InstResult(id, _)) => !function.blocks[block].insts[..=destination_at].contains(&id)
-            && !function.blocks[block].insts[destination_at + 1..].contains(&id),
+        Some(ValueDef::InstResult(id, _)) => {
+            let ids = &function.blocks[block].insts;
+            ids[..destination_at].contains(&id) || !ids.contains(&id)
+                || (id != ids[destination_at]
+                    && matches!(function.node(id).map(|node| &node.kind), Some(Inst::AllocList { .. })))
+        }
         None => false,
     }
 }
@@ -142,24 +152,32 @@ fn operand_use_counts(function: &Function) -> Vec<usize> {
 }
 
 fn find_plan(function: &Function, block_ix: usize, uses: &[usize]) -> Option<Plan> {
-    if function.exception_regions.iter().any(|region| region.protected_blocks.contains(&function.blocks[block_ix].id)) {
-        return None;
-    }
     let ids = &function.blocks[block_ix].insts;
     for (start, &allocation) in ids.iter().enumerate() {
         let alloc_node = function.node(allocation)?;
-        if !matches!(&alloc_node.kind, Inst::AllocList { capacity: None }) {
+        // Inferred element types do not install contracts. All uses between
+        // allocation and consumer are checked below, excluding BindInterface.
+        // Literal capacities are hints; negative/dynamic capacities must retain
+        // their validation and cannot be removed.
+        let safe_allocation = match &alloc_node.kind {
+            Inst::AllocList { capacity: None } => true,
+            Inst::AllocList { capacity: Some(value) } => {
+                super::loop_fusion::i32_literal(function, *value).is_some_and(|value| value >= 0)
+            }
+            _ => false,
+        };
+        if !safe_allocation {
             continue;
         }
         let &[tmp] = alloc_node.results.as_slice() else { continue };
-        if !matches!(function.value(tmp).map(|value| &value.ty), Some(Type::List(None)))
+        if !matches!(function.value(tmp).map(|value| &value.ty), Some(Type::List(_)))
             || has_snapshot_use(function, tmp)
         {
             continue;
         }
 
         let mut appends = Vec::new();
-        let mut producer_spread = None;
+        let mut spreads = Vec::new();
         let mut consumer = None;
         for (index, &id) in ids.iter().enumerate().skip(start + 1) {
             let kind = &function.node(id)?.kind;
@@ -168,18 +186,18 @@ fn find_plan(function: &Function, block_ix: usize, uses: &[usize]) -> Option<Pla
                     consumer = Some((index, id, *list));
                     break;
                 }
-                if *list == tmp && producer_spread.is_none() && appends.is_empty() {
-                    producer_spread = Some((id, *source));
+                if *list == tmp {
+                    spreads.push(id);
                     continue;
                 }
             }
             if let Inst::ListAppend { list, .. } = kind {
-                if *list == tmp && appends.len() < MAX_APPENDS {
+                if *list == tmp {
                     appends.push(id);
                     continue;
                 }
             }
-            if !movable_computation(kind) {
+            if !movable_computation(function, kind) {
                 break;
             }
             // Disallow computing aliases of the temporary list even if the
@@ -207,25 +225,20 @@ fn find_plan(function: &Function, block_ix: usize, uses: &[usize]) -> Option<Pla
         // No other SSA use of the temporary or of the producer spread's result
         // requires its identity. A producer ListSpread result is a guaranteed true
         // Bool and may be used by pure computations before the final copy.
-        let source = producer_spread.map(|(_, value)| value);
-        if let Some(source) = source {
-            if source == destination || source == tmp
-                || !is_unaliased_external_list(function, source, block_ix, dst_start)
-            {
-                continue;
-            }
+        if spreads.iter().any(|&id| {
+            let Inst::ListSpread { source, .. } = &function.nodes[id.0 as usize].kind else { return true };
+            *source == destination || *source == tmp
+                || !is_unaliased_external_list(function, *source, block_ix, dst_start)
+                || function.nodes[id.0 as usize].results.len() != 1
+        }) {
+            continue;
         }
         // Every use must be the List operand of a recognized initializing
         // append/spread or the source operand of the final copy. Counting raw
         // occurrences also catches self-appends (tmp is used twice).
-        let expected_uses = appends.len() + usize::from(producer_spread.is_some()) + 1;
+        let expected_uses = appends.len() + spreads.len() + 1;
         if uses.get(tmp.0 as usize).copied() != Some(expected_uses) {
             continue;
-        }
-        if let Some((id, _)) = producer_spread {
-            if !matches!(function.node(id)?.results.as_slice(), [_]) {
-                continue;
-            }
         }
         if !matches!(function.node(consumer_id)?.results.as_slice(), [_]) {
             continue;
@@ -242,7 +255,7 @@ fn find_plan(function: &Function, block_ix: usize, uses: &[usize]) -> Option<Pla
         return Some(Plan {
             block: block_ix,
             allocation,
-            producer_spread,
+            spreads,
             appends,
             consumer: consumer_id,
             destination,
@@ -252,34 +265,17 @@ fn find_plan(function: &Function, block_ix: usize, uses: &[usize]) -> Option<Pla
 }
 
 fn apply_plan(function: &mut Function, plan: &Plan) {
-    let ids = &mut function.blocks[plan.block].insts;
-    ids.retain(|id| *id != plan.allocation && !plan.appends.contains(id));
-
-    let position = ids.iter().position(|id| *id == plan.consumer)
-        .expect("deforestation consumer must remain live");
-
-    // For a copied input List, the original consumer becomes a direct spread
-    // of the input into the destination. Otherwise it becomes the successful
-    // Bool result of appending a known List. Both preserve the result ValueId.
-    if let Some((producer, source)) = plan.producer_spread {
-        function.nodes[plan.consumer.0 as usize].kind = Inst::ListSpread {
-            list: plan.destination,
-            source,
-        };
-        function.nodes[producer.0 as usize].kind = Inst::Const(Constant::Bool(true));
-    } else {
-        function.nodes[plan.consumer.0 as usize].kind = Inst::Const(Constant::Bool(true));
-    }
-
-    for &id in &plan.appends {
-        if let Inst::ListAppend { list, .. } = &mut function.nodes[id.0 as usize].kind {
-            *list = plan.destination;
+    function.blocks[plan.block].insts.retain(|id| *id != plan.allocation);
+    function.nodes[plan.consumer.0 as usize].kind = Inst::Const(Constant::Bool(true));
+    // No destination use or throwing operation can observe these earlier
+    // writes. Keeping their positions avoids extending every appended value's
+    // live range to the consumer (and exhausting the bytecode registers).
+    for &id in plan.appends.iter().chain(&plan.spreads) {
+        match &mut function.nodes[id.0 as usize].kind {
+            Inst::ListAppend { list, .. } | Inst::ListSpread { list, .. } => *list = plan.destination,
+            _ => unreachable!("recognized list producer"),
         }
     }
-
-    // Place the delayed appends *after* any directly-copied input List.
-    let insert_at = if plan.producer_spread.is_some() { position + 1 } else { position };
-    function.blocks[plan.block].insts.splice(insert_at..insert_at, plan.appends.iter().copied());
     repair_effect_chain(function, plan.block);
 }
 
@@ -432,5 +428,81 @@ mod tests {
         let ValueDef::InstResult(result_inst, 0) = function.values[flag.0 as usize].def else { panic!("missing result producer") };
         assert!(matches!(&function.nodes[result_inst.0 as usize].kind, Inst::Const(Constant::Bool(true))));
         crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    fn large_protected_builder(throw_during_build: bool) -> (Program, crate::napalm_ir::FuncId) {
+        use crate::napalm_ir::{BlockId, F64BinOp, IntBinOp};
+        let mut program = Program::new();
+        let module = program.add_module("large_builder", 0);
+        let mut builder = Builder::new(
+            &mut program, module, "large_builder", FunctionKind::ModuleBody, vec![], Type::Num,
+        );
+        // The spread source is allocated in the same block, before destination.
+        let source = builder.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let seven = builder.const_num(7.0);
+        builder.emit0(Inst::ListAppend { list: source, value: seven });
+        let destination = builder.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let temporary = builder.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        let handler = builder.new_block(&[Type::Top]);
+        let error = builder.block_param(handler, 0);
+        builder.add_exception_region(vec![BlockId(0)], handler, error, 0);
+        let one = builder.const_i32(1);
+        for index in 0..300 {
+            let raw = builder.const_i32(index);
+            let increment = builder.emit1(Inst::IntBin { op: IntBinOp::Add, left: raw, right: one }, Type::Int32);
+            let value = builder.emit1(Inst::Int32ToNum { value: increment }, Type::Num);
+            builder.emit0(Inst::ListAppend { list: temporary, value });
+            if index == 0 && throw_during_build {
+                let zero = builder.const_i32(0);
+                let quotient = builder.emit1(Inst::IntBin { op: IntBinOp::DivS, left: one, right: zero }, Type::Int32);
+                let quotient = builder.emit1(Inst::Int32ToNum { value: quotient }, Type::Num);
+                builder.emit0(Inst::ListAppend { list: temporary, value: quotient });
+            }
+            if index == 0 || index == 299 {
+                builder.emit1(Inst::ListSpread { list: temporary, source }, Type::Bool);
+            }
+        }
+        builder.emit1(Inst::ListSpread { list: destination, source: temporary }, Type::Bool);
+        // Weighted checksum observes both all elements and their order.
+        let zero = builder.const_num(0.0);
+        let mut total = builder.emit1(Inst::NumToF64 { value: zero }, Type::F64);
+        for index in 0..302 {
+            let position = builder.const_i32(index);
+            let value = builder.emit1(Inst::ListGet { list: destination, index: position }, Type::Num);
+            let value = builder.emit1(Inst::NumToF64 { value }, Type::F64);
+            let weight = builder.const_num((index + 1) as f64);
+            let weight = builder.emit1(Inst::NumToF64 { value: weight }, Type::F64);
+            let weighted = builder.emit1(Inst::F64Bin { op: F64BinOp::Mul, left: value, right: weight }, Type::F64);
+            total = builder.emit1(Inst::F64Bin { op: F64BinOp::Add, left: total, right: weighted }, Type::F64);
+        }
+        let result = builder.emit1(Inst::F64ToNum { value: total }, Type::Num);
+        builder.ret(result);
+        builder.position_at(handler);
+        let length = builder.emit1(Inst::ListLen { list: destination }, Type::Int32);
+        let result = builder.emit1(Inst::Int32ToNum { value: length }, Type::Num);
+        builder.ret(result);
+        let entry = builder.finish();
+        (program, entry)
+    }
+
+    #[test]
+    fn large_mixed_builder_in_try_preserves_contents_without_register_growth() {
+        let (mut program, entry) = large_protected_builder(false);
+        let before = run_module(&program, entry);
+        let mut pass = Deforestation::default();
+        assert!(pass.optimize_function(&mut program.functions[entry.0 as usize]));
+        assert_eq!(pass.stats.removed_lists, 1);
+        assert_eq!(pass.stats.transferred_appends, 300);
+        crate::napalm_ir::verify_function(&program.functions[entry.0 as usize]).unwrap();
+        assert_eq!(before, 9092327.0);
+        assert_eq!(run_module(&program, entry), before);
+    }
+
+    #[test]
+    fn throwing_computation_cannot_expose_partial_destination_to_handler() {
+        let (mut program, entry) = large_protected_builder(true);
+        assert_eq!(run_module(&program, entry), 0.0);
+        assert!(!Deforestation::default().optimize_function(&mut program.functions[entry.0 as usize]));
+        assert_eq!(run_module(&program, entry), 0.0);
     }
 }

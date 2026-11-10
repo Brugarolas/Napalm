@@ -4297,9 +4297,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_for(&mut self, name: &Ident, iterable: &Expr, body: &Stmt) {
         let sequence = self.lower_expr(iterable);
         let action_depth = self.exit_actions.len();
-        // Only a Generator needs IteratorClose. A protecting region disables
-        // deforestation/loop fusion for the whole body, so statically known
-        // Lists, Ranges, Maps... keep exactly the pre-generator lowering.
+        // Only a Generator needs IteratorClose. Avoid unnecessary cleanup and
+        // exceptional CFG edges for statically known Lists, Ranges, Maps...
+        // Total computations can still be optimized inside protected regions.
         let close = may_be_generator(self.builder.value_type(sequence)).then(|| {
             let handler = self.new_block(&[Type::Top]);
             let error = self.builder.block_param(handler, 0);
@@ -5118,6 +5118,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn append_iterable_to_list(&mut self, list: ValueId, sequence: ValueId) {
         // Lists use one bulk bytecode. Other iterables keep the language's
         // ordinary protocol, so custom iterators, strings and ranges still work.
+        if matches!(semantic_source_type(self.builder.value_type(sequence)), Type::List(_)) {
+            self.builder.emit1(Inst::ListSpread { list, source: sequence }, Type::Bool);
+            return;
+        }
         let saved_env = self.env.clone();
         let initial = self.builder.const_null();
         let header = self.new_block(&[]);

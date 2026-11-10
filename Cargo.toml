@@ -20,6 +20,7 @@ papaya = "0.2.5" # Concurrent hash map
 smallbox = "0.8.9" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
 compact_str = "0.10.0" # String drop-in replacement
+bytes = "1.12.1" # Utilities for working with byte buffers
 string-interner = "0.20.0" # String interning for efficient string handling
 parking_lot = "0.13.0" # Concurrency primitives
 #trc = "1.2.4" # Alternative to Trc with one non-atomic counter per thread and another general atomic-counter for all threads

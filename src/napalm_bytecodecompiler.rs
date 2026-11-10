@@ -4282,6 +4282,21 @@ impl FunctionEmitter<'_> {
 // Function/program compilation and deoptimization fixups
 // =============================================================================
 
+/// Check a speculative optimization against the backend's actual register
+/// allocator rather than imposing arbitrary IR-size or accumulator limits.
+pub(crate) fn check_register_allocation(function: &Function) -> Result<(), CompileError> {
+    let options = CompileOptions::default();
+    let arena = Bump::new();
+    let cfg = build_cfg(function)?;
+    let dce = analyze_dead_code(&arena, function, &cfg, options.eliminate_dead_code)?;
+    let layout = layout_blocks(function, &cfg, options.profile_guided_layout);
+    let positions = assign_positions(function, &layout);
+    let liveness = compute_liveness(&arena, function, &cfg, &dce, &layout)?;
+    let intervals = build_intervals(function, &dce, &liveness, &positions, &layout)?;
+    let affinities = build_affinities(function, &cfg, &dce, options.coalesce_registers);
+    allocate_registers(function, intervals, &affinities).map(|_| ())
+}
+
 fn compile_function(
     program: &Program,
     function: &Function,
