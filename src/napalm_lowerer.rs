@@ -6594,6 +6594,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ("Bytes", "empty" | "alloc" | "fromUtf8" | "fromArray") => Some(Type::Builtin(BuiltinId::Bytes, None)),
                 ("ByteBuffer", "new") => Some(Type::Builtin(BuiltinId::ByteBuffer, None)),
                 ("JSON", "stringify") => Some(Type::String),
+                ("Fs", "readText" | "realPath") => Some(Type::String),
+                ("Fs", "readBytes") => Some(Type::Builtin(BuiltinId::Bytes, None)),
+                ("Fs", "exists") => Some(Type::Bool),
+                ("Fs", "stat") => Some(Type::Map),
+                ("Fs", "readDir") => Some(Type::List(None)),
                 ("ConcurrentMap", "new") => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
                 ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
                 ("Map", "new") => Some(Type::Map),
@@ -8149,6 +8154,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(bindings.len(), 1);
         assert!(bindings[0].slot.0 < info.variable_count);
+    }
+
+    #[test]
+    fn filesystem_is_bound_as_native_global() {
+        let source = r#"
+            const text: String = Fs.readText("example.txt");
+            const bytes: Bytes = Fs.readBytes("example.dat");
+            const entries = Fs.readDir(".");
+            const metadata = Fs.stat(".");
+            const exists: Bool = Fs.exists(".");
+            const path: String = Fs.realPath(".");
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("fs-globals.napalm", source, "fs-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "Fs must be available in every module: {:#?}",
+            output.diagnostics,
+        );
+        let lowered = output.lowered.expect("lowered Fs module");
+        let module = output.program.module(lowered.module).expect("module metadata");
+        let bindings = module.builtin_bindings.iter()
+            .filter(|binding| binding.builtin == BuiltinId::Fs)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1, "Fs must be registered exactly once");
+        assert!(bindings[0].slot.0 < module.variable_count);
     }
 
     #[test]

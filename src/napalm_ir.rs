@@ -542,10 +542,11 @@ pub enum BuiltinId {
     Bytes = 40,
     ByteBuffer = 41,
     JSON = 42,
+    Fs = 43,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -557,7 +558,7 @@ impl BuiltinId {
         Self::Event, Self::Emitter, Self::Channel, Self::Receiver,
         Self::ConcurrentMap, Self::ConcurrentSet,
         Self::Generator,
-        Self::Bytes, Self::ByteBuffer, Self::JSON,
+        Self::Bytes, Self::ByteBuffer, Self::JSON, Self::Fs,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -597,6 +598,7 @@ impl BuiltinId {
             Self::Bytes => "Bytes",
             Self::ByteBuffer => "ByteBuffer",
             Self::JSON => "JSON",
+            Self::Fs => "Fs",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

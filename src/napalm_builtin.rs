@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -516,6 +516,32 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         1,
         NativeBuiltin::Json(JsonNative::Stringify),
     );
+
+    // Synchronous native filesystem utilities. File data is transferred through
+    // the existing String / Bytes representations, never through an FFI pointer.
+    for (name, arity, native) in [
+        ("readText", 1, FsNative::ReadText),
+        ("readBytes", 1, FsNative::ReadBytes),
+        ("writeText", 2, FsNative::WriteText),
+        ("writeBytes", 2, FsNative::WriteBytes),
+        ("exists", 1, FsNative::Exists),
+        ("stat", 1, FsNative::Stat),
+        ("readDir", 1, FsNative::ReadDir),
+        ("realPath", 1, FsNative::RealPath),
+        ("mkdir", 1, FsNative::Mkdir),
+        ("mkdirAll", 1, FsNative::MkdirAll),
+        ("removeFile", 1, FsNative::RemoveFile),
+        ("rename", 2, FsNative::Rename),
+    ] {
+        manifest.register_native(
+            program,
+            static_(BuiltinId::Fs),
+            name,
+            MethodKind::Method,
+            arity,
+            NativeBuiltin::Fs(native),
+        );
+    }
 
     // Native immutable Bytes and mutable ByteBuffer. These are ordinary
     // runtime calls so both JIT tiers use the established GC-safe call ABI.

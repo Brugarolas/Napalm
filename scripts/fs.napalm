@@ -1,0 +1,72 @@
+// End-to-end native Fs integration test.
+// Run from the repository root: cargo run --release -- scripts/fs_smoke.napalm
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+const root = "scripts/__napalm_fs_integration__";
+const nested = root + "/nested/deep";
+if (!Fs.exists(root)) {
+    Fs.mkdir(root);
+}
+Fs.mkdirAll(nested);
+expect(Fs.exists(root) && Fs.exists(nested), "mkdir and mkdirAll");
+expect(Fs.stat(nested)["isDirectory"] === true, "directory metadata");
+
+const textPath = nested + "/greeting.txt";
+const text = "Hello, Napalm! 😀 é\nSecond line";
+Fs.writeText(textPath, text);
+expect(Fs.exists(textPath), "writeText creates a file");
+const readText: String = Fs.readText(textPath);
+expect(readText === text, "UTF-8 file round-trip");
+const textStat = Fs.stat(textPath);
+expect(textStat["isFile"] === true, "file metadata type");
+expect(textStat["size"] === Bytes.fromUtf8(text).length, "file size reflects UTF-8");
+expect(textStat["readonly"] === false, "new test file is writable");
+
+const binaryPath = nested + "/binary.dat";
+const raw = Bytes.fromArray([0, 1, 2, 127, 255]);
+Fs.writeBytes(binaryPath, raw);
+const reloaded: Bytes = Fs.readBytes(binaryPath);
+expect(typeof reloaded === "Bytes", "readBytes returns Bytes");
+expect(reloaded.length === 5, "readBytes length");
+expect(reloaded[0] === 0 && reloaded[4] === 255, "raw binary round-trip");
+System.gc();
+expect(reloaded[4] === 255, "readBytes survives GC");
+
+const frame = new ByteBuffer();
+frame.append(Bytes.fromArray([9, 8, 7, 6]));
+const bufferPath = nested + "/buffer.dat";
+Fs.writeBytes(bufferPath, frame);
+expect(Fs.readBytes(bufferPath).toArray()[0] === 9, "writeBytes accepts ByteBuffer");
+expect(frame.length === 4, "writeBytes does not consume the input");
+
+const renamed = nested + "/renamed.txt";
+Fs.rename(textPath, renamed);
+expect(!Fs.exists(textPath) && Fs.exists(renamed), "rename moves a file");
+expect(Fs.readText(renamed) === text, "renamed file contents");
+
+const children = Fs.readDir(nested);
+let foundText = false;
+let foundBinary = false;
+for (const child of children) {
+    if (child["name"] === "renamed.txt") {
+        foundText = child["isFile"] && typeof child["path"] === "String";
+    }
+    if (child["name"] === "binary.dat") {
+        foundBinary = child["isFile"];
+    }
+}
+expect(foundText && foundBinary, "readDir returns file entries");
+
+const canonical: String = Fs.realPath(renamed);
+expect(canonical.length > 0, "realPath resolves an absolute path");
+expect(Fs.exists(canonical), "realPath result names the same file");
+
+Fs.removeFile(renamed);
+Fs.removeFile(binaryPath);
+Fs.removeFile(bufferPath);
+expect(!Fs.exists(renamed) && !Fs.exists(binaryPath), "removeFile deletes files");
+expect(Fs.readDir(nested).length === 0, "test directory is empty");
+
+System.print("Fs integration tests passed");

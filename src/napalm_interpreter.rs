@@ -92,6 +92,8 @@ use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
 use self::collection_ops::*;
 #[path = "napalm_bytes_vm.rs"]
 mod bytes_vm;
+#[path = "napalm_fs_vm.rs"]
+mod fs_vm;
 #[path = "napalm_json_vm.rs"]
 mod json_vm;
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
@@ -7313,6 +7315,7 @@ enum CallTarget {
 pub enum NativeBuiltin {
     Bytes(BytesNative),
     Json(JsonNative),
+    Fs(FsNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7457,6 +7460,22 @@ pub enum NativeBuiltin {
 pub enum JsonNative {
     Parse,
     Stringify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsNative {
+    ReadText,
+    ReadBytes,
+    WriteText,
+    WriteBytes,
+    Exists,
+    Stat,
+    ReadDir,
+    RealPath,
+    Mkdir,
+    MkdirAll,
+    RemoveFile,
+    Rename,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15734,6 +15753,7 @@ impl Interpreter<'_> {
         match native {
             NativeBuiltin::Bytes(native) => self.execute_bytes_native(op, native, receiver, args),
             NativeBuiltin::Json(native) => self.execute_json_native(op, native, args),
+            NativeBuiltin::Fs(native) => self.execute_fs_native(op, native, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
