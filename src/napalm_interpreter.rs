@@ -7322,6 +7322,10 @@ pub enum NativeBuiltin {
     InstanceValues,
     InstanceEntries,
     InstanceSize,
+    /// `instance[key]` and `instance[key] = value`: fields addressed by their
+    /// public name. Unknown keys read as null; instances cannot grow fields.
+    InstanceSubscript,
+    InstanceSubscriptSet,
     /// Hidden `System.__implements(value, layoutId, allowClassObject)` and
     /// `System.__inherits(value, class)` behind the `implements`,
     /// `instanceof Contract` and `inherits` operators.
@@ -8893,14 +8897,13 @@ impl<'p> Interpreter<'p> {
         let instance_protocol = program.metadata.methods.iter().enumerate()
             .filter_map(|(index, signature)| {
                 use crate::napalm_ir::MethodKind;
-                if signature.arity != 0 {
-                    return None;
-                }
-                let native = match (program.metadata.string(signature.name)?, signature.kind) {
-                    ("keys", MethodKind::Method) => NativeBuiltin::InstanceKeys,
-                    ("values", MethodKind::Method) => NativeBuiltin::InstanceValues,
-                    ("entries", MethodKind::Method) => NativeBuiltin::InstanceEntries,
-                    ("size", MethodKind::Getter) => NativeBuiltin::InstanceSize,
+                let native = match (program.metadata.string(signature.name)?, signature.kind, signature.arity) {
+                    ("keys", MethodKind::Method, 0) => NativeBuiltin::InstanceKeys,
+                    ("values", MethodKind::Method, 0) => NativeBuiltin::InstanceValues,
+                    ("entries", MethodKind::Method, 0) => NativeBuiltin::InstanceEntries,
+                    ("size", MethodKind::Getter, 0) => NativeBuiltin::InstanceSize,
+                    ("[]", MethodKind::SubscriptGetter, 1) => NativeBuiltin::InstanceSubscript,
+                    ("[]=", MethodKind::SubscriptSetter, 2) => NativeBuiltin::InstanceSubscriptSet,
                     _ => return None,
                 };
                 Some((MethodSymbol(index as u32), native))
@@ -14756,7 +14759,7 @@ impl Interpreter<'_> {
                 class.instance_methods = methods;
             } else {
                 // Root classes start from the instance protocol every object
-                // has (keys/values/entries/size). User methods bound later
+                // has (keys/values/entries/size/[]/[]=). User methods bound later
                 // override these defaults and are copied down to subclasses.
                 for &(method, native) in &self.instance_protocol {
                     if let Some(slot) = class.instance_methods.get_mut(method.0 as usize) {
@@ -16029,6 +16032,33 @@ impl Interpreter<'_> {
                         self.advance(op);
                     },
                     Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::InstanceSubscript => {
+                let object = Value::from_word(receiver);
+                let key = arg(0);
+                match self.instance_property_get(object, key) {
+                    Some(Ok(value)) => {
+                        if unlikely(self.reactive_tracking_active) {
+                            if let Some(Some((_, slot))) = self.instance_property_slot(object, key) {
+                                self.reactive_track_field(object, ReactiveSourceKind::InstanceField, slot as u32, value);
+                            }
+                        }
+                        unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+                    }
+                    Some(Err(error)) => self.fail_at(op, error.message),
+                    None => self.fail_at(op, "`[]` receiver has no properties to index"),
+                }
+            }
+            NativeBuiltin::InstanceSubscriptSet => {
+                let object = Value::from_word(receiver);
+                let value = arg(1);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.instance_property_set(object, arg(0), value) {
+                    Some(Ok(())) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Some(Err(error)) => self.fail_at(op, error.message),
+                    None => self.fail_at(op, "`[]=` receiver has no properties to index"),
                 }
             }
             NativeBuiltin::InstanceKeys | NativeBuiltin::InstanceValues | NativeBuiltin::InstanceEntries => {
@@ -17397,12 +17427,19 @@ impl Interpreter<'_> {
         };
         let class_slot = *class_slot;
         let slot = match self.heap.get(key) {
-            Some(HeapObject::String(name)) => self.classes[class_slot as usize]
-                .instance_field_names
-                .iter()
-                .position(|id| {
-                    self.program.metadata.string(*id).is_some_and(|text| text.as_bytes() == &*name.bytes)
-                }),
+            Some(HeapObject::String(key)) => {
+                let fields = &self.classes[class_slot as usize].instance_field_names;
+                let field_name = |id: &StringId| self.string_names.get(id.0 as usize).copied();
+                match key.name() {
+                    // Interning is canonical: an interned key names a field
+                    // iff the ids are equal.
+                    Some(key_name) => fields.iter().position(|id| field_name(id) == Some(key_name)),
+                    // Runtime-built key: cached content hash, then bytes.
+                    None => fields.iter().position(|id| field_name(id).is_some_and(|field| {
+                        field.content_hash() == key.hash && field.as_bytes() == &*key.bytes
+                    })),
+                }
+            }
             _ => None,
         };
         Some(slot.map(|slot| (class_slot, slot)))

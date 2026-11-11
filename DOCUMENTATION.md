@@ -1563,6 +1563,23 @@ field. Declare the fields that make up their API. Instances provide `keys()`,
 fields, in field-slot order. Computed getters and static fields are excluded.
 User-defined members can override these defaults.
 
+Stored fields can also be addressed by name with a computed key:
+
+```napalm
+class Point { x = 1; y = 2; }
+const point = new Point();
+const key = "x";
+System.print(point[key]);     // 1
+point[key] = 10;              // same checks as point.x = 10
+System.print(point["z"]);     // null: unknown names read as null
+```
+
+`instance[key]` reads the stored field named `key` (inherited fields included)
+and yields `null` for unknown names and non-String keys. `instance[key] = value`
+keeps the field's declared type and fails for a name that is not a field, like
+`object.extra = value`. Only stored fields are reachable this way: methods,
+getters, computed members and static fields are not.
+
 ### 14.2 Inheritance and super
 
 ```napalm

@@ -14,6 +14,70 @@ fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
 }
 
 #[test]
+fn napalm_collections_instance_subscript_reads_and_writes_fields_by_name() {
+    run_napalm(r#"
+        interface Point { x: number; y: number; }
+        class Base { name = 'base'; }
+        class P extends Base implements Point {
+            constructor() { super(); this.x = 3; this.y = 40; }
+        }
+        function read(p: Point, k: string) { return p[k]; }
+        function write(p: Point, k: string, v: number) { p[k] = v; }
+        const p = new P();
+        const parts = ['na', 'me'];
+        const first = [p['x'], read(p, 'y'), p[parts[0] + parts[1]], p['missing'], p[parts[1]], p[7]];
+        write(p, 'x', 5);
+        p[parts[0] + parts[1]] = 'renamed';
+        p['y'] += 2;
+        let total = 0;
+        const keys = ['x', 'y'];
+        for (let i = 0; i < 200; i++) {
+            const k = keys[i % 2];
+            p[k] = p[k] + 1;
+            total += read(p, k);
+        }
+        const result = [first, p.x, p.y, p.name, total, p.keys()];
+    "#, "[[3, 40, base, null, null, null], 105, 142, renamed, 14800, [name, x, y]]");
+}
+
+#[test]
+fn napalm_collections_instance_subscript_is_reactive() {
+    run_napalm(r#"
+        let evaluations = 0;
+        class Counter {
+            constructor() { this.hot = 1; this.cold = 100; this.key = 'hot'; }
+            computed doubled() { evaluations++; return this[this.key] * 2; }
+        }
+        const c = new Counter();
+        const first = [c.doubled, c.doubled];
+        c['hot'] = 5;                    // subscript write invalidates
+        const second = [c.doubled, c.doubled];
+        c.hot = 7;                       // subscript read was tracked
+        const third = c.doubled;
+        c['cold'] = 200;                 // unrelated field: still cached
+        const result = [first, second, third, c.doubled, evaluations];
+    "#, "[[2, 2], [10, 10], 14, 14, 3]");
+}
+
+#[test]
+fn napalm_collections_instance_subscript_keeps_field_types_and_layout() {
+    for (source, message) in [
+        ("class P { x: number = 1; } const p = new P(); const k = 'mis' + 'sing'; p[k] = 1;",
+            "cannot add property 'missing' to a class instance"),
+        ("class P { x: number = 1; } const p = new P(); const k = 'x'; p[k] = 'text';",
+            "Class field type error"),
+    ] {
+        let (program, entry, manifest) = compile_typescript_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let error = vm.run_module(entry).unwrap_err();
+            assert!(error.message.contains(message), "jit={jit} {source}: {error:?}");
+        }
+    }
+}
+
+#[test]
 fn napalm_collections_map_set_api() {
     run_napalm(r#"
         const m = new Map();
