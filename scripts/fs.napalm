@@ -11,7 +11,7 @@ if (!Fs.exists(root)) {
 }
 Fs.mkdirAll(nested);
 expect(Fs.exists(root) && Fs.exists(nested), "mkdir and mkdirAll");
-expect(Fs.stat(nested)["isDirectory"] === true, "directory metadata");
+expect(Fs.stat(nested).isDirectory === true, "directory metadata");
 
 const textPath = nested + "/greeting.txt";
 const text = "Hello, Napalm! 😀 é\nSecond line";
@@ -19,10 +19,12 @@ Fs.writeText(textPath, text);
 expect(Fs.exists(textPath), "writeText creates a file");
 const readText: String = Fs.readText(textPath);
 expect(readText === text, "UTF-8 file round-trip");
-const textStat = Fs.stat(textPath);
-expect(textStat["isFile"] === true, "file metadata type");
-expect(textStat["size"] === Bytes.fromUtf8(text).length, "file size reflects UTF-8");
-expect(textStat["readonly"] === false, "new test file is writable");
+const textStat: FileInfo = Fs.stat(textPath);
+expect(typeof textStat === "FileInfo" && textStat instanceof FileInfo, "FileInfo runtime type");
+expect(textStat.isFile === true, "file metadata type");
+expect(textStat.size === Bytes.fromUtf8(text).length, "file size reflects UTF-8");
+expect(textStat.name === "greeting.txt" && textStat.path === textPath, "file path and name");
+expect(textStat.modifiedAt === null || typeof textStat.modifiedAt === "Date", "metadata date");
 
 const binaryPath = nested + "/binary.dat";
 const raw = Bytes.fromArray([0, 1, 2, 127, 255]);
@@ -40,6 +42,20 @@ const bufferPath = nested + "/buffer.dat";
 Fs.writeBytes(bufferPath, frame);
 expect(Fs.readBytes(bufferPath).toArray()[0] === 9, "writeBytes accepts ByteBuffer");
 expect(frame.length === 4, "writeBytes does not consume the input");
+
+const file: File = Fs.open(bufferPath, "r+");
+try {
+    expect(file.read(2).toArray()[1] === 8, "File.read advances the cursor");
+    expect(file.seek(1) === 1, "File.seek uses an absolute offset");
+    expect(file.write(Bytes.fromArray([42])) === 1, "File.write returns byte count");
+    file.flush();
+    file.seek(0);
+    expect(file.read(10).toArray()[1] === 42, "File read/write round-trip");
+    expect(file.read(1).isEmpty, "EOF returns empty Bytes");
+} finally {
+    file.close();
+}
+file.close(); // Closing again is harmless.
 
 const renamed = nested + "/renamed.txt";
 Fs.rename(textPath, renamed);

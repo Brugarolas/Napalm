@@ -3037,6 +3037,8 @@ enum HeapObject {
     String(NapalmString),
     Bytes(NapalmBytes),
     ByteBuffer(NapalmByteBuffer),
+    FileInfo(Box<fs_vm::NapalmFileInfo>),
+    File(Box<fs_vm::NapalmFile>),
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
@@ -4034,6 +4036,8 @@ macro_rules! gc_descriptor {
 gc_descriptor!(GC_STRING, "Napalm.String", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BYTES, "Napalm.Bytes", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BYTE_BUFFER, "Napalm.ByteBuffer", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FILE_INFO, "Napalm.FileInfo", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FILE, "Napalm.File", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
@@ -4069,6 +4073,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::String(_) => &GC_STRING,
         HeapObject::Bytes(_) => &GC_BYTES,
         HeapObject::ByteBuffer(_) => &GC_BYTE_BUFFER,
+        HeapObject::FileInfo(_) => &GC_FILE_INFO,
+        HeapObject::File(_) => &GC_FILE,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::Proxy { .. } => &GC_PROXY,
@@ -4123,6 +4129,8 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::String(bytes) => bytes.len(),
         HeapObject::Bytes(bytes) => bytes.len(),
         HeapObject::ByteBuffer(buffer) => buffer.capacity(),
+        HeapObject::FileInfo(info) => std::mem::size_of::<fs_vm::NapalmFileInfo>() + info.external_bytes(),
+        HeapObject::File(file) => std::mem::size_of::<fs_vm::NapalmFile>() + file.external_bytes(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
@@ -4405,6 +4413,8 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::String(_)
         | HeapObject::Bytes(_)
         | HeapObject::ByteBuffer(_)
+        | HeapObject::FileInfo(_)
+        | HeapObject::File(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::Date { .. }
@@ -6121,6 +6131,8 @@ impl HostContext<'_> {
             Some(HeapObject::String(bytes)) => out.write_str(&String::from_utf8_lossy(bytes.as_ref())),
             Some(HeapObject::Bytes(bytes)) => write!(out, "<Bytes length={}>", bytes.len()),
             Some(HeapObject::ByteBuffer(bytes)) => write!(out, "<ByteBuffer length={}>", bytes.len()),
+            Some(HeapObject::FileInfo(info)) => write!(out, "<FileInfo path={:?}>", info.path),
+            Some(HeapObject::File(file)) => write!(out, "<File path={:?}>", file.path),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { out.push_str("[...]"); return; }
@@ -7435,6 +7447,7 @@ pub enum NativeBuiltin {
     Bytes(BytesNative),
     Json(JsonNative),
     Fs(FsNative),
+    File(FileNative),
     Path(PathNative),
     Uri(UriNative),
     /// Instance protocol of class instances: property names, values and
@@ -7584,6 +7597,7 @@ pub enum JsonNative {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsNative {
+    Open,
     ReadText,
     ReadBytes,
     WriteText,
@@ -7596,6 +7610,12 @@ pub enum FsNative {
     MkdirAll,
     RemoveFile,
     Rename,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileNative {
+    Path, Name, Size, IsFile, IsDirectory, IsSymlink, ModifiedAt, CreatedAt,
+    Read, Write, Seek, Flush, Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7659,9 +7679,11 @@ pub enum BuiltinClass {
     Generator,
     Bytes,
     ByteBuffer,
+    FileInfo,
+    File,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 30;
+const BUILTIN_CLASS_COUNT: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7683,6 +7705,10 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Bytes as u64),
         HeapObject::ByteBuffer(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::ByteBuffer as u64),
+        HeapObject::FileInfo(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FileInfo as u64),
+        HeapObject::File(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::File as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Set { .. } =>
@@ -12754,6 +12780,7 @@ impl<'p> Interpreter<'p> {
                 return Err(RuntimeError::new("captured mutable cells cannot cross a concurrent boundary"));
             }
             Some(HeapObject::Bytes(_)) | Some(HeapObject::ByteBuffer(_))
+            | Some(HeapObject::FileInfo(_)) | Some(HeapObject::File(_))
             | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
             | Some(HeapObject::Set { .. })
@@ -15949,6 +15976,7 @@ impl Interpreter<'_> {
             NativeBuiltin::Bytes(native) => self.execute_bytes_native(op, native, receiver, args),
             NativeBuiltin::Json(native) => self.execute_json_native(op, native, args),
             NativeBuiltin::Fs(native) => self.execute_fs_native(op, native, args),
+            NativeBuiltin::File(native) => self.execute_file_native(op, native, receiver, args),
             NativeBuiltin::Path(native) => self.execute_path_native(op, native, args),
             NativeBuiltin::Uri(native) => self.execute_uri_native(op, native, args),
             NativeBuiltin::ProxyNew => {
@@ -17187,6 +17215,8 @@ impl Interpreter<'_> {
                     (BuiltinId::Generator, Some(HeapObject::FiberObject { generator: true, .. })) => element.is_none() || self.heap.interface_matches(value, expected),
                     (BuiltinId::Bytes, Some(HeapObject::Bytes(_))) => true,
                     (BuiltinId::ByteBuffer, Some(HeapObject::ByteBuffer(_))) => true,
+                    (BuiltinId::FileInfo, Some(HeapObject::FileInfo(_))) => true,
+                    (BuiltinId::File, Some(HeapObject::File(_))) => true,
                     _ => false,
                 }
             }
@@ -17417,6 +17447,8 @@ impl Interpreter<'_> {
             Some(HeapObject::String(_)) => "String".to_owned(),
             Some(HeapObject::Bytes(_)) => "Bytes".to_owned(),
             Some(HeapObject::ByteBuffer(_)) => "ByteBuffer".to_owned(),
+            Some(HeapObject::FileInfo(_)) => "FileInfo".to_owned(),
+            Some(HeapObject::File(_)) => "File".to_owned(),
             Some(HeapObject::List(_)) => {
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::List(Some(element)) => Some(&**element),
@@ -19745,7 +19777,28 @@ unsafe fn h_store_static_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     if unlikely(vm.reactive_enabled) && old.raw_bits()!=value.raw_bits(){vm.reactive_trigger(class,ReactiveSourceKind::StaticField,op.x);}
     vm.advance(op)
 }
-unsafe fn h_is_instance(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));let class=Value::from_word(vm.reg(op.c));let target=match vm.heap.get(class){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.set_reg(op.a,Value::FALSE.word());vm.advance(op);return;}};let actual=match vm.heap.get(value){Some(HeapObject::Instance(InstanceObject { class_slot, .. }))|Some(HeapObject::Foreign{class_slot,..})=>Some(*class_slot),_=>None};vm.set_reg(op.a,Value::from_bool(actual.map_or(false,|slot|vm.is_subclass(slot,target))).word());vm.advance(op)}
+unsafe fn h_is_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = &*ptr;
+    let value = Value::from_word(vm.reg(op.b));
+    let class = Value::from_word(vm.reg(op.c));
+    let result = match vm.heap.get(class) {
+        Some(HeapObject::BuiltinClass { builtin: BuiltinId::FileInfo }) =>
+            matches!(vm.heap.get(value), Some(HeapObject::FileInfo(_))),
+        Some(HeapObject::BuiltinClass { builtin: BuiltinId::File }) =>
+            matches!(vm.heap.get(value), Some(HeapObject::File(_))),
+        Some(HeapObject::ClassObject { class_slot: target }) => {
+            let actual = match vm.heap.get(value) {
+                Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
+                | Some(HeapObject::Foreign { class_slot, .. }) => Some(*class_slot),
+                _ => None,
+            };
+            actual.is_some_and(|slot| vm.is_subclass(slot, *target))
+        }
+        _ => false,
+    };
+    vm.set_reg(op.a, Value::from_bool(result).word());
+    vm.advance(op)
+}
 
 unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
@@ -20465,6 +20518,8 @@ impl Interpreter<'_> {
             Some(HeapObject::String(string)) => String::from_utf8_lossy(string.as_ref()).into_owned(),
             Some(HeapObject::Bytes(bytes)) => format!("<Bytes length={}>", bytes.len()),
             Some(HeapObject::ByteBuffer(buffer)) => format!("<ByteBuffer length={}>", buffer.len()),
+            Some(HeapObject::FileInfo(info)) => format!("<FileInfo path={:?}>", info.path),
+            Some(HeapObject::File(file)) => format!("<File path={:?}>", file.path),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::Proxy { .. }) => "<proxy>".into(),
@@ -23626,6 +23681,7 @@ let result = r1 + r2 + r3 + r4 + r5;
 
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
+    include!("tests/napalm_fs_tests.rs");
     include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
     include!("tests/napalm_shared_literal_tests.rs");

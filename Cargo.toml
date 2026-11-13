@@ -60,6 +60,9 @@ inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-
 [target.'cfg(not(windows))'.dependencies]
 inkwell = { version = "0.11.0", features = ["llvm23-1-prefer-dynamic"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191" # O_NOFOLLOW/O_NONBLOCK for regular-file-only Fs.open
+
 [features]
 default = ["llvm-jit"]
 # Second trace tier: hot Cranelift traces are recompiled by LLVM (O3, host CPU).

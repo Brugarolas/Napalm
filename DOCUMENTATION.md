@@ -316,6 +316,7 @@ carry generic or contract information include it:
 | Promise; pending `Timer.delay`/`Timer.every` | `Promise`; `Timer` |
 | `new Emitter<number>()`, its `.event` | `Emitter<Number>`, `Event<Number>` |
 | Channel / Receiver | `Channel`, `Receiver` (with `<T>` when typed) |
+| `Fs.stat(path)`, `Fs.open(path, mode)` | `FileInfo`, `File` |
 | Date, Proxy, Range, Fiber, Generator, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Generator`, `Module` |
 | native decorator | `NativeDecorator` |
 
@@ -845,6 +846,7 @@ To validate a dynamic return, assign the result to an annotated variable.
 | Known class name | Class identity, not a literal object with the same fields. |
 | `{ x: number; }` | Inline structural schema. |
 | `Range`, `Fiber`, `Map`, `Set`, `List` | Native families recognized by the type resolver. |
+| `FileInfo`, `File` | Native filesystem metadata and open file handles. |
 
 Additional syntax is accepted as type information, but it is not equivalent
 to TypeScript's type system:
@@ -4102,7 +4104,8 @@ results directly, not Promises; invalid arguments and I/O failures throw.
 | `Fs.writeText(path, text)` | Creates or overwrites a file with a String's UTF-8 contents. Returns `null`. |
 | `Fs.writeBytes(path, data)` | Creates or overwrites a file from Bytes or ByteBuffer without consuming the input. Returns `null`. |
 | `Fs.exists(path)` | Bool indicating whether the path exists, following symlinks. Returns `false` for missing paths or dangling links; other lookup errors can throw. |
-| `Fs.stat(path)` | Metadata Map for the path itself, without following a final symlink. |
+| `Fs.stat(path)` | FileInfo instance containing a metadata snapshot for the path itself, without following a final symlink. |
+| `Fs.open(path, mode)` | Opens a regular file and returns a File instance. Directories, symlinks (including dangling links), and other non-regular files are rejected. See the modes below. |
 | `Fs.readDir(path)` | List of entry Maps sorted by name; does not recurse or follow entry symlinks for type flags. |
 | `Fs.realPath(path)` | Canonical absolute String path, resolving symlinks; the target must exist. |
 | `Fs.mkdir(path)` | Creates one directory; its parent must exist. An existing target is an error. Returns `null`. |
@@ -4111,18 +4114,31 @@ results directly, not Promises; invalid arguments and I/O failures throw.
 | `Fs.rename(from, to)` | Renames or moves a file or directory using host filesystem rules. Returns `null`. |
 
 Reads and writes are limited to 256 MiB per operation, and `readDir` to 100,000
-entries. Writes truncate existing files and do not create parent directories.
-There is no append, streaming file handle, or directory-removal API here.
+entries. `writeText` and `writeBytes` truncate existing files and do not create
+parent directories. Use `open` for incremental I/O or append mode. There is no
+directory-removal API here.
 `realPath` may return a Windows extended-length path such as `\\?\C:\...`.
 
-### 41.2 Result Maps
+### 41.2 FileInfo
 
-| `stat` field | Meaning |
+`Fs.stat(path)` returns a native `FileInfo`, not a Map. Its properties are
+read-only and describe the instant at which `stat` was called. Call `stat`
+again to refresh them. `FileInfo` is a global type usable in annotations and
+`instanceof`, but has no public constructor.
+
+| Property | Meaning |
 | --- | --- |
+| `path` | The supplied filesystem path as a String. |
+| `name` | Final filename component as a String, or `""` for a root. |
 | `size` | Filesystem metadata size in bytes, represented as Num. |
 | `isFile`, `isDirectory`, `isSymlink` | Bool type flags for the path itself. |
-| `readonly` | Bool indicating the filesystem's read-only permission flag. |
-| `modifiedMs`, `createdMs`, `accessedMs` | Milliseconds since the Unix epoch, or `null` if the timestamp is unavailable. |
+| `modifiedAt`, `createdAt` | Date values for modification and creation, or `null` if unavailable on the filesystem. Each access returns an independent Date. |
+
+Use `info.size` and `info.modifiedAt`, replacing the previous Map fields
+`info["size"]` and `info["modifiedMs"]`. The previous `readonly` and `accessedMs`
+fields are no longer exposed.
+
+### 41.3 Directory Entries
 
 Each `readDir` entry has `name`, `path`, `isFile`, `isDirectory`, and `isSymlink`.
 `path` includes the supplied directory path and is not necessarily absolute.
@@ -4134,15 +4150,75 @@ This example reads an existing repository file and performs no writes:
 const path = "scripts/json.napalm"; // Run from the repository root.
 if (Fs.exists(path)) {
     const text = Fs.readText(path);
-    const metadata = Fs.stat(path);
-    System.print(metadata["isFile"]); // true
-    System.print(metadata["size"] === Bytes.fromUtf8(text).length); // true
+    const metadata: FileInfo = Fs.stat(path);
+    System.print(metadata.isFile); // true
+    System.print(metadata.size === Bytes.fromUtf8(text).length); // true
     System.print(Fs.realPath(path)); // Host-specific absolute path.
 }
 ```
 
-See [scripts/fs.napalm](scripts/fs.napalm) for file creation, binary I/O,
-directory listing, renaming, and removal examples.
+### 41.4 Opening Files
+
+`Fs.open(path, mode)` requires an explicit mode String. Only regular files can
+be opened; the final path component cannot be a symlink. Existing parent
+directories are required. The opened resource is checked before truncating it.
+
+| Mode | Read | Write | Missing file | Existing contents |
+| --- | --- | --- | --- | --- |
+| `"r"` | Yes | No | Error | Preserved. |
+| `"r+"` | Yes | Yes | Error | Preserved. |
+| `"w"` | No | Yes | Created | Truncated. |
+| `"w+"` | Yes | Yes | Created | Truncated. |
+| `"a"` | No | Yes | Created | Preserved; writes always append. |
+| `"a+"` | Yes | Yes | Created | Preserved; writes always append. |
+
+The cursor initially starts at zero, including for reads in `a+` mode. Append
+writes go to the current end of the file regardless of an earlier `seek`.
+Reads and writes otherwise advance the shared cursor by the bytes transferred.
+
+### 41.5 File Properties and Methods
+
+`File` is a native global type with no public constructor; obtain an instance
+through `Fs.open`. It supports type annotations and `instanceof`.
+
+| Read-only property | Meaning |
+| --- | --- |
+| `path` | The path supplied to `Fs.open`. Remains readable after closing. |
+| `name` | Final filename component. Remains readable after closing. |
+| `modifiedAt`, `createdAt` | Fresh Date values from the open handle's current metadata, or `null` if unavailable. Access after closing throws. |
+
+| Method | Result and behavior |
+| --- | --- |
+| `read(count)` | Returns Bytes containing up to `count` bytes from the current cursor. EOF and a zero count return empty Bytes. Requires a readable mode. |
+| `write(bytes)` | Writes all supplied Bytes or ByteBuffer contents at the cursor (or end in append mode), without consuming the input. Returns the number of bytes written. Requires a writable mode; Strings are not accepted. |
+| `seek(offset)` | Sets the cursor to the absolute byte offset from the beginning and returns that offset. Seeking beyond EOF is allowed and does not itself extend the file. |
+| `flush()` | Synchronizes file data and metadata to storage. Returns `null`; filesystem errors throw. |
+| `close()` | Releases the OS file handle and returns `null`. Repeated calls are harmless. |
+
+Counts must be finite nonnegative integers at most 256 MiB; writes have the
+same per-call size limit. Offsets must be finite nonnegative integers no greater
+than `9007199254740991`. `read`, `write`, `seek`, and `flush` throw after closing.
+I/O failures throw and can occur after partial transfer. Close explicitly with
+`finally`; unreachable File objects also release their handles during heap
+cleanup, whose timing is not deterministic. `close` does not replace `flush`
+when storage synchronization is required. File and FileInfo cannot cross a
+`launch` boundary.
+
+```napalm
+const file: File = Fs.open("scripts/json.napalm", "r"); // Run from repository root.
+try {
+    System.print(file.name); // json.napalm
+    const prefix: Bytes = file.read(4);
+    System.print(prefix.toUtf8()); // // E
+    file.seek(0);
+    System.print(file.read(4).toUtf8()); // // E
+} finally {
+    file.close();
+}
+```
+
+See [scripts/fs.napalm](scripts/fs.napalm) for FileInfo, incremental File I/O,
+file creation, directory listing, renaming, and removal examples.
 
 ## 42. Path
 

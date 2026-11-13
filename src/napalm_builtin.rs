@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, PathNative, UriNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -338,6 +338,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::String,
         BuiltinClass::Bytes,
         BuiltinClass::ByteBuffer,
+        BuiltinClass::FileInfo,
+        BuiltinClass::File,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -556,6 +558,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // the existing String / Bytes representations, never through an FFI pointer.
     for (name, arity, native) in [
         ("readText", 1, FsNative::ReadText),
+        ("open", 2, FsNative::Open),
         ("readBytes", 1, FsNative::ReadBytes),
         ("writeText", 2, FsNative::WriteText),
         ("writeBytes", 2, FsNative::WriteBytes),
@@ -576,6 +579,28 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
             arity,
             NativeBuiltin::Fs(native),
         );
+    }
+
+    for class in [BuiltinClass::FileInfo, BuiltinClass::File] {
+        for (name, native) in [
+            ("path", FileNative::Path), ("name", FileNative::Name),
+            ("modifiedAt", FileNative::ModifiedAt), ("createdAt", FileNative::CreatedAt),
+        ] {
+            manifest.register_native(program, instance(class), name, MethodKind::Getter, 0, NativeBuiltin::File(native));
+        }
+    }
+    for (name, native) in [
+        ("size", FileNative::Size), ("isFile", FileNative::IsFile),
+        ("isDirectory", FileNative::IsDirectory), ("isSymlink", FileNative::IsSymlink),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::FileInfo), name, MethodKind::Getter, 0, NativeBuiltin::File(native));
+    }
+    for (name, arity, native) in [
+        ("read", 1, FileNative::Read), ("write", 1, FileNative::Write),
+        ("seek", 1, FileNative::Seek), ("flush", 0, FileNative::Flush),
+        ("close", 0, FileNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::File), name, MethodKind::Method, arity, NativeBuiltin::File(native));
     }
 
     // Native immutable Bytes and mutable ByteBuffer. These are ordinary

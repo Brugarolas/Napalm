@@ -543,6 +543,8 @@ fn resolve_type_annotation_with(
             "Promise" => Type::Builtin(BuiltinId::Promise, None),
             "Bytes" => Type::Builtin(BuiltinId::Bytes, None),
             "ByteBuffer" => Type::Builtin(BuiltinId::ByteBuffer, None),
+            "FileInfo" => Type::Builtin(BuiltinId::FileInfo, None),
+            "File" => Type::Builtin(BuiltinId::File, None),
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
             "Set" => Type::Set(None),
@@ -6628,7 +6630,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ("Fs", "readText" | "realPath") => Some(Type::String),
                 ("Fs", "readBytes") => Some(Type::Builtin(BuiltinId::Bytes, None)),
                 ("Fs", "exists") => Some(Type::Bool),
-                ("Fs", "stat") => Some(Type::Map),
+                ("Fs", "stat") => Some(Type::Builtin(BuiltinId::FileInfo, None)),
+                ("Fs", "open") => Some(Type::Builtin(BuiltinId::File, None)),
                 ("Fs", "readDir") => Some(Type::List(None)),
                 ("Path", "isAbsolute") => Some(Type::Bool),
                 ("Path", "join" | "resolve" | "normalize" | "dirname" | "basename" | "extension" | "relative") => Some(Type::String),
@@ -8197,7 +8200,8 @@ mod tests {
             const text: String = Fs.readText("example.txt");
             const bytes: Bytes = Fs.readBytes("example.dat");
             const entries = Fs.readDir(".");
-            const metadata = Fs.stat(".");
+            const metadata: FileInfo = Fs.stat(".");
+            const file: File = Fs.open("example.txt", "r");
             const exists: Bool = Fs.exists(".");
             const path: String = Fs.realPath(".");
         "#;

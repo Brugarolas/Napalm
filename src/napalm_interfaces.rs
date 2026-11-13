@@ -222,6 +222,12 @@ impl Heap {
             Type::Builtin(BuiltinId::ByteBuffer, None) => {
                 matches!(self.get(value), Some(HeapObject::ByteBuffer(_)))
             }
+            Type::Builtin(BuiltinId::FileInfo, None) => {
+                matches!(self.get(value), Some(HeapObject::FileInfo(_)))
+            }
+            Type::Builtin(BuiltinId::File, None) => {
+                matches!(self.get(value), Some(HeapObject::File(_)))
+            }
             Type::Builtin(BuiltinId::Generator, element) => {
                 if !matches!(self.get(value), Some(HeapObject::FiberObject { generator: true, .. })) {
                     return Err(mismatch(path, expected));
