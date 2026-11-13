@@ -3,6 +3,10 @@
   <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
 </p>
 
+<p align="center">
+  <img src="https://github.com/Brugarolas/Napalm/blob/master/img/logo.png?raw=true" alt="Napalm">
+</p>
+
 # Napalm
 
 Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dynamic runtime. WrenJIT remains the frozen Wren-syntax project. This repository builds the `napalm` executable.
