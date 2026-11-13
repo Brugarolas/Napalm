@@ -131,6 +131,14 @@ fn load_llvm_library() -> Result<(), String> {
     if let Some(explicit) = std::env::var_os("NAPALM_LLVM_DLL") {
         candidates.push(explicit);
     }
+    // A standalone executable (`--compile`) carries the DLL it was built with;
+    // it is extracted to the per-user cache the first time the tier starts.
+    if let Some(embedded) = crate::napalm_standalone::embedded().and_then(|e| e.llvm_library()) {
+        match embedded {
+            Ok(path) => candidates.push(path.clone().into_os_string()),
+            Err(error) => eprintln!("[napalm-llvm] {error}"),
+        }
+    }
     // The bundled copy shipped next to napalm.exe always wins over PATH, so a
     // different LLVM install on the user's machine can never be picked up.
     if let Some(bundled) = std::env::current_exe()

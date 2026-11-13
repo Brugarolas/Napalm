@@ -54,7 +54,7 @@ small_map = { path = "./crates/small_map" } # Small map optimization
 # rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the
 # LLVM-C.dll C-API instead and copies it next to the executables.
 llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C AP
-zstd = "0.14.3" # .burning compression (same version reqwest already builds)
+zstd = { version = "0.14.3", features = ["zstdmt"] } # .burning compression (same version reqwest already builds); multithreaded for embedding LLVM in --compile
 postcard = { version = "1.1.3", features = ["use-std"] } # Binary .burning metadata/bootstrap encoding
 # Napalm uses initialize_native(), which is independent of Inkwell's target-*
 # features. Its default target-all bindings reference backends absent from the

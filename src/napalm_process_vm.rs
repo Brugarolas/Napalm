@@ -130,10 +130,12 @@ impl Interpreter<'_> {
     }
 
     fn process_args(&mut self) -> Value {
-        // CLI convention: `napalm script.napalm [script arguments...]`.
+        // CLI convention: `napalm script.napalm [script arguments...]`; a
+        // standalone executable (`--compile`) has no script path: `app [args...]`.
         // Use OsString to avoid panicking if the OS supplied non-UTF-8 argv.
+        let skip = if crate::napalm_standalone::embedded().is_some() { 1 } else { 2 };
         let args: Vec<String> = std::env::args_os()
-            .skip(2)
+            .skip(skip)
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         let list = self.heap.alloc(HeapObject::List(Vec::with_capacity(args.len())));

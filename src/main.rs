@@ -20,6 +20,8 @@
 //! ```text
 //! cargo run -- path/to/program.nap
 //! cargo run -- path/to/program.burning
+//! cargo run -- --build path/to/program.napalm     # writes program.burning
+//! cargo run -- --compile path/to/program.napalm   # also writes program(.exe)
 //! ```
 //!
 //! The pipeline is:
@@ -65,6 +67,7 @@ pub mod napalm_ir_optimizing;
 pub mod napalm_ir_escape;
 pub mod napalm_pipeline;
 pub mod napalm_build_pipeline;
+pub mod napalm_standalone;
 
 #[cfg(test)]
 #[path = "tests/compiler_perf.rs"]
@@ -93,10 +96,22 @@ fn main() -> ExitCode {
     // Never let process exit wait for (or tear down) background LLVM compilers.
     napalm_tracing_jit::use_fast_process_exit();
     let code = run(); // drops the VM, flushing all program output
+    napalm_standalone::finish_pending_extraction();
     ExitCode::from(napalm_tracing_jit::finish_process(code))
 }
 
 fn run() -> u8 {
+    // A standalone executable (`--compile` output) runs its embedded artifact;
+    // every command-line argument belongs to the program.
+    match napalm_standalone::init() {
+        Ok(true) => return run_embedded(),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("invalid standalone executable: {error}");
+            return EXIT_COMPILE_ERROR;
+        }
+    }
+
     let command_line = match parse_command_line() {
         Ok(options) => options,
         Err(()) => return EXIT_USAGE_ERROR,
@@ -108,7 +123,7 @@ fn run() -> u8 {
     }
 
     if source_path.extension() == Some(OsStr::new("burning")) {
-        if command_line.build {
+        if command_line.mode == Mode::Build {
             eprintln!("usage error: --build requires a source file, not a .burning artifact");
             return EXIT_USAGE_ERROR;
         }
@@ -126,6 +141,10 @@ fn run() -> u8 {
                 return EXIT_COMPILE_ERROR;
             }
         };
+        // `--compile app.burning` embeds an existing, validated artifact as is.
+        if command_line.mode == Mode::Compile {
+            return write_standalone(&source_path, &bytes);
+        }
         return execute_program(
             &artifact.program,
             artifact.bootstrap.entry,
@@ -166,10 +185,10 @@ fn run() -> u8 {
     // Compilation pipeline: HIR -> optimizations -> register bytecode
     // -------------------------------------------------------------------------
 
-    let compiled = if command_line.build {
-        napalm_build_pipeline::compile_program(&mut hir)
-    } else {
+    let compiled = if command_line.mode == Mode::Run {
         napalm_pipeline::compile_program(&mut hir)
+    } else {
+        napalm_build_pipeline::compile_program(&mut hir)
     };
     let bytecode = match compiled {
         Ok(program) => program,
@@ -181,23 +200,82 @@ fn run() -> u8 {
 
     // -------------------------------------------------------------------------
     // Build pipeline output: serialize instead of initializing the VM.
-    if command_line.build {
-        return match napalm_burning::write_build(
+    if command_line.mode != Mode::Run {
+        let artifact = match napalm_burning::write_build(
             &source_path,
             &bytecode,
             lowered_module.entry,
             &module_name,
             &builtin_manifest,
         ) {
-            Ok(_) => EXIT_SUCCESS,
+            Ok(path) => path,
             Err(error) => {
                 eprintln!("build output error: {error}");
-                EXIT_IO_ERROR
+                return EXIT_IO_ERROR;
             }
         };
+        if command_line.mode == Mode::Build {
+            return EXIT_SUCCESS;
+        }
+        let bytes = match std::fs::read(&artifact) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("failed to read '{}': {error}", artifact.display());
+                return EXIT_IO_ERROR;
+            }
+        };
+        return write_standalone(&source_path, &bytes);
     }
 
     execute_program(&bytecode, lowered_module.entry, &module_name, &builtin_manifest)
+}
+
+/// Run the artifact embedded in this executable by `--compile`.
+fn run_embedded() -> u8 {
+    let embedded = napalm_standalone::embedded().expect("standalone payload detected");
+    let bytes = match embedded.read_burning() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("failed to read the embedded program: {error}");
+            return EXIT_IO_ERROR;
+        }
+    };
+    let artifact = match napalm_burning::decode(&bytes) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            eprintln!("invalid embedded burning artifact: {error}");
+            return EXIT_COMPILE_ERROR;
+        }
+    };
+    drop(bytes);
+    execute_program(
+        &artifact.program,
+        artifact.bootstrap.entry,
+        &artifact.bootstrap.module_name,
+        &artifact.bootstrap.builtins,
+    )
+}
+
+/// `--compile`: copy this runtime, append the artifact (and the LLVM library),
+/// and write it beside the entry file.
+fn write_standalone(entry: &Path, burning: &[u8]) -> u8 {
+    let output = napalm_standalone::default_output(entry);
+    if output == entry {
+        eprintln!("compile output error: output would overwrite '{}'", entry.display());
+        return EXIT_IO_ERROR;
+    }
+    match napalm_standalone::write_executable(&output, burning) {
+        Ok(report) => {
+            if let Some(warning) = report.llvm_warning {
+                eprintln!("warning: LLVM was not embedded ({warning}); the executable will look for it at run time");
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => {
+            eprintln!("compile output error: {error}");
+            EXIT_IO_ERROR
+        }
+    }
 }
 
 /// Source compilation and artifact loading share all VM/JIT initialization,
@@ -253,9 +331,19 @@ fn execute_program(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Execute a source file or `.burning` artifact.
+    Run,
+    /// `--build`: write the `.burning` artifact.
+    Build,
+    /// `--compile`: write the `.burning` artifact and a standalone executable.
+    Compile,
+}
+
 struct CommandLine {
     source_path: PathBuf,
-    build: bool,
+    mode: Mode,
 }
 
 fn parse_command_line() -> Result<CommandLine, ()> {
@@ -274,8 +362,14 @@ fn parse_command_line() -> Result<CommandLine, ()> {
         return Err(());
     };
 
-    let build = first == OsStr::new("--build");
-    if build {
+    let mode = if first == OsStr::new("--build") {
+        Mode::Build
+    } else if first == OsStr::new("--compile") {
+        Mode::Compile
+    } else {
+        Mode::Run
+    };
+    if mode != Mode::Run {
         first = match args.next() {
             Some(path) => path,
             None => {
@@ -294,11 +388,12 @@ fn parse_command_line() -> Result<CommandLine, ()> {
     // Do not interpret or reject them; each script decides what they mean.
     Ok(CommandLine {
         source_path: PathBuf::from(first),
-        build,
+        mode,
     })
 }
 
 fn print_usage(executable: &str) {
     eprintln!("Usage: {executable} <file.napalm|file.burning> [program arguments...]");
     eprintln!("       {executable} --build <file.napalm>");
+    eprintln!("       {executable} --compile <file.napalm|file.burning>");
 }

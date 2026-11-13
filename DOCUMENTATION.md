@@ -53,8 +53,8 @@ presented as existing features.
 33. [Complete Recipes](#33-complete-recipes)
 34. [Example and Source Map](#34-example-and-source-map)
 35. [Current Performance](#35-current-performance)
-36. [Napalm System platform helpers](#35-system-platform-helpers)
-37. [Napalm Native FFI](#35-native-ffi)
+36. [Platform Detection (System.os, System.arch)](#36-platform-detection)
+37. [Napalm Native FFI](#37-napalm-native-ffi)
 38. [JSON](#38-json)
 39. [Bytes](#39-bytes)
 40. [ByteBuffer](#40-bytebuffer)
@@ -114,8 +114,18 @@ If it has already been compiled:
 
 The CLI accepts an entry file followed by optional program arguments:
 `napalm program.napalm [arguments...]`. `Process.args` contains only the
-arguments after the filename. This implementation does not provide a REPL,
-`process.argv`, or an `-e` option.
+arguments after the filename. The entry file can also be a compiled
+`.burning` artifact (see [1.2](#12-building-and-distributing-programs)). This
+implementation does not provide a REPL, `process.argv`, or an `-e` option.
+
+| Command | Effect |
+| --- | --- |
+| `napalm program.napalm [arguments...]` | Compiles and runs the program. |
+| `napalm program.burning [arguments...]` | Runs a program compiled with `--build`. |
+| `napalm --build program.napalm` | Writes `program.burning` without running anything. |
+| `napalm --compile program.napalm` | Writes `program.burning` and a standalone executable. |
+| `napalm --compile program.burning` | Writes a standalone executable from an existing artifact. |
+| `napalm --help` | Prints the usage summary (exit code 2). |
 
 `scripts/process_args.napalm` prints these arguments as a JSON array and checks
 that they are Strings. It accepts any argument list, including none (`[]`):
@@ -130,21 +140,136 @@ cargo run --release -- scripts/process_args.napalm alpha "two words"
 with that extension. Older references to `.nap` or `.ts` in some texts do not
 describe the current resolver.
 
-### 1.2 Process Exit Codes
+### 1.2 Building and Distributing Programs
+
+Napalm can compile a program ahead of time instead of compiling it on every
+run. There are two output forms:
+
+- **`--build`** writes a `.burning` artifact: the compiled program, including
+  every module it imports. It runs with `napalm program.burning`.
+- **`--compile`** also writes a **standalone executable** that contains the
+  Napalm runtime and the program. It runs on its own, with no Napalm install.
+
+#### `--build`: `.burning` artifacts
+
+```powershell
+napalm --build .\scripts\fib.napalm     # writes .\scripts\fib.burning
+napalm .\scripts\fib.burning 30 extra   # Process.args is ["30", "extra"]
+```
+
+- The artifact is written beside the entry file, with the same name and a
+  `.burning` extension. An existing artifact is replaced only if the build
+  succeeds.
+- Statically imported modules (`import ... from './x'`, `@std`, `@lib`) are
+  compiled into the same artifact. They do not get their own `.burning` files.
+- **No code runs during a build**: no module body, import or `static` block
+  executes, and `System.print` produces no output. Compile errors are reported
+  as in a normal run.
+- `--build` must come **before** the entry file. In `napalm program.burning
+  --build`, `--build` is an ordinary program argument.
+- `--build` takes a source file. `napalm --build program.burning` is a usage
+  error (exit code 2) and leaves the artifact untouched.
+
+Running an artifact skips parsing and compiling. The original sources are no
+longer needed: the artifact can be moved to another directory or machine.
+Builtins, the JIT, error messages, `Process.args` and exit codes behave as
+they do for source files.
+
+The build uses extra whole-program optimizations that a normal run skips.
+They assume the artifact contains every module that can run. For example, a
+function called with constant arguments may be evaluated during the build:
+
+```napalm
+function fibonacci(n: number): number {
+    return n <= 1 ? n : fibonacci(n - 1) + fibonacci(n - 2);
+}
+System.print(fibonacci(25)); // 75025; with --build it may be computed during the build
+```
+
+These optimizations do not change what a program prints, returns or throws.
+Side effects (output, I/O, timers, exceptions) and their order are preserved,
+and source locations in error messages remain those of the original code.
+Building takes longer than a normal run's compilation; running the artifact
+is faster to start.
+
+#### `--compile`: standalone executables
+
+```powershell
+napalm --compile .\app.napalm     # writes .\app.burning and .\app.exe
+.\app.exe alpha "two words"       # Process.args is ["alpha", "two words"]
+```
+
+`--compile` builds the program exactly like `--build`, keeps the `.burning`
+file, and also writes an executable beside the entry file: `app.exe` on
+Windows, `app` (marked executable) on Linux and macOS.
+`napalm --compile app.burning` turns an existing artifact into an executable
+without needing the sources.
+
+Running the executable runs the embedded program:
+
+- **Every argument goes to the program.** The executable has no CLI options:
+  `app.exe --help` puts `"--help"` in `Process.args`.
+- Exit codes, error messages and output are the same as
+  `napalm app.burning`.
+- It can be renamed and moved freely. Neither the sources, the `.burning`
+  file nor a Napalm installation are needed.
+- Files, native libraries (FFI) and network resources that the program opens
+  at runtime are still read from the system as usual. Relative paths are
+  resolved against the current working directory, not the executable's.
+
+**Dependencies.** The executable contains the interpreter, garbage collector,
+builtins and both JIT tiers. On Windows it also contains the LLVM library
+(`LLVM-C.dll`) and needs no Visual C++ Redistributable. Expect roughly 45 MB.
+The LLVM library is unpacked automatically to
+`%LOCALAPPDATA%\napalm\llvm\` the first time a program becomes hot enough to
+use it. This happens once per machine and takes about a second. Executables
+that embed the same LLVM library share the unpacked copy. Set
+`NAPALM_CACHE_DIR` to use a different directory. If the LLVM library cannot be
+found when compiling, `--compile` prints a warning and the executable still
+works, but uses only the Cranelift JIT unless it finds LLVM at runtime.
+
+On Linux and macOS the LLVM library is not embedded: install LLVM 23 or put
+`libLLVM` next to the executable. Standalone executables are untested on macOS.
+Code-signing a standalone executable (Authenticode on Windows, `codesign` on
+macOS) is not supported.
+
+An executable runs only with the runtime that produced it. Recompile after
+updating Napalm. A `.burning` artifact is also tied to the Napalm version that
+built it: a runtime with a different format rejects it with exit code 1, and
+it must be rebuilt.
+
+The `NAPALM_*` diagnostic environment variables (for example `NAPALM_NO_JIT`)
+also affect standalone executables.
+
+#### Build and compile errors
+
+| Situation | Exit code |
+| --- | --- |
+| Success (nothing is printed, except the LLVM warning described above) | `0` |
+| Syntax or type error in the program; invalid or incompatible `.burning` file | `1` |
+| Missing entry file after `--build`/`--compile`; `--build` given a `.burning` file | `2` |
+| Unreadable source; output file cannot be written | `3` |
+
+A failed build or compile leaves any existing `.burning` file and executable
+untouched.
+
+### 1.3 Process Exit Codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The program completed successfully. |
-| `1` | Compilation error, including syntax errors or statically checked types. |
+| `1` | Compilation error, including syntax errors or statically checked types; invalid or incompatible `.burning` artifact or standalone executable. |
 | `2` | Incorrect CLI usage; this is also the current exit code for `--help`. |
-| `3` | I/O error while loading sources or emitting diagnostics. |
+| `3` | I/O error while loading sources or artifacts, writing build output, or emitting diagnostics. |
 | `4` | Uncaught runtime error or a module suspension that was not resumed. |
+
+Standalone executables and `.burning` artifacts use the same codes.
 
 An open HTTP listener, a periodic timer, or pending asynchronous work can keep
 the process alive after the module body has run. Close or cancel resources that
 are no longer needed.
 
-### 1.3 Process and Standard Streams
+### 1.4 Process and Standard Streams
 
 `Process.cwd()`, `Process.chdir(path)` and `Process.getenv(name)` expose the
 working directory and environment; a missing environment variable returns
@@ -2987,8 +3112,8 @@ There is no public seed API or cryptographic guarantee for these numbers.
 | `System.write(value)` | Prints without a line break and flushes stdout; returns value. |
 | `print(value)` | Global one-argument shortcut. |
 | `System.clock` | Monotonic seconds elapsed since host creation. |
-| `System.os()` | Build system, e.g. `"windows"`, `"linux"`, `"macos"`. |
-| `System.arch()` | Architecture, e.g. `"x86_64"` or `"aarch64"`. |
+| `System.os()` | Operating system as a String, e.g. `"windows"`, `"linux"`, `"macos"`. See [section 36](#36-platform-detection). |
+| `System.arch()` | CPU architecture as a String, e.g. `"x86_64"` or `"aarch64"`. See [section 36](#36-platform-detection). |
 | `System.gc()` | Requests explicit garbage collection. |
 
 ```napalm
@@ -3824,26 +3949,65 @@ Current engine, as of 02-Nov-2026, shows an impressive performance that can comp
 
 (Note: the impressive results in Fibonacci test are due to one of Napalm HIR optimization: the auto-memoization of pure functions with simple arguments).
 
-## 36. Napalm System platform helpers
+## 36. Platform Detection
 
-Adds two Napalm-specific zero-argument methods to `System`:
+`System.os()` and `System.arch()` tell a program which platform it is running
+on, so it can choose platform-specific paths, library names or commands.
 
-```typescript
-System.os()
-System.arch()
+| API | Returns |
+| --- | --- |
+| `System.os()` | The operating system, as a lowercase String. |
+| `System.arch()` | The CPU architecture, as a lowercase String. |
+
+```napalm
+System.print([System.os(), System.arch()]); // [windows, x86_64] on 64-bit Windows
+
+const separator = System.os() == "windows" ? "\\" : "/";
+const is64BitArm = System.arch() == "aarch64";
 ```
 
-They return the Rust target constants from `std::env::consts` as Napalm strings.
+Possible values:
 
-Typical values include:
+| `System.os()` | Platform |
+| --- | --- |
+| `"windows"` | Windows |
+| `"linux"` | Linux |
+| `"macos"` | macOS |
+| `"freebsd"`, `"netbsd"`, `"openbsd"`, `"dragonfly"` | BSD systems |
+| `"android"`, `"ios"` | Mobile systems |
 
-- OS: `linux`, `windows`, `macos`, `freebsd`, `android`, `ios`, ...
-- architecture: `x86_64`, `aarch64`, `x86`, `arm`, `riscv64`, ...
+| `System.arch()` | Architecture |
+| --- | --- |
+| `"x86_64"` | 64-bit Intel/AMD |
+| `"aarch64"` | 64-bit ARM (Apple Silicon, ARM servers, Windows on ARM) |
+| `"x86"` | 32-bit Intel/AMD |
+| `"arm"` | 32-bit ARM |
+| `"riscv64"` | 64-bit RISC-V |
 
-The values describe the platform Napalm was compiled for, which is the correct
-behavior for cross-compiled binaries.
+The lists are not exhaustive: compare against the values you support and
+handle anything else explicitly instead of assuming a default.
 
-No parser, IR, bytecode, JIT, GC, or FFI changes are required.
+Details:
+
+- **They are methods, not properties.** Write `System.os()`, unlike
+  `System.clock`. `System.os` without parentheses, or passing any argument,
+  throws a runtime error.
+- **The values describe the Napalm runtime, not the machine's hardware or OS
+  version.** A 32-bit or x86_64 build running under emulation (for example on
+  Windows on ARM or with Rosetta on macOS) reports its own architecture. There
+  is no API for the OS version or distribution.
+- **The values are fixed when the Napalm runtime is built.** The same running
+  program always gets the same values. They are never computed during
+  `--build`, so a `.burning` artifact moved to another platform reports the
+  platform of the runtime that runs it.
+- **A standalone executable reports the platform it was compiled on.**
+  `--compile` copies the Napalm runtime that ran it, so a program compiled on
+  Windows x86_64 always reports `"windows"` and `"x86_64"`. It only runs on
+  that platform anyway; to target another platform, run `--compile` with a
+  Napalm runtime for that platform.
+
+[Section 31.1](#311-loading-a-c-library) uses `System.os()` to choose the C
+library name to load with FFI.
 
 ## 37. Napalm native FFI
 

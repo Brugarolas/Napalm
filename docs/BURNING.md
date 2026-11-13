@@ -96,6 +96,80 @@ Unreadable artifacts return exit code 3; invalid or incompatible artifacts retur
 the artifact untouched. `napalm file.burning --build` passes `--build` to the
 program as an ordinary argument.
 
+## Standalone executables (`--compile`)
+
+```sh
+napalm --compile path/to/fib.napalm   # writes fib.burning and fib.exe (Windows) / fib
+napalm --compile path/to/fib.burning  # embeds an existing artifact as is
+./fib [program arguments...]
+```
+
+`--compile` runs the same build pipeline as `--build` (so it also writes
+`fib.burning`) and then writes an executable beside the entry file, with the
+extension replaced by the platform's executable extension. The executable is a
+copy of the running Napalm runtime with the artifact appended, so it contains
+the VM, GC, builtins, Cranelift and every statically linked Rust dependency. On
+Windows the MSVC CRT is linked statically (`.cargo/config.toml`), so no Visual
+C++ Redistributable is needed.
+
+When run, it executes the embedded artifact with the same validation, VM
+initialization, JIT and exit codes as `napalm fib.burning`. It parses no
+command-line options: every argument is a program argument, and `Process.args`
+contains them all. The `NAPALM_*` diagnostics environment variables keep
+working. Native libraries and files opened by the program are still runtime
+dependencies.
+
+The `.burning` path is validated before anything is written. The executable is
+assembled under a temporary name and renamed into place, so a failed compile
+leaves an existing executable untouched. Exit codes match `--build`.
+
+### LLVM
+
+On Windows, `LLVM-C.dll` is delay-loaded (see `build.rs`), so the executable
+embeds the copy this runtime would load (`NAPALM_LLVM_DLL`, then the one next
+to `napalm.exe`, then the build-time LLVM prefix), compressed with zstd. It is
+only extracted when the LLVM trace tier first starts, to
+`%LOCALAPPDATA%\napalm\llvm\<content hash>\LLVM-C.dll` (`NAPALM_CACHE_DIR`
+overrides `%LOCALAPPDATA%\napalm`). Later runs, and other executables built
+with the same DLL, reuse it. Programs that never get hot enough never extract
+it. Extraction runs on the background LLVM compiler thread. If the program ends
+during an extraction, the process waits for it to finish before exiting (about
+a second, once per machine) instead of abandoning it. Partial files left by
+killed processes are removed by the next extraction. If the DLL cannot be found at compile time, `--compile` warns and the
+executable falls back to the normal runtime lookup (Cranelift only if absent).
+
+Builds without the `llvm-jit` feature embed nothing. On Linux and macOS libLLVM
+is an ordinary dynamic dependency resolved before `main`, so it is not embedded:
+it must be installed or placed next to the executable (`rpath` `$ORIGIN` /
+`@executable_path`). On macOS the appended payload invalidates the code
+signature; that platform is untested.
+
+### Payload layout
+
+```text
+[runtime image][.burning artifact][LLVM library, zstd frame (optional)][trailer]
+```
+
+Operating systems ignore data appended after an executable image. At startup
+the runtime reads the last 64 bytes of its own file; without the magic it
+behaves as the normal CLI. Fields are little-endian:
+
+| Offset | Size | Meaning |
+| --- | --- | --- |
+| 0 | 8 | Runtime image length (the artifact starts here) |
+| 8 | 8 | Artifact length |
+| 16 | 8 | Compressed LLVM library length, `0` if absent |
+| 24 | 8 | Uncompressed LLVM library length |
+| 32 | 8 | FNV-1a 64 hash of the uncompressed library (cache directory name) |
+| 40 | 4 | Payload version, currently `1` |
+| 44 | 4 | Reserved, `0` |
+| 48 | 16 | Magic `NAPALM-STANDALN\0` |
+
+The lengths must add up to the file size. Otherwise, or with another payload
+version, the executable reports `invalid standalone executable` (exit 1). The
+artifact itself is decoded and verified as usual. Signing a standalone
+executable (Authenticode) appends data after the trailer and is not supported.
+
 ## Version 2 framing
 
 All fixed-width integers are unsigned and little-endian. Lengths count bytes

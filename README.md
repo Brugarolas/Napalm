@@ -56,6 +56,18 @@ Executing `.burning` loads the compiled program directly, including its imported
 modules, without reading or recompiling the original sources. It uses the same
 interpreter, JIT, builtins and `Process.args` behavior as source execution.
 
+To ship a program as a single executable, use `--compile`:
+
+```sh
+cargo run --release -- --compile scripts/fib.napalm
+scripts/fib.exe   # Windows; scripts/fib elsewhere
+```
+
+This writes `scripts/fib.burning` and an executable containing the Napalm
+runtime, the artifact and (on Windows) the LLVM tier's `LLVM-C.dll`. Running it
+executes the embedded program; all its arguments go to `Process.args`. See
+[standalone executables](docs/BURNING.md#standalone-executables---compile).
+
 ```typescript
 import { Answer } from './module_exports';
 
