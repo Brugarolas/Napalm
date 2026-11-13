@@ -20,6 +20,28 @@ Compilation errors retain exit code 1, usage errors 2, and file I/O errors 3.
 Success returns 0. Serialization finishes before the output file is opened, so
 compilation or serialization failures leave an existing artifact untouched.
 
+## Execute an artifact
+
+```sh
+napalm path/to/fib.burning [program arguments...]
+```
+
+The CLI recognizes the `.burning` extension, reads and validates the artifact,
+and executes its stored entry point. It skips source resolution, parsing,
+lowering and compilation. The entry source and statically imported source files
+are no longer needed; the artifact can be moved to another directory.
+
+Execution uses the same VM initialization, builtins, GC, JIT and diagnostics as
+source execution. `Process.args` contains the arguments following the artifact
+path, and relative runtime file accesses use the process working directory as
+usual. Native libraries and other files opened by the program are still runtime
+dependencies.
+
+Unreadable artifacts return exit code 3; invalid or incompatible artifacts return
+1; runtime errors return 4. `--build file.burning` is a usage error (2) and leaves
+the artifact untouched. `napalm file.burning --build` passes `--build` to the
+program as an ordinary argument.
+
 ## Version 1 framing
 
 All binary integers are unsigned and little-endian. Lengths count bytes unless
@@ -68,8 +90,8 @@ The corresponding implementations are supplied by the runtime.
 `napalm_burning::decode` reconstructs a `BytecodeProgram` and `Bootstrap`, rebuilds
 lookup indexes, checks the entry point, and runs the bytecode verifier. It rejects
 unknown versions, malformed framing, duplicate/unknown sections, truncated code,
-inconsistent function IDs/counts, and trailing data. The CLI currently builds
-artifacts; it does not yet accept `.burning` as an executable input.
+inconsistent function IDs/counts, and trailing data. The CLI validates the
+artifact before initializing the VM.
 
 A runtime can initialize the decoded program with `Interpreter::with_host`, using
 `BuiltinHost::new(bootstrap.builtins.clone())`, install the VM builtins, and call

@@ -19,6 +19,7 @@
 //!
 //! ```text
 //! cargo run -- path/to/program.nap
+//! cargo run -- path/to/program.burning
 //! ```
 //!
 //! The pipeline is:
@@ -105,6 +106,33 @@ fn run() -> u8 {
         eprintln!("Debug build: use `cargo run --release -- <file.nap>` for performance measurements.");
     }
 
+    if source_path.extension() == Some(OsStr::new("burning")) {
+        if command_line.build {
+            eprintln!("usage error: --build requires a source file, not a .burning artifact");
+            return EXIT_USAGE_ERROR;
+        }
+        let bytes = match std::fs::read(&source_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("failed to read '{}': {error}", source_path.display());
+                return EXIT_IO_ERROR;
+            }
+        };
+        let artifact = match napalm_burning::decode(&bytes) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                eprintln!("invalid burning artifact '{}': {error}", source_path.display());
+                return EXIT_COMPILE_ERROR;
+            }
+        };
+        return execute_program(
+            &artifact.program,
+            artifact.bootstrap.entry,
+            &artifact.bootstrap.module_name,
+            &artifact.bootstrap.builtins,
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Module graph: resolve -> parse -> lower every statically named module.
     // -------------------------------------------------------------------------
@@ -164,18 +192,26 @@ fn run() -> u8 {
         };
     }
 
-    // Runtime: bytecode -> execution
-    // -------------------------------------------------------------------------
+    execute_program(&bytecode, lowered_module.entry, &module_name, &builtin_manifest)
+}
 
+/// Source compilation and artifact loading share all VM/JIT initialization,
+/// builtin installation, runtime diagnostics and exit-code handling.
+fn execute_program(
+    bytecode: &napalm_bytecode::BytecodeProgram,
+    entry: napalm_ir::FuncId,
+    module_name: &str,
+    builtin_manifest: &napalm_builtin::BuiltinManifest,
+) -> u8 {
     let host = Box::new(napalm_builtin::BuiltinHost::new(builtin_manifest.clone()));
-    let mut interpreter = match Interpreter::with_host(&bytecode, host) {
+    let mut interpreter = match Interpreter::with_host(bytecode, host) {
         Ok(interpreter) => interpreter,
         Err(error) => {
             eprintln!("VM initialization error: {error}");
             return EXIT_RUNTIME_ERROR;
         }
     };
-    napalm_builtin::install_vm_builtins(&mut interpreter, &builtin_manifest);
+    napalm_builtin::install_vm_builtins(&mut interpreter, builtin_manifest);
 
     // Diagnostics useful for comparing the threaded baseline against the tracing
     // tier without recompiling the VM. They are intentionally opt-in so normal
@@ -184,7 +220,7 @@ fn run() -> u8 {
         interpreter.set_jit_options(None);
     }
 
-    let execution = interpreter.run_module(lowered_module.entry);
+    let execution = interpreter.run_module(entry);
 
     if env::var_os("NAPALM_JIT_STATS").is_some() || env::var_os("NAPALM_JIT_STATS").is_some() {
         eprintln!("Napalm JIT stats: {:#?}", interpreter.jit_stats());
@@ -258,5 +294,6 @@ fn parse_command_line() -> Result<CommandLine, ()> {
 }
 
 fn print_usage(executable: &str) {
-    eprintln!("Usage: {executable} [--build] <file.napalm> [program arguments...]");
+    eprintln!("Usage: {executable} <file.napalm|file.burning> [program arguments...]");
+    eprintln!("       {executable} --build <file.napalm>");
 }

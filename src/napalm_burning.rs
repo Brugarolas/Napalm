@@ -120,7 +120,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Reconstruct compiler output for tooling and future loaders. Does not execute
+/// Reconstruct compiler output for tooling and the CLI loader. Does not execute
 /// module initializers or install builtins; callers perform normal VM setup.
 pub fn decode(bytes: &[u8]) -> io::Result<BurningArtifact> {
     let mut reader = Reader(bytes);

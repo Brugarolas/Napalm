@@ -40,6 +40,7 @@ To compile without executing the program, put `--build` before the entry file:
 
 ```sh
 cargo run --release -- --build scripts/fib.napalm
+cargo run --release -- scripts/fib.burning
 ```
 
 This writes `scripts/fib.burning`, including statically imported modules and the
@@ -47,6 +48,9 @@ same HIR/bytecode optimizations used for normal execution. Instructions, runtime
 metadata (including structural layouts, registers and GC maps), and bootstrap
 bindings occupy separate sections. See [the `.burning` format](docs/BURNING.md).
 Arguments after the entry file remain program arguments, including `--build`.
+Executing `.burning` loads the compiled program directly, including its imported
+modules, without reading or recompiling the original sources. It uses the same
+interpreter, JIT, builtins and `Process.args` behavior as source execution.
 
 ```typescript
 import { Answer } from './module_exports';
