@@ -2127,6 +2127,15 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     instance.extend(method_instance);
                 }
             }
+            // The hidden cache/epoch storage of `computed` properties is only
+            // ever touched by the VM, so no method body mentions it.
+            instance.extend(
+                class
+                    .fields
+                    .iter()
+                    .filter(|field| !field.is_static && field.storage.value.starts_with("__reactive_computed_"))
+                    .map(|field| field.storage.value.as_str()),
+            );
 
             // Declared accessors (including the accessors synthesized for typed
             // class fields) keep their method semantics. A `this.x = ...` write to
@@ -2553,6 +2562,28 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 };
                 if let Some(function) = self.compile_function_node(module, &analysis, FunctionNodeId(0), spec) {
                     self.method_functions.insert(method.span, function);
+                    // A getter whose class declares the matching hidden fields
+                    // is the body of a `computed` property.
+                    if let (MethodSignatureAst::Getter { name }, false) = (&method.signature, method.is_static) {
+                        use crate::napalm_front_main::{computed_hidden_field_name, COMPUTED_HIDDEN_FIELDS};
+                        let slots = COMPUTED_HIDDEN_FIELDS.map(|kind| {
+                            class_plan.fields.get(computed_hidden_field_name(kind, &name.value).as_str()).map(|slot| slot.0)
+                        });
+                        if let [Some(cache), epoch, state] = slots {
+                            // The VM addresses all three from the cache slot.
+                            if epoch == cache.checked_add(1) && state == cache.checked_add(2) {
+                                if let Some(function) = self.program.function_mut(function) {
+                                    function.memoization = ir::MemoizationKind::Reactive { cache_slot: cache };
+                                }
+                            } else {
+                                self.error(
+                                    "NAPALM-L900",
+                                    format!("internal error: storage of computed property '{}' is not contiguous", name.value),
+                                    method.span,
+                                );
+                            }
+                        }
+                    }
                     if method.is_constructor {
                         plans.push(MethodPlan {
                             symbol: body_symbol,

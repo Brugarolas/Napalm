@@ -722,6 +722,11 @@ pub trait TraceRuntime {
     /// and control flow may still execute in native traces.
     fn trace_reactive_enabled(&self) -> bool { false }
     fn trace_reactive_tracking_active(&self) -> bool { false }
+    /// A read of the `computed` getter `function` on `receiver` that would be
+    /// answered from the instance right now: the absolute slot of its cached
+    /// value (the validation epoch sits in the next slot) and the address of
+    /// the VM word that epoch must equal.
+    fn trace_computed_hit(&self, _function: FuncId, _receiver: RegisterWord) -> Option<(u32, usize)> { None }
 
     /// Convert one recording-time VM binding into a semantic descriptor which can
     /// be reconstructed inside another isolated Interpreter. Returning `None`
@@ -2582,6 +2587,98 @@ impl<'a> TraceRecorder<'a> {
                 Ok(true)
             }
         }
+    }
+
+    /// Native fast path for reading a `computed` property whose cached value is
+    /// current. The instance keeps the value and the reactive epoch at which
+    /// it was validated in two hidden slots, so a hit is two field loads and
+    /// one compare against the VM's hit epoch (which no field matches while
+    /// dependencies are being collected). Speculated only for a read that hits
+    /// while recording; any guard replays the original Invoke, which revalidates
+    /// or recomputes.
+    fn record_computed_hit<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<bool, RecordingAbort> {
+        // Dynamic dispatch (Invoke) guards the receiver classes that resolve to
+        // the getter; a statically devirtualized read (CallDirect, receiver as
+        // the only source) already names it.
+        let (receiver_reg, target, classes) = match op.opcode {
+            Opcode::Invoke if op.c == 0 && op.args.is_empty() => {
+                let Ok(receiver_word) = runtime.trace_read_slot(FrameSlot::General(Reg(op.b))) else {
+                    return Ok(false);
+                };
+                let Some((target, classes)) =
+                    runtime.trace_inline_target(op.location.function, op.x, receiver_word)
+                else {
+                    return Ok(false);
+                };
+                if classes.is_empty() {
+                    return Ok(false);
+                }
+                (Reg(op.b), target, Some(classes))
+            }
+            Opcode::CallDirect if op.args.len() == 1 => (op.args[0], FuncId(op.x), None),
+            _ => return Ok(false),
+        };
+        let reactive = program.function(target).is_some_and(|callee| {
+            callee.memoization.is_reactive()
+                && callee.frame.return_kind == RegisterKind::Value
+                && crate::napalm_bytecode::function_kind_uses_this(callee.kind)
+                && callee.arity == 0
+        });
+        if !reactive {
+            return Ok(false);
+        }
+        let Ok(receiver_word) = runtime.trace_read_slot(FrameSlot::General(receiver_reg)) else {
+            return Ok(false);
+        };
+        let Some((cache_slot, epoch_address)) = runtime.trace_computed_hit(target, receiver_word) else {
+            if jit_events_enabled() {
+                eprintln!(
+                    "[napalm-jit] computed read at {:?}:{} is not current while recording; keeping the call",
+                    op.location.function, op.location.pc.0
+                );
+            }
+            return Ok(false);
+        };
+
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        let mut receiver = self.read_gpr(builder, receiver_reg.0, TraceType::Any, TraceRep::Tagged)?;
+        if let Some(classes) = classes {
+            builder.emit0(TraceInst::GuardMethodEpoch {
+                expected: runtime.trace_method_epoch(),
+                exit,
+            });
+            receiver = builder.emit1(
+                TraceInst::GuardClass { value: receiver, classes, exit },
+                TraceType::Any,
+                TraceRep::Tagged,
+            );
+        }
+        let object = self.guard_heap_object(builder, receiver, TraceHeapObjectKind::Instance, exit);
+        let validated = builder.emit1(
+            TraceInst::HeapLoadField { object, slot: cache_slot + 1, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        let current = builder.emit1(
+            TraceInst::LoadAbsoluteValue { address: epoch_address as u64 },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        builder.emit0(TraceInst::GuardEq { lhs: validated, rhs: current, exit });
+        let cached = builder.emit1(
+            TraceInst::HeapLoadField { object, slot: cache_slot, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        self.write_gpr(builder, op.a, cached);
+        builder.trace_mut().stats.devirtualized_calls += 1;
+        Ok(true)
     }
 
     /// Native fast path for the stock `list.length` and `list[i]` Invokes. Every
@@ -4808,6 +4905,7 @@ impl<'a> TraceRecorder<'a> {
 
             Invoke => {
                 if self.record_num_invoke(runtime, program, function, op, builder)?
+                    || self.record_computed_hit(runtime, program, op, builder)?
                     || self.record_list_invoke(runtime, op, builder)?
                     || self.record_map_invoke(runtime, op, builder)?
                     || self.record_map_property_invoke(runtime, program, function, op, builder)?
@@ -4819,7 +4917,13 @@ impl<'a> TraceRecorder<'a> {
                 }
             }
             InvokeSuper => self.inline_or_runtime_call(runtime, program, op, builder),
-            CallDirect => self.inline_or_runtime_call(runtime, program, op, builder),
+            CallDirect => {
+                if self.record_computed_hit(runtime, program, op, builder)? {
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    self.inline_or_runtime_call(runtime, program, op, builder)
+                }
+            }
 
             // Specialized integer unary.
             INeg | IBitNot => {
@@ -7058,6 +7162,8 @@ pub enum VmBindingDescriptor {
     AsciiCharTable,
     ModuleVariable { module: ModuleId, slot: u32 },
     StaticField { class: ClassId, slot: u32 },
+    /// The VM word a computed property's validation epoch is compared with.
+    ReactiveHitEpoch,
     ProfileCounter { function: FuncId, counter: u32 },
     BuiltinClassKey(u64),
     NominalClassKey { kind: u8, class: ClassId },

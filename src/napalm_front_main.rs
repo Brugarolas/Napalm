@@ -4122,16 +4122,17 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // `computed name() { ... }` creates a lazy cached property. The
-            // implementation body is stored as a zero-argument closure in one hidden
-            // fixed-layout field. Native reactive state owns the logical cache/version;
-            // a second hidden field only anchors managed cached values to the instance
-            // for GC and is never read by the getter. The public getter brackets closure
-            // execution with internal begin/finish hooks without changing the ABI.
+            // `computed name() { ... }` creates a lazy cached property. Its body
+            // is compiled as the public getter itself; three hidden fixed-layout
+            // fields hold the cached value, the reactive epoch at which it was
+            // last validated and the VM's bookkeeping. They are what marks the getter as a
+            // reactive-memoized function for the lowerer: the VM's call boundary
+            // answers a still-valid read without running the body and collects
+            // dependencies when it does run.
             //
-            // `watch name() { ... }` similarly stores a closure, but the reactive runtime
-            // schedules it as a microtask and re-schedules it when any dependency
-            // written during the previous run changes.
+            // `watch name() { ... }` stores a closure that the reactive runtime
+            // schedules as a microtask and re-schedules when any dependency
+            // read during the previous run changes.
             let reactive_member = if self.eat("computed") {
                 Some(true)
             } else if self.eat("watch") {
@@ -4167,18 +4168,14 @@ impl<'a> Parser<'a> {
                         "a watcher requires a function body"
                     });
                 }
-                // Computed/watch bodies are wrapped by reactive machinery whose
-                // public getter is synthesized separately; keep them unconstrained.
+                // Computed/watch bodies run under reactive machinery; keep
+                // their result unconstrained.
                 let body = self.function_body(Vec::new(), None, member_start)?;
                 if is_computed {
-                    let local_span = Span::empty(self.synthetic_span);
-                    self.synthetic_span += 1;
-                    let (callback_field, cache_field, getter, initializer) =
-                        synthesize_computed_property(&member, body, local_span);
-                    fields.push(callback_field);
-                    fields.push(cache_field);
+                    let (hidden_fields, getter) =
+                        synthesize_computed_property(&member, body, self.end(member_start));
+                    fields.extend(hidden_fields);
                     methods.push(getter);
-                    initializers.push(initializer);
                 } else {
                     let (field, initializer) = synthesize_watcher(&member, body);
                     fields.push(field);
@@ -4722,78 +4719,26 @@ fn instance_field_expr(storage: &Ident) -> Expr {
     Expr::new(ExprKind::Field(storage.clone()), storage.span)
 }
 
+/// Hidden storage of a `computed` property, in slot order: its cached value,
+/// the reactive epoch at which that value was last known to be current, and
+/// the VM's observer record. The lowerer pairs them with the getter of the
+/// same name by these exact spellings.
+pub(crate) const COMPUTED_HIDDEN_FIELDS: [&str; 3] = ["cache", "epoch", "state"];
+
+pub(crate) fn computed_hidden_field_name(kind: &str, member: &str) -> compact_str::CompactString {
+    compact_str::format_compact!("__reactive_computed_{kind}${member}")
+}
+
 fn synthesize_computed_property(
     member: &Ident,
     body: FunctionBody,
-    local_span: Span,
-) -> (ClassFieldDecl, ClassFieldDecl, MethodDecl, Stmt) {
-    let callback_storage = hidden_reactive_field(member, "computed");
-    let cache_storage = hidden_reactive_field(member, "computed_cache");
-    let callback_local = Spanned::new(
-        compact_str::format_compact!("<reactive:computed-local:{}>", member.value),
-        local_span,
-    );
-    let span = member.span;
-    let closure = Expr::new(ExprKind::Closure(body), span);
-    let callback_field = || instance_field_expr(&callback_storage);
-    let callback = || Expr::new(ExprKind::Name(callback_local.clone()), span);
-    let cache = || instance_field_expr(&cache_storage);
-
-    let callback_decl = Stmt {
-        kind: StmtKind::Variable {
-                    shared: false,
-            name: callback_local.clone(),
-            annotation: None,
-            initializer: Some(callback_field()),
-        },
-        span,
-    };
-
-    let begin = reactive_static_call("__beginComputed", vec![callback()], span);
-    let evaluate = invoke(callback(), "call", Vec::new(), span);
-    let finish = reactive_static_call(
-        "__finishComputed",
-        vec![callback(), evaluate],
-        span,
-    );
-    // Native state owns dirty/version metadata and mirrors the current value here.
-    // The hidden field is both the precise-GC anchor and the getter's cache-hit
-    // return path; runtime brackets suppress this implementation-only read from
-    // the parent reactive dependency graph.
-    let cache_anchor = Expr::new(
-        ExprKind::Assign {
-            target: Box::new(cache()),
-            value: Box::new(finish),
-        },
-        span,
-    );
-    let abort = reactive_static_call("__abortComputed", vec![callback()], span);
-    let guarded_eval = Stmt {
-        kind: StmtKind::If {
-            condition: begin,
-            then_branch: Box::new(Stmt {
-                kind: StmtKind::Try {
-                    body: Box::new(Stmt {
-                        kind: StmtKind::Block(vec![Stmt {
-                            kind: StmtKind::Expression(cache_anchor),
-                            span,
-                        }]),
-                        span,
-                    }),
-                    catch: None,
-                    finally_branch: Some(Box::new(Stmt {
-                        kind: StmtKind::Block(vec![Stmt {
-                            kind: StmtKind::Expression(abort),
-                            span,
-                        }]),
-                        span,
-                    })),
-                },
-                span,
-            }),
-            else_branch: None,
-        },
-        span,
+    span: Span,
+) -> ([ClassFieldDecl; 3], MethodDecl) {
+    let hidden = |storage: compact_str::CompactString| ClassFieldDecl {
+        storage: Spanned::new(storage, member.span),
+        annotation: None,
+        initializer: None,
+        is_static: false,
     };
     let getter = MethodDecl {
         signature: MethodSignatureAst::Getter { name: member.clone() },
@@ -4802,52 +4747,10 @@ fn synthesize_computed_property(
         is_foreign: false,
         is_constructor: false,
         attributes: Vec::new(),
-        body: Some(FunctionBody {
-            params: Vec::new(),
-            param_types: Vec::new(),
-            return_type: None,
-            kind: FunctionBodyKind::Statements(vec![
-                callback_decl,
-                guarded_eval,
-                // __beginComputed/__abortComputed arrange for this one hidden
-                // cache-anchor load to bypass dependency tracking. Returning the
-                // field directly removes a second native runtime call from every
-                // computed cache hit.
-                Stmt {
-                    kind: StmtKind::Return(Some(cache())),
-                    span,
-                },
-            ]),
-            span,
-        }),
+        body: Some(body),
         span,
     };
-    let initializer = Stmt {
-        kind: StmtKind::Expression(Expr::new(
-            ExprKind::Assign {
-                target: Box::new(callback_field()),
-                value: Box::new(reactive_static_call("__registerComputed", vec![closure], span)),
-            },
-            span,
-        )),
-        span,
-    };
-    (
-        ClassFieldDecl {
-            storage: callback_storage,
-            annotation: None,
-            initializer: None,
-            is_static: false,
-        },
-        ClassFieldDecl {
-            storage: cache_storage,
-            annotation: None,
-            initializer: None,
-            is_static: false,
-        },
-        getter,
-        initializer,
-    )
+    (COMPUTED_HIDDEN_FIELDS.map(|kind| hidden(computed_hidden_field_name(kind, &member.value))), getter)
 }
 
 fn synthesize_watcher(
@@ -6569,8 +6472,15 @@ mod napalm_syntax_tests {
             &method.signature,
             MethodSignatureAst::PrefixOperator { operator: OperatorName::Minus }
         )));
-        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed$magnitude2")));
-        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
+        for kind in COMPUTED_HIDDEN_FIELDS {
+            let name = computed_hidden_field_name(kind, "magnitude2");
+            assert!(class.fields.iter().any(|field| field.storage.value == name), "{name}");
+        }
+        // The body is the getter itself: no closure, no initializer.
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::Getter { name } if name.value == "magnitude2"
+        )));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
     }
 

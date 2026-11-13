@@ -1202,15 +1202,11 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // returns a cancellable Napalm Promise<Response>.
     // Reactive is a compiler/runtime service. Keep its entry points internal so
     // reactivity can be detected before execution and the JIT never compiles a
-    // field trace under the wrong tracking policy.
+    // field trace under the wrong tracking policy. Computed properties need no
+    // entry point: their getters are reactive-memoized by the call boundary.
     let reactive = static_(BuiltinId::Reactive);
-    manifest.register_native(program, reactive, "__registerComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveComputed);
     manifest.register_native(program, reactive, "__registerWatcher", MethodKind::Method, 1, NativeBuiltin::ReactiveWatch);
     manifest.register_native(program, reactive, "__unwatch", MethodKind::Method, 1, NativeBuiltin::ReactiveUnwatch);
-    manifest.register_native(program, reactive, "__beginComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveBeginComputed);
-    manifest.register_native(program, reactive, "__finishComputed", MethodKind::Method, 2, NativeBuiltin::ReactiveFinishComputed);
-    manifest.register_native(program, reactive, "__readComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveReadComputed);
-    manifest.register_native(program, reactive, "__abortComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveAbortComputed);
 
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 2, NativeBuiltin::FetchCall);

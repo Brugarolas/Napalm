@@ -336,6 +336,10 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
         allocating.extend(additional);
     }
     for function in &mut program.functions {
+        // `computed` getters are classified by the lowerer, not by purity.
+        if function.memoization.is_reactive() {
+            continue;
+        }
         // A constructor initializes a fresh `this` on every call: caching it
         // would hand out a shared instance. Constructors are never memoized
         // (NewClassInstance also relies on this and pushes the frame directly).

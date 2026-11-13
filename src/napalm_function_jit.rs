@@ -1692,10 +1692,7 @@ fn emit_native_class_field_load(
 
     let tracking = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
         offset_of!(Interpreter<'static>, reactive_tracking_active) as i32);
-    let skip = b.ins().load(types::I8, MemFlagsData::trusted(), vm,
-        offset_of!(Interpreter<'static>, reactive_skip_next_field_track) as i32);
-    let skip_or_track = b.ins().bor(tracking, skip);
-    let allow = b.ins().icmp_imm(IntCC::Equal, skip_or_track, 0);
+    let allow = b.ins().icmp_imm(IntCC::Equal, tracking, 0);
     b.ins().brif(allow, tag_ok, &[], fallback, &[]);
 
     b.switch_to_block(tag_ok);
@@ -2743,6 +2740,8 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
         Some((FunctionState::Cold, _)) => {}
     }
     if vm.prepared.functions[target as usize].memoization.enabled() {
+        // Settle the decision so later calls skip this path entirely.
+        unsafe { (*jit_ptr).reject(target) };
         return None;
     }
     if unsafe { (*jit_ptr).active_depth >= MAX_NATIVE_CALL_DEPTH } {

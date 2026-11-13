@@ -114,7 +114,7 @@ impl SharedMemoTables {
     /// Builds one table per memoized function, or `None` when nothing is memoized.
     pub(super) fn new(policies: impl Iterator<Item = MemoizationKind>) -> Option<Self> {
         let tables: Box<[Option<SharedMemoTable>]> = policies
-            .map(|policy| policy.enabled().then(|| SharedMemoTable::new(policy)))
+            .map(|policy| policy.uses_memo_table().then(|| SharedMemoTable::new(policy)))
             .collect();
         tables.iter().any(Option::is_some).then(|| Self {
             created: Instant::now(),
@@ -128,7 +128,7 @@ impl SharedMemoTables {
         for policy in policies {
             let same = match tables.next() {
                 Some(Some(table)) => table.policy == policy,
-                Some(None) => !policy.enabled(),
+                Some(None) => !policy.uses_memo_table(),
                 None => false,
             };
             if !same {

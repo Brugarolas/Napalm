@@ -904,12 +904,33 @@ pub enum MemoizationKind {
     Recursive,
     /// Recursive pure allocation with globally shareable results.
     RecursiveShared,
+    /// Getter of a `computed` property. Not an auto-memoization result: the
+    /// lowerer assigns it. The call boundary validates the cached value against
+    /// the reactive dependency graph instead of probing a memo table, and the
+    /// return stores it in the instance. `cache_slot` is the first of three
+    /// consecutive hidden instance slots (cached value, validation epoch,
+    /// observer record); it is class-local until the VM relocates it with the
+    /// declaring class's field base.
+    Reactive { cache_slot: u16 },
 }
 
 impl MemoizationKind {
+    /// Whether calls must go through the ordinary call boundary (never be
+    /// inlined or entered natively without it).
     #[inline]
     pub const fn enabled(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    #[inline]
+    pub const fn is_reactive(self) -> bool {
+        matches!(self, Self::Reactive { .. })
+    }
+
+    /// Whether results live in a scalar-key memo table.
+    #[inline]
+    pub const fn uses_memo_table(self) -> bool {
+        !matches!(self, Self::None | Self::Reactive { .. })
     }
 
     #[inline]
