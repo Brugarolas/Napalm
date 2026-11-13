@@ -1,10 +1,9 @@
-
 <p align="center">
-  <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
+  <img src="https://github.com/Brugarolas/Napalm/blob/master/img/logo.png?raw=true" alt="Napalm">
 </p>
 
 <p align="center">
-  <img src="https://github.com/Brugarolas/Napalm/blob/master/img/logo.png?raw=true" alt="Napalm">
+  <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
 </p>
 
 # Napalm
