@@ -19830,14 +19830,10 @@ unsafe fn h_is_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let value = Value::from_word(vm.reg(op.b));
     let class = Value::from_word(vm.reg(op.c));
     let result = match vm.heap.get(class) {
-        Some(HeapObject::BuiltinClass { builtin: BuiltinId::FileInfo }) =>
-            matches!(vm.heap.get(value), Some(HeapObject::FileInfo(_))),
-        Some(HeapObject::BuiltinClass { builtin: BuiltinId::File }) =>
-            matches!(vm.heap.get(value), Some(HeapObject::File(_))),
-        Some(HeapObject::BuiltinClass { builtin: BuiltinId::InputStream }) =>
-            matches!(vm.heap.get(value), Some(HeapObject::InputStream(_))),
-        Some(HeapObject::BuiltinClass { builtin: BuiltinId::OutputStream }) =>
-            matches!(vm.heap.get(value), Some(HeapObject::OutputStream(_))),
+        // Built-in value classes share the runtime type checks used by
+        // annotations, so `x instanceof List` and `x: List` always agree.
+        Some(HeapObject::BuiltinClass { builtin }) => builtin_instance_type(*builtin)
+            .is_some_and(|expected| vm.type_matches(value.word(), &expected)),
         Some(HeapObject::ClassObject { class_slot: target }) => {
             let actual = match vm.heap.get(value) {
                 Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
@@ -19850,6 +19846,38 @@ unsafe fn h_is_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
     };
     vm.set_reg(op.a, Value::from_bool(result).word());
     vm.advance(op)
+}
+
+/// Runtime type that a built-in class names as the right operand of
+/// `instanceof`. Built-ins that are namespaces or functions rather than value
+/// classes (System, JSON, Fs, Process, ...) have no instances.
+fn builtin_instance_type(builtin: BuiltinId) -> Option<Type> {
+    Some(match builtin {
+        BuiltinId::Bool => Type::Bool,
+        BuiltinId::Null => Type::Null,
+        BuiltinId::Num => Type::Num,
+        BuiltinId::String => Type::String,
+        BuiltinId::List => Type::List(None),
+        BuiltinId::Map => Type::Map,
+        BuiltinId::Set => Type::Set(None),
+        BuiltinId::Range => Type::Range,
+        BuiltinId::Fiber => Type::Fiber,
+        BuiltinId::Promise
+        | BuiltinId::Generator
+        | BuiltinId::Event
+        | BuiltinId::Emitter
+        | BuiltinId::Channel
+        | BuiltinId::Receiver
+        | BuiltinId::ConcurrentMap
+        | BuiltinId::ConcurrentSet
+        | BuiltinId::Bytes
+        | BuiltinId::ByteBuffer
+        | BuiltinId::FileInfo
+        | BuiltinId::File
+        | BuiltinId::InputStream
+        | BuiltinId::OutputStream => Type::Builtin(builtin, None),
+        _ => return None,
+    })
 }
 
 unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
