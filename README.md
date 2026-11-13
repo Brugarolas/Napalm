@@ -43,8 +43,10 @@ cargo run --release -- --build scripts/fib.napalm
 cargo run --release -- scripts/fib.burning
 ```
 
-This writes `scripts/fib.burning`, including statically imported modules and the
-same HIR/bytecode optimizations used for normal execution. Instructions, runtime
+This writes `scripts/fib.burning`, including statically imported modules. Its
+separate build pipeline currently uses the same HIR passes as normal execution,
+repeating the complete HIR optimizer until no changes remain, then compiling and
+optimizing bytecode once. Instructions, runtime
 metadata (including structural layouts, registers and GC maps), and bootstrap
 bindings occupy separate sections. See [the `.burning` format](docs/BURNING.md).
 Arguments after the entry file remain program arguments, including `--build`.

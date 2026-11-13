@@ -5,9 +5,21 @@ napalm --build path/to/fib.napalm
 ```
 
 The build pipeline resolves and parses the entire static module graph, installs
-the builtin declarations, lowers to HIR, runs the normal HIR optimization passes,
-lowers to register bytecode, and runs the normal bytecode optimizer. It shares
-the compilation implementation with normal execution. Its final stage writes
+the builtin declarations, and lowers to HIR. Its separate
+`napalm_build_pipeline::BuildCompilationPipeline` currently selects the same
+ordered HIR passes as normal compilation, but calls the complete HIR optimizer
+repeatedly until the HIR before and after a round is identical. Each round includes function/node
+passes and whole-program finalizers, so global rewrites can expose opportunities
+for the next round. There is no fixed iteration limit. The standalone
+`optimize_hir` phase compares canonical HIR snapshots (including metadata and
+exact numeric constant bits), independently of the passes' change flags. It
+neither generates nor inspects bytecode; it returns with the HIR stabilized.
+
+Once HIR is stable, the pipeline lowers it to register bytecode and runs the
+normal bytecode optimizer. Bytecode generation happens once, after convergence.
+The build pipeline has its own pass selection and orchestration so it can evolve
+independently; ordinary source execution keeps its existing single HIR round,
+and `.burning` execution performs no HIR optimization. Its final stage writes
 `path/to/fib.burning`, replacing an existing artifact on a successful build.
 No VM is initialized and no module body, import initializer or user code runs.
 

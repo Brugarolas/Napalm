@@ -26,6 +26,23 @@ use std::fmt;
 use smallvec::SmallVec;
 use compact_str::CompactString;
 
+// Canonical HIR snapshots compare actual state between optimization rounds.
+// Lookup indexes are derived and omitted; profile maps must not depend on hash
+// table iteration order. Constants already serialize their exact f64 bits.
+fn serialize_hir_map<K: Ord + serde::Serialize, V: serde::Serialize, S: serde::Serializer>(
+    map: &HashMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&map.iter().collect::<std::collections::BTreeMap<_, _>>(), serializer)
+}
+
+fn serialize_hir_strings<S: serde::Serializer>(
+    strings: &[CompactString],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(strings.iter().map(CompactString::as_str))
+}
+
 macro_rules! id_newtype {
     ($name:ident, $repr:ty) => {
         #[repr(transparent)]
@@ -659,6 +676,7 @@ pub struct BuiltinBinding {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Signature {
     pub name: StringId,
     /// IR-level call parameters. Method-like functions include the receiver as
@@ -781,11 +799,13 @@ pub struct SourceSpan {
 /// Opaque resume location. The bytecode lowerer can later associate this with a
 /// concrete bytecode PC without making the IR depend on a bytecode format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub struct ResumePoint {
     pub id: ResumeId,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct SnapshotSlot {
     /// Logical interpreter-visible slot. It is intentionally not a physical VM register.
     pub slot: u32,
@@ -793,6 +813,7 @@ pub struct SnapshotSlot {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct InlinedFrameState {
     pub function: FuncId,
     pub resume: ResumePoint,
@@ -800,6 +821,7 @@ pub struct InlinedFrameState {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct DeoptSnapshot {
     pub resume: ResumePoint,
     pub slots: Vec<SnapshotSlot>,
@@ -817,12 +839,14 @@ impl DeoptSnapshot {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct DeoptPoint {
     pub id: DeoptId,
     pub snapshot: DeoptSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum BailoutReason {
     TypeMismatch,
     ClassMismatch,
@@ -836,6 +860,7 @@ pub enum BailoutReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum EffectKind {
     Read,
     Write,
@@ -861,12 +886,14 @@ pub enum EffectBehavior {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct EffectValue {
     pub id: EffectId,
     pub def: EffectDef,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize)]
 pub enum EffectDef {
     Entry,
     BlockParam(BlockId),
@@ -874,12 +901,14 @@ pub enum EffectDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum IntUnaryOp {
     Neg,
     BitNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum IntBinOp {
     Add,
     Sub,
@@ -895,11 +924,13 @@ pub enum IntBinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum F64UnaryOp {
     Neg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum F64BinOp {
     Add,
     Sub,
@@ -909,6 +940,7 @@ pub enum F64BinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CmpKind {
     Eq,
     Ne,
@@ -919,6 +951,7 @@ pub enum CmpKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CallConv {
     Napalm,
     Fast,
@@ -981,6 +1014,7 @@ impl MemoizationKind {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Edge {
     pub target: BlockId,
     pub args: Vec<ValueId>,
@@ -988,6 +1022,7 @@ pub struct Edge {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct SwitchCase {
     pub value: i64,
     pub edge: Edge,
@@ -995,6 +1030,7 @@ pub struct SwitchCase {
 
 /// Mid/high-level Napalm operations.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub enum Inst {
     // ----- Control flow -----
     Jump {
@@ -2249,6 +2285,7 @@ impl Inst {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Node {
     pub id: InstId,
     pub kind: Inst,
@@ -2261,6 +2298,7 @@ pub struct Node {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Value {
     pub id: ValueId,
     pub ty: Type,
@@ -2268,6 +2306,7 @@ pub struct Value {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize)]
 pub enum ValueDef {
     InstResult(InstId, u8),
     BlockParam(BlockId, u16),
@@ -2275,6 +2314,7 @@ pub enum ValueDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CaptureMode {
     ByValue,
     /// The captured value is a `Type::Cell` and mutations go through the cell.
@@ -2282,6 +2322,7 @@ pub enum CaptureMode {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct CaptureParam {
     pub value: ValueId,
     pub ty: Type,
@@ -2289,6 +2330,7 @@ pub struct CaptureParam {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Block {
     pub id: BlockId,
     pub params: Vec<ValueId>,
@@ -2298,12 +2340,14 @@ pub struct Block {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct CallSiteProfile {
     pub receiver_classes: Vec<(ClassId, u64)>,
     pub targets: Vec<(FuncId, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct NumericProfile {
     pub int32_hits: u64,
     pub f64_hits: u64,
@@ -2311,9 +2355,13 @@ pub struct NumericProfile {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct ProfileData {
+    #[serde(serialize_with = "serialize_hir_map")]
     pub block_counters: HashMap<BlockId, u64>,
+    #[serde(serialize_with = "serialize_hir_map")]
     pub call_sites: HashMap<SiteId, CallSiteProfile>,
+    #[serde(serialize_with = "serialize_hir_map")]
     pub numeric_sites: HashMap<InstId, NumericProfile>,
 }
 
@@ -2325,6 +2373,7 @@ pub struct ProfileData {
 /// thrown Napalm value there on handler entry. `depth` resolves nested overlapping
 /// regions without putting enter/leave opcodes on the hot path.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct ExceptionRegion {
     pub protected_blocks: Vec<BlockId>,
     pub handler: BlockId,
@@ -2333,6 +2382,7 @@ pub struct ExceptionRegion {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Function {
     pub id: FuncId,
     pub module: ModuleId,
@@ -2387,12 +2437,14 @@ impl Function {
 /// Source declaration identity. A `type Alias = InterfaceName` remains a
 /// DefineType even when its resolved structural value is an Interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum ContractDeclarationKind {
     Interface,
     Type,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct ContractDeclaration {
     pub module: ModuleId,
     pub name: StringId,
@@ -2401,6 +2453,7 @@ pub struct ContractDeclaration {
 }
 
 #[derive(Default)]
+#[derive(serde::Serialize)]
 pub struct Program {
     next_func: u32,
     next_module: u32,
@@ -2411,13 +2464,17 @@ pub struct Program {
     next_resume: u32,
 
     pub functions: Vec<Function>,
+    #[serde(skip)]
     function_index: HashMap<FuncId, usize>,
     pub modules: Vec<ModuleInfo>,
+    #[serde(skip)]
     module_index: HashMap<ModuleId, usize>,
     pub classes: Vec<ClassInfo>,
+    #[serde(skip)]
     class_index: HashMap<ClassId, usize>,
     pub foreign_functions: Vec<ForeignFunctionInfo>,
     pub structural_layouts: Vec<StructuralLayoutInfo>,
+    #[serde(skip)]
     structural_layout_index: HashMap<Type, StructuralLayoutId>,
     /// Source names of declared interfaces and type aliases with their
     /// resolved contract, so the runtime can name contracts (`typeof`).
@@ -2426,9 +2483,12 @@ pub struct Program {
     /// bytecode at the owning module's entry, rather than guessing from Type.
     pub contract_declarations: Vec<ContractDeclaration>,
 
+    #[serde(serialize_with = "serialize_hir_strings")]
     strings: Vec<CompactString>,
+    #[serde(skip)]
     string_index: HashMap<CompactString, StringId>,
     methods: Vec<MethodSignature>,
+    #[serde(skip)]
     method_index: HashMap<MethodSignature, MethodSymbol>,
 }
 

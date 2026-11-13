@@ -64,6 +64,7 @@ pub mod napalm_ir_optimizer;
 pub mod napalm_ir_optimizing;
 pub mod napalm_ir_escape;
 pub mod napalm_pipeline;
+pub mod napalm_build_pipeline;
 
 #[cfg(test)]
 #[path = "tests/compiler_perf.rs"]
@@ -165,7 +166,12 @@ fn run() -> u8 {
     // Compilation pipeline: HIR -> optimizations -> register bytecode
     // -------------------------------------------------------------------------
 
-    let bytecode = match napalm_pipeline::compile_program(&mut hir) {
+    let compiled = if command_line.build {
+        napalm_build_pipeline::compile_program(&mut hir)
+    } else {
+        napalm_pipeline::compile_program(&mut hir)
+    };
+    let bytecode = match compiled {
         Ok(program) => program,
         Err(error) => {
             eprintln!("bytecode compilation error: {error}");
@@ -174,8 +180,7 @@ fn run() -> u8 {
     };
 
     // -------------------------------------------------------------------------
-    // Build pipeline: share every compilation pass, then serialize instead of
-    // initializing the VM or executing module bodies.
+    // Build pipeline output: serialize instead of initializing the VM.
     if command_line.build {
         return match napalm_burning::write_build(
             &source_path,

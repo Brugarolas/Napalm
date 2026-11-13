@@ -13,7 +13,7 @@ use crate::napalm_ir_optimizer::Optimize;
 use crate::napalm_ir_optimizing::optimization_passes;
 
 #[cfg(debug_assertions)]
-mod debug_dump {
+pub(crate) mod debug_dump {
     use super::*;
     use crate::napalm_bytecode::disassemble;
     use std::fs::{File, OpenOptions};
