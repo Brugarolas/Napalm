@@ -6,8 +6,8 @@ napalm --build path/to/fib.napalm
 
 The build pipeline resolves and parses the entire static module graph, installs
 the builtin declarations, and lowers to HIR. Its separate
-`napalm_build_pipeline::BuildCompilationPipeline` currently selects the same
-ordered HIR passes as normal compilation, but calls the complete HIR optimizer
+`napalm_build_pipeline::BuildCompilationPipeline` runs the normal HIR passes plus
+the AOT-only passes described below, and calls the complete HIR optimizer
 repeatedly until the HIR before and after a round is identical. Each round includes function/node
 passes and whole-program finalizers, so global rewrites can expose opportunities
 for the next round. There is no fixed iteration limit. The standalone
@@ -31,6 +31,48 @@ source path keep their existing `Process.args` meaning in normal execution.
 Compilation errors retain exit code 1, usage errors 2, and file I/O errors 3.
 Success returns 0. Serialization finishes before the output file is opened, so
 compilation or serialization failures leave an existing artifact untouched.
+
+## AOT-only HIR passes
+
+These live in `src/napalm_ir/aot/` and are installed only by
+`napalm_build_pipeline::optimization_passes`. They assume a closed program: the
+artifact contains every module that can run. Budgets bound code growth and
+compile-time evaluation per round; they never cap the outer fixed point.
+
+| Pass | What it does |
+| --- | --- |
+| GVN (`Gvn`) | Dominator-scoped value numbering after copy propagation. |
+| PRE (`Pre`) | At joins whose predecessors jump unconditionally, reuses an expression available on some paths and inserts it on the others; the join receives it as a parameter. |
+| LICM (`Licm`) | Hoists pure, non-trapping computations out of natural loops into a dedicated preheader. Constants and copies stay put: hoisting them only lengthens live ranges and adds loop-carried state to JIT traces. |
+| Escape analysis (`ScalarReplacement`) | The existing PEA/SROA, rerun after the AOT passes; inlining makes it interprocedural. |
+| IPCP (`Ipcp`) | Binds parameters to constants when every direct call agrees and the function is never address-taken (no closure, method binding or worker binding). |
+| SCCP (`Sccp`) | Sparse conditional constant propagation, including functions with `try`/`catch`. Folds builtin operators (`+ - * / % < <= > >= == != -x !x`) on Number/Bool/Null constants. |
+| Partial evaluation (`PartialEvaluation`) | Evaluates direct calls with constant arguments in a scalar HIR interpreter (recursion and loops included, bounded by fuel) and replaces them with the result. |
+| Specialization (`Specialization`) | Clones a callee per call site for constant arguments and for narrower object types (records, interfaces, class instances), so static type specialization can devirtualize inside the clone. A constant-only clone is kept only if SCCP on it removes work; an object fact only if the parameter is dispatched on, accessed or contract-checked. Unprofitable clones would split JIT warm-up and profiles. Clones keep the source name; `Function::specialization` records their origin and facts. |
+| Inlining (`Inlining`) | Copies straight-line helpers in place, then inlines small closed callees with their whole CFG (branches, tail calls, `throw`). Callees containing loops are not inlined: the loop amortizes the call, and moving it into the caller (often a module body) costs the JIT its function entry and bloats trace state. |
+| Automatic memoization (`MonotoneAutoMemoization`) | Runs before the AOT interprocedural passes. A classification is never withdrawn in a later round, even if the reshaped program defeats the whole-program proof (e.g. after literal hoisting). Hoisted shared literals count as the shareable allocation they replaced. |
+| Tree shaking (`TreeShaking`) | Removes unused module-variable reads, unobserved closure bindings and functions that are no longer reachable. Function IDs are never renumbered. |
+
+Shared safety rules:
+
+- Builtin operators are folded only for concrete scalar operands. Builtin method
+  tables are bound from the build's own manifest at VM setup and user code
+  cannot rebind them. NaN results are left to run time.
+- Contract checks (`BindInterface`) are never removed. When the checked value is
+  a known scalar that satisfies the contract, users of the result read the
+  constant.
+- Recursive functions (any direct-call cycle; a clone counts as its origin) are
+  neither inlined nor specialized. Inlining them would unroll one level per round.
+- Memoization has priority. No pass clones or inlines a memoized or `computed`
+  function, since a copy would bypass its memo table or reactive validation.
+- Inlining keeps memoized/`computed` functions behind their call boundary. It
+  rejects fiber switches, awaits and deopt-based speculation, and functions that
+  use class field slots of another class or module-relative primitives from
+  another module. Inlined blocks join every exception region that protects the
+  call. Argument types are narrowed to the parameter types with a `Move`, which
+  matches the unchecked call boundary. The callee's own entry contract checks are
+  copied with its body.
+- Error messages keep the source location of the inlined code.
 
 ## Execute an artifact
 

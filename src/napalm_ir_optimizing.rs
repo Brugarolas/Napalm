@@ -31,6 +31,9 @@ pub use shared_constant_literals::SharedConstantLiterals;
 mod static_type_specialization;
 pub use static_type_specialization::StaticTypeSpecialization;
 
+#[path = "napalm_ir/aot.rs"]
+pub mod aot;
+
 /// Interpreter-oriented WIR optimization pipeline.
 ///
 /// The default stage combines bounded scalar folding, local value numbering,
@@ -165,7 +168,22 @@ impl ProgramOptimization for AutoMemoization {
         // at whole-program time so recursive/hot calls can use the direct bytecode
         // ABI instead of Closure method dispatch on every edge.
         let direct_calls = rewrite_known_function_calls(program);
-        analyze_auto_memoization(program) | direct_calls
+        analyze_auto_memoization(program, false) | direct_calls
+    }
+}
+
+/// Build-pipeline auto-memoization. HIR rounds repeat until a fixed point, and
+/// later rounds see a reshaped program (hoisted literals, inlined bodies) on
+/// which the whole-program purity/identity proofs can lose precision. Memoization
+/// has priority over those reshaping passes: a classification made in an
+/// earlier round is never withdrawn, only new functions are added.
+#[derive(Default)]
+pub struct MonotoneAutoMemoization;
+
+impl ProgramOptimization for MonotoneAutoMemoization {
+    fn optimize_program(&mut self, program: &mut Program) -> bool {
+        let direct_calls = rewrite_known_function_calls(program);
+        analyze_auto_memoization(program, true) | direct_calls
     }
 }
 
@@ -292,16 +310,28 @@ fn resolve_direct_call_callee(
     }
 }
 
-fn analyze_auto_memoization(program: &mut Program) -> bool {
+fn analyze_auto_memoization(program: &mut Program, monotone: bool) -> bool {
     let module_functions = discover_module_function_bindings(program);
     let shareable_maps = shared_constant_literals::memoizable_map_operations(program);
+    let shared_literals = shared_constant_literals::shared_literal_slots(program);
     let mut summaries: HashMap<FuncId, MemoCandidate> = HashMap::default();
 
     for function in &program.functions {
         summaries.insert(
             function.id,
-            analyze_memo_candidate(program, function, &module_functions, &shareable_maps),
+            analyze_memo_candidate(program, function, &module_functions, &shareable_maps, &shared_literals),
         );
+        // Build rounds keep earlier classifications: every pass preserves
+        // semantics, so a function proven pure stays pure even when a later,
+        // reshaped program defeats the (imprecise) analysis. Seeding it as a
+        // pure leaf also lets its callers keep or gain memoization.
+        if monotone && function.memoization.enabled() && !function.memoization.is_reactive() {
+            summaries.insert(function.id, MemoCandidate {
+                locally_pure: true,
+                allocates: function.memoization.allows_heap_results(),
+                callees: Vec::new(),
+            });
+        }
     }
 
     // Purity is a closed property over the statically known call graph. Start
@@ -338,6 +368,10 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
     for function in &mut program.functions {
         // `computed` getters are classified by the lowerer, not by purity.
         if function.memoization.is_reactive() {
+            continue;
+        }
+        // Monotone (build) mode: an earlier round's classification stands.
+        if monotone && function.memoization.enabled() {
             continue;
         }
         // A constructor initializes a fresh `this` on every call: caching it
@@ -440,6 +474,7 @@ fn analyze_memo_candidate(
     function: &Function,
     module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
     shareable_maps: &HashSet<(FuncId, InstId)>,
+    shared_literals: &HashSet<(ModuleId, ModuleSlot)>,
 ) -> MemoCandidate {
     // Receiver-bearing methods and closures with captures have hidden inputs that
     // are not represented by the explicit scalar memo key. Async/concurrent code
@@ -492,6 +527,11 @@ fn analyze_memo_candidate(
                 | Inst::Int32ToNum { .. }
                 | Inst::F64ToNum { .. } => {}
 
+                // A hoisted shared literal stands for the shareable allocation it
+                // replaced (repeated build rounds see it after hoisting).
+                Inst::LoadModuleVar { module, slot } if shared_literals.contains(&(*module, *slot)) => {
+                    allocates = true;
+                }
                 Inst::LoadModuleVar { module, slot } => {
                     if !module_functions.contains_key(&(*module, *slot)) {
                         return MemoCandidate::default();

@@ -1153,6 +1153,8 @@ fn inline_body(function: &Function) -> Option<InlineBody> {
         || function.is_concurrent
         || !function.captures.is_empty()
         || !function.exception_regions.is_empty()
+        // Memo tables and `computed` validation live at the call boundary.
+        || function.memoization.enabled()
         || !matches!(function.kind, FunctionKind::Closure | FunctionKind::Method | FunctionKind::StaticMethod)
     {
         return None;
@@ -1226,6 +1228,27 @@ fn is_constructor_factory(body: &InlineBody) -> bool {
 /// removes the allocation, its contract binding and every property access.
 /// Returns the indices of the rewritten callers.
 fn inline_allocation_calls(program: &mut Program) -> Vec<usize> {
+    inline_calls(program, false)
+}
+
+/// AOT also inlines scalar helpers. Preserve the context/exception restrictions
+/// of allocation inlining and refuse recursive call-graph cycles/code explosion.
+pub(super) fn inline_aot_calls(program: &mut Program) -> Vec<usize> {
+    inline_calls(program, true)
+}
+
+fn inline_calls(program: &mut Program, aot: bool) -> Vec<usize> {
+    fn reaches(program: &Program, from: FuncId, target: FuncId, seen: &mut HashSet<FuncId>) -> bool {
+        if from == target { return true; }
+        if !seen.insert(from) { return false; }
+        let Some(function) = program.function(from) else { return true };
+        function.blocks.iter().flat_map(|b| &b.insts).any(|id| {
+            match &function.nodes[id.0 as usize].kind {
+                Inst::CallDirect { callee, .. } | Inst::TailCallDirect { callee, .. } => reaches(program, *callee, target, seen),
+                _ => false,
+            }
+        })
+    }
     let bodies: HashMap<FuncId, InlineBody> = program
         .functions
         .iter()
@@ -1240,6 +1263,7 @@ fn inline_allocation_calls(program: &mut Program) -> Vec<usize> {
         let mut sites: Vec<(usize, InstId, FuncId)> = Vec::new();
         {
             let caller = &program.functions[index];
+            let mut remaining = 512usize.saturating_sub(caller.blocks.iter().map(|b| b.insts.len()).sum());
             for (block_ix, block) in caller.blocks.iter().enumerate() {
                 for &id in &block.insts {
                     let Inst::CallDirect { conv: CallConv::Napalm, callee, args } = &caller.nodes[id.0 as usize].kind
@@ -1250,12 +1274,19 @@ fn inline_allocation_calls(program: &mut Program) -> Vec<usize> {
                     if *callee == caller_id
                         || body.params.len() != args.len()
                         || caller.nodes[id.0 as usize].results.len() != 1
-                        || !(is_constructor_factory(body)
+                        || !(aot || is_constructor_factory(body)
                             || args.iter().any(|arg| is_local_allocation(caller, *arg)))
+                        || (aot && (body.insts.len() > remaining
+                            || reaches(program, *callee, caller_id, &mut HashSet::default())
+                            // A recursive callee would unroll once per HIR round.
+                            || body.insts.iter().any(|(kind, ..)| matches!(kind,
+                                Inst::CallDirect { callee: next, .. }
+                                    if reaches(program, *next, *callee, &mut HashSet::default())))))
                     {
                         continue;
                     }
                     sites.push((block_ix, id, *callee));
+                    remaining = remaining.saturating_sub(body.insts.len());
                 }
             }
         }

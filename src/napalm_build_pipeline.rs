@@ -11,18 +11,41 @@ use crate::napalm_bytecodecompiler::{
 use crate::napalm_ir::Program;
 use crate::napalm_ir_optimizer::Optimize;
 use crate::napalm_ir_optimizing::{
-    AutoMemoization, InterpreterOptimizationBundle, SharedConstantLiterals,
+    InterpreterOptimizationBundle, MonotoneAutoMemoization, SharedConstantLiterals,
     StaticTypeSpecialization,
 };
+use crate::napalm_ir_optimizing::aot::{Ipcp, Specialization, Inlining, Sccp, Licm, Gvn, Pre, PartialEvaluation, TreeShaking};
+use crate::napalm_ir_escape::ScalarReplacement;
 
-/// Separate pass selection for ahead-of-time builds. Initially the same ordered
-/// transforms as normal compilation, with an independent evolution path.
+/// Separate pass selection for ahead-of-time builds: the interpreter transforms
+/// plus AOT-only HIR passes (see `napalm_ir_optimizing::aot`). The whole list is
+/// one round of the fixed-point loop in `optimize_hir`, so every pass sees the
+/// facts exposed by the others (inlined bodies, specialized clones, constants).
 pub fn optimization_passes() -> Optimize {
     Optimize::new()
+        // Function-local: interpreter bundle, then GVN, PRE, LICM and escape
+        // analysis/scalar replacement over the result.
         .with_function_pass(InterpreterOptimizationBundle::default())
+        .with_function_pass(Gvn)
+        .with_function_pass(Pre)
+        .with_function_pass(Licm)
+        .with_function_pass(ScalarReplacement::default())
+        // Whole-program: static types first (direct calls), then automatic
+        // memoization, IPCP, SCCP, partial evaluation, interprocedural (object)
+        // specialization and inlining; literal sharing follows memoization's
+        // direct call graph, and tree shaking drops what became unreachable.
+        // Memoization has priority: it classifies before any clone or inlined
+        // copy can bypass a function, its classifications are never withdrawn in
+        // later rounds, and no AOT pass clones or inlines a memoized function.
         .with_program_finalizer(StaticTypeSpecialization::default())
-        .with_program_finalizer(AutoMemoization::default())
+        .with_program_finalizer(MonotoneAutoMemoization)
+        .with_program_finalizer(Ipcp)
+        .with_program_finalizer(Sccp)
+        .with_program_finalizer(PartialEvaluation)
+        .with_program_finalizer(Specialization)
+        .with_program_finalizer(Inlining)
         .with_program_finalizer(SharedConstantLiterals::default())
+        .with_program_finalizer(TreeShaking)
 }
 
 pub struct BuildCompilationPipeline {

@@ -2414,6 +2414,20 @@ pub struct Function {
     /// pays no bytecode dispatch cost merely for being inside a try/defer region.
     pub exception_regions: Vec<ExceptionRegion>,
     pub profiles: ProfileData,
+    /// Build-only provenance of an AOT call-site specialization clone. The
+    /// clone keeps the generic function's source name (stack traces, closures'
+    /// `toString`), so optimizers identify and deduplicate clones through this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialization: Option<SpecializationOrigin>,
+}
+
+/// Generic function a specialization clone was copied from and the canonical,
+/// interned description of the call-site facts it was specialized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
+pub struct SpecializationOrigin {
+    pub origin: FuncId,
+    pub facts: StringId,
 }
 
 impl Function {
@@ -2606,6 +2620,15 @@ impl Program {
     pub fn function_mut(&mut self, id: FuncId) -> Option<&mut Function> {
         let index = *self.function_index.get(&id)?;
         self.functions.get_mut(index)
+    }
+
+    /// Remove unreachable function bodies without renumbering public FuncIds.
+    pub(crate) fn retain_functions(&mut self, mut retain: impl FnMut(&Function) -> bool) {
+        self.functions.retain(|function| retain(function));
+        self.function_index.clear();
+        for (index, function) in self.functions.iter().enumerate() {
+            self.function_index.insert(function.id, index);
+        }
     }
 
     pub fn add_module(&mut self, name: impl AsRef<str>, variable_count: u32) -> ModuleId {
@@ -2823,6 +2846,7 @@ impl<'p> Builder<'p> {
             deopts: Vec::new(),
             exception_regions: Vec::new(),
             profiles: ProfileData::default(),
+            specialization: None,
         };
 
         let mut block_params = Vec::with_capacity(params.len());

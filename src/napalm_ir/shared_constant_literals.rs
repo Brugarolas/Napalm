@@ -189,6 +189,28 @@ pub(super) fn memoizable_map_operations(program: &Program) -> HashSet<(FuncId, I
     allowed
 }
 
+/// Hidden slots published by `hoist_candidate`: every write comes from a module
+/// body and stores a freshly allocated literal map. A read of one yields the
+/// shared literal whose identity and contents this analysis proved unobservable
+/// and immutable, i.e. it stands for the shareable `AllocMap` it replaced. The
+/// build pipeline re-runs automatic memoization after hoisting, so it must
+/// classify these reads like the original allocation.
+pub(super) fn shared_literal_slots(program: &Program) -> HashSet<(ModuleId, ModuleSlot)> {
+    let mut slots = HashSet::default();
+    let mut rejected = HashSet::default();
+    for function in &program.functions {
+        for &id in function.blocks.iter().flat_map(|block| &block.insts) {
+            let Inst::StoreModuleVar { module, slot, value } = &function.nodes[id.0 as usize].kind else { continue };
+            let hidden = program.module(*module).is_some_and(|m| slot.0 >= m.source_variable_count());
+            let literal = function.kind == FunctionKind::ModuleBody
+                && matches!(producer(function, *value), Some(Inst::AllocMap));
+            if hidden && literal { slots.insert((*module, *slot)); } else { rejected.insert((*module, *slot)); }
+        }
+    }
+    slots.retain(|key| !rejected.contains(key));
+    slots
+}
+
 /// Hidden module slots are initialized by the module body, which isolated
 /// workers never run. Workers only exist when some function is concurrent (the
 /// VM's `concurrency_capable` check), so such programs are rejected; the

@@ -586,11 +586,45 @@ fn napalm_destructuring_and_spread_report_catchable_errors() {
     "#, "5");
 }
 
+#[test]
+fn napalm_aot_passes_preserve_semantics() {
+    // Inlined throws inside try/catch, folded recursion, -0.0 and NaN, branchy
+    // helpers in loops and a contract check fed by a constant.
+    run_napalm(r#"
+        function clamp(x: number, lo: number, hi: number): number {
+            if (x < lo) { return lo; }
+            if (x > hi) { return hi; }
+            return x;
+        }
+        function fact(n: number): number { if (n <= 1) { return 1; } return n * fact(n - 1); }
+        function sum(n: number, acc: number): number { if (n == 0) { return acc; } return sum(n - 1, acc + n); }
+        function risky(x: number): number { if (x > 5) { throw "big"; } return x * 2; }
+        function inverse(x: number): number { return 1 / x; }
+        function isNan(x: number): number { if (x != x) { return 1; } return 2; }
+        let counter = 0;
+        function bump(): number { counter = counter + 1; return counter; }
+        let total = 0;
+        for (let i = 0; i < 10; i++) { total = total + clamp(i, 2, 7); }
+        let caught = 0;
+        for (let i = 3; i < 8; i++) { try { total = total + risky(i); } catch (e) { caught++; } }
+        const twice = bump() + bump();
+        const result = [total, fact(10), sum(100, 0), caught, inverse(-0.0) < 0, isNan(0 / 0), isNan(1), twice, counter];
+    "#, "[69, 3628800, 5050, 2, true, 1, 2, 3, 2]");
+}
+
 fn run_napalm(source: &str, expected: &str) {
     run_napalm_checked(source, expected, false);
 }
 
+/// Every program also runs through the `--build` pipeline (AOT HIR passes to a
+/// fixed point) and must produce the same result as normal compilation.
 fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
+    for build in [false, true] {
+        run_napalm_pipeline(source, expected, require_native && !build, build);
+    }
+}
+
+fn run_napalm_pipeline(source: &str, expected: &str, require_native: bool, build: bool) {
     let parsed = crate::napalm_front_main::parse("test.nap", source);
     assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
     let mut hir = Program::new();
@@ -598,7 +632,11 @@ fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
     let output = lower_module(&mut hir, "test.nap", source, "test", &parsed.module);
     assert!(!output.has_errors(), "{:#?}", output.diagnostics);
     let entry = output.lowered.unwrap().entry;
-    let program = compile_program(&mut hir).unwrap();
+    let program = if build {
+        crate::napalm_build_pipeline::compile_program(&mut hir).unwrap()
+    } else {
+        compile_program(&mut hir).unwrap()
+    };
     for enabled in [false, true] {
         let mut vm = source_vm(&program, &manifest);
         vm.set_jit_options(enabled.then(|| TracingJitOptions {
@@ -627,7 +665,7 @@ fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
         assert_eq!(
             context.format_value(value),
             expected,
-            "jit={enabled}, {result:?}"
+            "build={build}, jit={enabled}, {result:?}"
         );
     }
 }
