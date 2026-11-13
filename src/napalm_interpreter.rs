@@ -7456,6 +7456,7 @@ enum CallTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum NativeBuiltin {
     Bytes(BytesNative),
     Json(JsonNative),
@@ -7606,12 +7607,14 @@ pub enum NativeBuiltin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum JsonNative {
     Parse,
     Stringify,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum FsNative {
     Open,
     ReadText,
@@ -7629,37 +7632,44 @@ pub enum FsNative {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum FileNative {
     Path, Name, Size, IsFile, IsDirectory, IsSymlink, ModifiedAt, CreatedAt,
     Read, Write, Seek, Flush, Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum PathNative {
     Join, Resolve, Normalize, Dirname, Basename, Extension, IsAbsolute, Relative,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum UriNative {
     Parse, FromFilePath, ToFilePath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ProcessNative {
     Stdin, Stdout, Stderr, Args, Cwd, Chdir, Getenv, Exit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum InputStreamNative {
     Read, ReadExact, ReadLine, Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum OutputStreamNative {
     Write, WriteAll, WriteText, Flush, Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BytesNative {
     BytesEmpty, BytesAlloc, BytesFromUtf8, BytesFromArray,
     BytesLength, BytesIsEmpty, BytesIndex, BytesSlice, BytesClone,
@@ -7674,6 +7684,7 @@ pub enum BytesNative {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BuiltinClass {
     Null,
     Bool,

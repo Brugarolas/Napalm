@@ -1,0 +1,23 @@
+import { seed, Counter } from './dependency';
+
+interface Named { name: string; value: number; }
+
+function makeIncrementer(start: number) {
+    let captured = start;
+    return (delta: number) => { captured += delta; return captured; };
+}
+
+const increment = makeIncrementer(seed);
+const counter = new Counter(increment(1));
+const record: Named = { name: 'petición 😀', value: counter.add(21) };
+const list = [record, { name: 'other', value: 7 }];
+System.gc();
+if (list[0].value != 42 || record.name != 'petición 😀') {
+    throw 'round-trip changed objects, closures or imports';
+}
+
+let caught = false;
+try { throw 'expected'; } catch (error) { caught = error == 'expected'; }
+if (!caught || JSON.parse('{"answer":42}').answer != 42) {
+    throw 'round-trip changed exception handlers or native builtins';
+}

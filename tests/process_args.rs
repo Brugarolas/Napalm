@@ -7,6 +7,7 @@ fn process_args_example_accepts_no_arguments_and_preserves_supplied_arguments() 
         (&[], "[]"),
         (&["alpha", "beta"], r#"["alpha","beta"]"#),
         (&["only-one"], r#"["only-one"]"#),
+        (&["--build"], r#"["--build"]"#),
         (
             &["", "two words", "a\"quote", "C:\\path\\", "petición 😀", "--help", "--"],
             r#"["","two words","a\"quote","C:\\path\\","petición 😀","--help","--"]"#,

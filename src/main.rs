@@ -31,7 +31,7 @@
 //!   -> one multi-module dynamic HIR program
 //!   -> HIR optimization passes
 //!   -> register bytecode
-//!   -> interpreter / tracing JIT
+//!   -> interpreter / tracing JIT (or .burning artifact with --build)
 //! ```
 
 #![allow(warnings)]
@@ -41,6 +41,7 @@
 #![feature(hint_prefetch)]
 
 pub mod napalm_builtin;
+pub mod napalm_burning;
 pub mod napalm_bytes;
 pub mod napalm_collections;
 pub mod napalm_bytecode;
@@ -94,10 +95,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> u8 {
-    let source_path = match parse_command_line() {
-        Ok(path) => path,
+    let command_line = match parse_command_line() {
+        Ok(options) => options,
         Err(()) => return EXIT_USAGE_ERROR,
     };
+    let source_path = command_line.source_path;
 
     if cfg!(debug_assertions) {
         eprintln!("Debug build: use `cargo run --release -- <file.nap>` for performance measurements.");
@@ -144,6 +146,24 @@ fn run() -> u8 {
     };
 
     // -------------------------------------------------------------------------
+    // Build pipeline: share every compilation pass, then serialize instead of
+    // initializing the VM or executing module bodies.
+    if command_line.build {
+        return match napalm_burning::write_build(
+            &source_path,
+            &bytecode,
+            lowered_module.entry,
+            &module_name,
+            &builtin_manifest,
+        ) {
+            Ok(_) => EXIT_SUCCESS,
+            Err(error) => {
+                eprintln!("build output error: {error}");
+                EXIT_IO_ERROR
+            }
+        };
+    }
+
     // Runtime: bytecode -> execution
     // -------------------------------------------------------------------------
 
@@ -192,7 +212,12 @@ fn run() -> u8 {
     }
 }
 
-fn parse_command_line() -> Result<PathBuf, ()> {
+struct CommandLine {
+    source_path: PathBuf,
+    build: bool,
+}
+
+fn parse_command_line() -> Result<CommandLine, ()> {
     let mut args = env::args_os();
     let executable = args
         .next()
@@ -203,10 +228,21 @@ fn parse_command_line() -> Result<PathBuf, ()> {
         .unwrap_or_else(|| OsStr::new("napalm"))
         .to_string_lossy();
 
-    let Some(first) = args.next() else {
+    let Some(mut first) = args.next() else {
         print_usage(&executable);
         return Err(());
     };
+
+    let build = first == OsStr::new("--build");
+    if build {
+        first = match args.next() {
+            Some(path) => path,
+            None => {
+                print_usage(&executable);
+                return Err(());
+            }
+        };
+    }
 
     if first == OsStr::new("-h") || first == OsStr::new("--help") {
         print_usage(&executable);
@@ -215,9 +251,12 @@ fn parse_command_line() -> Result<PathBuf, ()> {
 
     // Arguments after the entry file are script arguments, exposed by Process.args.
     // Do not interpret or reject them; each script decides what they mean.
-    Ok(PathBuf::from(first))
+    Ok(CommandLine {
+        source_path: PathBuf::from(first),
+        build,
+    })
 }
 
 fn print_usage(executable: &str) {
-    eprintln!("Usage: {executable} <file.napalm> [program arguments...]");
+    eprintln!("Usage: {executable} [--build] <file.napalm> [program arguments...]");
 }

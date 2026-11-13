@@ -33,6 +33,18 @@ cargo test napalm -- --test-threads=1
 
 Use `.napalm` for Napalm programs. An extensionless import tries the exact path, `.napalm`, and `index.napalm`.
 
+To compile without executing the program, put `--build` before the entry file:
+
+```sh
+cargo run --release -- --build scripts/fib.napalm
+```
+
+This writes `scripts/fib.burning`, including statically imported modules and the
+same HIR/bytecode optimizations used for normal execution. Instructions, runtime
+metadata (including structural layouts, registers and GC maps), and bootstrap
+bindings occupy separate sections. See [the `.burning` format](docs/BURNING.md).
+Arguments after the entry file remain program arguments, including `--build`.
+
 ```typescript
 import { Answer } from './module_exports';
 

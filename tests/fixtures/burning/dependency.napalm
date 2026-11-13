@@ -1,0 +1,7 @@
+export const seed = 20;
+
+export class Counter {
+    value: number;
+    constructor(value: number) { this.value = value; }
+    add(delta: number): number { this.value += delta; return this.value; }
+}

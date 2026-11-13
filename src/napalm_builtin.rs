@@ -18,12 +18,14 @@ use chrono::{
 };
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BuiltinTarget {
     Instance(BuiltinClass),
     Static(BuiltinId),
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PrimitiveBinding {
     pub target: BuiltinTarget,
     pub method: MethodSymbol,
@@ -31,6 +33,7 @@ pub struct PrimitiveBinding {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BuiltinManifest {
     bindings: Vec<PrimitiveBinding>,
     native_bindings: Vec<NativeBinding>,
@@ -47,6 +50,7 @@ pub struct BuiltinManifest {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NativeBinding {
     pub target: BuiltinTarget,
     pub method: MethodSymbol,
@@ -105,6 +109,7 @@ impl BuiltinManifest {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateField {
     YearLegacy,
     FullYear,
@@ -118,6 +123,7 @@ enum DateField {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateSetField {
     YearLegacy,
     FullYear,
@@ -130,6 +136,7 @@ enum DateSetField {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateStringFormat {
     String,
     UtcString,
@@ -142,6 +149,7 @@ enum DateStringFormat {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum BuiltinPrimitive {
     RandomNew,
     RandomInt,

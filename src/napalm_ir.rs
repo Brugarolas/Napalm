@@ -30,6 +30,7 @@ macro_rules! id_newtype {
     ($name:ident, $repr:ty) => {
         #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         pub struct $name(pub $repr);
 
         impl fmt::Debug for $name {
@@ -62,6 +63,7 @@ id_newtype!(PropertySlotId, u16);
 
 /// A small, canonicalized set of observed/possible runtime classes.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClassSet {
     classes: SmallVec<[ClassId; 2]>,
 }
@@ -116,6 +118,7 @@ impl fmt::Debug for ClassSet {
 
 /// Napalm semantic types plus a few internal optimization representations.
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Bottom,
     Top,
@@ -171,6 +174,7 @@ pub enum Type {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct InterfaceFieldType {
     pub name: String,
     pub ty: Type,
@@ -179,12 +183,14 @@ pub struct InterfaceFieldType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum StructuralLayoutKind {
     Interface,
     Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StructuralPropertyInfo {
     pub slot: PropertySlotId,
     pub name: StringId,
@@ -194,6 +200,7 @@ pub struct StructuralPropertyInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StructuralLayoutInfo {
     pub id: StructuralLayoutId,
     pub kind: StructuralLayoutKind,
@@ -442,17 +449,19 @@ impl fmt::Debug for Type {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Constant {
     Null,
     Bool(bool),
     /// A Napalm source-level number. Napalm numbers are semantically f64 values.
-    Num(f64),
+    Num(#[serde(with = "crate::napalm_burning::f64_bits")] f64),
     String(StringId),
     /// Internal constant introduced by integer-specialization passes.
     Int32(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum MethodKind {
     Getter,
     Setter,
@@ -462,6 +471,7 @@ pub enum MethodKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MethodSignature {
     pub name: StringId,
     pub kind: MethodKind,
@@ -470,6 +480,7 @@ pub struct MethodSignature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum FunctionKind {
     ModuleBody,
     Method,
@@ -487,6 +498,7 @@ pub enum FunctionKind {
 /// bindings before executing its body.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BuiltinId {
     Object = 0,
     Class = 1,
@@ -640,6 +652,7 @@ impl BuiltinId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BuiltinBinding {
     pub slot: ModuleSlot,
     pub builtin: BuiltinId,
@@ -655,6 +668,7 @@ pub struct Signature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleExport {
     pub name: StringId,
     pub slot: ModuleSlot,
@@ -664,12 +678,14 @@ pub struct ModuleExport {
 /// carries no managed state: workers materialize a fresh zero-capture Closure
 /// pointing at the same immutable bytecode function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WorkerFunctionBinding {
     pub slot: ModuleSlot,
     pub function: FuncId,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleInfo {
     pub id: ModuleId,
     /// Canonical module identity used by ImportModule. This is intentionally
@@ -708,6 +724,7 @@ impl ModuleInfo {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClassInfo {
     pub id: ClassId,
     pub module: ModuleId,
@@ -743,6 +760,7 @@ pub struct ClassInfo {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ForeignFunctionInfo {
     pub id: ForeignFnId,
     pub module: StringId,
@@ -752,6 +770,7 @@ pub struct ForeignFunctionInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     pub file: Option<StringId>,
     pub line: u32,
@@ -911,6 +930,7 @@ pub enum CallConv {
 /// Keys are always scalar. Shared-result policies additionally require a
 /// whole-program proof of unobservable object identity and GC-rooted results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum MemoizationKind {
     #[default]
     None,

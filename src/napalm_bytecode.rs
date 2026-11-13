@@ -86,6 +86,7 @@ pub const MAX_CLOSURE_CAPTURES: usize = u16::MAX as usize;
 /// value is reserved as a sentinel.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Reg(pub u8);
 
 impl Reg {
@@ -362,6 +363,7 @@ pub const GENERAL_REGISTERS: [Reg; GENERAL_REGISTER_COUNT] = [R0, R1, R2, R3, R4
 /// Call-transfer argument register. These are caller-clobbered by the ABI.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ArgReg(pub u8);
 
 impl ArgReg {
@@ -406,6 +408,7 @@ pub const ARGUMENT_REGISTERS: [ArgReg; ARGUMENT_REGISTER_COUNT] = [ARG0, ARG1, A
 /// Call-transfer return register.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ReturnReg(pub u8);
 
 impl ReturnReg {
@@ -439,6 +442,7 @@ pub const RETURN_REGISTERS: [ReturnReg; RETURN_REGISTER_COUNT] = [RET0, RET1];
 /// SSA values to them permanently.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SpecialReg {
     This = 0,
     Closure = 1,
@@ -736,6 +740,7 @@ macro_rules! bc_id {
     ($name:ident) => {
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         pub struct $name(pub u32);
     };
 }
@@ -758,6 +763,7 @@ impl BytecodePc {
 
 /// Physical representation currently stored in a register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum RegisterKind {
     /// Normal tagged Napalm value.
     Value,
@@ -772,12 +778,14 @@ pub enum RegisterKind {
 /// Where an incoming function parameter comes from before it is copied into a
 /// frame-local GPR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum IncomingSource {
     This,
     Argument(ArgReg),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ParameterBinding {
     pub source: IncomingSource,
     pub destination: Reg,
@@ -785,6 +793,7 @@ pub struct ParameterBinding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CaptureBinding {
     pub capture_index: u16,
     pub destination: Reg,
@@ -792,6 +801,7 @@ pub struct CaptureBinding {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FrameLayout {
     /// Number of GPRs that are semantically part of the frame. `256` is valid.
     pub general_register_count: u16,
@@ -1332,12 +1342,14 @@ pub fn unpack_registers(words: &[Word], count: usize) -> Result<Vec<Reg>, Decode
 
 /// Compiled method binding consumed atomically by a Define*Class opcode.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SpecializedMethodTarget {
     Function(FuncId),
     Foreign(ForeignFnId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SpecializedMethod {
     pub symbol: MethodSymbol,
     pub target: SpecializedMethodTarget,
@@ -1349,6 +1361,7 @@ pub struct SpecializedMethod {
 /// to the original semantics on a failed speculation. No speculative assumption
 /// may silently change observable getter, callback or exception ordering.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SpecializedDescriptor {
     Class {
         class: ClassId,
@@ -1412,6 +1425,7 @@ impl SpecializedDescriptor {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct InlineCacheDescriptor {
     pub site: SiteId,
     pub method: MethodSymbol,
@@ -1420,6 +1434,7 @@ pub struct InlineCacheDescriptor {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TypeGuardDescriptor {
     pub expected: Type,
     /// Canonical top-level structural layout when `expected` itself is an
@@ -1428,23 +1443,27 @@ pub struct TypeGuardDescriptor {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClassGuardDescriptor {
     pub expected: ClassSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SwitchTarget {
     pub value: i64,
     pub target: BytecodePc,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SwitchTable {
     pub default_target: BytecodePc,
     pub cases: Vec<SwitchTarget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SafepointKind {
     ExplicitPoll,
     Call,
@@ -1457,6 +1476,7 @@ pub enum SafepointKind {
 
 /// Precise GC reference bitmap for one safepoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ReferenceMap {
     /// 256 bits, one per GPR.
     pub general: [u64; 4],
@@ -1525,6 +1545,7 @@ impl ReferenceMap {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SafepointEntry {
     pub pc: BytecodePc,
     pub kind: SafepointKind,
@@ -1537,6 +1558,7 @@ pub struct SafepointEntry {
 /// every value that the baseline interpreter may read after resuming, including
 /// unboxed numeric registers, while the GC map only tracks tagged references.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LiveRegisterMap {
     pub general: [u64; 4],
 }
@@ -1562,6 +1584,7 @@ impl LiveRegisterMap {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LiveRegisterEntry {
     pub pc: BytecodePc,
     pub live: LiveRegisterMap,
@@ -1575,6 +1598,7 @@ pub struct LiveRegisterEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum DeoptLocation {
     General(Reg),
     Argument(ArgReg),
@@ -1590,6 +1614,7 @@ pub enum DeoptLocation {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeSnapshotSlot {
     pub slot: u32,
     pub location: DeoptLocation,
@@ -1597,6 +1622,7 @@ pub struct BytecodeSnapshotSlot {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeInlinedFrameState {
     pub function: FuncId,
     pub resume_pc: BytecodePc,
@@ -1604,6 +1630,7 @@ pub struct BytecodeInlinedFrameState {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeDeoptPoint {
     pub id: DeoptId,
     pub resume_pc: BytecodePc,
@@ -1612,12 +1639,14 @@ pub struct BytecodeDeoptPoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ResumeEntry {
     pub id: ResumeId,
     pub pc: BytecodePc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SourceMapEntry {
     pub start_pc: BytecodePc,
     pub end_pc: BytecodePc,
@@ -1625,12 +1654,14 @@ pub struct SourceMapEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ProfileCounterKind {
     Block,
     Numeric,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProfileCounterDescriptor {
     pub kind: ProfileCounterKind,
     /// Optional original IR call/numeric site. Block counters normally use None.
@@ -1638,6 +1669,7 @@ pub struct ProfileCounterDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExceptionHandlerEntry {
     /// Inclusive start of the protected bytecode range.
     pub start_pc: BytecodePc,
@@ -1652,7 +1684,11 @@ pub struct ExceptionHandlerEntry {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeChunk {
+    // The .burning CODE section stores these as little-endian words separately
+    // from the serde metadata. Decoding restores them before verification.
+    #[serde(skip)]
     pub code: Vec<Word>,
     pub constants: Vec<Constant>,
     pub inline_caches: Vec<InlineCacheDescriptor>,
@@ -1754,6 +1790,7 @@ impl BytecodeChunk {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeFunction {
     pub id: FuncId,
     pub module: ModuleId,
@@ -1784,6 +1821,7 @@ pub struct BytecodeFunction {
 }
 
 #[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RuntimeMetadata {
     pub strings: Vec<String>,
     pub methods: Vec<MethodSignature>,
@@ -1794,9 +1832,13 @@ pub struct RuntimeMetadata {
     /// Declared interface/type alias names with their contracts (`typeof`).
     pub contract_names: Vec<(StringId, Type)>,
 
+    #[serde(skip)]
     module_index: HashMap<ModuleId, usize>,
+    #[serde(skip)]
     class_index: HashMap<ClassId, usize>,
+    #[serde(skip)]
     foreign_index: HashMap<ForeignFnId, usize>,
+    #[serde(skip)]
     structural_layout_index: HashMap<Type, StructuralLayoutId>,
 }
 
@@ -1878,9 +1920,11 @@ impl RuntimeMetadata {
 }
 
 #[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BytecodeProgram {
     pub functions: Vec<BytecodeFunction>,
     pub metadata: RuntimeMetadata,
+    #[serde(skip)]
     function_index: HashMap<FuncId, usize>,
 }
 

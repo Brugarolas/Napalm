@@ -13,7 +13,9 @@ overflow-checks = false
 ariadne = "0.6" # For painting nice error logs
 logos = "0.16" # Create ridiculously fast and easy tokenizers
 
-smallvec = "1.16.5" # Fast hash map
+smallvec = { version = "1.16.5", features = ["serde"] } # Fast hash map
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154" # Versioned .burning metadata; instruction words stay binary
 ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 papaya = "0.2.5" # Concurrent hash map
@@ -32,7 +34,7 @@ mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually fast
 
 libffi = "5.2.0" # Native C calls
 libloading = "0.9.0" # Dynamic library loading
-http-body-util = "0.1"
+http-body-util = "0.1.5"
 crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
 
 bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator

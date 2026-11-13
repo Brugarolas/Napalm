@@ -34,6 +34,7 @@
         "cargo::bench::trees": "cargo run --release -- scripts/trees.napalm",
         "cargo::bench::gc": "cargo run --release -- scripts/gc.napalm",
         "cargo::bench::concurrent": "cargo run --release -- scripts/concurrent.napalm",
+        "cargo::build::index": "cargo run --release -- --build scripts/index.napalm",
         "node::bench::fib": "node bench/fib.js",
         "node::bench::trees": "node bench/trees.js",
         "node::bench::lev": "node bench/lev.js",
