@@ -98,6 +98,8 @@ mod bytes_vm;
 mod fs_vm;
 #[path = "napalm_json_vm.rs"]
 mod json_vm;
+#[path = "napalm_process_vm.rs"]
+mod process_vm;
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -3039,6 +3041,8 @@ enum HeapObject {
     ByteBuffer(NapalmByteBuffer),
     FileInfo(Box<fs_vm::NapalmFileInfo>),
     File(Box<fs_vm::NapalmFile>),
+    InputStream(process_vm::NativeInputStream),
+    OutputStream(process_vm::NativeOutputStream),
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
@@ -4038,6 +4042,8 @@ gc_descriptor!(GC_BYTES, "Napalm.Bytes", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BYTE_BUFFER, "Napalm.ByteBuffer", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FILE_INFO, "Napalm.FileInfo", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FILE, "Napalm.File", GcTraceLayout::Leaf);
+gc_descriptor!(GC_INPUT_STREAM, "Napalm.InputStream", GcTraceLayout::Leaf);
+gc_descriptor!(GC_OUTPUT_STREAM, "Napalm.OutputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
@@ -4075,6 +4081,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::ByteBuffer(_) => &GC_BYTE_BUFFER,
         HeapObject::FileInfo(_) => &GC_FILE_INFO,
         HeapObject::File(_) => &GC_FILE,
+        HeapObject::InputStream(_) => &GC_INPUT_STREAM,
+        HeapObject::OutputStream(_) => &GC_OUTPUT_STREAM,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::Proxy { .. } => &GC_PROXY,
@@ -4131,6 +4139,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::ByteBuffer(buffer) => buffer.capacity(),
         HeapObject::FileInfo(info) => std::mem::size_of::<fs_vm::NapalmFileInfo>() + info.external_bytes(),
         HeapObject::File(file) => std::mem::size_of::<fs_vm::NapalmFile>() + file.external_bytes(),
+        HeapObject::InputStream(_) | HeapObject::OutputStream(_) => 0,
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
@@ -4415,6 +4424,8 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         | HeapObject::ByteBuffer(_)
         | HeapObject::FileInfo(_)
         | HeapObject::File(_)
+        | HeapObject::InputStream(_)
+        | HeapObject::OutputStream(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::Date { .. }
@@ -6132,7 +6143,9 @@ impl HostContext<'_> {
             Some(HeapObject::Bytes(bytes)) => write!(out, "<Bytes length={}>", bytes.len()),
             Some(HeapObject::ByteBuffer(bytes)) => write!(out, "<ByteBuffer length={}>", bytes.len()),
             Some(HeapObject::FileInfo(info)) => write!(out, "<FileInfo path={:?}>", info.path),
-            Some(HeapObject::File(file)) => write!(out, "<File path={:?}>", file.path),
+                Some(HeapObject::File(file)) => write!(out, "<File path={:?}>", file.path),
+            Some(HeapObject::InputStream(_)) => out.write_str("<InputStream:stdin>"),
+            Some(HeapObject::OutputStream(stream)) => write!(out, "<OutputStream:{}>", stream.label()),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { out.push_str("[...]"); return; }
@@ -7450,6 +7463,9 @@ pub enum NativeBuiltin {
     File(FileNative),
     Path(PathNative),
     Uri(UriNative),
+    Process(ProcessNative),
+    InputStream(InputStreamNative),
+    OutputStream(OutputStreamNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7629,6 +7645,21 @@ pub enum UriNative {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessNative {
+    Stdin, Stdout, Stderr, Args, Cwd, Chdir, Getenv, Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputStreamNative {
+    Read, ReadExact, ReadLine, Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStreamNative {
+    Write, WriteAll, WriteText, Flush, Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BytesNative {
     BytesEmpty, BytesAlloc, BytesFromUtf8, BytesFromArray,
     BytesLength, BytesIsEmpty, BytesIndex, BytesSlice, BytesClone,
@@ -7681,9 +7712,11 @@ pub enum BuiltinClass {
     ByteBuffer,
     FileInfo,
     File,
+    InputStream,
+    OutputStream,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 32;
+const BUILTIN_CLASS_COUNT: usize = 34;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7709,6 +7742,10 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FileInfo as u64),
         HeapObject::File(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::File as u64),
+        HeapObject::InputStream(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::InputStream as u64),
+        HeapObject::OutputStream(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::OutputStream as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Set { .. } =>
@@ -8517,6 +8554,8 @@ pub struct Interpreter<'p> {
     /// `strings`: script names resolve to a 4-byte id with no metadata lookup.
     string_names: Box<[Name]>,
     builtin_values: Vec<Value>,
+    /// Process standard streams are pinned as VM roots on first access.
+    process_standard_streams: [Option<Value>; 3],
     builtin_static_methods: Vec<Vec<Option<CallTarget>>>,
     instance_protocol: Vec<(MethodSymbol, NativeBuiltin)>,
     /// Hidden core helper for the runtime-only `anything + String` coercion arm.
@@ -9095,6 +9134,7 @@ impl<'p> Interpreter<'p> {
             strings,
             string_names,
             builtin_values,
+            process_standard_streams: [None; 3],
             builtin_static_methods: vec![vec![None; program.metadata.methods.len()]; BuiltinId::COUNT],
             instance_protocol,
             string_right_add: None,
@@ -12781,6 +12821,7 @@ impl<'p> Interpreter<'p> {
             }
             Some(HeapObject::Bytes(_)) | Some(HeapObject::ByteBuffer(_))
             | Some(HeapObject::FileInfo(_)) | Some(HeapObject::File(_))
+            | Some(HeapObject::InputStream(_)) | Some(HeapObject::OutputStream(_))
             | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
             | Some(HeapObject::Set { .. })
@@ -15979,6 +16020,9 @@ impl Interpreter<'_> {
             NativeBuiltin::File(native) => self.execute_file_native(op, native, receiver, args),
             NativeBuiltin::Path(native) => self.execute_path_native(op, native, args),
             NativeBuiltin::Uri(native) => self.execute_uri_native(op, native, args),
+            NativeBuiltin::Process(native) => self.execute_process_native(op, native, args),
+            NativeBuiltin::InputStream(native) => self.execute_input_stream_native(op, native, receiver, args),
+            NativeBuiltin::OutputStream(native) => self.execute_output_stream_native(op, native, receiver, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -17217,6 +17261,8 @@ impl Interpreter<'_> {
                     (BuiltinId::ByteBuffer, Some(HeapObject::ByteBuffer(_))) => true,
                     (BuiltinId::FileInfo, Some(HeapObject::FileInfo(_))) => true,
                     (BuiltinId::File, Some(HeapObject::File(_))) => true,
+                    (BuiltinId::InputStream, Some(HeapObject::InputStream(_))) => true,
+                    (BuiltinId::OutputStream, Some(HeapObject::OutputStream(_))) => true,
                     _ => false,
                 }
             }
@@ -17448,7 +17494,9 @@ impl Interpreter<'_> {
             Some(HeapObject::Bytes(_)) => "Bytes".to_owned(),
             Some(HeapObject::ByteBuffer(_)) => "ByteBuffer".to_owned(),
             Some(HeapObject::FileInfo(_)) => "FileInfo".to_owned(),
-            Some(HeapObject::File(_)) => "File".to_owned(),
+                Some(HeapObject::File(_)) => "File".to_owned(),
+            Some(HeapObject::InputStream(_)) => "InputStream".to_owned(),
+            Some(HeapObject::OutputStream(_)) => "OutputStream".to_owned(),
             Some(HeapObject::List(_)) => {
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::List(Some(element)) => Some(&**element),
@@ -18014,7 +18062,7 @@ impl Interpreter<'_> {
         if current == 0 {
             let (function, pc) = self.current_location(op);
             let runtime_error = self.annotate_runtime_error_source(
-                RuntimeError::new(format!("fiber aborted: {:?}", error)).at(function, pc),
+                RuntimeError::new(format!("fiber aborted: {}", self.value_to_string(error))).at(function, pc),
                 function,
                 pc,
             );
@@ -18034,7 +18082,7 @@ impl Interpreter<'_> {
                 self.reject_current_async_task(current, promise, error);
                 return;
             }
-            self.fail_terminal(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
+            self.fail_terminal(RuntimeError::new(format!("unhandled fiber error: {}", self.value_to_string(error))));
             return;
         };
         self.switch_current_fiber(link.caller);
@@ -19786,6 +19834,10 @@ unsafe fn h_is_instance(vm: &mut Interpreter, ptr: *const PreparedOp) {
             matches!(vm.heap.get(value), Some(HeapObject::FileInfo(_))),
         Some(HeapObject::BuiltinClass { builtin: BuiltinId::File }) =>
             matches!(vm.heap.get(value), Some(HeapObject::File(_))),
+        Some(HeapObject::BuiltinClass { builtin: BuiltinId::InputStream }) =>
+            matches!(vm.heap.get(value), Some(HeapObject::InputStream(_))),
+        Some(HeapObject::BuiltinClass { builtin: BuiltinId::OutputStream }) =>
+            matches!(vm.heap.get(value), Some(HeapObject::OutputStream(_))),
         Some(HeapObject::ClassObject { class_slot: target }) => {
             let actual = match vm.heap.get(value) {
                 Some(HeapObject::Instance(InstanceObject { class_slot, .. }))
@@ -20520,6 +20572,8 @@ impl Interpreter<'_> {
             Some(HeapObject::ByteBuffer(buffer)) => format!("<ByteBuffer length={}>", buffer.len()),
             Some(HeapObject::FileInfo(info)) => format!("<FileInfo path={:?}>", info.path),
             Some(HeapObject::File(file)) => format!("<File path={:?}>", file.path),
+            Some(HeapObject::InputStream(_)) => "<InputStream:stdin>".into(),
+            Some(HeapObject::OutputStream(stream)) => format!("<OutputStream:{}>", stream.label()),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::Proxy { .. }) => "<proxy>".into(),

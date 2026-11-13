@@ -1,0 +1,13 @@
+// Run with any arguments, or none:
+// cargo run --release -- scripts/process_args.napalm alpha beta
+// Expected argument values are checked by tests/process_args.rs.
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+const argumentsList = Process.args;
+expect(argumentsList instanceof List, "Process.args must be a List");
+for (const argument of argumentsList) {
+    expect(typeof argument === "String", "script arguments must be Strings");
+}
+System.print(JSON.stringify(argumentsList));
+System.print("Process.args integration tests passed");

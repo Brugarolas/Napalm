@@ -112,9 +112,18 @@ If it has already been compiled:
 .\target\release\napalm.exe .\hello.napalm
 ```
 
-The CLI accepts **a single file**, not a list of program arguments. This
-implementation does not provide a REPL, `process.argv`, or an `-e` option.
-Do not infer those features from Cargo's capabilities.
+The CLI accepts an entry file followed by optional program arguments:
+`napalm program.napalm [arguments...]`. `Process.args` contains only the
+arguments after the filename. This implementation does not provide a REPL,
+`process.argv`, or an `-e` option.
+
+`scripts/process_args.napalm` prints these arguments as a JSON array and checks
+that they are Strings. It accepts any argument list, including none (`[]`):
+
+```powershell
+cargo run --release -- scripts/process_args.napalm
+cargo run --release -- scripts/process_args.napalm alpha "two words"
+```
 
 **Current extension:** use `.napalm`. Imports with an extension accept
 `.napalm`; imports without an extension look for the file and directory index
@@ -134,6 +143,46 @@ describe the current resolver.
 An open HTTP listener, a periodic timer, or pending asynchronous work can keep
 the process alive after the module body has run. Close or cancel resources that
 are no longer needed.
+
+### 1.3 Process and Standard Streams
+
+`Process.cwd()`, `Process.chdir(path)` and `Process.getenv(name)` expose the
+working directory and environment; a missing environment variable returns
+`null`. `Process.exit(code)` immediately exits the host process with the given
+integer status, overriding the normal CLI exit codes above.
+
+`Process.stdin` is an `InputStream`; `Process.stdout` and `Process.stderr` are
+distinct `OutputStream` singletons. Their operations are synchronous:
+
+| Operation | Result |
+| --- | --- |
+| `stdin.read(count)` | Up to `count` bytes, or `null` at EOF. |
+| `stdin.readExact(count)` | Exactly `count` bytes; throws if EOF arrives early. |
+| `stdin.readLine()` | A UTF-8 string without LF/CRLF, or `null` at EOF; an empty line is `""`. |
+| `stdout.write(bytes)` / `stderr.write(bytes)` | Number of bytes written; accepts `Bytes` or `ByteBuffer`. |
+| `stream.writeAll(bytes)` | Writes all bytes and returns their count. |
+| `stream.writeText(text)` | Writes a UTF-8 String and returns its byte count. |
+| `stream.flush()` | Flushes output and returns `null`. |
+| `stream.close()` | Returns `null`; standard streams remain usable. |
+
+Input reads wait for data or EOF. Zero-byte reads return empty `Bytes` without
+waiting. Binary reads accept integer counts from 0 through 256 MiB; lines are
+limited to 16 MiB. Invalid types, lengths, UTF-8 and I/O errors throw catchable
+runtime errors.
+
+`scripts/process_complete.napalm` runs self-contained checks by default and
+exits successfully without reading stdin. Its optional `lsp`, `line`, `eof`
+and `binary` modes require specific input; `exit` deliberately returns status
+17. The LSP mode reads one Content-Length frame and emits only its framed
+JSON response. Keep diagnostics on stderr when using protocol stdout.
+
+Run every mode with controlled binary input, expected output/status checks
+and timeouts:
+
+```powershell
+cargo build --release
+python tools/verify_process_integration.py
+```
 
 ## 2. Basic Syntax and Literals
 

@@ -1,0 +1,145 @@
+// With no arguments, run self-contained tests without waiting for stdin.
+// Input-dependent examples are separate modes: lsp, line, eof, binary, exit.
+// Run all modes with controlled input: python tools/verify_process_integration.py
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+function expectError(action, message) {
+    let caught = false;
+    try { action(); } catch (e) { caught = true; }
+    expect(caught, message);
+}
+
+function lsp() {
+    // Minimal one-frame binary LSP transport demonstration. Stdin must contain
+    // Content-Length: <UTF-8 byte count>\r\n\r\n followed by one JSON request.
+    // stdout contains only the framed response, with no test-status messages.
+    const header = Process.stdin.readLine();
+    if (header === null || !header.startsWith("Content-Length: ")) {
+        Process.stderr.writeText("Missing Content-Length header\n");
+        Process.exit(1);
+    }
+    const count = Num.fromString(header.slice(16));
+    if (count === null || !count.isInteger || count < 0) {
+        Process.stderr.writeText("Invalid Content-Length header\n");
+        Process.exit(1);
+    }
+    const terminator = Process.stdin.readLine();
+    if (terminator !== "") {
+        Process.stderr.writeText("Expected empty line after LSP headers\n");
+        Process.exit(1);
+    }
+    const payload = Process.stdin.readExact(count);
+    const request = JSON.parse(payload);
+    const response = JSON.stringify({"jsonrpc":"2.0","id":request["id"],"result":null});
+    const wire = "Content-Length: " + response.utf8Length.toString() + "\r\n\r\n";
+    Process.stdout.writeAll(Bytes.fromUtf8(wire));
+    Process.stdout.writeAll(Bytes.fromUtf8(response));
+    Process.stdout.flush();
+}
+
+function lineEcho() {
+    // Feed one UTF-8 line. The line terminator is stripped.
+    const line = Process.stdin.readLine();
+    if (line === null) {
+        Process.stderr.writeText("EOF before first line\n");
+        Process.exit(1);
+    }
+    Process.stdout.writeText(line);
+    Process.stdout.flush();
+}
+
+function eof() {
+    // Requires closed/empty stdin. Keep this separate from successful reads.
+    expect(Process.stdin.readLine() === null, "readLine at EOF");
+    expect(Process.stdin.read(1) === null, "read at EOF");
+    expectError(() => Process.stdin.readExact(1), "readExact must reject EOF");
+    System.print("Process EOF tests passed");
+}
+
+function smoke() {
+    // Native Process and standard-stream integration smoke test.
+    // This script does not perform blocking reads or emit protocol bytes.
+
+    const typedInput: InputStream = Process.stdin;
+    const typedOutput: OutputStream = Process.stdout;
+    expect(typedInput === Process.stdin, "typed stdin binding");
+    expect(typedOutput === Process.stdout, "typed stdout binding");
+    expect(typeof Process.stdin === "InputStream", "stdin type");
+    expect(typeof Process.stdout === "OutputStream", "stdout type");
+    expect(typeof Process.stderr === "OutputStream", "stderr type");
+    expect(Process.stdin instanceof InputStream, "stdin instanceof InputStream");
+    expect(Process.stdout instanceof OutputStream, "stdout instanceof OutputStream");
+    expect(!(Process.stdin instanceof OutputStream), "stream types are distinct");
+    expect(Process.stdin === Process.stdin, "stable stdin singleton");
+    expect(Process.stdout === Process.stdout, "stable stdout singleton");
+    expect(Process.stderr === Process.stderr, "stable stderr singleton");
+    expect(Process.stdout !== Process.stderr, "stdout and stderr must differ");
+
+    const location = Process.cwd();
+    expect(typeof location === "String" && location.length > 0, "cwd");
+    expect(Process.chdir(location) === null, "chdir return value");
+    expect(Process.cwd() === location, "chdir same directory");
+
+    const missing = Process.getenv("NAPALM_TEST_VARIABLE_UNLIKELY_TO_EXIST_91CA928FE3A5");
+    expect(missing === null, "missing environment variable");
+    const argumentsList = Process.args;
+    expect(argumentsList.length >= 0, "args is a list");
+
+    expect(Process.stdin.read(0).isEmpty, "zero-byte input read");
+    expect(Process.stdin.readExact(0).isEmpty, "zero-byte exact input read");
+    expect(Process.stdout.writeAll(Bytes.empty()) === 0, "empty binary stdout write");
+    expect(Process.stderr.write(Bytes.empty()) === 0, "empty binary stderr write");
+    expect(Process.stdout.writeText("") === 0, "empty UTF-8 write");
+    expect(Process.stdout.flush() === null, "flush stdout");
+    expect(Process.stderr.flush() === null, "flush stderr");
+
+    // Neither call may close the process-wide OS descriptor.
+    expect(Process.stdin.close() === null, "closing borrowed stdin");
+    expect(Process.stdout.close() === null, "closing borrowed stdout");
+    expect(Process.stderr.close() === null, "closing borrowed stderr");
+    expect(Process.stdout.writeAll(Bytes.empty()) === 0, "stdout usable after close");
+    expect(Process.stderr.writeText("") === 0, "stderr usable after close");
+
+    // Each negative test must actually throw; silently succeeding is a failure.
+    expectError(() => Process.stdout.write("This is a String, not Bytes"), "binary write rejects String");
+    expectError(() => Process.stdout.writeAll("text"), "binary writeAll rejects String");
+    expectError(() => Process.stdout.writeText(Bytes.empty()), "writeText rejects Bytes");
+    for (const invalid of [-1, 0.5, 268435457, "1", null]) {
+        expectError(() => Process.stdin.read(invalid), "read rejects invalid count");
+        expectError(() => Process.stdin.readExact(invalid), "readExact rejects invalid count");
+    }
+    expectError(() => Process.getenv(""), "getenv rejects empty name");
+    expectError(() => Process.getenv("a=b"), "getenv rejects invalid name");
+    expectError(() => Process.chdir(null), "chdir rejects non-String");
+    expectError(() => Process.exit(0.5), "exit rejects fractional status");
+    expectError(() => Process.exit("0"), "exit rejects non-Number");
+
+    System.gc();
+    expect(Process.stdin === typedInput, "stdin survives GC");
+    expect(Process.stdout === typedOutput, "stdout survives GC");
+    expect(Process.stderr === Process.stderr, "stderr survives GC");
+    System.print("Process integration tests passed");
+}
+
+function binary() {
+    // Binary pipeline test: feed exactly five bytes on stdin.
+    // No System.print/System.write: stdout contains exactly the input bytes.
+    const five = Process.stdin.readExact(5);
+    Process.stdout.writeAll(five);
+    Process.stdout.flush();
+}
+
+const argumentsList = Process.args;
+const mode = argumentsList.length === 0 ? "smoke" : argumentsList[0];
+if (mode === "smoke") smoke();
+else if (mode === "lsp") lsp();
+else if (mode === "line") lineEcho();
+else if (mode === "eof") eof();
+else if (mode === "binary") binary();
+else if (mode === "exit") Process.exit(17);
+else {
+    Process.stderr.writeText("Usage: process_complete.napalm [smoke|lsp|line|eof|binary|exit]\n");
+    Process.exit(2);
+}

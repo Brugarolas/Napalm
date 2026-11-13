@@ -1,5 +1,36 @@
 // Production frontend -> HIR -> optimizer -> bytecode -> interpreter/JIT.
 #[test]
+fn napalm_uncaught_throw_displays_value_and_source_location() {
+    for (source, expected) in [
+        (r#"function expect(ok, message) { if (!ok) throw message; }
+            expect(false, "script argument count");"#, "script argument count"),
+        ("throw 42;", "42"),
+        (r#"Fiber.abort("explicit abort");"#, "explicit abort"),
+        (r#"Fiber.new(() => { throw "child error"; }).call();"#, "child error"),
+    ] {
+        let (program, entry, manifest) = compile_typescript_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let error = vm.run_module(entry).unwrap_err();
+            assert_eq!(error.message, format!("fiber aborted: {expected}"), "jit={jit}");
+            assert_eq!(error.source_file.as_deref(), Some("typed_runtime_test.napalm"));
+            assert!(error.source_line.is_some() && error.source_column.is_some());
+        }
+    }
+}
+
+#[test]
+fn napalm_uncaught_throw_in_transferred_fiber_displays_value() {
+    let (program, entry, manifest) = compile_typescript_module(
+        r#"Fiber.new(() => { throw "detached error"; }).transfer();"#,
+    );
+    let mut vm = source_vm(&program, &manifest);
+    let error = vm.run_module(entry).unwrap_err();
+    assert_eq!(error.message, "unhandled fiber error: detached error");
+}
+
+#[test]
 fn napalm_destructuring_assignments_parameters_and_captures() {
     run_napalm(r#"
         function swap(pair) { let [a, b] = pair; [a, b] = [b, a]; return [a, b]; }

@@ -213,18 +213,11 @@ fn parse_command_line() -> Result<PathBuf, ()> {
         return Err(());
     }
 
-    if let Some(extra) = args.next() {
-        eprintln!(
-            "error: unexpected extra argument '{}'",
-            extra.to_string_lossy()
-        );
-        print_usage(&executable);
-        return Err(());
-    }
-
+    // Arguments after the entry file are script arguments, exposed by Process.args.
+    // Do not interpret or reject them; each script decides what they mean.
     Ok(PathBuf::from(first))
 }
 
 fn print_usage(executable: &str) {
-    eprintln!("Usage: {executable} <file.nap>");
+    eprintln!("Usage: {executable} <file.napalm> [program arguments...]");
 }

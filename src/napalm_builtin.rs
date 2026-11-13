@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, ProcessNative, InputStreamNative, OutputStreamNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -340,6 +340,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::ByteBuffer,
         BuiltinClass::FileInfo,
         BuiltinClass::File,
+        BuiltinClass::InputStream,
+        BuiltinClass::OutputStream,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -524,6 +526,46 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         1,
         NativeBuiltin::Json(JsonNative::Stringify),
     );
+
+    // Process streams are native heap objects. The Process.* getters return
+    // VM-rooted singletons: standard descriptors cannot be closed by scripts.
+    for (name, native) in [
+        ("stdin", ProcessNative::Stdin),
+        ("stdout", ProcessNative::Stdout),
+        ("stderr", ProcessNative::Stderr),
+        ("args", ProcessNative::Args),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Process), name,
+            MethodKind::Getter, 0, NativeBuiltin::Process(native));
+    }
+    for (name, arity, native) in [
+        ("cwd", 0, ProcessNative::Cwd),
+        ("chdir", 1, ProcessNative::Chdir),
+        ("getenv", 1, ProcessNative::Getenv),
+        ("exit", 1, ProcessNative::Exit),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Process), name,
+            MethodKind::Method, arity, NativeBuiltin::Process(native));
+    }
+    for (name, arity, native) in [
+        ("read", 1, InputStreamNative::Read),
+        ("readExact", 1, InputStreamNative::ReadExact),
+        ("readLine", 0, InputStreamNative::ReadLine),
+        ("close", 0, InputStreamNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::InputStream), name,
+            MethodKind::Method, arity, NativeBuiltin::InputStream(native));
+    }
+    for (name, arity, native) in [
+        ("write", 1, OutputStreamNative::Write),
+        ("writeAll", 1, OutputStreamNative::WriteAll),
+        ("writeText", 1, OutputStreamNative::WriteText),
+        ("flush", 0, OutputStreamNative::Flush),
+        ("close", 0, OutputStreamNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::OutputStream), name,
+            MethodKind::Method, arity, NativeBuiltin::OutputStream(native));
+    }
 
     // Lexical path operations are platform-independent; the runtime selects the
     // appropriate path syntax from the input (Windows drive/UNC or POSIX).

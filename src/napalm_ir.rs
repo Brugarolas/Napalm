@@ -547,10 +547,13 @@ pub enum BuiltinId {
     Uri = 45,
     FileInfo = 46,
     File = 47,
+    Process = 48,
+    InputStream = 49,
+    OutputStream = 50,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 51] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -564,6 +567,7 @@ impl BuiltinId {
         Self::Generator,
         Self::Bytes, Self::ByteBuffer, Self::JSON, Self::Fs, Self::Path, Self::Uri,
         Self::FileInfo, Self::File,
+        Self::Process, Self::InputStream, Self::OutputStream,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -608,6 +612,9 @@ impl BuiltinId {
             Self::Uri => "Uri",
             Self::FileInfo => "FileInfo",
             Self::File => "File",
+            Self::Process => "Process",
+            Self::InputStream => "InputStream",
+            Self::OutputStream => "OutputStream",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

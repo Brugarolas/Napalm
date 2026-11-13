@@ -228,6 +228,14 @@ impl Heap {
             Type::Builtin(BuiltinId::File, None) => {
                 matches!(self.get(value), Some(HeapObject::File(_)))
             }
+            // Native streams have no generic element payload or persistent contract.
+            // Validate their actual heap variant on dynamic BindInterface paths.
+            Type::Builtin(BuiltinId::InputStream, None) => {
+                matches!(self.get(value), Some(HeapObject::InputStream(_)))
+            }
+            Type::Builtin(BuiltinId::OutputStream, None) => {
+                matches!(self.get(value), Some(HeapObject::OutputStream(_)))
+            }
             Type::Builtin(BuiltinId::Generator, element) => {
                 if !matches!(self.get(value), Some(HeapObject::FiberObject { generator: true, .. })) {
                     return Err(mismatch(path, expected));
