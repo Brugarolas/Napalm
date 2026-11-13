@@ -1,0 +1,75 @@
+// Cross-platform lexical Path, file URI and Unicode integration tests.
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+// POSIX paths remain POSIX even when executed on Windows.
+expect(Path.normalize("a/b/../c") === "a/c", "POSIX normalization");
+expect(Path.normalize("/a/../../b") === "/b", "POSIX root clamp");
+expect(Path.join("src", "lib", "..", "main.napalm") === "src/main.napalm", "variadic Path.join");
+expect(Path.join() === ".", "empty Path.join");
+expect(Path.dirname("/src/main.napalm") === "/src", "dirname");
+expect(Path.basename("/src/main.napalm") === "main.napalm", "basename");
+expect(Path.extension("/src/main.napalm") === ".napalm", "file extension");
+expect(Path.extension(".gitignore") === "", "dot-file extension");
+expect(Path.relative("/a/b", "/a/c/d") === "../c/d", "relative POSIX path");
+expect(Path.resolve("/a", "..", "b") === "/b", "resolve absolute POSIX");
+expect(Path.isAbsolute("/usr/bin"), "POSIX absolute path");
+expect(!Path.isAbsolute("a/b"), "relative path");
+
+// Windows roots, drive-relative paths and network shares.
+expect(Path.normalize("C:\\a\\..\\b") === "C:\\b", "Windows drive normalization");
+expect(Path.normalize("C:a\\..\\b") === "C:b", "Windows drive-relative normalization");
+expect(Path.isAbsolute("C:\\hello"), "Windows drive absolute");
+expect(!Path.isAbsolute("C:hello"), "Windows drive relative");
+expect(Path.dirname("C:\\work\\file.txt") === "C:\\work", "Windows dirname");
+expect(Path.basename("C:\\work\\file.txt") === "file.txt", "Windows basename");
+expect(Path.relative("C:\\work\\one", "c:\\work\\two") === "..\\two", "case-insensitive Windows roots");
+expect(Path.normalize("\\\\server\\share\\a\\..\\b") === "\\\\server\\share\\b", "UNC preservation");
+expect(Path.isAbsolute("\\\\server\\share\\file"), "UNC is absolute");
+
+// URI parsing has an authority, scheme, raw encoded path, query and fragment.
+const parsed = Uri.parse("https://example.com/a%20b?x=1#part");
+expect(parsed["scheme"] === "https", "URI scheme");
+expect(parsed["authority"] === "example.com", "URI authority");
+expect(parsed["path"] === "/a%20b", "URI encoded path");
+expect(parsed["query"] === "x=1", "URI query");
+expect(parsed["fragment"] === "part", "URI fragment");
+expect(parsed["hasAuthority"] === true, "URI authority flag");
+
+const windowsPath = "C:\\My Docs\\é #?.napalm";
+const windowsUri = Uri.fromFilePath(windowsPath);
+expect(windowsUri === "file:///C:/My%20Docs/%C3%A9%20%23%3F.napalm", "Windows file URI encoding");
+expect(Uri.toFilePath(windowsUri) === windowsPath, "Windows file URI roundtrip");
+expect(Uri.toFilePath(Uri.parse(windowsUri)) === windowsPath, "parsed URI accepted");
+
+const uncPath = "\\\\server\\share\\space name";
+const uncUri = Uri.fromFilePath(uncPath);
+expect(uncUri === "file://server/share/space%20name", "UNC to file URI");
+expect(Uri.toFilePath(uncUri) === uncPath, "UNC file URI roundtrip");
+
+const posixUri = Uri.fromFilePath("/tmp/hello 😀.txt");
+expect(posixUri === "file:///tmp/hello%20%F0%9F%98%80.txt", "POSIX UTF-8 URI");
+expect(Uri.toFilePath(posixUri) === "/tmp/hello 😀.txt", "POSIX UTF-8 roundtrip");
+
+// Napalm String.length and codePointAt count Unicode scalar values.
+const unicode = "A😀é";
+expect(unicode.length === 3, "Unicode scalar count");
+expect(unicode.utf8Length === 7, "UTF-8 byte length");
+expect(unicode.utf16Length === 4, "UTF-16 code-unit length");
+expect(unicode.codePointAt(0) === 65, "ASCII code point");
+expect(unicode.codePointAt(1) === 128512, "supplementary plane code point");
+expect(unicode.codePointAt(2) === 233, "accented code point");
+expect(unicode.codePointAt(-1) === 233, "negative code point index");
+expect(unicode.codePointAt(3) === null, "out-of-bounds code point");
+expect("".utf16Length === 0 && "".utf8Length === 0, "empty String lengths");
+expect("😀😀".utf16Length === 4 && "😀😀".utf8Length === 8, "multiple supplementary scalars");
+System.gc();
+expect(unicode.codePointAt(1) === 128512, "Unicode utility survives GC");
+try {
+    Uri.toFilePath("file:///tmp/a%2Fb");
+} catch (e) {
+    System.print(e);
+}
+
+System.print("Path, Uri and Unicode integration tests passed");

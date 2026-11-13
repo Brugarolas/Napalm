@@ -90,6 +90,8 @@ mod native_decorators;
 mod function_jit;
 use self::function_jit::{WholeFunctionJit, WholeFunctionJitStats};
 use self::collection_ops::*;
+#[path = "napalm_path_vm.rs"]
+mod path_vm;
 #[path = "napalm_bytes_vm.rs"]
 mod bytes_vm;
 #[path = "napalm_fs_vm.rs"]
@@ -7433,6 +7435,8 @@ pub enum NativeBuiltin {
     Bytes(BytesNative),
     Json(JsonNative),
     Fs(FsNative),
+    Path(PathNative),
+    Uri(UriNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7592,6 +7596,16 @@ pub enum FsNative {
     MkdirAll,
     RemoveFile,
     Rename,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathNative {
+    Join, Resolve, Normalize, Dirname, Basename, Extension, IsAbsolute, Relative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UriNative {
+    Parse, FromFilePath, ToFilePath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15935,6 +15949,8 @@ impl Interpreter<'_> {
             NativeBuiltin::Bytes(native) => self.execute_bytes_native(op, native, receiver, args),
             NativeBuiltin::Json(native) => self.execute_json_native(op, native, args),
             NativeBuiltin::Fs(native) => self.execute_fs_native(op, native, args),
+            NativeBuiltin::Path(native) => self.execute_path_native(op, native, args),
+            NativeBuiltin::Uri(native) => self.execute_uri_native(op, native, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -22452,6 +22468,39 @@ mod tests {
         assert!(
             matches!(vm.run_module(entry), Ok(ExecutionResult::Returned(_))),
             "JSON integration should finish successfully",
+        );
+    }
+
+    #[test]
+    fn path_uri_and_unicode_execute_through_compiler_and_vm() {
+        let source = r#"
+            if (Path.normalize("C:\\a\\..\\b") !== "C:\\b") {
+                throw "Windows path normalization failed";
+            }
+            if (Path.relative("/home/a", "/home/b") !== "../b") {
+                throw "POSIX relative path failed";
+            }
+            const uri = Uri.fromFilePath("C:\\some folder\\file.napalm");
+            if (uri !== "file:///C:/some%20folder/file.napalm") {
+                throw "file URI encoding failed";
+            }
+            if (Uri.toFilePath(Uri.parse(uri)) !== "C:\\some folder\\file.napalm") {
+                throw "URI roundtrip failed";
+            }
+            const unicode = "A😀é";
+            if (unicode.length !== 3 || unicode.utf8Length !== 7 || unicode.utf16Length !== 4) {
+                throw "Unicode lengths failed";
+            }
+            if (unicode.codePointAt(1) !== 128512 || unicode.codePointAt(3) !== null) {
+                throw "Unicode scalar indexing failed";
+            }
+        "#;
+        let (program, entry, manifest) = compile_typescript_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        assert!(
+            matches!(vm.run_module(entry), Ok(ExecutionResult::Returned(_))),
+            "Path/Uri/Unicode integration should finish successfully",
         );
     }
 

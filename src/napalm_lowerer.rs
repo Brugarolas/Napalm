@@ -6630,6 +6630,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ("Fs", "exists") => Some(Type::Bool),
                 ("Fs", "stat") => Some(Type::Map),
                 ("Fs", "readDir") => Some(Type::List(None)),
+                ("Path", "isAbsolute") => Some(Type::Bool),
+                ("Path", "join" | "resolve" | "normalize" | "dirname" | "basename" | "extension" | "relative") => Some(Type::String),
+                ("Uri", "fromFilePath" | "toFilePath") => Some(Type::String),
+                ("Uri", "parse") => Some(Type::Map),
                 ("ConcurrentMap", "new") => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
                 ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
                 ("Map", "new") => Some(Type::Map),
@@ -8211,6 +8215,29 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(bindings.len(), 1, "Fs must be registered exactly once");
         assert!(bindings[0].slot.0 < module.variable_count);
+    }
+
+    #[test]
+    fn path_and_uri_are_implicitly_bound_globals() {
+        let source = r#"
+            const joined: String = Path.join("a", "b");
+            const absolute: Bool = Path.isAbsolute("C:\\work");
+            const uri: String = Uri.fromFilePath("C:\\work\\test.napalm");
+            const value = Uri.parse(uri);
+            const back: String = Uri.toFilePath(value);
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("path-uri.napalm", source, "path-uri", &module);
+        assert!(!output.has_errors(), "Path and Uri lowering diagnostics: {:#?}", output.diagnostics);
+        let lowered = output.lowered.expect("lowered module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        for builtin in [BuiltinId::Path, BuiltinId::Uri] {
+            let bindings = info.builtin_bindings.iter()
+                .filter(|binding| binding.builtin == builtin)
+                .collect::<Vec<_>>();
+            assert_eq!(bindings.len(), 1, "missing or duplicate {builtin:?} registration");
+            assert!(bindings[0].slot.0 < info.variable_count);
+        }
     }
 
     #[test]

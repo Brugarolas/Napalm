@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, PathNative, UriNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -203,6 +203,9 @@ enum BuiltinPrimitive {
     NumNan,
 
     StringCount,
+    StringUtf8Length,
+    StringUtf16Length,
+    StringCodePointAt,
     StringAdd,
     StringEq,
     StringNe,
@@ -417,6 +420,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
         ("length", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
+        ("utf8Length", MethodKind::Getter, 0, BuiltinPrimitive::StringUtf8Length),
+        ("utf16Length", MethodKind::Getter, 0, BuiltinPrimitive::StringUtf16Length),
+        ("codePointAt", MethodKind::Method, 1, BuiltinPrimitive::StringCodePointAt),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::StringIsEmpty),
         ("==", MethodKind::Method, 1, BuiltinPrimitive::StringEq),
         ("!=", MethodKind::Method, 1, BuiltinPrimitive::StringNe),
@@ -516,6 +522,35 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         1,
         NativeBuiltin::Json(JsonNative::Stringify),
     );
+
+    // Lexical path operations are platform-independent; the runtime selects the
+    // appropriate path syntax from the input (Windows drive/UNC or POSIX).
+    // Variadic calls must have a dispatch entry at each legal call arity.
+    for arity in 0..=16u8 {
+        manifest.register_native(program, static_(BuiltinId::Path), "join",
+            MethodKind::Method, arity, NativeBuiltin::Path(PathNative::Join));
+        manifest.register_native(program, static_(BuiltinId::Path), "resolve",
+            MethodKind::Method, arity, NativeBuiltin::Path(PathNative::Resolve));
+    }
+    for (name, arity, native) in [
+        ("normalize", 1, PathNative::Normalize),
+        ("dirname", 1, PathNative::Dirname),
+        ("basename", 1, PathNative::Basename),
+        ("extension", 1, PathNative::Extension),
+        ("isAbsolute", 1, PathNative::IsAbsolute),
+        ("relative", 2, PathNative::Relative),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Path), name,
+            MethodKind::Method, arity, NativeBuiltin::Path(native));
+    }
+    for (name, native) in [
+        ("parse", UriNative::Parse),
+        ("fromFilePath", UriNative::FromFilePath),
+        ("toFilePath", UriNative::ToFilePath),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Uri), name,
+            MethodKind::Method, 1, NativeBuiltin::Uri(native));
+    }
 
     // Synchronous native filesystem utilities. File data is transferred through
     // the existing String / Bytes representations, never through an FFI pointer.
@@ -2533,6 +2568,29 @@ fn execute_primitive(
         NumInfinity => Ok(Value::from_num(f64::INFINITY)),
         NumNan => Ok(Value::from_num(f64::NAN)),
 
+        StringUtf8Length => {
+            let text = context.string_bytes(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not String"))?;
+            Ok(Value::from_num(text.len() as f64))
+        }
+        StringUtf16Length => {
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            Ok(Value::from_num(text.encode_utf16().count() as f64))
+        }
+        StringCodePointAt => {
+            let index = integer(argument(args, 0)?, "code point index")?;
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let length = string_char_len(text) as i64;
+            let index = if index < 0 { length.saturating_add(index) } else { index };
+            Ok(if index >= 0 && index < length {
+                Value::from_num(text.chars().nth(index as usize)
+                    .expect("validated code point index") as u32 as f64)
+            } else {
+                Value::NULL
+            })
+        }
         StringCount => {
             let text = context.string_utf8(this)
                 .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
