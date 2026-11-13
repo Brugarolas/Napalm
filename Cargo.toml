@@ -14,8 +14,8 @@ ariadne = "0.6" # For painting nice error logs
 logos = "0.16" # Create ridiculously fast and easy tokenizers
 
 smallvec = { version = "1.16.5", features = ["serde"] } # Fast hash map
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154" # Versioned .burning metadata; instruction words stay binary
+serde = { version = "1.0.229", features = ["derive"] } # Serialization and deserialization framework for Rust
+serde_json = "1.0.154" # Canonical HIR snapshots for the --build fixed point
 ahash = "0.8.12" # Portable fallback for the runtime hasher
 hashbrown = "0.17.1" # Fast hash map
 papaya = "0.2.5" # Concurrent hash map
@@ -33,7 +33,7 @@ chrono = "0.4.45" # Date and time library for Rust
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
 
 libffi = "5.2.0" # Native C calls
-libloading = "0.9.0" # Dynamic library loading
+libloading = "0.9.1" # Dynamic library loading
 http-body-util = "0.1.5"
 crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
 
@@ -54,6 +54,8 @@ small_map = { path = "./crates/small_map" } # Small map optimization
 # rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the
 # LLVM-C.dll C-API instead and copies it next to the executables.
 llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C AP
+zstd = "0.14.3" # .burning compression (same version reqwest already builds)
+postcard = { version = "1.1.3", features = ["use-std"] } # Binary .burning metadata/bootstrap encoding
 # Napalm uses initialize_native(), which is independent of Inkwell's target-*
 # features. Its default target-all bindings reference backends absent from the
 # Windows LLVM-C.dll and cause unresolved symbols in unoptimized debug builds.

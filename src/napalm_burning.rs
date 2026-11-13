@@ -1,18 +1,30 @@
-//! Versioned build artifacts. CODE contains little-endian instruction words;
-//! META contains all immutable runtime metadata, and BOOT the entry and builtins.
-//! See docs/BURNING.md for the framing and compatibility contract.
+//! Versioned build artifacts. A fixed header precedes one zstd frame that holds
+//! three binary sections: CODE (little-endian instruction words), META (all
+//! immutable runtime metadata) and BOOT (entry and builtins), the last two
+//! postcard-encoded. See docs/BURNING.md for the framing and compatibility
+//! contract.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::napalm_builtin::BuiltinManifest;
 use crate::napalm_bytecode::{BytecodeProgram, BytecodeVerifier, Word};
 use crate::napalm_ir::{FuncId, FunctionKind};
 
 pub const MAGIC: &[u8; 8] = b"NAPBURN\0";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+/// Payload compression identifier stored at header offset 12.
+const COMPRESSION_ZSTD: u32 = 1;
+/// Compression cost is paid once per build; zstd decompression speed barely
+/// depends on the level.
+const ZSTD_LEVEL: i32 = 18;
+/// Magic, version, compression and uncompressed payload length.
+const HEADER_LEN: usize = 24;
+/// Larger declared payloads are rejected before allocating, so a corrupt or
+/// hostile header cannot request an arbitrary allocation.
+const MAX_PAYLOAD_LEN: u64 = 1 << 30;
 
 #[derive(Serialize, Deserialize)]
 pub struct Bootstrap {
@@ -37,6 +49,21 @@ fn validate_entry(program: &BytecodeProgram, entry: FuncId) -> io::Result<()> {
     }
 }
 
+fn to_binary<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    postcard::to_stdvec(value).map_err(invalid)
+}
+
+/// Postcard is not self-delimiting at the section level: a section must be
+/// consumed exactly, so leftover bytes are corruption rather than padding.
+fn from_binary<T: DeserializeOwned>(bytes: &[u8], section: &str) -> io::Result<T> {
+    let (value, rest) = postcard::take_from_bytes(bytes)
+        .map_err(|error| invalid(format!("invalid {section} section: {error}")))?;
+    if !rest.is_empty() {
+        return Err(invalid(format!("trailing data in {section} section")));
+    }
+    Ok(value)
+}
+
 /// Serialize the final compiler output without preparing or executing a VM.
 pub fn encode(program: &BytecodeProgram, bootstrap: &Bootstrap) -> io::Result<Vec<u8>> {
     validate_entry(program, bootstrap.entry)?;
@@ -55,17 +82,32 @@ pub fn encode(program: &BytecodeProgram, bootstrap: &Bootstrap) -> io::Result<Ve
 
     // Serde omits code and derived lookup indexes. Every other field in the
     // program is retained, including future additions to the bytecode structs.
-    let metadata = serde_json::to_vec(program).map_err(invalid)?;
-    let bootstrap = serde_json::to_vec(bootstrap).map_err(invalid)?;
-    let mut out = Vec::new();
+    let metadata = to_binary(program)?;
+    let bootstrap = to_binary(bootstrap)?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    for (tag, section) in [(b"CODE", code), (b"META", metadata), (b"BOOT", bootstrap)] {
+        payload.extend_from_slice(tag);
+        payload.extend_from_slice(&(section.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&section);
+    }
+    if payload.len() as u64 > MAX_PAYLOAD_LEN {
+        return Err(invalid("build artifact payload exceeds the format limit"));
+    }
+
+    // The frame checksum makes any corruption of the compressed bytes an error
+    // instead of a silently different program.
+    let mut compressor = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
+    compressor.include_checksum(true)?;
+    compressor.include_contentsize(true)?;
+    let frame = compressor.compress(&payload)?;
+
+    let mut out = Vec::with_capacity(HEADER_LEN + frame.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&3u32.to_le_bytes());
-    for (tag, payload) in [(b"CODE", code), (b"META", metadata), (b"BOOT", bootstrap)] {
-        out.extend_from_slice(tag);
-        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        out.extend_from_slice(&payload);
-    }
+    out.extend_from_slice(&COMPRESSION_ZSTD.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&frame);
     Ok(out)
 }
 
@@ -114,22 +156,42 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn length(&mut self) -> io::Result<usize> {
-        let value = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
-        usize::try_from(value).map_err(invalid)
+        usize::try_from(self.u64()?).map_err(invalid)
     }
 }
 
 /// Reconstruct compiler output for tooling and the CLI loader. Does not execute
 /// module initializers or install builtins; callers perform normal VM setup.
 pub fn decode(bytes: &[u8]) -> io::Result<BurningArtifact> {
-    let mut reader = Reader(bytes);
-    if reader.take(MAGIC.len())? != MAGIC {
+    let mut header = Reader(bytes);
+    if header.take(MAGIC.len())? != MAGIC {
         return Err(invalid("invalid burning magic"));
     }
-    if reader.u32()? != FORMAT_VERSION {
-        return Err(invalid("unsupported burning format version"));
+    match header.u32()? {
+        FORMAT_VERSION => {}
+        1 => return Err(invalid("burning format 1 (JSON) is no longer supported; rebuild with --build")),
+        _ => return Err(invalid("unsupported burning format version")),
     }
+    if header.u32()? != COMPRESSION_ZSTD {
+        return Err(invalid("unsupported burning compression"));
+    }
+    let payload_len = header.u64()?;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(invalid("burning payload exceeds the format limit"));
+    }
+    // Capacity is the declared size: a frame that inflates beyond it fails.
+    let payload = zstd::bulk::decompress(header.0, payload_len as usize)
+        .map_err(|error| invalid(format!("corrupt burning payload: {error}")))?;
+    if payload.len() as u64 != payload_len {
+        return Err(invalid("burning payload length mismatch"));
+    }
+
+    let mut reader = Reader(&payload);
     if reader.u32()? != 3 {
         return Err(invalid("expected CODE, META and BOOT sections"));
     }
@@ -151,9 +213,8 @@ pub fn decode(bytes: &[u8]) -> io::Result<BurningArtifact> {
     if !reader.0.is_empty() {
         return Err(invalid("trailing data after burning sections"));
     }
-    let mut program: BytecodeProgram =
-        serde_json::from_slice(metadata.unwrap()).map_err(invalid)?;
-    let bootstrap: Bootstrap = serde_json::from_slice(bootstrap.unwrap()).map_err(invalid)?;
+    let mut program: BytecodeProgram = from_binary(metadata.unwrap(), "META")?;
+    let bootstrap: Bootstrap = from_binary(bootstrap.unwrap(), "BOOT")?;
     let mut code = Reader(code.unwrap());
     if code.u32()? as usize != program.functions.len() {
         return Err(invalid("CODE/META function count mismatch"));
@@ -184,8 +245,9 @@ pub fn decode(bytes: &[u8]) -> io::Result<BurningArtifact> {
     Ok(BurningArtifact { program, bootstrap })
 }
 
-/// JSON numbers cannot represent NaNs/infinities and may lose NaN payloads.
-/// Store all source-number constants as their exact IEEE-754 binary64 bits.
+/// Store all source-number constants as their exact IEEE-754 binary64 bits
+/// (signed zero, infinities, NaN payloads), independently of how the chosen
+/// serializer would encode a float.
 pub(crate) mod f64_bits {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -324,8 +386,41 @@ mod tests {
             corrupt[offset] ^= 0xff;
             assert!(decode(&corrupt).is_err(), "accepted corruption at {offset}");
         }
-        let mut trailing = bytes;
+        let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(decode(&trailing).is_err());
+        // Corruption deep inside the compressed frame trips the zstd checksum.
+        let mut deep = bytes;
+        let middle = HEADER_LEN + (deep.len() - HEADER_LEN) / 2;
+        deep[middle] ^= 0x55;
+        assert!(decode(&deep).is_err());
+    }
+
+    #[test]
+    fn rejects_format_one_and_oversized_payload_headers() {
+        let (program, bootstrap) = minimal_program();
+        let bytes = encode(&program, &bootstrap).unwrap();
+        let mut old = bytes.clone();
+        old[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let error = decode(&old).err().unwrap().to_string();
+        assert!(error.contains("rebuild"), "{error}");
+        let mut huge = bytes;
+        huge[16..24].copy_from_slice(&(MAX_PAYLOAD_LEN + 1).to_le_bytes());
+        assert!(decode(&huge).is_err());
+    }
+
+    #[test]
+    fn compressed_artifact_is_much_smaller_than_its_payload() {
+        let mut hir = Program::new();
+        let builtins = install_hir_builtins(&mut hir);
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/burning/entry.napalm");
+        let modules = crate::napalm_modules::compile_module_graph(&mut hir, &path).unwrap();
+        let bootstrap = Bootstrap { entry: modules.entry.entry, module_name: modules.entry_name, builtins };
+        let program = crate::napalm_pipeline::compile_program(&mut hir).unwrap();
+        let bytes = encode(&program, &bootstrap).unwrap();
+        let payload = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        // Postcard is already compact; zstd still removes at least a third.
+        assert!(bytes.len() * 3 < payload * 2, "{} vs {payload}", bytes.len());
     }
 }

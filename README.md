@@ -44,11 +44,13 @@ cargo run --release -- scripts/fib.burning
 ```
 
 This writes `scripts/fib.burning`, including statically imported modules. Its
-separate build pipeline currently uses the same HIR passes as normal execution,
-repeating the complete HIR optimizer until no changes remain, then compiling and
-optimizing bytecode once. Instructions, runtime
-metadata (including structural layouts, registers and GC maps), and bootstrap
-bindings occupy separate sections. See [the `.burning` format](docs/BURNING.md).
+separate build pipeline adds AOT-only HIR passes (IPCP, SCCP, partial
+evaluation, specialization, inlining, LICM, GVN, PRE, tree shaking) to the
+normal ones, repeating the complete HIR optimizer until no changes remain, then
+compiling and optimizing bytecode once. Instructions, runtime metadata
+(including structural layouts, registers and GC maps), and bootstrap bindings
+occupy separate binary sections, compressed together with zstd. See
+[the `.burning` format](docs/BURNING.md).
 Arguments after the entry file remain program arguments, including `--build`.
 Executing `.burning` loads the compiled program directly, including its imported
 modules, without reading or recompiling the original sources. It uses the same

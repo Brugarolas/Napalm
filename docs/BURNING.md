@@ -96,26 +96,45 @@ Unreadable artifacts return exit code 3; invalid or incompatible artifacts retur
 the artifact untouched. `napalm file.burning --build` passes `--build` to the
 program as an ordinary argument.
 
-## Version 1 framing
+## Version 2 framing
 
-All binary integers are unsigned and little-endian. Lengths count bytes unless
-specified otherwise. The file starts with this 16-byte header:
+All fixed-width integers are unsigned and little-endian. Lengths count bytes
+unless specified otherwise. The file starts with this uncompressed 24-byte header:
 
 | Offset | Size | Meaning |
 | --- | --- | --- |
 | 0 | 8 | Magic bytes `NAPBURN\0` (one final NUL byte) |
-| 8 | 4 | Format version, currently `1` |
-| 12 | 4 | Section count, currently `3` |
+| 8 | 4 | Format version, currently `2` |
+| 12 | 4 | Payload compression, currently `1` (zstd) |
+| 16 | 8 | Uncompressed payload length |
 
-Each section consists of a four-byte ASCII tag, a `u64` payload length, and exactly
-that many payload bytes. Writers emit `CODE`, `META`, then `BOOT`. Readers identify
-sections by tag. A tool can extract or skip any section without decoding others.
+The rest of the file is exactly one zstd frame (level 18, with content size and
+checksum). The level only affects build time; decompression costs well under a
+millisecond for typical programs. Readers reject declared payloads above 1 GiB
+before allocating. They also reject frames that inflate to a different size or
+fail their checksum, and any trailing data.
+
+The decompressed payload starts with a `u32` section count, currently `3`. Each
+section consists of a four-byte ASCII tag, a `u64` length, and exactly that many
+bytes. Writers emit `CODE`, `META`, then `BOOT`. Readers identify sections by
+tag. After decompression, a tool can extract or skip any section without
+decoding the others.
 
 | Section | Encoding | Contents |
 | --- | --- | --- |
 | `CODE` | Binary | Optimized instruction streams for all functions, including builtin bytecode bodies |
-| `META` | UTF-8 JSON | `BytecodeProgram`, with instruction words and derived lookup indexes omitted |
-| `BOOT` | UTF-8 JSON | Entry `FuncId`, module name, and complete `BuiltinManifest` |
+| `META` | [postcard](https://docs.rs/postcard) | `BytecodeProgram`, with instruction words and derived lookup indexes omitted |
+| `BOOT` | postcard | Entry `FuncId`, module name, and complete `BuiltinManifest` |
+
+Every section is binary. Postcard is not self-describing: `META` and `BOOT`
+are only readable with the runtime's own type definitions, and a section must be
+consumed exactly.
+
+Format 1 stored `META` and `BOOT` as JSON without compression. The current
+runtime rejects it with a message asking to rebuild. Compared with format 1,
+`index.napalm` went from 1197 KB to 34 KB and `basic.napalm` from 167 KB to 9 KB.
+Loading (decompression, decoding, index rebuild and verification) also takes
+less time than parsing format 1's JSON alone.
 
 `CODE` starts with a `u32` function count. Each function then has a `u32` function
 ID, a `u64` instruction **word** count, and that many `u32` words. Extension words
@@ -130,9 +149,9 @@ metadata retains strings, methods, module slots/exports/builtin bindings/worker
 bindings, classes, foreign function declarations, structural layouts and named
 contracts. All references use logical IDs, never process addresses.
 
-Serde's named enum representation is used in JSON. `Constant::Num` stores a `u64`
-IEEE-754 bit pattern, for example `{"Num":4631107791820423168}` for `42.0`. This
-preserves signed zero, infinities, subnormals and NaN payloads exactly.
+`Constant::Num` stores its `u64` IEEE-754 bit pattern rather than a float. This
+preserves signed zero, infinities, subnormals and NaN payloads exactly,
+independently of the serializer.
 
 `BOOT.builtins` stores the complete builtin method/primitive/native mapping and
 helper function IDs, including decorator wrappers. Native implementations are
@@ -143,9 +162,10 @@ The corresponding implementations are supplied by the runtime.
 
 `napalm_burning::decode` reconstructs a `BytecodeProgram` and `Bootstrap`, rebuilds
 lookup indexes, checks the entry point, and runs the bytecode verifier. It rejects
-unknown versions, malformed framing, duplicate/unknown sections, truncated code,
-inconsistent function IDs/counts, and trailing data. The CLI validates the
-artifact before initializing the VM.
+unknown versions and compressions, corrupt or mis-sized frames, malformed
+framing, duplicate/unknown sections, truncated code, inconsistent function
+IDs/counts, and trailing data. The CLI validates the artifact before
+initializing the VM.
 
 A runtime can initialize the decoded program with `Interpreter::with_host`, using
 `BuiltinHost::new(bootstrap.builtins.clone())`, install the VM builtins, and call
@@ -159,7 +179,8 @@ initialization/execution. They contain process-local state and are not compiler
 output. The artifact stores the layouts, descriptors and GC/register maps needed
 to recreate them; it is not a snapshot of an executing process.
 
-Version 1 is tied to the current bytecode/runtime schema. Changes to opcode
-encoding, metadata semantics, builtin identities or incompatible serialized
-fields must bump `FORMAT_VERSION`. Cross-version runtime compatibility is not
-implied by the JSON encoding.
+Version 2 is tied to the current bytecode/runtime schema. Changes to opcode
+encoding, metadata semantics or builtin identities must bump `FORMAT_VERSION`.
+Postcard encodes fields by position, so any change to a serialized struct or
+enum (adding, removing or reordering fields or variants) is also a format break
+and must bump it. Cross-version runtime compatibility is not implied.
