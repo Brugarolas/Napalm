@@ -54,7 +54,13 @@ presented as existing features.
 34. [Example and Source Map](#34-example-and-source-map)
 35. [Current Performance](#35-current-performance)
 36. [Napalm System platform helpers](#35-system-platform-helpers)
-37. [Napalm nNative FFI](#35-native-ffi)
+37. [Napalm Native FFI](#35-native-ffi)
+38. [JSON](#38-json)
+39. [Bytes](#39-bytes)
+40. [ByteBuffer](#40-bytebuffer)
+41. [Fs](#41-fs)
+42. [Path](#42-path)
+43. [Uri](#43-uri)
 
 ### How to Read the Examples
 
@@ -286,9 +292,10 @@ protocol. Many builtins also retain the `value.toString` getter.
 Classes can implement `toString()` and participate in interpolation,
 concatenation, and `System.print`.
 
-Do not use `String(value)`, `Number(value)`, `Boolean(value)`, or
-`JSON.stringify` by analogy with JavaScript: equivalent APIs are not provided
-here. The textual output of Maps and lists is for presentation, **not JSON**.
+Do not use `String(value)`, `Number(value)`, or `Boolean(value)` by analogy
+with JavaScript: equivalent conversion APIs are not provided here. The textual
+output of Maps and lists is for presentation, **not JSON**. Use
+[`JSON.stringify(value)`](#38-json) to serialize supported values as JSON.
 
 ### 3.5 typeof
 
@@ -3166,7 +3173,7 @@ The returned Promise can be canceled.
 
 JSON bodies must be serializable data: scalars, lists, and Maps with string
 keys; not functions or cyclic graphs. Depth is limited.
-This does not provide a complete global `JSON` API.
+The global [`JSON`](#38-json) utility also exposes `parse` and `stringify`.
 
 ### 29.2 Response and Headers
 
@@ -3942,3 +3949,283 @@ libloading = "0.9.0"
 ```
 
 `libffi` uses its bundled libffi build by default. If a deployment deliberately uses a system libffi, enable the crate's `system` feature instead.
+
+## 38. JSON
+
+`JSON` is a global utility; no import or constructor is needed. Both methods
+take exactly one argument and run synchronously.
+
+| Method | Result and behavior |
+| --- | --- |
+| `JSON.parse(input)` | Parses a String, Bytes, or ByteBuffer containing UTF-8 JSON. Returns null, Bool, Num, String, List, or Map according to the JSON value. Binary input is neither modified nor consumed. |
+| `JSON.stringify(value)` | Returns a compact JSON String for null, Bool, Num, String, List, or Map. Map keys must be Strings; nested values must also be supported. |
+
+Objects become Maps in source order. Duplicate keys keep their original
+position but use the last value. Stringification preserves Map insertion order.
+Numbers use Napalm's floating-point representation, so large JSON integers may
+lose precision. `stringify` encodes non-finite numbers as `null` and negative
+zero as `0`.
+
+Invalid JSON, unsupported values (including Bytes, ByteBuffer, functions, and
+class instances), non-String Map keys, and cycles throw errors. Shared children
+without cycles are allowed. Nesting is limited to depth 256, with the root at
+depth zero; input and output are limited to 256 MiB. There are no reviver,
+replacer, indentation, or automatic `toJSON()` hooks.
+
+```napalm
+const value = JSON.parse('{"name":"Napalm","ready":true}');
+System.print(value["name"]); // Napalm
+System.print(JSON.stringify(value)); // {"name":"Napalm","ready":true}
+
+const bytes = Bytes.fromUtf8('[1,2,3]');
+System.print(JSON.parse(bytes)[1]); // 2
+```
+
+See [scripts/json.napalm](scripts/json.napalm) for further examples.
+
+## 39. Bytes
+
+`Bytes` is an immutable binary value, available globally. Lengths and indices
+count bytes, not characters. Create values with the static factories below;
+there is no public `new Bytes()` constructor.
+
+### 39.1 Factories
+
+| Method | Result |
+| --- | --- |
+| `Bytes.empty()` | Empty Bytes. |
+| `Bytes.alloc(length)` | Bytes containing `length` zero bytes. |
+| `Bytes.fromUtf8(text)` | Bytes copied from a String's UTF-8 encoding. |
+| `Bytes.fromArray(values)` | Bytes copied from a List of integer byte values in `0..255`. |
+
+### 39.2 Properties and Methods
+
+| Member | Result and behavior |
+| --- | --- |
+| `length` | Number of bytes. |
+| `isEmpty` | Whether length is zero. |
+| `bytes[index]` | Numeric byte at a zero-based index. Out-of-bounds access throws. |
+| `slice(start, end?)` | Bytes sharing the original storage for the half-open range `[start, end)`. Omitted `end` means length. Requires `0 <= start <= end <= length`. |
+| `clone()` | New Bytes value sharing immutable storage. |
+| `toUtf8()` | Decoded String; invalid UTF-8 throws. |
+| `toArray()` | New List of numeric bytes; limited to 16,777,216 elements. |
+| `toMutable()` | Independent mutable ByteBuffer copy. |
+| `indexOf(pattern)` | First matching byte offset, or `-1`; accepts Bytes, ByteBuffer, or String. An empty pattern matches at `0`. |
+| `toString`, `toString()` | Diagnostic String such as `<Bytes length=3>`. Use `toUtf8()` to decode text. |
+| `iterate(state)` | Iteration protocol: pass `null` to start, then the previous state; returns the next index or `false`. |
+| `iteratorValue(state)` | Numeric byte at the iteration index. |
+
+`for...of` iterates numeric bytes. Byte values, lengths, and indices must be
+finite integers; negative indices and invalid ranges throw rather than wrap or
+clamp. Binary allocations are limited to 256 MiB. Slices and clones retain their
+backing storage; changing a `toMutable()` copy does not affect the source.
+
+```napalm
+const data = Bytes.fromUtf8("Hello");
+System.print(data.length); // 5
+System.print(data[0]); // 72
+System.print(data.slice(1, 4).toUtf8()); // ell
+
+const edited = data.toMutable();
+edited[0] = 104;
+System.print(edited.toUtf8()); // hello
+System.print(data.toUtf8()); // Hello
+```
+
+## 40. ByteBuffer
+
+`ByteBuffer` is a mutable, growable binary buffer. `new ByteBuffer()` creates
+an empty buffer; `new ByteBuffer(capacity)` reserves initial storage but still
+starts with length zero. It is available globally, without an import.
+
+### 40.1 Properties and Methods
+
+| Member | Result and behavior |
+| --- | --- |
+| `length` | Current number of bytes. |
+| `capacity` | Current storage capacity in bytes. |
+| `isEmpty` | Whether length is zero. |
+| `buffer[index]` | Reads a numeric byte at a zero-based index. |
+| `buffer[index] = value` | Replaces an existing byte with an integer in `0..255`; does not grow the buffer. |
+| `append(data)` | Appends Bytes, ByteBuffer, or a String's UTF-8 bytes. Self-append is supported. Returns the buffer. |
+| `reserve(additional)` | Ensures room for at least `additional` bytes beyond the current length, without changing length. Returns the buffer. |
+| `resize(length)` | Truncates or grows to the requested length, filling new bytes with zero. Returns the buffer. |
+| `writeUInt8(value)` | Appends one unsigned byte. Returns the buffer. |
+| `writeUInt16BE(value)`, `writeUInt16LE(value)` | Appends an unsigned 16-bit integer in big-/little-endian order. Returns the buffer. |
+| `writeUInt32BE(value)`, `writeUInt32LE(value)` | Appends an unsigned 32-bit integer in big-/little-endian order. Returns the buffer. |
+| `take(count)` | Removes the first `count` bytes and returns them as immutable Bytes. Returns `null` without consuming anything if insufficient bytes are available. |
+| `peek(count)` | Copies the first `count` bytes into Bytes without consuming them; returns `null` if insufficient bytes are available. |
+| `discard(count)` | Removes the first `count` bytes. Throws if insufficient bytes are available. Returns the buffer. |
+| `freeze()` | Transfers all contents into immutable Bytes and leaves the buffer empty and reusable. |
+| `clear()` | Removes all contents. Returns the buffer. |
+| `fill(value)` | Replaces all existing bytes with an integer in `0..255`, preserving length. Returns the buffer. |
+| `indexOf(pattern)` | First matching byte offset, or `-1`; accepts Bytes, ByteBuffer, or String. An empty pattern matches at `0`. |
+| `toUtf8()` | Decodes current contents as a String without consuming them; invalid UTF-8 throws. |
+| `toString`, `toString()` | Diagnostic String such as `<ByteBuffer length=3>`. |
+| `iterate(state)` | Iteration protocol: pass `null` to start, then the previous state; returns the next index or `false`. |
+| `iteratorValue(state)` | Numeric byte at the iteration index. |
+
+`for...of` iterates numeric bytes. The same integer, bounds, and 256 MiB size
+limits as Bytes apply. Integer writes require values in `0..255`, `0..65535`,
+or `0..4294967295`, respectively; they append rather than overwrite. Bytes
+returned by `take`, `peek`, or `freeze` remain unchanged when the buffer is
+subsequently reused.
+
+```napalm
+const frame = new ByteBuffer(16);
+frame.writeUInt16BE(4660).append("OK");
+System.print(frame.length); // 4
+System.print(frame.peek(2)[0]); // 18
+frame.discard(2);
+System.print(frame.take(2).toUtf8()); // OK
+System.print(frame.take(1)); // null
+frame.append("reused");
+System.print(frame.freeze().toUtf8()); // reused
+System.print(frame.isEmpty); // true
+```
+
+See [scripts/bytes.napalm](scripts/bytes.napalm) for Bytes and ByteBuffer examples.
+
+## 41. Fs
+
+`Fs` is a global utility for synchronous, blocking filesystem operations.
+Paths must be UTF-8 Strings and follow the host operating system's filesystem
+rules. Relative paths use the process working directory. Methods return their
+results directly, not Promises; invalid arguments and I/O failures throw.
+
+### 41.1 Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Fs.readText(path)` | Reads the whole file into a String; invalid UTF-8 throws. |
+| `Fs.readBytes(path)` | Reads the whole file into immutable Bytes. |
+| `Fs.writeText(path, text)` | Creates or overwrites a file with a String's UTF-8 contents. Returns `null`. |
+| `Fs.writeBytes(path, data)` | Creates or overwrites a file from Bytes or ByteBuffer without consuming the input. Returns `null`. |
+| `Fs.exists(path)` | Bool indicating whether the path exists, following symlinks. Returns `false` for missing paths or dangling links; other lookup errors can throw. |
+| `Fs.stat(path)` | Metadata Map for the path itself, without following a final symlink. |
+| `Fs.readDir(path)` | List of entry Maps sorted by name; does not recurse or follow entry symlinks for type flags. |
+| `Fs.realPath(path)` | Canonical absolute String path, resolving symlinks; the target must exist. |
+| `Fs.mkdir(path)` | Creates one directory; its parent must exist. An existing target is an error. Returns `null`. |
+| `Fs.mkdirAll(path)` | Creates missing parent directories too; succeeds for an existing directory. Returns `null`. |
+| `Fs.removeFile(path)` | Removes a file or symlink. Returns `null`. |
+| `Fs.rename(from, to)` | Renames or moves a file or directory using host filesystem rules. Returns `null`. |
+
+Reads and writes are limited to 256 MiB per operation, and `readDir` to 100,000
+entries. Writes truncate existing files and do not create parent directories.
+There is no append, streaming file handle, or directory-removal API here.
+`realPath` may return a Windows extended-length path such as `\\?\C:\...`.
+
+### 41.2 Result Maps
+
+| `stat` field | Meaning |
+| --- | --- |
+| `size` | Filesystem metadata size in bytes, represented as Num. |
+| `isFile`, `isDirectory`, `isSymlink` | Bool type flags for the path itself. |
+| `readonly` | Bool indicating the filesystem's read-only permission flag. |
+| `modifiedMs`, `createdMs`, `accessedMs` | Milliseconds since the Unix epoch, or `null` if the timestamp is unavailable. |
+
+Each `readDir` entry has `name`, `path`, `isFile`, `isDirectory`, and `isSymlink`.
+`path` includes the supplied directory path and is not necessarily absolute.
+Directory names and returned paths must be representable as UTF-8.
+
+This example reads an existing repository file and performs no writes:
+
+```napalm
+const path = "scripts/json.napalm"; // Run from the repository root.
+if (Fs.exists(path)) {
+    const text = Fs.readText(path);
+    const metadata = Fs.stat(path);
+    System.print(metadata["isFile"]); // true
+    System.print(metadata["size"] === Bytes.fromUtf8(text).length); // true
+    System.print(Fs.realPath(path)); // Host-specific absolute path.
+}
+```
+
+See [scripts/fs.napalm](scripts/fs.napalm) for file creation, binary I/O,
+directory listing, renaming, and removal examples.
+
+## 42. Path
+
+`Path` is a global utility for lexical path operations. It normalizes path
+text without checking whether a file exists or resolving symlinks; use
+`Fs.realPath` when filesystem canonicalization is needed. Inputs must be
+UTF-8 Strings, at most 1 MiB each, without NUL characters.
+
+| Method | Result and behavior |
+| --- | --- |
+| `Path.join(...parts)` | Joins and normalizes 0–16 String parts, skipping empty parts. With no nonempty parts, returns `"."`. Leading separators on later parts do not reset the accumulated path. |
+| `Path.resolve(...parts)` | Resolves 0–16 String parts against the current working directory to an absolute path. A later absolute part replaces the preceding base. With no parts, returns the normalized working directory. |
+| `Path.normalize(path)` | Normalizes separators, `.` and `..`; absolute paths cannot traverse above their root. An empty relative path becomes `"."`. |
+| `Path.dirname(path)` | Parent of the normalized path; a root remains its own parent. |
+| `Path.basename(path)` | Final component of the normalized path; an absolute root has an empty basename. |
+| `Path.extension(path)` | Final extension including its dot, or `""`. A leading dot alone does not count: `.gitignore` has no extension. |
+| `Path.isAbsolute(path)` | Bool indicating whether the parsed path is rooted. `C:work` is drive-relative; `C:\work` is absolute. |
+| `Path.relative(from, to)` | Resolves both paths, then returns the path from `from` to `to`; identical paths produce `"."`. Different roots produce the absolute destination. |
+
+POSIX and Windows drive/UNC syntax are recognized from the input, including
+Windows paths on non-Windows hosts. Windows-style results use backslashes;
+POSIX results use forward slashes. A leading `//server/share` is treated as UNC
+on Windows. Windows component comparisons in `relative` are ASCII
+case-insensitive.
+
+`isAbsolute` also treats a Windows root-relative path such as `\work` as rooted,
+but resolving it requires an active drive. Resolving `C:work` requires a base
+on that drive. Incomplete UNC roots and Windows device paths throw; ordinary
+extended-length drive and UNC prefixes are normalized.
+
+```napalm
+System.print(Path.join("src", "lib", "..", "main.napalm")); // src/main.napalm
+System.print(Path.normalize("/a/../../b")); // /b
+System.print(Path.extension("/src/main.napalm")); // .napalm
+System.print(Path.relative("/a/b", "/a/c/d")); // ../c/d
+System.print(Path.normalize("C:\\a\\..\\b")); // C:\b
+```
+
+## 43. Uri
+
+`Uri` is a global utility for parsing URI text and converting file URIs.
+String inputs must be valid UTF-8 and at most 1 MiB. These operations do not
+access the filesystem.
+
+### 43.1 Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Uri.parse(text)` | Parses a URI with a scheme and returns a Map of its components. Percent-encoded components stay encoded. |
+| `Uri.fromFilePath(path)` | Converts an absolute POSIX, Windows drive, or UNC path to a normalized `file:` URI String, percent-encoding spaces, reserved characters, and UTF-8 bytes as needed. Relative paths and Windows rooted paths without a drive throw. |
+| `Uri.toFilePath(uri)` | Converts a `file:` URI String, or a Map returned by `parse`, to a normalized filesystem path String. For a Map, reparses its `text` field; edits to other fields do not affect the result. |
+
+### 43.2 Parsed Fields and Validation
+
+| Field | Meaning |
+| --- | --- |
+| `text` | Original URI String. |
+| `scheme` | Scheme before `:`, retaining its original spelling. |
+| `authority` | Text after `//` and before the path, or `""`. |
+| `path` | Raw path with percent encoding preserved. |
+| `query` | Text after `?`, excluding the fragment, or `""`. |
+| `fragment` | Text after `#`, or `""`. |
+| `hasAuthority`, `hasQuery`, `hasFragment` | Bool flags distinguishing an absent component from a present but empty one. |
+
+`parse` rejects missing or invalid schemes, malformed percent escapes,
+unescaped spaces, and control characters. It does not decode query parameters
+or split the authority into hostname, port, or credentials.
+
+`toFilePath` requires the `file` scheme, an absolute URI path, and no query or
+fragment (even an empty `?` or `#` is rejected). Empty authority and `localhost`
+denote local paths; other supported authorities become UNC server names and
+require a share. Encoded slashes, backslashes, NUL, and decoded invalid UTF-8
+are rejected. Windows drive/UNC URIs produce Windows paths even on other hosts.
+
+```napalm
+const parsed = Uri.parse("https://example.com/a%20b?x=1#part");
+System.print(parsed["authority"]); // example.com
+System.print(parsed["path"]); // /a%20b
+System.print(parsed["query"]); // x=1
+
+const uri = Uri.fromFilePath("/tmp/hello world.txt");
+System.print(uri); // file:///tmp/hello%20world.txt
+System.print(Uri.toFilePath(Uri.parse(uri))); // /tmp/hello world.txt
+```
+
+See [scripts/path.napalm](scripts/path.napalm) for Path and Uri examples.
