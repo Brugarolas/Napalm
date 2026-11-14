@@ -1,0 +1,74 @@
+{
+  "name": "napalm-language",
+  "displayName": "Napalm Language",
+  "description": "Declarative language support for Napalm source files; the language server is a separate Napalm executable.",
+  "version": "0.1.0",
+  "publisher": "napalm-local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "napalm",
+    "syntax",
+    "highlighting",
+    "language"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "napalm",
+        "aliases": [
+          "Napalm",
+          "napalm"
+        ],
+        "extensions": [
+          ".napalm"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "napalm-burning",
+        "aliases": [
+          "Napalm Compiled Bytecode"
+        ],
+        "extensions": [
+          ".burning"
+        ]
+      },
+      {
+        "id": "napalm-fire",
+        "aliases": [
+          "Napalm Fire File"
+        ],
+        "extensions": [
+          ".fire"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "napalm",
+        "scopeName": "source.napalm",
+        "path": "./syntaxes/napalm.tmLanguage.json"
+      }
+    ]
+  },
+  "files": [
+    "syntaxes",
+    "language-configuration.json",
+    "icons",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test ./tests/*.test.mjs",
+    "configure:icons": "node ./scripts/configure-icons.mjs"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}

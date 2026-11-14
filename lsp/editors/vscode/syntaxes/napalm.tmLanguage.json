@@ -1,0 +1,302 @@
+{
+  "name": "Napalm",
+  "scopeName": "source.napalm",
+  "fileTypes": [
+    "napalm"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#decorators"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.napalm",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.napalm",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "name": "keyword.other.documentation.napalm",
+              "match": "(?<!\\w)@[A-Za-z][A-Za-z0-9]*\\b"
+            }
+          ]
+        }
+      ]
+    },
+    "escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.napalm",
+          "match": "\\\\(?:[0btnfrv\\\\\\'\"`$]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|u\\{[0-9A-Fa-f]{1,6}\\}|\\r?\\n)"
+        },
+        {
+          "name": "invalid.illegal.escape.napalm",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.napalm",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "include": "#escapes"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.napalm",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "include": "#escapes"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.template.napalm",
+          "begin": "`",
+          "end": "`",
+          "patterns": [
+            {
+              "include": "#template-interpolation"
+            },
+            {
+              "include": "#escapes"
+            }
+          ]
+        }
+      ]
+    },
+    "template-interpolation": {
+      "patterns": [
+        {
+          "name": "meta.interpolation.napalm",
+          "begin": "\\$\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.begin.napalm"
+            }
+          },
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.end.napalm"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#nested-braces"
+            },
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "nested-braces": {
+      "patterns": [
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "patterns": [
+            {
+              "include": "#nested-braces"
+            },
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "(?<![.\\w$])\\b(class|interface|type|enum)\\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.declaration.napalm"
+            },
+            "2": {
+              "name": "entity.name.type.napalm"
+            }
+          }
+        },
+        {
+          "match": "(?<![.\\w$])\\b(function)\\s*([A-Za-z_$][A-Za-z0-9_$]*)?",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.napalm"
+            },
+            "2": {
+              "name": "entity.name.function.napalm"
+            }
+          }
+        },
+        {
+          "match": "(?<![.\\w$])\\b(?:get|set|computed)\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.method.napalm"
+            }
+          }
+        }
+      ]
+    },
+    "decorators": {
+      "patterns": [
+        {
+          "name": "meta.annotation.napalm",
+          "match": "@[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.napalm",
+          "match": "(?<![.\\w$])\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.napalm",
+          "match": "(?<![.\\w$])\\bnull\\b"
+        },
+        {
+          "name": "variable.language.napalm",
+          "match": "(?<![.\\w$])\\b(?:this|super)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.napalm",
+          "match": "(?<![\\w$])0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*\\b"
+        },
+        {
+          "name": "constant.numeric.binary.napalm",
+          "match": "(?<![\\w$])0[bB][01](?:_?[01])*\\b"
+        },
+        {
+          "name": "constant.numeric.octal.napalm",
+          "match": "(?<![\\w$])0[oO][0-7](?:_?[0-7])*\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.napalm",
+          "match": "(?<![\\w$])(?:[0-9](?:_?[0-9])*(?:\\.[0-9](?:_?[0-9])*)?|\\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?(?![\\w$])"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.napalm",
+          "match": "(?<![.\\w$])\\b(?:any|number|string|boolean|void|never|unknown)\\b"
+        },
+        {
+          "name": "support.type.builtin.napalm",
+          "match": "(?<![.\\w$])\\b(?:Number|String|Boolean|Null|Array|List|Map|Set|Range|Bytes|ByteBuffer|Date|File|FileInfo|FileWatcher|InputStream|OutputStream|Promise|Event|Emitter|Channel|Receiver|Generator|Fiber)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.flow.napalm",
+          "match": "(?<![.\\w$])\\b(?:if|else|switch|case|default|for|while|do|break|continue|return|throw|try|catch|finally|yield|await|in|of)\\b"
+        },
+        {
+          "name": "keyword.control.import.napalm",
+          "match": "(?<![.\\w$])\\b(?:import|export|from|as)\\b"
+        },
+        {
+          "name": "storage.modifier.napalm",
+          "match": "(?<![.\\w$])\\b(?:const|let|var|new|class|extends|implements|inherits|interface|type|enum|declare|async|concurrent|shared|static|readonly|public|private|protected|abstract|override|computed|get|set)\\b"
+        },
+        {
+          "name": "keyword.operator.word.napalm",
+          "match": "(?<![.\\w$])\\b(?:typeof|instanceof|delete|launch)\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.class.builtin.napalm",
+          "match": "(?<![.\\w$])\\b(?:System|Fs|Path|Uri|JSON|Process|Timer|Math|Random|Http|Bytes|ByteBuffer|Date)\\b(?=\\s*(?:\\.|\\?\\.))"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.pipeline.napalm",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.comparison.napalm",
+          "match": "===|!==|==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.napalm",
+          "match": "&&=?|\\|\\|=?|\\?\\?=?"
+        },
+        {
+          "name": "keyword.operator.access.napalm",
+          "match": "\\?\\."
+        },
+        {
+          "name": "keyword.operator.assignment.napalm",
+          "match": "(?:\\*\\*|<<|>>|[+*/%&|^~-])?="
+        },
+        {
+          "name": "keyword.operator.arithmetic.napalm",
+          "match": "\\*\\*|\\.\\.\\.?|<<|>>|[+*/%&|^~-]"
+        },
+        {
+          "name": "punctuation.separator.napalm",
+          "match": "[;,]"
+        }
+      ]
+    }
+  }
+}

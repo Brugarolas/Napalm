@@ -1,0 +1,30 @@
+// Napalm syntax-highlighting fixture, not a compiler conformance test.
+import { transform as apply } from "./utility";
+
+/** Documented example with @tag annotations. */
+@memoize
+function greet(name: string): string {
+    const emoji = "A😀é";
+    const message = `Hello ${name.toUpperCase()}, ${emoji}!`;
+    return message;
+}
+
+interface Point { x: number; y: number; }
+type Identifier = string | number;
+enum Status { Pending, Ready, Failed }
+
+class Model {
+    x = 12;
+    computed doubled() { return this.x * 2; }
+}
+
+const binary = 0b1010;
+const hex = 0xDEAD_BEEF;
+const scientific = 1.25e3;
+const result = 5 |> apply(2);
+
+async function run() {
+    const path = Path.normalize("C:\\project\\src\\..\\main.napalm");
+    const data = JSON.parse('{"ok":true,"value":null}');
+    System.print(`${path} ${data["ok"]}`);
+}
