@@ -1,0 +1,86 @@
+// Binary-safe LSP message framing. Standard output is exclusively for JSON-RPC.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_HEADER_BYTES = 8192;
+const MAX_HEADERS = 32;
+
+function requireFrameLength(value) {
+    if (value.length === 0) throw "Missing Content-Length value";
+    for (let i = 0; i < value.length; i++) {
+        const point = value.codePointAt(i);
+        if (point < 48 || point > 57) throw "Content-Length must contain only decimal digits";
+    }
+    const count = Num.fromString(value);
+    if (count === null || !count.isInteger || count < 0 || count > MAX_FRAME_BYTES) {
+        throw "Content-Length is invalid or exceeds the configured limit";
+    }
+    return count;
+}
+
+function validateContentType(value) {
+    const segments = value.toLowerCase().split(";");
+    for (let i = 1; i < segments.length; i++) {
+        const param = segments[i].trim();
+        if (param.startsWith("charset=")) {
+            const charset = param.slice(8).trim();
+            if (charset !== "utf-8" && charset !== "\"utf-8\"") {
+                throw "Unsupported LSP Content-Type charset";
+            }
+        }
+    }
+}
+
+// Returns null only for EOF at the start of a frame.
+// The 'parsed' flag distinguishes malformed JSON from a valid JSON null.
+export function readFrame() {
+    let contentLength = null;
+    let headerCount = 0;
+    let headerBytes = 0;
+
+    while (true) {
+        const line = Process.stdin.readLine();
+        if (line === null) {
+            if (headerCount === 0) return null;
+            throw "Unexpected EOF while reading LSP headers";
+        }
+        headerBytes += line.utf8Length + 2;
+        if (headerBytes > MAX_HEADER_BYTES) throw "LSP headers exceed the configured limit";
+        if (line === "") break;
+
+        headerCount++;
+        if (headerCount > MAX_HEADERS) throw "Too many LSP headers";
+        const separator = line.indexOf(":");
+        if (separator <= 0) throw "Malformed LSP header";
+        const name = line.slice(0, separator).trim().toLowerCase();
+        const value = line.slice(separator + 1).trim();
+
+        if (name === "content-length") {
+            if (contentLength !== null) throw "Duplicate Content-Length header";
+            contentLength = requireFrameLength(value);
+        } else if (name === "content-type") {
+            validateContentType(value);
+        }
+    }
+
+    if (contentLength === null) throw "Missing Content-Length header";
+    const payload = Process.stdin.readExact(contentLength);
+    try {
+        return {parsed: true, message: JSON.parse(payload)};
+    } catch (error) {
+        return {parsed: false, message: null};
+    }
+}
+
+export function sendFrame(message) {
+    const body = JSON.stringify(message);
+    if (body.utf8Length > MAX_FRAME_BYTES) throw "Outgoing LSP message exceeds size limit";
+    const header = "Content-Length: " + body.utf8Length.toString() + "\r\n\r\n";
+    const buffer = new ByteBuffer(header.utf8Length + body.utf8Length);
+    buffer.append(header);
+    buffer.append(body);
+    Process.stdout.writeAll(buffer.freeze());
+    Process.stdout.flush();
+}
+
+export function logError(message) {
+    Process.stderr.writeText("[napalm-lsp] " + message + "\n");
+}

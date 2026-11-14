@@ -1,0 +1,110 @@
+// LSP positions use UTF-16 code units; Napalm String indices are Unicode scalars.
+// CRLF is one line break, and a cursor may never split a surrogate pair.
+function assertPositionNumber(value, field) {
+    if (typeof value !== "Number" || !value.isInteger || value < 0) {
+        throw "Invalid LSP position " + field;
+    }
+}
+
+// Return the Unicode-scalar offset, or null for an invalid position.
+// Columns past the end of an existing line clamp to that line's end.
+export function offsetAt(text, line, character) {
+    assertPositionNumber(line, "line");
+    assertPositionNumber(character, "character");
+    let index = 0;
+    let currentLine = 0;
+
+    while (currentLine < line) {
+        let found = false;
+        while (index < text.length) {
+            const scalar = text[index];
+            index++;
+            if (scalar === "\r") {
+                if (index < text.length && text[index] === "\n") index++;
+                found = true;
+                break;
+            }
+            if (scalar === "\n") {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return null;
+        currentLine++;
+    }
+
+    let units = 0;
+    while (index < text.length) {
+        const scalar = text[index];
+        if (scalar === "\r" || scalar === "\n") break;
+        if (units === character) return index;
+        const width = scalar.utf16Length;
+        if (units + width > character) return null;
+        units += width;
+        index++;
+    }
+    return index;
+}
+
+// Converts a scalar offset back to the LSP's line and UTF-16 column.
+export function positionAt(text, offset) {
+    assertPositionNumber(offset, "offset");
+    if (offset > text.length) offset = text.length;
+    let line = 0;
+    let character = 0;
+    let index = 0;
+    while (index < offset) {
+        const scalar = text[index];
+        if (scalar === "\r") {
+            line++;
+            character = 0;
+            index++;
+            if (index < offset && text[index] === "\n") index++;
+        } else if (scalar === "\n") {
+            line++;
+            character = 0;
+            index++;
+        } else {
+            character += scalar.utf16Length;
+            index++;
+        }
+    }
+    return {line: line, character: character};
+}
+
+function requirePosition(value) {
+    if (value === null) throw "Missing text edit position";
+    const line = value["line"];
+    const character = value["character"];
+    assertPositionNumber(line, "line");
+    assertPositionNumber(character, "character");
+    return {line: line, character: character};
+}
+
+// Apply all content changes in order, without mutating the old snapshot.
+// LSP incremental edits are defined against the document after previous edits.
+export function applyChanges(source, changes) {
+    let text = source;
+    for (const change of changes) {
+        const replacement = change["text"];
+        if (typeof replacement !== "String") throw "Text edit must contain a String";
+        const range = change["range"];
+        if (range === null) {
+            text = replacement;
+            continue;
+        }
+        const start = requirePosition(range["start"]);
+        const end = requirePosition(range["end"]);
+        const from = offsetAt(text, start["line"], start["character"]);
+        const to = offsetAt(text, end["line"], end["character"]);
+        if (from === null || to === null || from > to) throw "Invalid incremental edit range";
+
+        const removed = text.slice(from, to);
+        const rangeLength = change["rangeLength"];
+        if (rangeLength !== null && rangeLength !== removed.utf16Length) {
+            throw "Incremental edit rangeLength does not match UTF-16 length";
+        }
+        text = text.slice(0, from) + replacement + text.slice(to);
+    }
+    return text;
+}

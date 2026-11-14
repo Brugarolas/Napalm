@@ -1,0 +1,118 @@
+// JSON-RPC 2.0 / LSP 3.17 lifecycle and text-document synchronization.
+import {sendFrame, logError} from "./transport";
+import {createDocumentStore, openDocument, changeDocument, closeDocument} from "./documents";
+
+export function createServerState() {
+    return {
+        initialized: false,
+        shutdown: false,
+        documents: createDocumentStore()
+    };
+}
+
+function respond(id, result) {
+    sendFrame({jsonrpc: "2.0", id: id, result: result});
+}
+
+function respondError(id, code, message) {
+    sendFrame({jsonrpc: "2.0", id: id, error: {code: code, message: message}});
+}
+
+export function reportParseError() {
+    respondError(null, -32700, "Parse error");
+}
+
+function validateRequestId(id) {
+    if (id === null) return true;
+    if (typeof id === "String") return true;
+    if (typeof id === "Number" && id.isInteger) return true;
+    return false;
+}
+
+// Returns true only when an 'exit' notification requires process termination.
+export function handleMessage(state, request) {
+    // JSON.parse creates object-origin Maps that expose typeof "Object".
+    const requestType = typeof request;
+    if (request === null || (requestType !== "Object" && requestType !== "Map")) {
+        respondError(null, -32600, "Invalid Request");
+        return false;
+    }
+    if (request["jsonrpc"] !== "2.0" || typeof request["method"] !== "String") {
+        respondError(null, -32600, "Invalid Request");
+        return false;
+    }
+
+    const hasId = request.has("id");
+    const id = request["id"];
+    if (hasId && !validateRequestId(id)) {
+        respondError(null, -32600, "Invalid request id");
+        return false;
+    }
+    const method = request["method"];
+
+    if (method === "exit") return true;
+
+    if (method === "initialize") {
+        if (!hasId) return false;
+        if (state["initialized"]) {
+            respondError(id, -32600, "Server already initialized");
+            return false;
+        }
+        state["initialized"] = true;
+        respond(id, {
+            capabilities: {
+                positionEncoding: "utf-16",
+                textDocumentSync: {openClose: true, change: 2}
+            },
+            serverInfo: {name: "napalm-lsp", version: "0.1.0"}
+        });
+        return false;
+    }
+
+    if (!state["initialized"]) {
+        if (hasId) respondError(id, -32002, "Server not initialized");
+        return false;
+    }
+
+    if (method === "shutdown") {
+        if (!hasId) return false;
+        state["shutdown"] = true;
+        respond(id, null);
+        return false;
+    }
+    if (state["shutdown"]) {
+        if (hasId) respondError(id, -32600, "Server is shutting down");
+        return false;
+    }
+
+    if (method === "initialized") return false;
+    if (method === "$/cancelRequest" || method === "$/setTrace") return false;
+
+    if (method === "textDocument/didOpen" ||
+        method === "textDocument/didChange" ||
+        method === "textDocument/didClose") {
+        const params = request["params"];
+        if (params === null) {
+            if (hasId) respondError(id, -32602, "Missing document notification params");
+            else logError("Ignoring document notification without params");
+            return false;
+        }
+        try {
+            if (method === "textDocument/didOpen") {
+                openDocument(state["documents"], params);
+            } else if (method === "textDocument/didChange") {
+                changeDocument(state["documents"], params);
+            } else {
+                closeDocument(state["documents"], params);
+            }
+            if (hasId) respond(id, null);
+        } catch (error) {
+            if (hasId) respondError(id, -32602, "Invalid document notification params");
+            else logError("Rejected malformed document notification: " + method);
+        }
+        return false;
+    }
+
+    if (hasId) respondError(id, -32601, "Method not found: " + method);
+    return false;
+}

@@ -1,0 +1,58 @@
+// In-memory authoritative copies of editor buffers, including unsaved changes.
+import {applyChanges} from "./positions";
+
+export function createDocumentStore() {
+    return new Map();
+}
+
+function requireDocumentData(value) {
+    if (value === null) throw "Missing textDocument";
+    const uri = value["uri"];
+    const version = value["version"];
+    if (typeof uri !== "String" || uri.length === 0) throw "Invalid document URI";
+    if (typeof version !== "Number" || !version.isInteger) throw "Invalid document version";
+    return {uri: uri, version: version};
+}
+
+export function openDocument(store, params) {
+    const descriptor = params["textDocument"];
+    const identity = requireDocumentData(descriptor);
+    const text = descriptor["text"];
+    if (typeof text !== "String") throw "didOpen is missing document text";
+    store.set(identity["uri"], {
+        uri: identity["uri"],
+        version: identity["version"],
+        languageId: descriptor["languageId"],
+        text: text
+    });
+}
+
+export function changeDocument(store, params) {
+    const identity = requireDocumentData(params["textDocument"]);
+    const old = store.get(identity["uri"]);
+    if (old === null) throw "didChange for an unopened document";
+    if (identity["version"] <= old["version"]) {
+        throw "Out-of-order document version";
+    }
+    const changes = params["contentChanges"];
+    if (changes === null) throw "didChange requires contentChanges";
+    const updated = applyChanges(old["text"], changes);
+    store.set(identity["uri"], {
+        uri: identity["uri"],
+        version: identity["version"],
+        languageId: old["languageId"],
+        text: updated
+    });
+}
+
+export function closeDocument(store, params) {
+    const descriptor = params["textDocument"];
+    if (descriptor === null || typeof descriptor["uri"] !== "String") {
+        throw "didClose requires a document URI";
+    }
+    store.delete(descriptor["uri"]);
+}
+
+export function getDocument(store, uri) {
+    return store.get(uri);
+}

@@ -1,0 +1,66 @@
+// Run: cargo run --release -- lsp/scripts/documents_smoke.napalm
+import {offsetAt, positionAt, applyChanges} from "../src/positions";
+import {createDocumentStore, openDocument, changeDocument, closeDocument, getDocument} from "../src/documents";
+
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+
+const sample = "A😀é\r\nline\nend";
+expect(sample.length === 13, "Napalm scalar length");
+expect(offsetAt(sample, 0, 0) === 0, "first position");
+expect(offsetAt(sample, 0, 1) === 1, "before supplementary scalar");
+expect(offsetAt(sample, 0, 2) === null, "cannot split a surrogate pair");
+expect(offsetAt(sample, 0, 3) === 2, "after supplementary scalar");
+expect(offsetAt(sample, 0, 4) === 3, "after accented scalar");
+expect(offsetAt(sample, 0, 100) === 3, "column past line end clamps");
+expect(offsetAt(sample, 1, 0) === 5, "CRLF consumes two scalars");
+expect(offsetAt(sample, 2, 0) === 10, "LF starts the third line");
+expect(positionAt(sample, 2)["character"] === 3, "UTF-16 inverse position");
+expect(positionAt(sample, 5)["line"] === 1, "inverse position after CRLF");
+
+const edit = [{
+    range: {
+        start: {line: 0, character: 1},
+        end: {line: 0, character: 3}
+    },
+    rangeLength: 2,
+    text: "Z"
+}];
+expect(applyChanges(sample, edit) === "AZé\r\nline\nend", "incremental UTF-16 edit");
+expect(applyChanges("a", [{text: "replacement"}]) === "replacement", "full-document update");
+
+const edits = [
+    {range: {start: {line: 0, character: 1}, end: {line: 0, character: 2}}, text: "Z"},
+    {range: {start: {line: 0, character: 2}, end: {line: 0, character: 2}}, text: "!"}
+];
+expect(applyChanges("abc", edits) === "aZ!c", "sequential edits see earlier changes");
+let invalidSurrogateRejected = false;
+try {
+    applyChanges(sample, [{range: {
+        start: {line: 0, character: 2}, end: {line: 0, character: 3}
+    }, text: "bad"}]);
+} catch (error) {
+    invalidSurrogateRejected = true;
+}
+expect(invalidSurrogateRejected, "edits cannot split surrogate pairs");
+let invalidRangeLengthRejected = false;
+try {
+    applyChanges(sample, [{range: {
+        start: {line: 0, character: 1}, end: {line: 0, character: 3}
+    }, rangeLength: 1, text: "bad"}]);
+} catch (error) {
+    invalidRangeLengthRejected = true;
+}
+expect(invalidRangeLengthRejected, "rangeLength must count UTF-16 units");
+
+const store = createDocumentStore();
+const uri = "file:///source.napalm";
+openDocument(store, {textDocument: {uri: uri, version: 1, text: sample, languageId: "napalm"}});
+expect(getDocument(store, uri)["text"] === sample, "didOpen");
+changeDocument(store, {textDocument: {uri: uri, version: 2}, contentChanges: edit});
+expect(getDocument(store, uri)["text"] === "AZé\r\nline\nend", "didChange");
+expect(getDocument(store, uri)["version"] === 2, "version update");
+closeDocument(store, {textDocument: {uri: uri}});
+expect(getDocument(store, uri) === null, "didClose");
+System.print("LSP document/UTF-16 integration tests passed");

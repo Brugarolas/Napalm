@@ -1,0 +1,22 @@
+// Napalm language server entry point. Never print protocol debugging to stdout.
+import {readFrame, logError} from "./src/transport";
+import {createServerState, handleMessage, reportParseError} from "./src/server";
+
+const state = createServerState();
+try {
+    while (true) {
+        const frame = readFrame();
+        if (frame === null) break;
+        if (!frame["parsed"]) {
+            reportParseError();
+            continue;
+        }
+        if (handleMessage(state, frame["message"])) {
+            Process.exit(state["shutdown"] ? 0 : 1);
+        }
+    }
+} catch (error) {
+    logError("Protocol transport failed");
+    Process.exit(1);
+}
+Process.exit(state["shutdown"] ? 0 : 1);
