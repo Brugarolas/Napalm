@@ -2345,11 +2345,11 @@ impl LlvmLowering<'_> {
         value
     }
 
+    /// Shaped-Map values: inline (<= 4 slots) as a tagged owner-relative
+    /// offset, spilled (larger shapes) as a stable absolute pointer. Same
+    /// encoding, and therefore the same decode, as Instance fields.
     fn heap_entry_map_data(&mut self, entry: &V, owner: &V) -> V {
-        let encoded = self.heap_entry_data(entry);
-        let encoded = self.word(&encoded);
-        let offset = self.bin("and", &encoded, &V::i64(!(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64));
-        self.gep8_dyn(owner, &offset)
+        self.heap_entry_instance_data(entry, owner)
     }
 
     /// Instance field-array pointer: inline fields (in the moving owner) are a

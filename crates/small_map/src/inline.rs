@@ -1,15 +1,14 @@
 use core::{
     hash::{BuildHasher, Hash},
     iter::FusedIterator,
-    mem::{self, transmute, ManuallyDrop, MaybeUninit},
-    ptr::NonNull,
+    mem::{self, ManuallyDrop, MaybeUninit},
 };
 
 use crate::{
     raw::{
         h2,
         util::{
-            equivalent_key, likely, make_hash, unlikely, Bucket, InsertSlot, SizedTypeProperties,
+            equivalent_key, likely, make_hash, unlikely, SizedTypeProperties,
         },
         Group,
     },
@@ -156,19 +155,25 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
         }
     }
 
-    /// Searches for an element. Uses linear search for small N/len, SIMD otherwise.
-    /// Hash is computed lazily only when SIMD path is taken.
+    /// Searches for an element and returns its index. Uses linear search for
+    /// small N/len, SIMD otherwise. Hash is computed lazily only when SIMD path
+    /// is taken.
+    ///
+    /// Returns an index rather than a pointer on purpose: a pointer derived
+    /// from this `&self` borrow must not be used for writes, and must not be
+    /// read after a later `&mut self` borrow writes the storage. LLVM exploits
+    /// both (see `remove`). Callers re-derive access from the borrow they hold.
     #[inline]
     fn find<F: FnOnce() -> u64>(
         &self,
         hash: &mut HashValue<F>,
         mut eq: impl FnMut(&T) -> bool,
-    ) -> Option<Bucket<T>> {
+    ) -> Option<usize> {
         if N < LINEAR_THRESHOLD || self.len < Self::MIN_LINEAR_LEN {
             // Linear search - no hash needed
             for i in 0..self.len {
                 if eq(unsafe { self.data.get_unchecked(i).assume_init_ref() }) {
-                    return Some(unsafe { self.bucket(i) });
+                    return Some(i);
                 }
             }
             None
@@ -185,7 +190,7 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
                         let index = probe_pos + bit;
                         let item: &T = self.data.get_unchecked(index).assume_init_ref();
                         if likely(eq(item)) {
-                            return Some(self.bucket(index));
+                            return Some(index);
                         }
                     }
                     probe_pos += Group::WIDTH;
@@ -206,7 +211,7 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
                         let index = probe_pos + bit;
                         let item: &T = self.data.get_unchecked(index).assume_init_ref();
                         if likely(eq(item)) {
-                            return Some(self.bucket(index));
+                            return Some(index);
                         }
                     }
                 }
@@ -215,16 +220,26 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
         }
     }
 
-    /// Inserts a new element into the table in the given slot, and returns its
-    /// raw bucket.
+    /// Mutable access to an element found by [`Self::find`].
+    ///
+    /// # Safety
+    /// `index < self.len`.
     #[inline]
-    unsafe fn insert_in_slot(&mut self, hash: u64, slot: InsertSlot, value: T) -> Bucket<T> { unsafe {
-        // SAFETY: The caller must uphold the safety rules for the [`RawTableInner::set_ctrl_h2`]
-        let bucket = self.bucket(slot.index);
-        bucket.write(value);
-        *self.aligned_groups.ctrl(slot.index) = h2(hash);
+    unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T { unsafe {
+        self.data.get_unchecked_mut(index).assume_init_mut()
+    }}
+
+    /// Appends a new element (the caller checked it is absent and that the
+    /// table is not full) and returns it.
+    ///
+    /// # Safety
+    /// `self.len < N`.
+    #[inline]
+    unsafe fn insert_at_end(&mut self, hash: u64, value: T) -> &mut T { unsafe {
+        let index = self.len;
+        *self.aligned_groups.ctrl(index) = h2(hash);
         self.len += 1;
-        bucket
+        self.data.get_unchecked_mut(index).write(value)
     }}
 
     /// Finds and removes an element from the table.
@@ -235,27 +250,27 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
         eq: impl FnMut(&T) -> bool,
     ) -> Option<T> {
         match self.find(hash, eq) {
-            Some(bucket) => Some(unsafe { self.remove(bucket).0 }),
+            Some(index) => Some(unsafe { self.remove(index) }),
             None => None,
         }
     }
 
-    /// Removes an element from the table, returning it.
+    /// Removes the element at `index`, returning it.
     /// Uses swap-delete: swaps with last element to maintain contiguity.
+    ///
+    /// The value must be read through `self`. This used to read through a
+    /// pointer obtained from `find(&self)`: under `&mut self` (`noalias`) LLVM
+    /// may then assume that pointer does not alias `self.data` and move the
+    /// read after `erase` overwrites the slot. Release builds returned the
+    /// moved element's value instead of the removed one for 40-byte entries.
+    ///
+    /// # Safety
+    /// `index < self.len`.
     #[inline]
-    #[allow(clippy::needless_pass_by_value)]
-    unsafe fn remove(&mut self, item: Bucket<T>) -> (T, InsertSlot) { unsafe {
-        let index = self.bucket_index(&item);
-        // Read value before swap-delete
-        let value = item.read();
+    unsafe fn remove(&mut self, index: usize) -> T { unsafe {
+        let value = self.data.get_unchecked(index).assume_init_read();
         self.erase(index);
-        (value, InsertSlot { index })
-    }}
-
-    /// Returns the index of a bucket from a `Bucket`.
-    #[inline]
-    unsafe fn bucket_index(&self, bucket: &Bucket<T>) -> usize { unsafe {
-        bucket.to_base_index(NonNull::new_unchecked(self.data.as_ptr() as _))
+        value
     }}
 
     /// Erases the element at index using swap-delete.
@@ -273,17 +288,6 @@ impl<const N: usize, T, const LINEAR_THRESHOLD: usize> RawInline<N, T, LINEAR_TH
             self.aligned_groups.groups[index] = self.aligned_groups.groups[last];
         }
         self.len -= 1;
-    }}
-
-    /// Returns a pointer to an element in the table.
-    #[inline]
-    unsafe fn bucket(&self, index: usize) -> Bucket<T> { unsafe {
-        Bucket::from_base_index(
-            NonNull::new_unchecked(transmute::<*mut MaybeUninit<T>, *mut T>(
-                self.data.as_ptr().cast_mut(),
-            )),
-            index,
-        )
     }}
 }
 
@@ -580,12 +584,10 @@ where
             let hash_builder = self.inline_hasher.as_ref().unwrap();
             let mut hash = HashValue::new(|| make_hash::<K, SI>(hash_builder, &k));
             match self.raw.find(&mut hash, equivalent_key(&k)) {
-                Some(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                Some(index) => Some(mem::replace(unsafe { &mut self.raw.get_unchecked_mut(index).1 }, v)),
                 None => {
-                    let slot = InsertSlot {
-                        index: self.raw.len,
-                    };
-                    unsafe { self.raw.insert_in_slot(hash.get(), slot, (k, v)) };
+                    // SAFETY: the caller (`SmallMap::insert`) spills full maps first.
+                    unsafe { self.raw.insert_at_end(hash.get(), (k, v)) };
                     None
                 }
             }
@@ -607,9 +609,7 @@ where
         } else {
             let hash_builder = self.inline_hasher.as_ref().unwrap();
             let hash = make_hash::<K, SI>(hash_builder, &k);
-            let slot = InsertSlot { index: len };
-            let bucket = self.raw.insert_in_slot(hash, slot, (k, v));
-            let (k, v) = bucket.as_mut();
+            let (k, v) = self.raw.insert_at_end(hash, (k, v));
             (k, v)
         }
     }}
@@ -657,7 +657,7 @@ where
         }
         let mut hash = HashValue::new(|| make_hash::<Q, SI>(self.inline_hasher(), k));
         match self.raw.find(&mut hash, equivalent_key(k)) {
-            Some(bucket) => Some(unsafe { bucket.as_ref() }),
+            Some(index) => Some(unsafe { self.raw.data.get_unchecked(index).assume_init_ref() }),
             None => None,
         }
     }
@@ -673,7 +673,7 @@ where
         let hash_builder = self.inline_hasher.as_ref().unwrap();
         let mut hash = HashValue::new(|| make_hash::<Q, SI>(hash_builder, k));
         match self.raw.find(&mut hash, equivalent_key(k)) {
-            Some(bucket) => Some(unsafe { bucket.as_mut() }),
+            Some(index) => Some(unsafe { self.raw.get_unchecked_mut(index) }),
             None => None,
         }
     }

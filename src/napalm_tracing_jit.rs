@@ -10529,18 +10529,14 @@ impl CraneliftLoweringState<'_, '_> {
         value
     }
 
-    /// Resolve a shaped-Map dense-value pointer. Inline maps encode `data` as a
-    /// tagged byte offset from the current GC object address; dictionary maps never
-    /// reach shaped native operations. This avoids storing interior pointers that
-    /// become stale when StickyImmix moves the owner.
+    /// Resolve a shaped-Map dense-value pointer. Shapes with up to four slots
+    /// keep values inline and encode `data` as a tagged byte offset from the
+    /// current GC object address (no interior pointer can go stale when
+    /// StickyImmix moves the owner); larger shapes publish their stable spilled
+    /// buffer as an absolute pointer (bit 0 clear). Dictionary maps never reach
+    /// shaped native operations. Same branch-free decode as Instance fields.
     fn heap_entry_map_data(&mut self, entry: Value, owner_address: Value) -> Value {
-        let encoded = self.heap_entry_data(entry);
-        let offset_mask = self.builder.ins().iconst(
-            self.pointer_type,
-            !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64,
-        );
-        let offset = self.builder.ins().band(encoded, offset_mask);
-        self.builder.ins().iadd(owner_address, offset)
+        self.heap_entry_instance_data(entry, owner_address)
     }
 
     /// Resolve an Instance field-array pointer. Inline fields (<= 4) live in

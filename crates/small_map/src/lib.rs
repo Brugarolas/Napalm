@@ -1166,7 +1166,7 @@ mod tests {
     use std::{cell::RefCell, collections::hash_map::RandomState, rc::Rc};
 
     use hashbrown::HashMap;
-    use rand::Rng;
+    use rand::RngExt; // rand 0.10 moved `random`/`random_range` from `Rng` to `RngExt`
 
     use crate::SmallMap;
 
@@ -2126,6 +2126,41 @@ mod tests {
 
         assert_eq!(map.get(&1), Some(&10), "Failed to find 1");
         assert_eq!(map.get(&5), Some(&50), "Failed to find 5");
+    }
+
+    /// Regression: inline `remove` read the removed value through a pointer
+    /// taken from `find(&self)` and then swap-deleted through `&mut self`.
+    /// With 40-byte entries, release builds moved that read after the
+    /// overwrite and returned the moved element's value. Only reproduces with
+    /// optimizations: run with `cargo test --release`.
+    #[test]
+    fn inline_remove_returns_removed_value_for_large_entries() {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        enum Key {
+            Num(u64),
+            Str(std::sync::Arc<[u8]>, u32, Option<u32>),
+        }
+        fn key(s: &str) -> Key {
+            Key::Str(std::sync::Arc::from(s.as_bytes()), s.len() as u32, Some(s.len() as u32))
+        }
+        fn check<const N: usize>() {
+            let mut map: SmallMap<N, Key, usize, RandomState, RandomState> = SmallMap::new();
+            for (index, name) in ["left", "right", "middle"].iter().enumerate() {
+                map.insert(key(name), index);
+            }
+            assert!(map.is_inline());
+            assert_eq!(map.remove(&key("left")), Some(0), "N={N}");
+            assert_eq!(map.get(&key("middle")), Some(&2), "N={N}");
+            *map.get_mut(&key("middle")).unwrap() = 0;
+            assert_eq!(map.get(&key("middle")), Some(&0), "N={N}");
+            assert_eq!(map.remove(&key("right")), Some(1), "N={N}");
+            assert_eq!(map.remove(&key("middle")), Some(0), "N={N}");
+            assert!(map.is_empty());
+            assert_eq!(map.get(&Key::Num(0)), None);
+        }
+        check::<4>();
+        check::<16>();
+        check::<32>();
     }
 
     #[test]

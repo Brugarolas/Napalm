@@ -1312,20 +1312,9 @@ fn emit_map_property_fast_path(
 
     b.switch_to_block(kind_ok);
     let shape = b.ins().ushr_imm_u(metadata, TRACE_HEAP_METADATA_SHIFT as i64);
-    let encoded_data = b.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        entry,
-        offset_of!(TraceHeapEntry, data) as i32,
-    );
-    // A successful shaped-Map PIC can only target the fixed inline representation.
-    // `data` is therefore a tagged owner-relative offset, never an external pointer.
-    let offset_mask = b.ins().iconst(
-        types::I64,
-        !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64,
-    );
-    let relative_offset = b.ins().band(encoded_data, offset_mask);
-    let data = b.ins().iadd(address, relative_offset);
+    // Shapes with up to four slots keep values inline (owner-relative `data`);
+    // larger shapes use a stable spilled buffer (absolute `data`).
+    let data = emit_heap_data_base(b, entry, address);
 
     let mut check_block = kind_ok;
     for (entry_index, cached) in pic.entries.iter().enumerate() {
@@ -1442,18 +1431,10 @@ fn emit_native_shape_property_store(
 
     b.switch_to_block(map_kind_ok);
     let shape = b.ins().ushr_imm_u(kind, TRACE_HEAP_METADATA_SHIFT as i64);
-    let encoded = b.ins().load(types::I64, MemFlagsData::trusted(), entry,
-        offset_of!(TraceHeapEntry, data) as i32);
-    let relative_bit = b.ins().band_imm(encoded, TRACE_HEAP_DATA_RELATIVE_MASK as i64);
-    let relative = b.ins().icmp_imm(IntCC::NotEqual, relative_bit, 0);
-    let relative_ok = b.create_block();
-    b.ins().brif(relative, relative_ok, &[], fallback, &[]);
-    b.seal_block(map_kind_ok);
-
-    b.switch_to_block(relative_ok);
-    let offset = b.ins().band_imm(encoded, !(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64);
-    let data = b.ins().iadd(address, offset);
-    let mut check_block = relative_ok;
+    // Inline (owner-relative) or spilled (absolute) dense values; a dictionary
+    // Map never matches a cached shape, so `data` is only used on a shape hit.
+    let data = emit_heap_data_base(b, entry, address);
+    let mut check_block = map_kind_ok;
     for (i, cached) in pic.entries.iter().enumerate() {
         if i != 0 { b.switch_to_block(check_block); }
         let hit = b.create_block();
@@ -1478,11 +1459,12 @@ fn emit_native_shape_property_store(
     b.block_params(done)[0]
 }
 
-/// Instance field-array base from a handle sidecar: inline fields publish a
-/// tagged owner-relative offset (they move with the GC object), boxed fields
-/// an absolute pointer (bit 0 clear). Branch-free decode against the live
-/// owner `address` already loaded from the same entry.
-fn emit_instance_field_base(
+/// Dense value base (Instance fields or shaped-Map values) from a handle
+/// sidecar: inline storage publishes a tagged owner-relative offset (it moves
+/// with the GC object), boxed/spilled storage an absolute pointer (bit 0
+/// clear). Branch-free decode against the live owner `address` already loaded
+/// from the same entry.
+fn emit_heap_data_base(
     b: &mut FunctionBuilder<'_>,
     entry: cranelift::prelude::Value,
     address: cranelift::prelude::Value,
@@ -1576,7 +1558,7 @@ fn emit_native_class_field_store(
     b.seal_block(class_ok);
 
     b.switch_to_block(store_ok);
-    let data = emit_instance_field_base(b, entry, address);
+    let data = emit_heap_data_base(b, entry, address);
     b.ins().store(MemFlagsData::trusted(), value, data,
         op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
     b.ins().jump(done, &[BlockArg::Value(regs)]);
@@ -1737,7 +1719,7 @@ fn emit_native_class_field_load(
     b.seal_block(kind_ok);
 
     b.switch_to_block(bounds_ok);
-    let data = emit_instance_field_base(b, entry, address);
+    let data = emit_heap_data_base(b, entry, address);
     let value = b.ins().load(types::I64, MemFlagsData::trusted(), data,
         op.x as i32 * std::mem::size_of::<RegisterWord>() as i32);
     let result_ok = b.create_block();

@@ -1929,18 +1929,105 @@ mod indexed_table_tests {
     }
 }
 
+/// Key -> entry position for dictionary-mode objects. The first 16 keys live
+/// inline (linear search below 16 entries, one SIMD control group at 16);
+/// beyond that the map spills to a hashbrown table using the keyed AES hasher
+/// (keys are user data).
+type ObjectIndex = small_map::SmallMap<16, MapKey, usize, runtime_hash::AesBuildHasher, runtime_hash::AesBuildHasher>;
+
+/// Ordered dictionary storage of an object that left hidden-class mode
+/// (property deletion, non-string or overlong keys, more than
+/// `MAX_SHAPED_MAP_SLOTS` properties, or shape-table exhaustion).
+///
+/// Boxed inside `MapDictionary::Object`: the inline `ObjectIndex` is ~700
+/// bytes and must not inflate the `MapDictionary` of every `new Map()`/`Set`.
+#[derive(Debug, Default)]
+struct ObjectDictionary {
+    indices: ObjectIndex,
+    entries: Vec<(MapKey, Value)>,
+}
+
+impl ObjectDictionary {
+    #[inline]
+    fn get(&self, key: MapKeyRef<'_>) -> Option<Value> {
+        self.indices.get(&key).map(|&index| self.entries[index].1)
+    }
+
+    fn insert(&mut self, key: MapKey, value: Value) -> Option<Value> {
+        if let Some(&index) = self.indices.get(&key) {
+            return Some(std::mem::replace(&mut self.entries[index].1, value));
+        }
+        self.indices.insert(key.clone(), self.entries.len());
+        self.entries.push((key, value));
+        None
+    }
+
+    /// Append a key known to be absent (hidden-class keys during promotion).
+    fn push_unique(&mut self, key: MapKey, value: Value) {
+        debug_assert!(self.indices.get(&key).is_none(), "duplicate dictionary key");
+        // SAFETY: the caller guarantees `key` is not present.
+        unsafe { self.indices.insert_unique_unchecked(key.clone(), self.entries.len()) };
+        self.entries.push((key, value));
+    }
+
+    fn lookup_or_insert(&mut self, key: MapKey, value: Value) -> Value {
+        if let Some(&index) = self.indices.get(&key) {
+            return self.entries[index].1;
+        }
+        self.indices.insert(key.clone(), self.entries.len());
+        self.entries.push((key, value));
+        value
+    }
+
+    /// Order-preserving removal: later entries shift down one position.
+    fn remove(&mut self, key: &MapKey) -> Option<Value> {
+        let index = self.indices.remove(key)?;
+        let (_, value) = self.entries.remove(index);
+        for (offset, (key, _)) in self.entries[index..].iter().enumerate() {
+            *self.indices.get_mut(key).expect("dictionary entry must be indexed") = index + offset;
+        }
+        Some(value)
+    }
+
+    fn clear(&mut self) {
+        self.indices.clear();
+        self.entries.clear();
+    }
+
+    /// `SmallMap` has no `reserve`. An empty index that is known to outgrow
+    /// its inline capacity starts on the heap instead of filling the inline
+    /// array and migrating every key on the next insertion.
+    fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+        if self.indices.is_empty() && additional > self.indices.capacity() {
+            self.indices = ObjectIndex::with_capacity_and_hasher(additional, Default::default());
+        }
+    }
+
+    /// Unmanaged bytes beyond `size_of::<ObjectDictionary>()` (whose inline
+    /// index the caller counts with the Box itself).
+    fn external_bytes(&self) -> usize {
+        let index = if self.indices.is_inline() {
+            0
+        } else {
+            self.indices.capacity() * std::mem::size_of::<(MapKey, usize)>()
+        };
+        index + self.entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
+    }
+}
+
 /// Objects retain ordered dictionary fallback; language Map and Set use dense
 /// AES-keyed indexed tables, without shapes or property caches.
 #[derive(Debug)]
 enum MapDictionary {
-    Object { indices: FastMap<MapKey, usize>, entries: Vec<(MapKey, Value)> },
+    Object(Box<ObjectDictionary>),
     Map(IndexedTable),
     Set(IndexedTable),
     ConcurrentMap(ConcurrentTable<crate::napalm_collections::ConcurrentMap<MapKey, Value>>),
     ConcurrentSet(ConcurrentTable<crate::napalm_collections::ConcurrentSet<SetEntry>>),
 }
 impl Default for MapDictionary {
-    fn default() -> Self { Self::Object { indices: FastMap::default(), entries: Vec::new() } }
+    fn default() -> Self { Self::Object(Box::default()) }
 }
 impl MapDictionary {
     fn concurrent_contracts(&self) -> Option<&parking_lot::RwLock<Vec<Type>>> { match self {
@@ -1982,31 +2069,24 @@ impl MapDictionary {
         let before = self.len();
         let result = match self {
             Self::Map(table) | Self::Set(table) => table.get_or_insert(key, value),
-            Self::Object { indices, entries } => {
-                let index = *indices.entry(key.clone()).or_insert_with(|| {
-                    let index = entries.len();
-                    entries.push((key, value));
-                    index
-                });
-                entries[index].1
-            }
+            Self::Object(object) => object.lookup_or_insert(key, value),
             _ => unreachable!("concurrent insertion requires a shared borrow"),
         };
         (result, self.len() != before)
     }
-    fn is_map_origin(&self) -> bool { !matches!(self, Self::Object { .. }) }
+    fn is_map_origin(&self) -> bool { !matches!(self, Self::Object(_)) }
     fn len(&self) -> usize { match self {
-        Self::Object { entries, .. } => entries.len(), Self::Map(m) => m.len(), Self::Set(s) => s.len(),
+        Self::Object(object) => object.entries.len(), Self::Map(m) => m.len(), Self::Set(s) => s.len(),
         Self::ConcurrentMap(m) => m.len(), Self::ConcurrentSet(s) => s.len(),
     } }
     fn is_empty(&self) -> bool { self.len() == 0 }
     fn reserve(&mut self, additional: usize) { match self {
-        Self::Object { indices, entries } => { indices.reserve(additional); entries.reserve(additional); }
+        Self::Object(object) => object.reserve(additional),
         Self::Map(table) | Self::Set(table) => table.reserve(additional),
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => {},
     } }
     fn external_bytes(&self) -> usize { match self {
-        Self::Object { indices, entries } => indices.capacity() * std::mem::size_of::<(MapKey, usize)>() + entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        Self::Object(object) => std::mem::size_of::<ObjectDictionary>() + object.external_bytes(),
         Self::Map(table) | Self::Set(table) => table.external_bytes(),
         Self::ConcurrentMap(m) => m.len() * std::mem::size_of::<(MapKey, Value)>(),
         Self::ConcurrentSet(s) => s.len() * std::mem::size_of::<SetEntry>(),
@@ -2015,7 +2095,7 @@ impl MapDictionary {
     fn get(&self, key: &MapKey) -> Option<Value> { self.get_ref(MapKeyRef::from_key(key)) }
     /// Allocation- and refcount-free probe with a borrowed key.
     fn get_ref(&self, key: MapKeyRef<'_>) -> Option<Value> { match self {
-        Self::Object { indices, entries } => indices.get(&key).map(|&i| entries[i].1),
+        Self::Object(object) => object.get(key),
         Self::Map(table) | Self::Set(table) => table.get(key),
         Self::ConcurrentMap(m) => m.pin().get(&key).copied(),
         Self::ConcurrentSet(s) => s.pin().get(&key).map(|e| e.1),
@@ -2024,27 +2104,20 @@ impl MapDictionary {
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent writes require a shared borrow"),
         Self::Map(table) => table.insert(key, value),
         Self::Set(table) => table.replace(key, value),
-        Self::Object { indices, entries } => {
-            if let Some(&i) = indices.get(&key) { return Some(std::mem::replace(&mut entries[i].1, value)); }
-            indices.insert(key.clone(), entries.len()); entries.push((key, value)); None
-        }
+        Self::Object(object) => object.insert(key, value),
     } }
     fn remove(&mut self, key: &MapKey) -> Option<Value> { match self {
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => unreachable!("concurrent removal requires a shared borrow"),
         Self::Map(table) | Self::Set(table) => table.remove(MapKeyRef::from_key(key)),
-        Self::Object { indices, entries } => {
-            let index = indices.remove(key)?; let (_, value) = entries.remove(index);
-            for (offset, (key, _)) in entries[index..].iter().enumerate() { *indices.get_mut(key).unwrap() = index + offset; }
-            Some(value)
-        }
+        Self::Object(object) => object.remove(key),
     } }
     fn clear(&mut self) { match self {
-        Self::Object { indices, entries } => { indices.clear(); entries.clear(); }
+        Self::Object(object) => object.clear(),
         Self::Map(table) | Self::Set(table) => table.clear(),
         Self::ConcurrentMap(_) | Self::ConcurrentSet(_) => self.concurrent_clear(),
     } }
     fn iter(&self) -> Box<dyn Iterator<Item = (MapKey, Value)> + '_> { match self {
-        Self::Object { entries, .. } => Box::new(entries.iter().cloned()),
+        Self::Object(object) => Box::new(object.entries.iter().cloned()),
         Self::Map(table) | Self::Set(table) => Box::new(table.entries.iter().cloned()),
         Self::ConcurrentMap(m) => Box::new(m.pin().iter().map(|(k,v)| (k.clone(), *v)).collect::<Vec<_>>().into_iter()),
         Self::ConcurrentSet(s) => Box::new(s.pin().iter().map(|e| (e.0.clone(), e.1)).collect::<Vec<_>>().into_iter()),
@@ -2054,7 +2127,7 @@ impl MapDictionary {
     /// and snapshots concurrent tables into a Vec.
     #[inline]
     fn for_each_entry(&self, mut f: impl FnMut(&MapKey, Value)) { match self {
-        Self::Object { entries, .. } => for (key, value) in entries { f(key, *value) },
+        Self::Object(object) => for (key, value) in &object.entries { f(key, *value) },
         Self::Map(table) | Self::Set(table) => for (key, value) in &table.entries { f(key, *value) },
         Self::ConcurrentMap(m) => for (key, value) in m.pin().iter() { f(key, *value) },
         Self::ConcurrentSet(s) => for entry in s.pin().iter() { f(&entry.0, entry.1) },
@@ -2063,13 +2136,13 @@ impl MapDictionary {
     /// tables answer in O(1); concurrent tables walk their buckets once without
     /// snapshotting the whole table or cloning every skipped key.
     fn nth_key(&self, index: usize) -> Option<MapKey> { match self {
-        Self::Object { entries, .. } => entries.get(index).map(|(key, _)| key.clone()),
+        Self::Object(object) => object.entries.get(index).map(|(key, _)| key.clone()),
         Self::Map(table) | Self::Set(table) => table.entries.get(index).map(|(key, _)| key.clone()),
         Self::ConcurrentMap(m) => m.pin().iter().nth(index).map(|(key, _)| key.clone()),
         Self::ConcurrentSet(s) => s.pin().iter().nth(index).map(|entry| entry.0.clone()),
     } }
     fn nth_value(&self, index: usize) -> Option<Value> { match self {
-        Self::Object { entries, .. } => entries.get(index).map(|&(_, value)| value),
+        Self::Object(object) => object.entries.get(index).map(|&(_, value)| value),
         Self::Map(table) | Self::Set(table) => table.entries.get(index).map(|&(_, value)| value),
         Self::ConcurrentMap(m) => m.pin().iter().nth(index).map(|(_, value)| *value),
         Self::ConcurrentSet(s) => s.pin().iter().nth(index).map(|entry| entry.1),
@@ -2079,22 +2152,41 @@ impl MapDictionary {
 
 const SMALL_MAP_INLINE_FIELDS: usize = 4;
 
-/// Fixed-capacity storage for the hot object-like Map representation.
-///
-/// Unlike `SmallVec`, this type can never allocate or spill. Maps that outgrow
-/// four dense properties are promoted to dictionary storage before the fifth
-/// value is inserted. Keeping the array physically inside `NapalmMap` makes the
-/// common `{ a, b }` / `{ left, right }` case a single managed allocation.
+/// Dense value slots of a shaped Map. The first [`SMALL_MAP_INLINE_FIELDS`]
+/// live inside the managed object; a larger shape moves every value into one
+/// unmanaged buffer sized for the largest shape. That buffer is allocated once
+/// and never reallocated, so its address stays stable for native code.
 #[repr(C)]
-#[derive(Clone, Debug)]
+union MapValueStorage {
+    inline: [Value; SMALL_MAP_INLINE_FIELDS],
+    spilled: std::mem::ManuallyDrop<Box<[Value; MAX_SHAPED_MAP_SLOTS]>>,
+}
+
+/// Storage for the hot object-like Map representation: up to
+/// `MAX_SHAPED_MAP_SLOTS` dense values addressed by hidden-class slot.
+///
+/// Small objects (`{ a, b }`, `{ left, right }`) keep their values physically
+/// inside `NapalmMap`: a single managed allocation. The fifth value moves all
+/// values to a fixed-capacity unmanaged buffer, so objects keep their shape
+/// (and every PIC/JIT fast path) instead of degrading to dictionary mode.
+/// `HeapObject` does not grow: the buffer pointer shares the inline array's
+/// space, exactly like `InstanceObject`.
+///
+/// Native code builds inline values on its stack by zeroing the first word
+/// (`len`, `map_origin`, `spilled`, padding) and storing `values` by offset, so
+/// generated literals are always inline.
+#[repr(C)]
 struct InlineMapValues {
     len: u8,
     /// Nonzero when the Map was created with `new Map()` rather than an object
     /// literal (only `typeof` distinguishes them). Lives in what was padding,
     /// so `len`/`values` offsets used by native code are unchanged.
     map_origin: u8,
-    _padding: [u8; 6],
-    values: [Value; SMALL_MAP_INLINE_FIELDS],
+    /// Nonzero when `values.spilled` is the active union field. Lives in what
+    /// was padding and is zeroed together with `len` by native code.
+    spilled: u8,
+    _padding: [u8; 5],
+    values: MapValueStorage,
 }
 
 impl InlineMapValues {
@@ -2103,8 +2195,9 @@ impl InlineMapValues {
         Self {
             len: 0,
             map_origin: 0,
-            _padding: [0; 6],
-            values: [Value::NULL; SMALL_MAP_INLINE_FIELDS],
+            spilled: 0,
+            _padding: [0; 5],
+            values: MapValueStorage { inline: [Value::NULL; SMALL_MAP_INLINE_FIELDS] },
         }
     }
 
@@ -2115,13 +2208,51 @@ impl InlineMapValues {
     fn is_empty(&self) -> bool { self.len == 0 }
 
     #[inline(always)]
-    fn as_slice(&self) -> &[Value] {
-        &self.values[..self.len()]
+    fn is_spilled(&self) -> bool { self.spilled != 0 }
+
+    /// Every allocated slot, live or not.
+    #[inline(always)]
+    fn storage(&self) -> &[Value] {
+        unsafe {
+            if self.is_spilled() { &self.values.spilled[..] } else { &self.values.inline[..] }
+        }
     }
 
     #[inline(always)]
+    fn storage_mut(&mut self) -> &mut [Value] {
+        unsafe {
+            if self.is_spilled() { &mut (**self.values.spilled)[..] } else { &mut self.values.inline[..] }
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[Value] {
+        let len = self.len();
+        unsafe { self.storage().get_unchecked(..len) }
+    }
+
+    /// Address of slot 0. Inline values move with the managed owner; spilled
+    /// values have a stable address. Publish it through [`Self::heap_data`].
+    #[inline(always)]
     fn as_ptr(&self) -> *const Value {
-        self.values.as_ptr()
+        self.storage().as_ptr()
+    }
+
+    /// `TraceHeapEntry::data` for these values: an owner-relative tagged
+    /// offset while inline, the stable absolute pointer once spilled.
+    #[inline(always)]
+    fn heap_data(&self, owner_address: usize) -> usize {
+        if self.is_spilled() {
+            self.as_ptr() as usize
+        } else {
+            encode_inline_heap_data(owner_address, self.as_ptr() as usize)
+        }
+    }
+
+    /// Bytes of unmanaged storage owned by these values (0 while inline).
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        if self.is_spilled() { std::mem::size_of::<[Value; MAX_SHAPED_MAP_SLOTS]>() } else { 0 }
     }
 
     #[inline(always)]
@@ -2132,7 +2263,7 @@ impl InlineMapValues {
     #[inline(always)]
     fn iter_mut(&mut self) -> std::slice::IterMut<'_, Value> {
         let len = self.len();
-        self.values[..len].iter_mut()
+        self.storage_mut()[..len].iter_mut()
     }
 
     #[inline(always)]
@@ -2148,34 +2279,87 @@ impl InlineMapValues {
     #[inline(always)]
     unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
         debug_assert!(index < self.len());
-        unsafe { self.values.get_unchecked_mut(index) }
+        unsafe { self.storage_mut().get_unchecked_mut(index) }
+    }
+
+    /// Move the inline values into the fixed-capacity unmanaged buffer.
+    #[cold]
+    #[inline(never)]
+    fn spill(&mut self) {
+        if self.is_spilled() {
+            return;
+        }
+        let mut buffer = Box::new([Value::NULL; MAX_SHAPED_MAP_SLOTS]);
+        buffer[..SMALL_MAP_INLINE_FIELDS].copy_from_slice(unsafe { &self.values.inline });
+        // The inline array is Copy: overwriting it with the buffer pointer
+        // drops nothing.
+        self.values = MapValueStorage { spilled: std::mem::ManuallyDrop::new(buffer) };
+        self.spilled = 1;
     }
 
     #[inline(always)]
     fn push(&mut self, value: Value) {
         let index = self.len();
-        assert!(index < SMALL_MAP_INLINE_FIELDS, "inline Map storage overflow");
-        self.values[index] = value;
+        assert!(index < MAX_SHAPED_MAP_SLOTS, "shaped Map storage overflow");
+        if index == SMALL_MAP_INLINE_FIELDS && !self.is_spilled() {
+            self.spill();
+        }
+        unsafe { *self.storage_mut().get_unchecked_mut(index) = value; }
         self.len += 1;
     }
 
     #[inline]
     fn resize(&mut self, new_len: usize, value: Value) {
-        assert!(new_len <= SMALL_MAP_INLINE_FIELDS, "inline Map storage overflow");
+        assert!(new_len <= MAX_SHAPED_MAP_SLOTS, "shaped Map storage overflow");
+        if new_len > SMALL_MAP_INLINE_FIELDS {
+            self.spill();
+        }
         let old_len = self.len();
+        let storage = self.storage_mut();
         if new_len > old_len {
-            self.values[old_len..new_len].fill(value);
+            storage[old_len..new_len].fill(value);
         } else if new_len < old_len {
-            self.values[new_len..old_len].fill(Value::NULL);
+            storage[new_len..old_len].fill(Value::NULL);
         }
         self.len = new_len as u8;
     }
 
+    /// Empty the values. A spilled buffer is kept: the published sidecar
+    /// pointer stays valid and refilling the object does not reallocate.
     #[inline]
     fn clear(&mut self) {
         let len = self.len();
-        self.values[..len].fill(Value::NULL);
+        self.storage_mut()[..len].fill(Value::NULL);
         self.len = 0;
+    }
+}
+
+impl Drop for InlineMapValues {
+    fn drop(&mut self) {
+        if self.is_spilled() {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.values.spilled) };
+        }
+    }
+}
+
+impl Clone for InlineMapValues {
+    fn clone(&self) -> Self {
+        let values = if self.is_spilled() {
+            MapValueStorage { spilled: std::mem::ManuallyDrop::new(unsafe { (*self.values.spilled).clone() }) }
+        } else {
+            MapValueStorage { inline: unsafe { self.values.inline } }
+        };
+        Self { len: self.len, map_origin: self.map_origin, spilled: self.spilled, _padding: [0; 5], values }
+    }
+}
+
+impl std::fmt::Debug for InlineMapValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineMapValues")
+            .field("map_origin", &self.map_origin)
+            .field("spilled", &self.is_spilled())
+            .field("values", &self.as_slice())
+            .finish()
     }
 }
 
@@ -2252,7 +2436,7 @@ impl NapalmMap {
     #[inline]
     fn external_bytes(&self) -> usize {
         match &self.storage {
-            NapalmMapStorage::Shaped { .. } => 0,
+            NapalmMapStorage::Shaped { values, .. } => values.external_bytes(),
             NapalmMapStorage::Dictionary(entries) => {
                 std::mem::size_of::<MapDictionary>() + entries.external_bytes()
             }
@@ -2293,7 +2477,7 @@ impl NapalmMap {
                     unsafe { *values.get_unchecked_mut(slot as usize) = value; }
                     return Some(slot);
                 }
-                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                if values.len() < MAX_SHAPED_MAP_SLOTS {
                     if let Some((next_shape, slot)) = shapes.transition_with_contract(
                         *shape,
                         bytes.clone(),
@@ -2317,25 +2501,21 @@ impl NapalmMap {
     }
 
     fn promote_to_dictionary(&mut self, shapes: &MapShapeTable) {
-        let old = std::mem::replace(
-            &mut self.storage,
-            NapalmMapStorage::Dictionary(Box::new(MapDictionary::default())),
-        );
-        match old {
-            NapalmMapStorage::Dictionary(entries) => {
-                self.storage = NapalmMapStorage::Dictionary(entries);
-            }
-            NapalmMapStorage::Shaped { shape, values } => {
-                let keys = shapes.keys(shape);
-                debug_assert_eq!(keys.len(), values.len());
-                let mut entries = MapDictionary::default();
-                entries.reserve(values.len());
-                for (key, value) in keys.iter().cloned().zip(values.as_slice().iter().copied()) {
-                    entries.insert(MapKey::String(key), value);
-                }
-                self.storage = NapalmMapStorage::Dictionary(Box::new(entries));
-            }
+        let NapalmMapStorage::Shaped { shape, values } = &self.storage else {
+            return;
+        };
+        let keys = shapes.keys(*shape);
+        debug_assert_eq!(keys.len(), values.len());
+        // Promotion usually precedes inserting one more key (a full largest
+        // shape getting its 17th property): size for it as well.
+        let mut object = ObjectDictionary::default();
+        object.reserve(values.len() + 1);
+        for (key, &value) in keys.iter().zip(values.as_slice()) {
+            // Hidden-class keys are unique by construction.
+            object.push_unique(MapKey::String(key.clone()), value);
         }
+        // Replacing the shaped storage also frees a spilled value buffer.
+        self.storage = NapalmMapStorage::Dictionary(Box::new(MapDictionary::Object(Box::new(object))));
     }
 
     fn nth_key(&self, shapes: &MapShapeTable, index: usize) -> Option<MapKey> {
@@ -3520,7 +3700,7 @@ impl HandleTable {
             HeapObject::Map(map) => match &map.storage {
                 NapalmMapStorage::Shaped { shape, values } => (
                     TraceHeapKind::Map,
-                    encode_inline_heap_data(object_address, values.as_slice().as_ptr() as usize),
+                    values.heap_data(object_address),
                     values.len(),
                     *shape,
                 ),
@@ -4562,17 +4742,15 @@ impl Heap {
                 object: HeapObject::Map(NapalmMap::with_shaped_buffer(shape, values)),
             });
         }
-        let HeapObject::Map(map) = &unsafe { managed_object(object) }.object else {
+        let HeapObject::Map(NapalmMap { storage: NapalmMapStorage::Shaped { values, .. } }) =
+            &unsafe { managed_object(object) }.object
+        else {
             unreachable!()
         };
-        let (_, values) = map.shaped().unwrap();
         let entry = self.handle_table.entry(handle);
         entry.address.store(object.address(), Ordering::Relaxed);
         entry.receiver_class.store(class.0, Ordering::Relaxed);
-        entry.data.store(
-            encode_inline_heap_data(object.address(), values.as_ptr() as usize),
-            Ordering::Relaxed,
-        );
+        entry.data.store(values.heap_data(object.address()), Ordering::Relaxed);
         entry.len.store(values.len(), Ordering::Relaxed);
         entry.promise_value.store(0, Ordering::Relaxed);
         entry.kind.store(
@@ -5200,7 +5378,7 @@ impl Heap {
                     return Ok(false);
                 }
 
-                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                if values.len() < MAX_SHAPED_MAP_SLOTS {
                     if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
                         *shape,
                         bytes.clone(),
@@ -5217,8 +5395,8 @@ impl Heap {
                 }
             }
 
-            // Non-string keys, shape-budget exhaustion and maps that grow past
-            // the small-object threshold become ordinary dictionaries forever.
+            // Non-string keys, overlong keys, shape-table exhaustion and maps that
+            // grow past MAX_SHAPED_MAP_SLOTS become ordinary dictionaries forever.
             map.promote_to_dictionary(&self.map_shapes);
         }
 
@@ -5329,7 +5507,7 @@ impl Heap {
                     return Ok(false);
                 }
 
-                if values.len() < SMALL_MAP_INLINE_FIELDS {
+                if values.len() < MAX_SHAPED_MAP_SLOTS {
                     let key = MapStringKey::from_napalm(bytes);
                     if let Some((next_shape, slot)) = self.map_shapes.transition_with_contract(
                         *shape,
@@ -5349,8 +5527,8 @@ impl Heap {
                 encoded_key = Some(MapKey::String(MapStringKey::from_napalm(bytes)));
             }
 
-            // Non-string keys, shape-budget exhaustion and maps that grow past
-            // the small-object threshold become ordinary dictionaries forever.
+            // Non-string keys, overlong keys, shape-table exhaustion and maps that
+            // grow past MAX_SHAPED_MAP_SLOTS become ordinary dictionaries forever.
             map.promote_to_dictionary(&self.map_shapes);
         }
 
@@ -22716,29 +22894,76 @@ mod tests {
     }
 
     #[test]
-    fn shaped_map_promotes_before_inline_storage_can_spill() {
+    fn shaped_map_keeps_its_shape_up_to_the_slot_limit() {
         let mut shapes = MapShapeTable::default();
         let mut map = NapalmMap::default();
-        for index in 0..SMALL_MAP_INLINE_FIELDS {
-            let key = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(
-                format!("k{index}").into_bytes(),
-            )));
+        let key = |index: usize| MapKey::String(MapStringKey::new(Arc::<[u8]>::from(format!("k{index}").into_bytes())));
+        for index in 0..MAX_SHAPED_MAP_SLOTS {
             assert_eq!(
-                map.insert_unpublished(&mut shapes, key, Value::from_num(index as f64)),
+                map.insert_unpublished(&mut shapes, key(index), Value::from_num(index as f64)),
                 Some(index as u16),
             );
+            let NapalmMapStorage::Shaped { values, .. } = &map.storage else {
+                panic!("map with {} properties lost its shape", index + 1)
+            };
+            // Values leave the managed object exactly when the fifth arrives.
+            assert_eq!(values.is_spilled(), index >= SMALL_MAP_INLINE_FIELDS, "{index}");
         }
-        assert!(matches!(map.storage, NapalmMapStorage::Shaped { .. }));
+        for index in 0..MAX_SHAPED_MAP_SLOTS {
+            assert_eq!(map.get(&shapes, &key(index)).and_then(|v| v.as_num()), Some(index as f64));
+        }
+        assert_eq!(map.external_bytes(), MAX_SHAPED_MAP_SLOTS * std::mem::size_of::<Value>());
+        let clone = match &map.storage { NapalmMapStorage::Shaped { values, .. } => values.clone(), _ => unreachable!() };
+        assert!(clone.is_spilled());
+        assert_eq!(clone.len(), MAX_SHAPED_MAP_SLOTS);
 
-        let fifth = MapKey::String(MapStringKey::new(Arc::<[u8]>::from(&b"fifth"[..])));
-        assert_eq!(
-            map.insert_unpublished(&mut shapes, fifth, Value::from_num(5.0)),
-            None,
-        );
+        // Past the largest shape the map becomes a dictionary, keeping every entry.
+        assert_eq!(map.insert_unpublished(&mut shapes, key(MAX_SHAPED_MAP_SLOTS), Value::NULL), None);
         assert!(matches!(
             map.storage,
-            NapalmMapStorage::Dictionary(ref entries) if entries.len() == SMALL_MAP_INLINE_FIELDS + 1
+            NapalmMapStorage::Dictionary(ref entries) if entries.len() == MAX_SHAPED_MAP_SLOTS + 1
         ));
+        assert_eq!(map.get(&shapes, &key(3)).and_then(|v| v.as_num()), Some(3.0));
+    }
+
+    #[test]
+    fn map_storage_sizes_do_not_regress() {
+        // Spilling shares the inline array's space (like InstanceObject):
+        // header word + four inline values.
+        assert_eq!(std::mem::size_of::<InlineMapValues>(), 8 + SMALL_MAP_INLINE_FIELDS * 8);
+        // The ~700-byte inline object index is boxed, so every `new Map()` /
+        // `new Set()` keeps a small dictionary allocation.
+        assert!(std::mem::size_of::<ObjectIndex>() > 512);
+        assert!(
+            std::mem::size_of::<MapDictionary>() <= 128,
+            "MapDictionary grew to {} bytes",
+            std::mem::size_of::<MapDictionary>()
+        );
+    }
+
+    #[test]
+    fn spilled_map_sidecar_publishes_its_stable_absolute_buffer() {
+        let entry = HandleEntry::new(FREE_HANDLE_NONE);
+        let mut values = InlineMapValues::new();
+        for index in 0..(SMALL_MAP_INLINE_FIELDS + 2) {
+            values.push(Value::from_num(index as f64));
+        }
+        assert!(values.is_spilled());
+        let buffer = values.as_ptr() as usize;
+        let managed = ManagedObject {
+            handle: 0,
+            object: HeapObject::Map(NapalmMap::with_shaped_buffer(9, values)),
+        };
+        // Moving the owner (as the GC does) must not move the spilled values.
+        let moved = Box::new(managed);
+        let base = (&*moved as *const ManagedObject) as usize;
+        HandleTable::refresh_entry(&entry, base, &moved.object);
+        let encoded = entry.data.load(Ordering::Relaxed);
+        assert_eq!(encoded & crate::napalm_tracing_jit::TRACE_HEAP_DATA_RELATIVE_MASK, 0);
+        assert_eq!(encoded, buffer);
+        assert_eq!(entry.len.load(Ordering::Relaxed), SMALL_MAP_INLINE_FIELDS + 2);
+        let slot5 = unsafe { *(encoded as *const Value).add(5) };
+        assert_eq!(slot5.as_num(), Some(5.0));
     }
 
     #[test]
